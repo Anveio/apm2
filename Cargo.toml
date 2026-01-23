@@ -81,7 +81,7 @@ rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Internal crates
-apm2-core = { version = "0.1.0", path = "crates/apm2-core" }
+apm2-core = { version = "0.2.0", path = "crates/apm2-core" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
