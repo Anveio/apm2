@@ -57,8 +57,10 @@ impl FromStr for ExitClassification {
 
 /// The state of a session in the lifecycle state machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SessionState {
     /// Session is actively running.
+    #[non_exhaustive]
     Running {
         /// Timestamp when the session started (nanoseconds since epoch).
         started_at: u64,
@@ -86,6 +88,7 @@ pub enum SessionState {
         timeout_count: u64,
     },
     /// Session has terminated (final state).
+    #[non_exhaustive]
     Terminated {
         /// Timestamp when the session started (nanoseconds since epoch).
         started_at: u64,
@@ -99,6 +102,7 @@ pub enum SessionState {
         final_entropy: u64,
     },
     /// Session is quarantined (blocked from execution).
+    #[non_exhaustive]
     Quarantined {
         /// Timestamp when the session started (nanoseconds since epoch).
         started_at: u64,
