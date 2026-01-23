@@ -23,6 +23,7 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Errors that can occur during ledger operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LedgerError {
     /// Database error from `SQLite`.
     #[error("database error: {0}")]
@@ -81,6 +82,7 @@ pub const CURRENT_RECORD_VERSION: u32 = 1;
 
 /// A single event record in the ledger.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EventRecord {
     /// Sequence ID (assigned by the ledger on append).
     pub seq_id: Option<u64>,
