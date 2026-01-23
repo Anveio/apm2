@@ -36,7 +36,9 @@
 pub mod config;
 pub mod credentials;
 pub mod health;
+pub mod identity;
 pub mod ipc;
+pub mod ledger;
 pub mod log;
 pub mod process;
 pub mod restart;
@@ -48,6 +50,8 @@ pub mod supervisor;
 pub mod prelude {
     pub use crate::config::EcosystemConfig;
     pub use crate::credentials::{AuthMethod, CredentialProfile, Provider};
+    pub use crate::identity::{ActorId, NodeIdentity, NodeRole};
+    pub use crate::ledger::{Event, FileLedger, Ledger};
     pub use crate::process::{ProcessHandle, ProcessSpec, ProcessState};
     pub use crate::restart::RestartConfig;
     pub use crate::supervisor::Supervisor;
@@ -56,6 +60,8 @@ pub mod prelude {
 /// Re-export commonly used types at the crate root.
 pub use config::EcosystemConfig;
 pub use credentials::CredentialProfile;
+pub use identity::{ActorId, NodeIdentity, NodeRole};
+pub use ledger::{Event, FileLedger, Ledger, LedgerError};
 pub use process::{ProcessHandle, ProcessSpec, ProcessState};
 pub use restart::RestartConfig;
 pub use supervisor::Supervisor;

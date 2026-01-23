@@ -4,6 +4,7 @@ members = [
     "crates/apm2-core",
     "crates/apm2-daemon",
     "crates/apm2-cli",
+    "crates/apm2-node",
 ]
 exclude = ["fuzz"]
 
@@ -35,6 +36,11 @@ clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 thiserror = "2.0"
 anyhow = "1.0"
 
+# HTTP
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2.5"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -58,6 +64,7 @@ humantime = "2.1"
 ctrlc = "3.4"
 regex = "1.10"
 once_cell = "1.19"
+sha2 = "0.10"
 
 # Testing
 proptest = "1.0"
