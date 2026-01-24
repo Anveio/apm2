@@ -16,6 +16,13 @@ prd_problem:
   non_goals:
     - id: NG-0001
       statement: Full GitHub replacement including CI runner, artifact storage, and team management. GitHub remains for CI execution; this PRD focuses on decoupling work state and review.
+      clarification: |
+        CI result handling: GitHub Actions executes CI pipelines (near-term).
+        CI results ARE imported as external evidence artifacts via explicit import.
+        Import is explicit (not automatic sync) and tagged with external provenance.
+        This is not bidirectional sync: the ledger remains authoritative, but accepts
+        external evidence with clear provenance marking. Long-term internal CI execution
+        is future scope (separate PRD).
     - id: NG-0002
       statement: Browser-based UI for work management. The interface is CLI commands and ledger projections; UI can be built later on top of projections.
     - id: NG-0003

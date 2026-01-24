@@ -4,10 +4,16 @@ prd_success_metrics:
   metrics:
     - id: MET-0001
       name: PRD refinement tool invocation count
-      description: Number of tool invocations required for an agent to produce a high-fidelity PRD from a low-fidelity idea.
+      description: |
+        Number of CLI command invocations required for an agent to produce a high-fidelity PRD from a low-fidelity idea.
+        Clarification: "tool invocations" means apm2 CLI commands (e.g., `apm2 plan new`, `apm2 plan refine`),
+        NOT internal LLM API calls within a command. Internal LLM calls during plan refinement do not count.
+        Example: `plan new` (1) + `plan refine` (up to 3x) + `plan validate` (1) = 5 commands max.
       baseline: Manual PRD creation requires extensive back-and-forth; no automated baseline.
-      target: Agent produces lint-passing PRD in <=5 tool invocations.
-      measurement_method: Count plan create + plan refine invocations from ledger events for successful PRD completions.
+      target: Agent produces lint-passing PRD in <=5 CLI command invocations.
+      measurement_method: |
+        Count PlanCreated, PlanRefined, and PlanValidated events from ledger for successful PRD completions.
+        Each event represents one CLI command invocation. Internal LLM calls within commands are not counted.
       evidence_ids:
         - EVID-0001
     - id: MET-0002

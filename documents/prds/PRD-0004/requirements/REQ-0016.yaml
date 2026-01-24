@@ -14,5 +14,5 @@ prd_requirement:
     - System operates correctly with GitHub adapter disabled (offline mode).
   evidence:
     evidence_ids:
-      - EVID-0002
+      - EVID-0003
       - EVID-0007

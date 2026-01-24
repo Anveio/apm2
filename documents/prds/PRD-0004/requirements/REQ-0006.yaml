@@ -14,5 +14,4 @@ prd_requirement:
     - Canonicalization is deterministic; same logical spec always produces same hash.
   evidence:
     evidence_ids:
-      - EVID-0001
       - EVID-0002

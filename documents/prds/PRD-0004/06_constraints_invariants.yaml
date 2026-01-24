@@ -70,3 +70,16 @@ prd_constraints_invariants:
       enforcement: Intervention commands require rationale parameter; events are signed and include operator identity.
       evidence_ids:
         - EVID-0008
+    - id: INV-0007
+      title: 'Event Chain Cryptographic Binding'
+      statement: 'Every work substrate event E[n] MUST include a BLAKE3 hash of its predecessor E[n-1]; chain verification is mandatory before event acceptance; chain breaks MUST be detected and trigger alerts.'
+      rationale: 'Per Principia Holonica (Chain of Causality): "Every event E[n] you emit is cryptographically bound to E[n-1]. To forge history is to break the chain." Cryptographic binding ensures tamper-evidence, enables dispute resolution, and maintains an immutable audit trail.'
+      verification_method: |
+        1. Unit tests verify each emitted event contains prev_event_hash field with valid BLAKE3 hash
+        2. Integration tests confirm BLAKE3 hash of E[n-1] canonical bytes matches E[n].prev_event_hash
+        3. Ledger writer rejects events where prev_event_hash validation fails
+        4. Chain integrity scanner runs on ledger open and detects hash discontinuities
+        5. Alert subsystem triggers on chain break detection with event IDs and expected vs actual hashes
+      evidence_ids:
+        - EVID-0004
+        - EVID-0016

@@ -2,16 +2,29 @@ prd_requirement:
   schema_version: "2026-01-23"
   template_version: "2026-01-23"
   id: REQ-0009
-  type: FUNCTIONAL
-  title: Gate outcomes as ledger events with evidence bundles
-  statement: 'Gate outcomes (PASS, FAIL, NEEDS_ADJUDICATION) MUST be recorded as GateRunCompleted events in the ledger. Each event MUST reference an evidence bundle containing the artifacts that support the gate decision.'
+  type: SECURITY
+  title: Signed GateRunCompleted events
+  statement: GateRunCompleted events MUST be cryptographically signed by the gate
+    executor identity using Ed25519 signatures; the signature binds the verdict,
+    evidence references, and execution metadata to the executor's attestation.
   acceptance_criteria:
-    - GateRunCompleted event includes gate_run_id, gate_type, changeset_id, result, evidence_bundle_id.
-    - Evidence bundle is content-addressed and stored in CAS.
-    - Evidence bundle contains all artifacts needed to independently verify the gate result.
-    - 'FAIL result includes finding_ids referencing the blocking findings.'
-    - NEEDS_ADJUDICATION result includes adjudication_request_id for human/authority review.
-    - Gate result is reproducible from evidence bundle (not dependent on external state).
+  - GateRunCompleted events include gate_executor_actor_id and executor_signature fields.
+  - Signatures are Ed25519 over canonical protobuf-encoded event bytes with domain
+    separator "GATE_RUN_COMPLETED:".
+  - Signature verification is mandatory on event ingestion; unsigned or invalid-signature
+    events are rejected with reason code INVALID_SIGNATURE.
+  - The executor_actor_id MUST match an authorized gate executor for the work scope;
+    mismatch causes rejection with reason code UNAUTHORIZED_EXECUTOR.
+  - Gate verdicts (PASS, FAIL, NEEDS_INPUT) are only considered binding when accompanied
+    by a valid executor signature.
+  - Evidence artifact hashes referenced in the event are covered by the signature,
+    preventing post-hoc evidence substitution.
+  - Audit log records signature verification results for all GateRunCompleted events.
   evidence:
     evidence_ids:
-      - EVID-0006
+    - EVID-0004
+    - EVID-0016
+    inherited_from_prd: true
+    notes:
+    - "Gate executor identity is bound to Ed25519 key per REQ-0022"
+    - "Prevents unauthorized agents from forging gate results"
