@@ -5,11 +5,131 @@ prd_traceability:
     mode: "FILE_PER_REQUIREMENT"
     local_root: "requirements/"
     local_requirements:
-      - requirement_id: "REQ-0001"
-        requirement_ref: "requirements/REQ-0001.yaml#prd_requirement"
+      - requirement_id: REQ-0001
+        requirement_ref: requirements/REQ-0001.yaml#prd_requirement
+      - requirement_id: REQ-0002
+        requirement_ref: requirements/REQ-0002.yaml#prd_requirement
+      - requirement_id: REQ-0003
+        requirement_ref: requirements/REQ-0003.yaml#prd_requirement
+      - requirement_id: REQ-0004
+        requirement_ref: requirements/REQ-0004.yaml#prd_requirement
+      - requirement_id: REQ-0005
+        requirement_ref: requirements/REQ-0005.yaml#prd_requirement
+      - requirement_id: REQ-0006
+        requirement_ref: requirements/REQ-0006.yaml#prd_requirement
+      - requirement_id: REQ-0007
+        requirement_ref: requirements/REQ-0007.yaml#prd_requirement
+      - requirement_id: REQ-0008
+        requirement_ref: requirements/REQ-0008.yaml#prd_requirement
+      - requirement_id: REQ-0009
+        requirement_ref: requirements/REQ-0009.yaml#prd_requirement
+      - requirement_id: REQ-0010
+        requirement_ref: requirements/REQ-0010.yaml#prd_requirement
+      - requirement_id: REQ-0011
+        requirement_ref: requirements/REQ-0011.yaml#prd_requirement
+      - requirement_id: REQ-0012
+        requirement_ref: requirements/REQ-0012.yaml#prd_requirement
+      - requirement_id: REQ-0013
+        requirement_ref: requirements/REQ-0013.yaml#prd_requirement
+      - requirement_id: REQ-0014
+        requirement_ref: requirements/REQ-0014.yaml#prd_requirement
+      - requirement_id: REQ-0015
+        requirement_ref: requirements/REQ-0015.yaml#prd_requirement
+      - requirement_id: REQ-0016
+        requirement_ref: requirements/REQ-0016.yaml#prd_requirement
+      - requirement_id: REQ-0017
+        requirement_ref: requirements/REQ-0017.yaml#prd_requirement
+      - requirement_id: REQ-0018
+        requirement_ref: requirements/REQ-0018.yaml#prd_requirement
+      - requirement_id: REQ-0019
+        requirement_ref: requirements/REQ-0019.yaml#prd_requirement
+      - requirement_id: REQ-0020
+        requirement_ref: requirements/REQ-0020.yaml#prd_requirement
     imports: []
   mapping:
     requirement_to_sections:
-      - requirement_id: "REQ-0001"
+      # Plan Lifecycle (REQ-0001 to REQ-0004)
+      - requirement_id: REQ-0001
         section_refs:
-          - "04_solution_overview.yaml#prd_solution_overview"
+          - 03_goals_scope.yaml#prd_goals_scope.goals[0]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0002
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[0]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0003
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[0]
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.invariants
+      - requirement_id: REQ-0004
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[0]
+          - 05_success_metrics.yaml#prd_success_metrics.metrics
+      # ChangeSet Abstraction (REQ-0005 to REQ-0007)
+      - requirement_id: REQ-0005
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[1]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0006
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[1]
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.invariants
+      - requirement_id: REQ-0007
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[2]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      # Internal Gate System (REQ-0008 to REQ-0011)
+      - requirement_id: REQ-0008
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[2]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0009
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[2]
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.invariants
+      - requirement_id: REQ-0010
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[2]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0011
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[2]
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.constraints
+      # Finding & Recurrence (REQ-0012 to REQ-0014)
+      - requirement_id: REQ-0012
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[3]
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.constraints
+      - requirement_id: REQ-0013
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[3]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0014
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[3]
+          - 05_success_metrics.yaml#prd_success_metrics.metrics
+      # GitHub Adapter (REQ-0015 to REQ-0017)
+      - requirement_id: REQ-0015
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[1]
+          - 04_solution_overview.yaml#prd_solution_overview.key_components
+      - requirement_id: REQ-0016
+        section_refs:
+          - 03_goals_scope.yaml#prd_goals_scope.goals[1]
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.constraints
+      - requirement_id: REQ-0017
+        section_refs:
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.constraints
+          - 05_success_metrics.yaml#prd_success_metrics.guardrails
+      # Operator Console (REQ-0018 to REQ-0020)
+      - requirement_id: REQ-0018
+        section_refs:
+          - 04_solution_overview.yaml#prd_solution_overview.interfaces.user_surfaces
+      - requirement_id: REQ-0019
+        section_refs:
+          - 04_solution_overview.yaml#prd_solution_overview.interfaces.user_surfaces
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.invariants
+      - requirement_id: REQ-0020
+        section_refs:
+          - 04_solution_overview.yaml#prd_solution_overview.interfaces.user_surfaces
+          - 06_constraints_invariants.yaml#prd_constraints_invariants.invariants

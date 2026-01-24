@@ -3,6 +3,16 @@ name: holonic-agent-network
 description: Theoretical foundations for holonic agent coordination. Defines axioms, boundaries, and protocols for multi-agent systems.
 user-invocable: false
 ---
+
+## Reference Documents
+
+| Document | Purpose |
+|----------|---------|
+| [Principia Holonica](references/principia-holonic.md) | **Axiomatic law for agents.** Defines existence (Markov blanket), truth topology (ledger), holarchy physics, resource boundedness, and the algorithm of action. Read this first. |
+| [Agent-Native Software](references/agent-native-software.md) | **Architectural doctrine.** Problem statement, canonical terminology (Work Substrate, Plan, ChangeSet, Gate, Finding, Countermeasure), spec/state separation, internal forge model, and recurrence feedback loops. |
+
+---
+
 Holonic systems describe complex organizations as recursive compositions of units (“holons”) that function as autonomous actors while also operating as constrained parts of larger aggregates. A holon is characterized by its externally observable interface, the boundary conditions under which it operates, and the invariants it is obligated to preserve. A holarchy is the resulting composition across scales; in software settings this composition may be represented as a hierarchy, a partially ordered set, or an overlay network, depending on membership and dependency structure.
 
 In software engineering, a holonic boundary is treated as a contract surface. The contract specifies admissible inputs, outputs, and state transitions, and it constrains side effects and authority. Inputs are typically modeled as typed work requests, constraints, and references to context and policies. Outputs are modeled as artifacts and declared external effects. Allowed state transitions are defined by an explicit lifecycle that includes success states, failure states, retry states, and escalation states. Boundary invariants include safety properties, integrity properties, and operational properties such as idempotency requirements and monotonicity constraints.

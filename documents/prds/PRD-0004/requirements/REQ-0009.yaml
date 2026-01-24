@@ -1,0 +1,17 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0009
+  type: FUNCTIONAL
+  title: Gate outcomes as ledger events with evidence bundles
+  statement: 'Gate outcomes (PASS, FAIL, NEEDS_ADJUDICATION) MUST be recorded as GateRunCompleted events in the ledger. Each event MUST reference an evidence bundle containing the artifacts that support the gate decision.'
+  acceptance_criteria:
+    - GateRunCompleted event includes gate_run_id, gate_type, changeset_id, result, evidence_bundle_id.
+    - Evidence bundle is content-addressed and stored in CAS.
+    - Evidence bundle contains all artifacts needed to independently verify the gate result.
+    - 'FAIL result includes finding_ids referencing the blocking findings.'
+    - NEEDS_ADJUDICATION result includes adjudication_request_id for human/authority review.
+    - Gate result is reproducible from evidence bundle (not dependent on external state).
+  evidence:
+    evidence_ids:
+      - EVID-0006

@@ -1,0 +1,18 @@
+prd_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: REQ-0013
+  type: FUNCTIONAL
+  title: Recurrence threshold triggers countermeasure work
+  statement: 'When a finding signature recurs beyond a configurable threshold (default: 3 occurrences), the system MUST automatically create a countermeasure work item. This closes the feedback loop and prevents recurring issues from becoming technical debt.'
+  acceptance_criteria:
+    - RecurrenceReducer tracks finding occurrences by signature.
+    - When signature count exceeds threshold, CountermeasureProposed event is emitted.
+    - Countermeasure work item specifies finding signatures and suggested remediation type.
+    - Remediation types include LINT_RULE, TEMPLATE_UPDATE, SAFE_API, POLICY_UPDATE, TEST_HARNESS.
+    - Countermeasure creation is automatic; no human trigger required.
+    - Threshold is configurable per finding category (security may have lower threshold).
+  evidence:
+    evidence_ids:
+      - EVID-0004
+      - EVID-0005
