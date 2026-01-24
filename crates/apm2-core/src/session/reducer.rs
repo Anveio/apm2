@@ -309,6 +309,54 @@ impl SessionReducer {
             }),
         }
     }
+
+    /// Handles a session crash detected event.
+    ///
+    /// This event is informational - it records that a crash was detected
+    /// but doesn't change session state (that's done by `restart_scheduled`
+    /// or terminated events).
+    fn handle_crash_detected(
+        &self,
+        event: &crate::events::SessionCrashDetected,
+        _timestamp: u64,
+    ) -> Result<(), SessionError> {
+        let session_id = &event.session_id;
+
+        // Verify session exists
+        if !self.state.sessions.contains_key(session_id) {
+            return Err(SessionError::SessionNotFound {
+                session_id: session_id.clone(),
+            });
+        }
+
+        // Crash detection is informational - state transitions happen via
+        // SessionTerminated or SessionRestartScheduled events
+        Ok(())
+    }
+
+    /// Handles a session restart scheduled event.
+    ///
+    /// This event is informational - it records that a restart has been
+    /// scheduled but the actual restart happens via a new `SessionStarted`
+    /// event.
+    fn handle_restart_scheduled(
+        &self,
+        event: &crate::events::SessionRestartScheduled,
+        _timestamp: u64,
+    ) -> Result<(), SessionError> {
+        let session_id = &event.session_id;
+
+        // Verify session exists
+        if !self.state.sessions.contains_key(session_id) {
+            return Err(SessionError::SessionNotFound {
+                session_id: session_id.clone(),
+            });
+        }
+
+        // Restart scheduling is informational - the actual restart happens
+        // via a new SessionStarted event with resume_cursor set
+        Ok(())
+    }
 }
 
 impl Reducer for SessionReducer {
@@ -330,6 +378,12 @@ impl Reducer for SessionReducer {
                 Some(session_event::Event::Progress(ref e)) => self.handle_progress(e, timestamp),
                 Some(session_event::Event::Terminated(e)) => self.handle_terminated(e, timestamp),
                 Some(session_event::Event::Quarantined(e)) => self.handle_quarantined(e, timestamp),
+                Some(session_event::Event::CrashDetected(ref e)) => {
+                    self.handle_crash_detected(e, timestamp)
+                },
+                Some(session_event::Event::RestartScheduled(ref e)) => {
+                    self.handle_restart_scheduled(e, timestamp)
+                },
                 None => Ok(()),
             };
         }
@@ -366,8 +420,9 @@ pub mod helpers {
     use prost::Message;
 
     use crate::events::{
-        BudgetExceeded, PolicyEvent, PolicyViolation, SessionEvent, SessionProgress,
-        SessionQuarantined, SessionStarted, SessionTerminated, policy_event, session_event,
+        BudgetExceeded, PolicyEvent, PolicyViolation, SessionCrashDetected, SessionEvent,
+        SessionProgress, SessionQuarantined, SessionRestartScheduled, SessionStarted,
+        SessionTerminated, policy_event, session_event,
     };
 
     /// Creates a `SessionStarted` event payload.
@@ -380,6 +435,31 @@ pub mod helpers {
         lease_id: &str,
         entropy_budget: u64,
     ) -> Vec<u8> {
+        session_started_payload_with_restart(
+            session_id,
+            actor_id,
+            adapter_type,
+            work_id,
+            lease_id,
+            entropy_budget,
+            0, // resume_cursor
+            0, // restart_attempt
+        )
+    }
+
+    /// Creates a `SessionStarted` event payload for a restarted session.
+    #[must_use]
+    #[expect(clippy::too_many_arguments)]
+    pub fn session_started_payload_with_restart(
+        session_id: &str,
+        actor_id: &str,
+        adapter_type: &str,
+        work_id: &str,
+        lease_id: &str,
+        entropy_budget: u64,
+        resume_cursor: u64,
+        restart_attempt: u32,
+    ) -> Vec<u8> {
         let started = SessionStarted {
             session_id: session_id.to_string(),
             actor_id: actor_id.to_string(),
@@ -387,6 +467,8 @@ pub mod helpers {
             work_id: work_id.to_string(),
             lease_id: lease_id.to_string(),
             entropy_budget,
+            resume_cursor,
+            restart_attempt,
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Started(started)),
@@ -448,6 +530,57 @@ pub mod helpers {
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Quarantined(quarantined)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `SessionCrashDetected` event payload.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn session_crash_detected_payload(
+        session_id: &str,
+        crash_type: &str,
+        exit_code: i32,
+        signal: i32,
+        uptime_ms: u64,
+        last_cursor: u64,
+        restart_count: u32,
+    ) -> Vec<u8> {
+        let crash = SessionCrashDetected {
+            session_id: session_id.to_string(),
+            crash_type: crash_type.to_string(),
+            exit_code,
+            signal,
+            uptime_ms,
+            last_cursor,
+            restart_count,
+        };
+        let event = SessionEvent {
+            event: Some(session_event::Event::CrashDetected(crash)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `SessionRestartScheduled` event payload.
+    #[must_use]
+    pub fn session_restart_scheduled_payload(
+        session_id: &str,
+        scheduled_at: u64,
+        restart_at: u64,
+        resume_cursor: u64,
+        attempt_number: u32,
+        backoff_type: &str,
+    ) -> Vec<u8> {
+        let restart = SessionRestartScheduled {
+            session_id: session_id.to_string(),
+            scheduled_at,
+            restart_at,
+            resume_cursor,
+            attempt_number,
+            backoff_type: backoff_type.to_string(),
+        };
+        let event = SessionEvent {
+            event: Some(session_event::Event::RestartScheduled(restart)),
         };
         event.encode_to_vec()
     }
