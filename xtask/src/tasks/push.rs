@@ -312,23 +312,11 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
     let codex_available = cmd!(sh, "which codex").ignore_status().read().is_ok();
     if codex_available && Path::new(&code_quality_prompt_path).exists() {
         println!("  Spawning Codex code quality review...");
-        // Read and substitute variables in the prompt
-        if let Ok(prompt_content) = std::fs::read_to_string(&code_quality_prompt_path) {
-            let prompt = prompt_content
-                .replace("$PR_URL", pr_url)
-                .replace("$HEAD_SHA", &head_sha);
-            // Spawn Codex review in background
-            let _ = std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    &format!(
-                        "codex -m o3 --approval-mode full-auto '{}' &",
-                        prompt.replace('\'', "'\\''")
-                    ),
-                ])
-                .spawn();
-            println!("    Code quality review started in background");
-        }
+        // Spawn Codex review in background using the review subcommand
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "codex review --base main &"])
+            .spawn();
+        println!("    Code quality review started in background");
     } else if !codex_available {
         println!("  Note: Codex CLI not available, skipping code quality review");
     }
@@ -364,28 +352,59 @@ fn parse_owner_repo(remote_url: &str) -> &str {
 
 /// Create pending status checks for AI reviews.
 fn create_pending_statuses(sh: &Shell, owner_repo: &str, head_sha: &str) {
-    let security_endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
-    let security_pending = cmd!(
+    let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
+    let state = "pending";
+
+    // Security review status
+    let security_context = "ai-review/security";
+    let security_description = "Waiting for security review";
+    let security_result = cmd!(
         sh,
-        "gh api --method POST {security_endpoint} -f state=pending -f context=ai-review/security -f description=Waiting for security review"
+        "gh api --method POST {endpoint} -f state={state} -f context={security_context} -f description={security_description}"
     )
     .ignore_status()
-    .run();
+    .output();
 
-    if security_pending.is_ok() {
-        println!("    Created pending status: ai-review/security");
+    match security_result {
+        Ok(output) if output.status.success() => {
+            println!("    Created pending status: ai-review/security");
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "    Warning: Failed to create security status: {}",
+                stderr.trim()
+            );
+        },
+        Err(e) => {
+            println!("    Warning: Failed to create security status: {e}");
+        },
     }
 
-    let quality_endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
-    let quality_pending = cmd!(
+    // Code quality review status
+    let quality_context = "ai-review/code-quality";
+    let quality_description = "Waiting for code quality review";
+    let quality_result = cmd!(
         sh,
-        "gh api --method POST {quality_endpoint} -f state=pending -f context=ai-review/code-quality -f description=Waiting for code quality review"
+        "gh api --method POST {endpoint} -f state={state} -f context={quality_context} -f description={quality_description}"
     )
     .ignore_status()
-    .run();
+    .output();
 
-    if quality_pending.is_ok() {
-        println!("    Created pending status: ai-review/code-quality");
+    match quality_result {
+        Ok(output) if output.status.success() => {
+            println!("    Created pending status: ai-review/code-quality");
+        },
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "    Warning: Failed to create code quality status: {}",
+                stderr.trim()
+            );
+        },
+        Err(e) => {
+            println!("    Warning: Failed to create code quality status: {e}");
+        },
     }
 }
 

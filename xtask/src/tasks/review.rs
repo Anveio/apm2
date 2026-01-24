@@ -286,10 +286,9 @@ fn run_ai_review(
             }
         },
         ReviewType::Quality => {
-            // Codex takes a prompt as argument
-            let escaped_prompt = prompt.replace('\'', "'\\''");
+            // Codex uses the 'review' subcommand to review changes against base branch
             let result = std::process::Command::new("codex")
-                .args(["-m", "o3", "--approval-mode", "full-auto", &escaped_prompt])
+                .args(["review", "--base", "main"])
                 .status();
 
             match result {
