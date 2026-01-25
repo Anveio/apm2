@@ -8,9 +8,11 @@
 //! - Enables auto-merge if available
 //! - Triggers AI reviews (security and code quality)
 
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
 use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
@@ -300,24 +302,40 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
             // (including run_shell_command) are available. Without this, headless mode
             // filters out shell tools causing "Tool not found in registry" errors.
             //
-            // We write the prompt to a temp file to avoid shell escaping issues with
-            // the complex markdown prompt containing backticks, nested quotes, etc.
-            let prompt_file =
-                std::env::temp_dir().join(format!("gemini_prompt_{}.md", std::process::id()));
-            if std::fs::write(&prompt_file, &prompt).is_ok() {
-                let prompt_path = prompt_file.display().to_string();
-                // Use a subshell that runs gemini then cleans up the temp file
-                let _ = std::process::Command::new("sh")
-                    .args([
-                        "-c",
-                        &format!(
-                            "(script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null; rm -f '{prompt_path}') &"
-                        ),
-                    ])
-                    .spawn();
-                println!("    Security review started in background");
-            } else {
-                println!("    Warning: Failed to write prompt file for Gemini");
+            // We write the prompt to a secure temp file (via tempfile crate) to:
+            // 1. Avoid shell escaping issues with complex markdown
+            // 2. Use random filenames to prevent symlink/TOCTOU attacks
+            // 3. Create with restrictive permissions (0600)
+            let temp_file_result =
+                NamedTempFile::new().and_then(|mut f| f.write_all(prompt.as_bytes()).map(|()| f));
+            match temp_file_result {
+                Ok(temp_file) => {
+                    // Persist the file so it survives after NamedTempFile is dropped
+                    // The background shell will delete it after gemini finishes
+                    let (_, temp_path) = temp_file.keep().unwrap_or_else(|e| {
+                        eprintln!("    Warning: Failed to persist temp file: {e}");
+                        (
+                            std::fs::File::open("/dev/null").unwrap(),
+                            std::path::PathBuf::new(),
+                        )
+                    });
+                    let prompt_path = temp_path.display().to_string();
+                    if !prompt_path.is_empty() {
+                        // Use a subshell that runs gemini then cleans up the temp file
+                        let _ = std::process::Command::new("sh")
+                            .args([
+                                "-c",
+                                &format!(
+                                    "(script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null; rm -f '{prompt_path}') &"
+                                ),
+                            ])
+                            .spawn();
+                        println!("    Security review started in background");
+                    }
+                },
+                Err(e) => {
+                    println!("    Warning: Failed to create temp file for Gemini: {e}");
+                },
             }
         }
     } else if !gemini_available {

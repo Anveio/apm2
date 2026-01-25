@@ -11,9 +11,11 @@
 //! 3. Posts a PR comment with findings
 //! 4. Updates the status check to success/failure
 
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
 /// Review type determines which prompt and status check to use.
@@ -262,22 +264,21 @@ fn run_ai_review(
             // (including run_shell_command) are available. Without this, headless mode
             // filters out shell tools causing "Tool not found in registry" errors.
             //
-            // We write the prompt to a temp file to avoid shell escaping issues with
-            // the complex markdown prompt containing backticks, nested quotes, etc.
-            let prompt_file =
-                std::env::temp_dir().join(format!("gemini_review_{}.md", std::process::id()));
-            let result = if std::fs::write(&prompt_file, &prompt).is_ok() {
-                let prompt_path = prompt_file.display().to_string();
+            // We write the prompt to a secure temp file (via tempfile crate) to:
+            // 1. Avoid shell escaping issues with complex markdown
+            // 2. Use random filenames to prevent symlink/TOCTOU attacks
+            // 3. Create with restrictive permissions (0600)
+            // 4. Auto-cleanup when NamedTempFile is dropped
+            // temp_file is auto-deleted when dropped at end of closure
+            let result = NamedTempFile::new().and_then(|mut temp_file| {
+                temp_file.write_all(prompt.as_bytes())?;
+                let prompt_path = temp_file.path().display().to_string();
                 let shell_cmd =
                     format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
-                let res = std::process::Command::new("sh")
+                std::process::Command::new("sh")
                     .args(["-c", &shell_cmd])
-                    .status();
-                let _ = std::fs::remove_file(&prompt_file);
-                res
-            } else {
-                Err(std::io::Error::other("Failed to write prompt file"))
-            };
+                    .status()
+            });
 
             match result {
                 Ok(status) if status.success() => {
