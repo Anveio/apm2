@@ -534,6 +534,12 @@ fn matches_path_pattern(pattern: &str, path: &str) -> bool {
 }
 
 /// Matches a pattern containing `**` against a path.
+///
+/// # Security
+///
+/// This function ensures path component boundaries are respected:
+/// - `/workspace/**` must NOT match `/workspaces` (different directory)
+/// - `**/Cargo.toml` must NOT match `/Cargo.toml.bak` (different file)
 fn matches_glob_double_star(pattern: &str, path: &str) -> bool {
     // Split pattern by **
     let parts: Vec<&str> = pattern.split("**").collect();
@@ -547,17 +553,30 @@ fn matches_glob_double_star(pattern: &str, path: &str) -> bool {
             if suffix.is_empty() || suffix == "/" {
                 return true;
             }
-            // Suffix after ** - check if path ends with it
+            // Suffix after ** - must match exact path component at end
             if let Some(suffix) = suffix.strip_prefix('/') {
-                // Path must contain the suffix somewhere
-                return path.ends_with(suffix) || path.contains(&format!("/{suffix}"));
+                // Security: Must match exactly at end of path (full component)
+                // e.g., **/Cargo.toml must NOT match /Cargo.toml.bak
+                return path.ends_with(&format!("/{suffix}")) || path == suffix;
             }
             return true;
         }
 
-        // Check prefix
+        // Check prefix with path component boundary
         let prefix = prefix.trim_end_matches('/');
         if !path.starts_with(prefix) {
+            return false;
+        }
+
+        // Security: Ensure prefix matches a full path component
+        // /workspace/** must NOT match /workspaces
+        let remaining_after_prefix = &path[prefix.len()..];
+        if !remaining_after_prefix.is_empty()
+            && !remaining_after_prefix.starts_with('/')
+            && prefix != "/"
+        {
+            // The path continues without a separator, so it's a different directory
+            // e.g., prefix="/workspace" but path="/workspaces/file"
             return false;
         }
 
@@ -566,10 +585,14 @@ fn matches_glob_double_star(pattern: &str, path: &str) -> bool {
             return true;
         }
 
-        // Path must end with suffix
+        // Path must end with suffix (as a complete component)
         let suffix = suffix.trim_start_matches('/');
-        let remaining = &path[prefix.len()..];
-        remaining.ends_with(suffix) || remaining.contains(&format!("/{suffix}"))
+        // Security: suffix must match a complete path component at the end
+        // e.g., **/Cargo.toml must NOT match /foo/Cargo.toml.bak
+        remaining_after_prefix.ends_with(&format!("/{suffix}"))
+            || remaining_after_prefix
+                .strip_prefix('/')
+                .is_some_and(|r| r == suffix)
     } else {
         // Complex pattern - fall back to simple matching
         pattern == path
@@ -577,6 +600,11 @@ fn matches_glob_double_star(pattern: &str, path: &str) -> bool {
 }
 
 /// Matches a pattern containing single `*` (not `**`) against a path.
+///
+/// # Safety
+///
+/// This function guards against arithmetic underflow by checking that
+/// the path is long enough to contain both prefix and suffix.
 fn matches_glob_single_star(pattern: &str, path: &str) -> bool {
     // Split by * and check if parts match
     let parts: Vec<&str> = pattern.split('*').collect();
@@ -591,6 +619,13 @@ fn matches_glob_single_star(pattern: &str, path: &str) -> bool {
 
     // Check prefix and suffix
     if !path.starts_with(prefix) || !path.ends_with(suffix) {
+        return false;
+    }
+
+    // Security: Guard against arithmetic underflow
+    // If path is shorter than prefix + suffix combined, the match is ambiguous
+    // e.g., pattern "a*a" with path "a" would underflow
+    if path.len() < prefix.len() + suffix.len() {
         return false;
     }
 
@@ -916,6 +951,60 @@ policy:
         // ./** (current directory)
         assert!(matches_path_pattern("./**", "./src/main.rs"));
         assert!(matches_path_pattern("./**", "src/main.rs"));
+    }
+
+    #[test]
+    fn test_path_pattern_component_boundaries() {
+        // Security: Prefix must match full path component
+        // /workspace/** must NOT match /workspaces (different directory)
+        assert!(!matches_path_pattern("/workspace/**", "/workspaces"));
+        assert!(!matches_path_pattern(
+            "/workspace/**",
+            "/workspaces/file.txt"
+        ));
+        assert!(!matches_path_pattern("/workspace/**", "/workspace-backup"));
+        assert!(!matches_path_pattern(
+            "/workspace/**",
+            "/workspace-backup/file.txt"
+        ));
+
+        // But should match /workspace exactly and its children
+        assert!(matches_path_pattern("/workspace/**", "/workspace"));
+        assert!(matches_path_pattern("/workspace/**", "/workspace/"));
+        assert!(matches_path_pattern("/workspace/**", "/workspace/file.txt"));
+
+        // Security: Suffix must match exact file name at end
+        // **/Cargo.toml must NOT match /Cargo.toml.bak
+        assert!(!matches_path_pattern("**/Cargo.toml", "/Cargo.toml.bak"));
+        assert!(!matches_path_pattern(
+            "**/Cargo.toml",
+            "/foo/Cargo.toml.bak"
+        ));
+        assert!(!matches_path_pattern(
+            "**/Cargo.toml",
+            "/foo/Cargo.toml.backup"
+        ));
+
+        // But should match exact Cargo.toml
+        assert!(matches_path_pattern("**/Cargo.toml", "/Cargo.toml"));
+        assert!(matches_path_pattern("**/Cargo.toml", "/foo/Cargo.toml"));
+        assert!(matches_path_pattern("**/Cargo.toml", "/foo/bar/Cargo.toml"));
+        assert!(matches_path_pattern("**/Cargo.toml", "Cargo.toml"));
+    }
+
+    #[test]
+    fn test_single_star_underflow_protection() {
+        // Security: Prevent arithmetic underflow with overlapping prefix/suffix
+        // Pattern "a*a" with path "a" should NOT panic
+        assert!(!matches_path_pattern("a*a", "a"));
+        assert!(!matches_path_pattern("ab*ab", "ab"));
+        assert!(!matches_path_pattern("/foo*bar", "/foo"));
+        assert!(!matches_path_pattern("/foo*bar", "/bar"));
+
+        // But should match when there's actually content between
+        assert!(matches_path_pattern("a*a", "axa"));
+        assert!(matches_path_pattern("a*a", "aa"));
+        assert!(matches_path_pattern("/foo*.txt", "/foobar.txt"));
     }
 
     #[test]
