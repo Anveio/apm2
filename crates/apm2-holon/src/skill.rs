@@ -116,7 +116,14 @@ const fn default_user_invocable() -> bool {
 ///
 /// This defines the contract surface, execution boundaries, and
 /// tool permissions for a holon-based skill.
+///
+/// # Security
+///
+/// This struct uses `deny_unknown_fields` to prevent fail-open behavior
+/// from typos (e.g., `time_out_ms` vs `timeout_ms` would silently use
+/// default values if unknown fields were allowed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HolonConfig {
     /// The contract defining input/output types.
     pub contract: HolonContract,
@@ -167,7 +174,12 @@ impl HolonConfig {
 /// The contract surface for a holon.
 ///
 /// Defines the types that the holon accepts and produces.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to catch typos in field names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HolonContract {
     /// The type of input this holon accepts.
     ///
@@ -217,7 +229,14 @@ impl HolonContract {
 /// Configuration for holon stop conditions.
 ///
 /// These define when the holon should terminate its episode loop.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent fail-open behavior from typos.
+/// For example, `time_out_ms` instead of `timeout_ms` would result in
+/// no timeout if unknown fields were silently ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StopConditionsConfig {
     /// Maximum number of episodes before forced termination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -590,5 +609,39 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_unknown_field_in_holon_config_rejected() {
+        // Unknown field in HolonConfig should be rejected to prevent fail-open security
+        // issues
+        let content = "---\nname: typo-skill\ndescription: Has typo\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  unknown_field: true\n---\n";
+
+        let result = parse_frontmatter(content);
+        assert!(result.is_err(), "unknown field should be rejected");
+    }
+
+    #[test]
+    fn test_unknown_field_in_contract_rejected() {
+        // Unknown field in contract should be rejected
+        let content = "---\nname: typo-skill\ndescription: Has typo\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n    extra_field: value\n---\n";
+
+        let result = parse_frontmatter(content);
+        assert!(
+            result.is_err(),
+            "unknown field in contract should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_typo_in_stop_conditions_rejected() {
+        // Typo: "time_out_ms" instead of "timeout_ms" should be rejected
+        let content = "---\nname: typo-skill\ndescription: Has typo\nholon:\n  contract:\n    input_type: Input\n    output_type: Output\n  stop_conditions:\n    time_out_ms: 60000\n---\n";
+
+        let result = parse_frontmatter(content);
+        assert!(
+            result.is_err(),
+            "typo in stop_conditions should be rejected"
+        );
     }
 }
