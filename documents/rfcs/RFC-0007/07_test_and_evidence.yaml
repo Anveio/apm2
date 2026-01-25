@@ -155,7 +155,7 @@ rfc_test_and_evidence:
         verification:
           automated: "cargo build -vv 2>&1 | grep mold"
           manual: "MV-7001 passes with documented output"
-        location: "evidence/RFC-0007/EVID-7001_mold_config.log"
+        location: "evidence/rfc/RFC-0007/EVID-7001_mold_config.log"
 
       - artifact_id: EVID-7002
         artifact_ref: "evidence_artifacts/EVID-7002.yaml#rfc_evidence_artifact"
@@ -163,7 +163,7 @@ rfc_test_and_evidence:
         artifact_type: "documentation_review"
         verification:
           manual: "MV-7002 passes with complete documentation"
-        location: "evidence/RFC-0007/EVID-7002_sccache_docs.md"
+        location: "evidence/rfc/RFC-0007/EVID-7002_sccache_docs.md"
 
       - artifact_id: EVID-7003
         artifact_ref: "evidence_artifacts/EVID-7003.yaml#rfc_evidence_artifact"
@@ -171,7 +171,7 @@ rfc_test_and_evidence:
         artifact_type: "documentation_review"
         verification:
           manual: "MV-7003 passes with complete documentation"
-        location: "evidence/RFC-0007/EVID-7003_nextest_docs.md"
+        location: "evidence/rfc/RFC-0007/EVID-7003_nextest_docs.md"
 
       - artifact_id: EVID-7004
         artifact_ref: "evidence_artifacts/EVID-7004.yaml#rfc_evidence_artifact"
@@ -179,7 +179,7 @@ rfc_test_and_evidence:
         artifact_type: "documentation_review"
         verification:
           manual: "MV-7004 passes with complete documentation"
-        location: "evidence/RFC-0007/EVID-7004_settings_docs.md"
+        location: "evidence/rfc/RFC-0007/EVID-7004_settings_docs.md"
 
       imports: []
 
