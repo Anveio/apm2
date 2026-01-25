@@ -35,6 +35,8 @@
 //! assert!(hypothesis.result.is_some());
 //! ```
 
+use std::fmt::Write as _;
+use std::io::Read;
 use std::process::Command;
 use std::time::Duration;
 
@@ -52,6 +54,29 @@ use crate::aat::types::{Hypothesis, HypothesisResult};
 /// more than 2 minutes, the hypothesis `verification_method` should be
 /// restructured to run faster or use async patterns.
 const HYPOTHESIS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum size of captured stdout or stderr (10 MB).
+///
+/// This prevents memory exhaustion from commands that produce excessive output.
+/// If a command's output exceeds this limit, it will be truncated with a
+/// warning message appended.
+const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
+
+/// Environment variables that are safe to pass to child processes.
+///
+/// This allowlist ensures that sensitive environment variables (API keys,
+/// tokens, credentials) are not leaked to verification commands.
+const ALLOWED_ENV_VARS: &[&str] = &[
+    "PATH",           // Required for command execution
+    "HOME",           // Required for many tools (cargo, git, etc.)
+    "USER",           // User identity
+    "LANG",           // Locale settings
+    "LC_ALL",         // Locale settings
+    "TERM",           // Terminal type (for colored output)
+    "RUST_BACKTRACE", // Useful for debugging test failures
+    "CARGO_HOME",     // Cargo installation directory
+    "RUSTUP_HOME",    // Rustup installation directory
+];
 
 /// Hypothesis execution engine.
 ///
@@ -108,19 +133,28 @@ impl HypothesisExecutor {
     /// assert!(h.stdout.as_ref().unwrap().contains("hello"));
     /// ```
     pub fn execute(hypothesis: &mut Hypothesis) -> Result<()> {
-        // Spawn the verification command in a shell
-        let mut child = Command::new("sh")
-            .args(["-c", &hypothesis.verification_method])
+        // Build command with isolated environment to prevent credential leakage
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &hypothesis.verification_method])
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Failed to spawn verification command for hypothesis {}\n\
-                     Command: {}",
-                    hypothesis.id, hypothesis.verification_method
-                )
-            })?;
+            .stderr(std::process::Stdio::piped());
+
+        // Clear environment and only pass allowlisted variables
+        // This prevents leaking sensitive env vars (API keys, tokens, etc.)
+        cmd.env_clear();
+        for var_name in ALLOWED_ENV_VARS {
+            if let Ok(value) = std::env::var(var_name) {
+                cmd.env(var_name, value);
+            }
+        }
+
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "Failed to spawn verification command for hypothesis {}\n\
+                 Command: {}",
+                hypothesis.id, hypothesis.verification_method
+            )
+        })?;
 
         // Wait with timeout to prevent hung commands
         let Some(status) = child.wait_timeout(HYPOTHESIS_TIMEOUT)? else {
@@ -142,22 +176,15 @@ impl HypothesisExecutor {
         // This ensures formed_at < executed_at invariant
         hypothesis.executed_at = Some(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
 
-        // Read stdout and stderr from the completed process
-        let mut stdout_buf = Vec::new();
-        let mut stderr_buf = Vec::new();
+        // Read stdout and stderr with bounded size to prevent memory exhaustion
+        let (stdout_str, stdout_truncated) =
+            Self::read_bounded_output(child.stdout.take(), "stdout", &hypothesis.id)?;
+        let (stderr_str, stderr_truncated) =
+            Self::read_bounded_stderr(child.stderr.take(), "stderr", &hypothesis.id)?;
 
-        if let Some(mut stdout) = child.stdout.take() {
-            std::io::Read::read_to_end(&mut stdout, &mut stdout_buf)
-                .context("Failed to read hypothesis verification stdout")?;
-        }
-        if let Some(mut stderr) = child.stderr.take() {
-            std::io::Read::read_to_end(&mut stderr, &mut stderr_buf)
-                .context("Failed to read hypothesis verification stderr")?;
-        }
-
-        // Store captured output
-        hypothesis.stdout = Some(String::from_utf8_lossy(&stdout_buf).to_string());
-        hypothesis.stderr = Some(String::from_utf8_lossy(&stderr_buf).to_string());
+        // Store captured output (with truncation warning if applicable)
+        hypothesis.stdout = Some(stdout_str);
+        hypothesis.stderr = Some(stderr_str);
         hypothesis.exit_code = status.code();
 
         // Determine result based on exit code
@@ -168,9 +195,89 @@ impl HypothesisExecutor {
         });
 
         // Set actual_outcome to summarize what happened
-        hypothesis.actual_outcome = Some(format!("Exit code: {:?}", status.code()));
+        let truncation_note = match (stdout_truncated, stderr_truncated) {
+            (true, true) => " (stdout and stderr truncated)",
+            (true, false) => " (stdout truncated)",
+            (false, true) => " (stderr truncated)",
+            (false, false) => "",
+        };
+        hypothesis.actual_outcome =
+            Some(format!("Exit code: {:?}{}", status.code(), truncation_note));
 
         Ok(())
+    }
+
+    /// Read output from a child process pipe with a size limit.
+    ///
+    /// Returns the output as a string and a flag indicating if truncation
+    /// occurred. If the output exceeds `MAX_OUTPUT_SIZE`, it is truncated
+    /// and a warning is appended.
+    fn read_bounded_output(
+        pipe: Option<std::process::ChildStdout>,
+        stream_name: &str,
+        hypothesis_id: &str,
+    ) -> Result<(String, bool)> {
+        let Some(mut pipe) = pipe else {
+            return Ok((String::new(), false));
+        };
+
+        // Read up to MAX_OUTPUT_SIZE + 1 to detect truncation
+        let mut buffer = vec![0u8; MAX_OUTPUT_SIZE + 1];
+        let bytes_read = pipe
+            .read(&mut buffer)
+            .with_context(|| format!("Failed to read hypothesis {hypothesis_id} {stream_name}"))?;
+
+        let truncated = bytes_read > MAX_OUTPUT_SIZE;
+        let actual_bytes = bytes_read.min(MAX_OUTPUT_SIZE);
+        buffer.truncate(actual_bytes);
+
+        let mut output = String::from_utf8_lossy(&buffer).to_string();
+
+        if truncated {
+            // Use write! to avoid extra allocation from format!
+            let _ = write!(
+                output,
+                "\n\n[TRUNCATED: {stream_name} exceeded {MAX_OUTPUT_SIZE} bytes limit]"
+            );
+        }
+
+        Ok((output, truncated))
+    }
+
+    /// Read output from a child process stderr pipe with a size limit.
+    ///
+    /// This is a separate function because `ChildStderr` and `ChildStdout` are
+    /// different types even though they both implement Read.
+    fn read_bounded_stderr(
+        pipe: Option<std::process::ChildStderr>,
+        stream_name: &str,
+        hypothesis_id: &str,
+    ) -> Result<(String, bool)> {
+        let Some(mut pipe) = pipe else {
+            return Ok((String::new(), false));
+        };
+
+        // Read up to MAX_OUTPUT_SIZE + 1 to detect truncation
+        let mut buffer = vec![0u8; MAX_OUTPUT_SIZE + 1];
+        let bytes_read = pipe
+            .read(&mut buffer)
+            .with_context(|| format!("Failed to read hypothesis {hypothesis_id} {stream_name}"))?;
+
+        let truncated = bytes_read > MAX_OUTPUT_SIZE;
+        let actual_bytes = bytes_read.min(MAX_OUTPUT_SIZE);
+        buffer.truncate(actual_bytes);
+
+        let mut output = String::from_utf8_lossy(&buffer).to_string();
+
+        if truncated {
+            // Use write! to avoid extra allocation from format!
+            let _ = write!(
+                output,
+                "\n\n[TRUNCATED: {stream_name} exceeded {MAX_OUTPUT_SIZE} bytes limit]"
+            );
+        }
+
+        Ok((output, truncated))
     }
 
     /// Execute all hypotheses in a collection.
@@ -590,6 +697,157 @@ mod tests {
         assert!(
             HYPOTHESIS_TIMEOUT.as_secs() <= 300,
             "Timeout should not exceed 5 minutes"
+        );
+    }
+
+    // =========================================================================
+    // Security tests - Environment isolation
+    // =========================================================================
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn test_environment_isolation_sensitive_vars_not_leaked() {
+        // Set a "sensitive" environment variable in the parent process
+        // This simulates API keys, tokens, or credentials that should not leak
+        // SAFETY: This test runs in isolation and we clean up after ourselves.
+        // The set_var/remove_var calls are unsafe in Rust 2024 due to potential
+        // data races, but our test framework runs tests serially by default
+        // for tests that modify global state.
+        unsafe {
+            std::env::set_var("SUPER_SECRET_API_KEY", "sensitive_value_12345");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "fake_aws_secret");
+            std::env::set_var("GITHUB_TOKEN", "ghp_fake_token");
+        }
+
+        // Try to echo these variables in the child process
+        let mut h = make_test_hypothesis(
+            "H-SEC-001",
+            "echo \"KEY=$SUPER_SECRET_API_KEY AWS=$AWS_SECRET_ACCESS_KEY GH=$GITHUB_TOKEN\"",
+        );
+
+        let result = HypothesisExecutor::execute(&mut h);
+
+        // Clean up before assertions to ensure cleanup happens even on failure
+        // SAFETY: Same as above - test isolation
+        unsafe {
+            std::env::remove_var("SUPER_SECRET_API_KEY");
+            std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+
+        assert!(result.is_ok());
+        let stdout = h.stdout.as_ref().unwrap();
+
+        // The sensitive values should NOT appear in the output because
+        // environment is cleared and only allowlisted vars are passed
+        assert!(
+            !stdout.contains("sensitive_value_12345"),
+            "Secret API key should not be leaked to child process. Got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("fake_aws_secret"),
+            "AWS secret should not be leaked to child process. Got: {stdout}"
+        );
+        assert!(
+            !stdout.contains("ghp_fake_token"),
+            "GitHub token should not be leaked to child process. Got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_environment_isolation_allowlisted_vars_passed() {
+        // PATH should be passed through so commands work
+        let mut h = make_test_hypothesis("H-SEC-002", "echo $PATH");
+
+        let result = HypothesisExecutor::execute(&mut h);
+
+        assert!(result.is_ok());
+        let stdout = h.stdout.as_ref().unwrap();
+
+        // PATH should be present and non-empty
+        assert!(
+            !stdout.trim().is_empty(),
+            "PATH should be passed to child process"
+        );
+    }
+
+    #[test]
+    fn test_allowlist_contains_essential_vars() {
+        // Verify our allowlist includes essential variables
+        assert!(
+            ALLOWED_ENV_VARS.contains(&"PATH"),
+            "PATH must be in allowlist"
+        );
+        assert!(
+            ALLOWED_ENV_VARS.contains(&"HOME"),
+            "HOME must be in allowlist"
+        );
+
+        // Verify our allowlist does NOT include sensitive patterns
+        for var in ALLOWED_ENV_VARS {
+            let var_upper = var.to_uppercase();
+            assert!(
+                !var_upper.contains("SECRET"),
+                "Allowlist should not include SECRET vars"
+            );
+            assert!(
+                !var_upper.contains("TOKEN"),
+                "Allowlist should not include TOKEN vars"
+            );
+            assert!(
+                !var_upper.contains("KEY") || *var == "SSH_AUTH_SOCK",
+                "Allowlist should not include KEY vars (except SSH_AUTH_SOCK)"
+            );
+            assert!(
+                !var_upper.contains("PASSWORD"),
+                "Allowlist should not include PASSWORD vars"
+            );
+            assert!(
+                !var_upper.contains("CREDENTIAL"),
+                "Allowlist should not include CREDENTIAL vars"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Security tests - Bounded output
+    // =========================================================================
+
+    #[test]
+    fn test_max_output_size_is_reasonable() {
+        // 10 MB should be enough for legitimate test output
+        // but prevents memory exhaustion from runaway commands
+        // The exact value is verified; bounds are documented in the constant definition
+        assert_eq!(MAX_OUTPUT_SIZE, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_bounded_output_small_output_not_truncated() {
+        // Small outputs should pass through unchanged
+        let mut h = make_test_hypothesis("H-SEC-003", "echo 'small output'");
+
+        let result = HypothesisExecutor::execute(&mut h);
+
+        assert!(result.is_ok());
+        let stdout = h.stdout.as_ref().unwrap();
+        assert!(stdout.contains("small output"));
+        assert!(
+            !stdout.contains("TRUNCATED"),
+            "Small output should not be truncated"
+        );
+    }
+
+    #[test]
+    fn test_actual_outcome_no_truncation_note_for_small_output() {
+        let mut h = make_test_hypothesis("H-SEC-004", "echo 'normal'");
+
+        let result = HypothesisExecutor::execute(&mut h);
+
+        assert!(result.is_ok());
+        let outcome = h.actual_outcome.as_ref().unwrap();
+        assert!(
+            !outcome.contains("truncated"),
+            "Small output should not have truncation note: {outcome}"
         );
     }
 }
