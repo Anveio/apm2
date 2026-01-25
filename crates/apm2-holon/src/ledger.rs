@@ -585,7 +585,7 @@ impl LedgerEvent {
     /// Returns the canonical byte representation for hashing/signing.
     ///
     /// This produces a deterministic JSON serialization that:
-    /// - Has consistent field ordering
+    /// - Has consistent field ordering (via RFC 8785 / JCS)
     /// - Excludes the signature field
     /// - Is suitable for hash computation and signature verification
     ///
@@ -616,60 +616,20 @@ impl LedgerEvent {
             "previous_hash": self.previous_hash.to_hex(),
         });
 
-        serde_json::to_vec(&canonical).expect("serialization cannot fail")
+        // Use serde_jcs to ensure RFC 8785 canonicalization (sorted keys, no whitespace)
+        serde_jcs::to_vec(&canonical).expect("serialization cannot fail")
     }
 
     /// Computes the hash of this event.
     ///
     /// The hash is computed over the canonical byte representation,
     /// which excludes the signature field.
-    ///
-    /// # Implementation Note
-    ///
-    /// This implementation uses a deterministic hash function suitable for
-    /// chain verification. In production deployments requiring cryptographic
-    /// security, this should be replaced with SHA-256 or BLAKE3.
     #[must_use]
     #[allow(clippy::collection_is_never_read)] // bytes is read via Hash trait
     pub fn compute_hash(&self) -> EventHash {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let bytes = self.canonical_bytes();
-
-        // Use multiple independent hash passes to fill 32 bytes
-        // Each pass uses a different seed to ensure independence
-        let mut result = [0u8; 32];
-
-        // Pass 1: Hash the entire input with seed 0
-        let mut hasher = DefaultHasher::new();
-        0u64.hash(&mut hasher);
-        bytes.hash(&mut hasher);
-        let h1 = hasher.finish();
-        result[0..8].copy_from_slice(&h1.to_le_bytes());
-
-        // Pass 2: Hash with seed 1
-        let mut hasher = DefaultHasher::new();
-        1u64.hash(&mut hasher);
-        bytes.hash(&mut hasher);
-        let h2 = hasher.finish();
-        result[8..16].copy_from_slice(&h2.to_le_bytes());
-
-        // Pass 3: Hash with seed 2
-        let mut hasher = DefaultHasher::new();
-        2u64.hash(&mut hasher);
-        bytes.hash(&mut hasher);
-        let h3 = hasher.finish();
-        result[16..24].copy_from_slice(&h3.to_le_bytes());
-
-        // Pass 4: Hash with seed 3
-        let mut hasher = DefaultHasher::new();
-        3u64.hash(&mut hasher);
-        bytes.hash(&mut hasher);
-        let h4 = hasher.finish();
-        result[24..32].copy_from_slice(&h4.to_le_bytes());
-
-        EventHash(result)
+        let hash = blake3::hash(&bytes);
+        EventHash(*hash.as_bytes())
     }
 
     /// Verifies that this event correctly links to the given previous event.
