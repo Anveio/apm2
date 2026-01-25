@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -36,6 +36,7 @@ use nix::libc;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 /// Stale threshold in seconds. A reviewer is considered stale if its log file
 /// has not been modified for this many seconds.
@@ -71,6 +72,7 @@ impl HealthStatus {
 
 /// Entry for a single reviewer agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewerEntry {
     /// Process ID of the reviewer agent.
     pub pid: u32,
@@ -97,9 +99,19 @@ impl ReviewerEntry {
     /// - `Dead` if process is not alive or PID was reused
     /// - `Stale` if process is alive but no recent activity
     /// - `Healthy` if process is alive and has recent activity
-    #[allow(clippy::cast_possible_wrap)]
     pub fn check_health(&self) -> HealthStatus {
-        let pid = Pid::from_raw(self.pid as i32);
+        // Validate PID is within safe range to prevent kill(-1) which would kill all
+        // processes u32::MAX wraps to -1 when cast to i32, which would be
+        // catastrophic
+        let Ok(pid_i32) = i32::try_from(self.pid) else {
+            // PID out of valid range, treat as dead
+            return HealthStatus::Dead;
+        };
+        if pid_i32 <= 0 {
+            // PID must be positive
+            return HealthStatus::Dead;
+        }
+        let pid = Pid::from_raw(pid_i32);
 
         // Check if process is alive using kill with signal 0
         let process_alive = kill(pid, None).is_ok();
@@ -135,27 +147,50 @@ impl ReviewerEntry {
     /// Check if the PID is still our process (not reused by an unrelated
     /// process).
     ///
-    /// Checks `/proc/<pid>/cmdline` for "gemini" or "script" to verify
-    /// the process is still our reviewer agent.
+    /// Uses `/proc/<pid>/cmdline` to verify the process is a reviewer agent.
+    /// We check for:
+    /// - "gemini" binary in argv[0] or the command line (the AI tool)
+    /// - "script" binary (the PTY wrapper we use)
+    ///
+    /// We specifically avoid matching editor processes like "vim script.rs"
+    /// by checking if the cmdline starts with a known wrapper pattern.
     fn is_our_process(&self) -> bool {
         let cmdline_path = format!("/proc/{}/cmdline", self.pid);
         let Ok(mut file) = File::open(&cmdline_path) else {
             return false;
         };
 
-        let mut cmdline = String::new();
-        if file.read_to_string(&mut cmdline).is_err() {
+        // Read as bytes since cmdline may not be valid UTF-8
+        let mut cmdline_bytes = Vec::new();
+        if file.read_to_end(&mut cmdline_bytes).is_err() {
             return false;
         }
 
         // cmdline uses null bytes as separators
+        // Convert to lossy UTF-8 for matching
+        let cmdline = String::from_utf8_lossy(&cmdline_bytes);
         let cmdline_lower = cmdline.to_lowercase();
-        cmdline_lower.contains("gemini") || cmdline_lower.contains("script")
+
+        // Split into arguments to check argv[0] more precisely
+        let args: Vec<&str> = cmdline_lower.split('\0').collect();
+        let argv0 = args.first().unwrap_or(&"");
+
+        // Check for our known patterns in argv[0]:
+        // - Contains "gemini" (the AI tool binary or script)
+        // - Equals "script" or ends with "/script" (the PTY wrapper)
+        // - Contains "bash" and subsequent args contain "gemini" (shell wrapper)
+        let is_gemini_binary = argv0.contains("gemini");
+        let is_script_binary = *argv0 == "script" || argv0.ends_with("/script");
+        let is_shell_wrapper = (argv0.contains("bash") || argv0.contains("sh"))
+            && args.iter().any(|arg| arg.contains("gemini"));
+
+        is_gemini_binary || is_script_binary || is_shell_wrapper
     }
 }
 
 /// State file containing all active reviewer entries.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewerStateFile {
     /// Map from reviewer type (e.g., "security", "quality") to entry.
     pub reviewers: HashMap<String, ReviewerEntry>,
@@ -179,21 +214,21 @@ impl ReviewerStateFile {
     ///
     /// # Errors
     ///
-    /// Returns an error only if the state file path cannot be determined.
+    /// Returns an error if:
+    /// - The state file path cannot be determined
+    /// - The file exists but cannot be read (permission denied, etc.)
     pub fn load() -> Result<Self> {
         let path = Self::path().context("Could not determine home directory")?;
 
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to read reviewer state file: {e}. Starting with empty state."
-                );
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                // File doesn't exist - this is fine, just means no active reviewers
                 return Ok(Self::default());
+            },
+            Err(e) => {
+                // Other errors (permission denied, etc.) should fail closed
+                return Err(e).context("Failed to read reviewer state file");
             },
         };
 
@@ -213,6 +248,8 @@ impl ReviewerStateFile {
     /// Save the state file to disk using atomic write (temp file + rename).
     ///
     /// Creates the parent directory (~/.apm2) with 0700 permissions if needed.
+    /// Uses `tempfile::NamedTempFile` for secure temporary file creation with
+    /// automatic cleanup on panic.
     ///
     /// # Errors
     ///
@@ -224,28 +261,34 @@ impl ReviewerStateFile {
         let path = Self::path().context("Could not determine home directory")?;
 
         // Create parent directory with 0700 permissions
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).context("Failed to create ~/.apm2 directory")?;
-                // Set directory permissions to 0700
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                    .context("Failed to set ~/.apm2 directory permissions")?;
-            }
+        let parent = path.parent().context("State file path has no parent")?;
+        if !parent.exists() {
+            fs::create_dir_all(parent).context("Failed to create ~/.apm2 directory")?;
+            // Set directory permissions to 0700
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .context("Failed to set ~/.apm2 directory permissions")?;
         }
 
         // Serialize to JSON
         let content =
             serde_json::to_string_pretty(self).context("Failed to serialize reviewer state")?;
 
-        // Write to temp file first
-        let temp_path = path.with_extension("json.tmp");
-        let mut file = File::create(&temp_path).context("Failed to create temp state file")?;
-        file.write_all(content.as_bytes())
+        // Create temp file in the same directory as the target for atomic rename
+        // NamedTempFile ensures cleanup on panic and uses unique random names
+        let mut temp_file =
+            NamedTempFile::new_in(parent).context("Failed to create temp state file")?;
+        temp_file
+            .write_all(content.as_bytes())
             .context("Failed to write temp state file")?;
-        file.sync_all().context("Failed to sync temp state file")?;
+        temp_file
+            .as_file()
+            .sync_all()
+            .context("Failed to sync temp state file")?;
 
-        // Atomic rename
-        fs::rename(&temp_path, &path).context("Failed to rename temp state file")?;
+        // Persist and rename atomically
+        temp_file
+            .persist(&path)
+            .context("Failed to persist temp state file")?;
 
         Ok(())
     }
@@ -275,9 +318,17 @@ impl ReviewerStateFile {
 /// # Returns
 ///
 /// Returns `true` if the process was successfully killed, `false` otherwise.
-#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 pub fn kill_process(pid: u32) -> bool {
-    let nix_pid = Pid::from_raw(pid as i32);
+    // Validate PID is within safe range to prevent kill(-1) which would kill all
+    // processes
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false; // Invalid PID
+    };
+    if pid_i32 <= 0 {
+        return false; // PID must be positive
+    }
+    let nix_pid = Pid::from_raw(pid_i32);
 
     // First, check if process is even alive
     if kill(nix_pid, None).is_err() {
@@ -509,5 +560,37 @@ mod tests {
         assert!(elapsed.is_some());
         // File was just created, so elapsed should be very small
         assert!(elapsed.unwrap() < 5);
+    }
+
+    #[test]
+    fn test_check_health_max_pid_returns_dead() {
+        // u32::MAX would become -1 when cast to i32, which would kill all processes
+        // This test verifies we handle this safely
+        let entry = ReviewerEntry {
+            pid: u32::MAX,
+            started_at: Utc::now(),
+            log_file: PathBuf::from("/tmp/test.log"),
+            pr_url: "https://github.com/owner/repo/pull/123".to_string(),
+            head_sha: "abc123".to_string(),
+        };
+
+        // Should return Dead without attempting to signal PID -1
+        assert_eq!(entry.check_health(), HealthStatus::Dead);
+    }
+
+    #[test]
+    fn test_kill_process_max_pid_returns_false() {
+        // u32::MAX would become -1 when cast to i32, which would kill all processes
+        // This test verifies we handle this safely
+        let result = kill_process(u32::MAX);
+        // Should return false without attempting to signal PID -1
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_kill_process_zero_pid_returns_false() {
+        // PID 0 is special (process group) and should not be signaled
+        let result = kill_process(0);
+        assert!(!result);
     }
 }
