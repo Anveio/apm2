@@ -189,7 +189,7 @@ impl<C: ContentAddressedStore> EvidencePublisher<C> {
     ///
     /// # Errors
     ///
-    /// Same as [`publish`], plus:
+    /// Same as [`Self::publish`], plus:
     /// - [`EvidenceError::MalformedMetadata`] if a metadata entry is malformed
     #[allow(clippy::too_many_arguments)]
     pub fn publish_with_metadata(
