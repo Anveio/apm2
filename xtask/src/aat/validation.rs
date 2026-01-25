@@ -462,6 +462,25 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_evidence_script_absolute_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let parsed = ParsedPRDescription {
+            usage: "test".to_string(),
+            expected_outcomes: vec![],
+            evidence_script: Some("/etc/passwd".to_string()),
+            known_limitations: vec![],
+        };
+
+        let errors = validate_evidence_script(&parsed, temp_dir.path());
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            ValidationError::PathTraversalDetected { path } if path == "/etc/passwd"
+        ));
+    }
+
+    #[test]
     fn test_validate_usage_with_code_block() {
         let parsed = ParsedPRDescription {
             usage: "Run the command:\n\n```bash\ncargo xtask aat\n```".to_string(),
