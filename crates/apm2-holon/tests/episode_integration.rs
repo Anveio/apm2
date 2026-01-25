@@ -293,6 +293,7 @@ fn test_happy_path_goal_satisfied() {
             "work-001",
             &mut lease,
             Some("Count to 5"),
+            1, // initial_episode_number
             clock,
         )
         .expect("should not fail");
@@ -346,7 +347,7 @@ fn test_budget_exhaustion_tokens() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Verify outcome - should stop due to budget
@@ -377,7 +378,7 @@ fn test_max_episodes_reached() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Verify outcome
@@ -400,7 +401,7 @@ fn test_escalation() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Verify outcome
@@ -432,7 +433,7 @@ fn test_error_handling() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should return result even on error");
 
     // Verify outcome
@@ -464,7 +465,7 @@ fn test_blocking() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Verify outcome
@@ -493,7 +494,7 @@ fn test_event_chain_integrity() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Verify event chain
@@ -548,7 +549,7 @@ fn test_events_disabled() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Should complete successfully
@@ -576,7 +577,7 @@ fn test_lease_budget_integration() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     assert!(result.is_successful());
@@ -607,6 +608,7 @@ fn test_context_with_goal_spec() {
             "work-001",
             &mut lease,
             Some("Test goal specification"),
+            1, // initial_episode_number
             clock,
         )
         .expect("should not fail");
@@ -641,7 +643,7 @@ fn test_stop_condition_priorities() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // Should stop due to token budget, not max episodes
@@ -663,7 +665,7 @@ fn test_event_serialization() {
 
     let clock = mock_clock();
     let result = controller
-        .run_episode_loop(&mut holon, "work-001", &mut lease, None, clock)
+        .run_episode_loop(&mut holon, "work-001", &mut lease, None, 1, clock)
         .expect("should not fail");
 
     // All events should be serializable

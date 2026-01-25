@@ -41,13 +41,57 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::HolonError;
 use crate::stop::StopCondition;
+
+/// Maximum length for IDs (`episode_id`, `work_id`, `lease_id`).
+///
+/// This limit prevents resource exhaustion attacks through excessively long
+/// IDs.
+pub const MAX_ID_LENGTH: usize = 256;
+
+/// Validates an ID string.
+///
+/// # Rules
+///
+/// - Must not be empty
+/// - Must not exceed `MAX_ID_LENGTH` bytes
+/// - Must not contain `/` (prevents path traversal in storage)
+/// - Must not contain null bytes
+///
+/// # Errors
+///
+/// Returns `HolonError::InvalidInput` if validation fails.
+pub fn validate_id(id: &str, field_name: &str) -> Result<(), HolonError> {
+    if id.is_empty() {
+        return Err(HolonError::invalid_input(format!(
+            "{field_name} cannot be empty"
+        )));
+    }
+    if id.len() > MAX_ID_LENGTH {
+        return Err(HolonError::invalid_input(format!(
+            "{field_name} exceeds maximum length of {MAX_ID_LENGTH} bytes"
+        )));
+    }
+    if id.contains('/') {
+        return Err(HolonError::invalid_input(format!(
+            "{field_name} contains invalid character '/'"
+        )));
+    }
+    if id.contains('\0') {
+        return Err(HolonError::invalid_input(format!(
+            "{field_name} contains null byte"
+        )));
+    }
+    Ok(())
+}
 
 /// Event emitted when an episode starts execution.
 ///
 /// This event captures the initial state and context at the beginning of
 /// an episode, enabling replay and audit of the execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpisodeStarted {
     /// Unique identifier for this episode.
     episode_id: String,
@@ -78,7 +122,74 @@ pub struct EpisodeStarted {
 }
 
 impl EpisodeStarted {
-    /// Creates a new episode started event.
+    /// Creates a new episode started event with ID validation.
+    ///
+    /// This is the recommended constructor for external callers. It validates
+    /// all ID fields according to [`validate_id`] rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HolonError::InvalidInput` if any ID fails validation:
+    /// - Empty IDs
+    /// - IDs exceeding 256 bytes
+    /// - IDs containing `/` or null bytes
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_holon::ledger::EpisodeStarted;
+    ///
+    /// let event = EpisodeStarted::try_new(
+    ///     "ep-001",
+    ///     "work-123",
+    ///     "lease-456",
+    ///     1,
+    ///     1_000_000_000,
+    /// )
+    /// .expect("valid IDs");
+    /// ```
+    pub fn try_new(
+        episode_id: impl Into<String>,
+        work_id: impl Into<String>,
+        lease_id: impl Into<String>,
+        episode_number: u64,
+        started_at_ns: u64,
+    ) -> Result<Self, HolonError> {
+        let episode_id = episode_id.into();
+        let work_id = work_id.into();
+        let lease_id = lease_id.into();
+
+        validate_id(&episode_id, "episode_id")?;
+        validate_id(&work_id, "work_id")?;
+        validate_id(&lease_id, "lease_id")?;
+
+        Ok(Self {
+            episode_id,
+            work_id,
+            lease_id,
+            episode_number,
+            started_at_ns,
+            parent_episode_id: None,
+            remaining_tokens: None,
+            remaining_time_ms: None,
+            goal_spec: None,
+        })
+    }
+
+    /// Creates a new episode started event without validation.
+    ///
+    /// # Safety Note (Logic)
+    ///
+    /// This constructor skips ID validation for performance in internal code
+    /// paths where IDs are already validated. External callers should prefer
+    /// [`try_new`](Self::try_new) which validates all ID fields.
+    ///
+    /// # Preconditions
+    ///
+    /// All ID arguments must satisfy [`validate_id`] rules:
+    /// - Not empty
+    /// - At most 256 bytes
+    /// - No `/` or null bytes
     #[must_use]
     pub fn new(
         episode_id: impl Into<String>,
@@ -188,6 +299,7 @@ impl EpisodeStarted {
 /// This enum captures why an episode ended, which is used for metrics,
 /// debugging, and determining the next action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum EpisodeCompletionReason {
     /// The goal was satisfied.
@@ -362,6 +474,7 @@ impl From<StopCondition> for EpisodeCompletionReason {
 /// This event captures the outcome and resource consumption of an episode,
 /// enabling audit, metrics, and debugging.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpisodeCompleted {
     /// The episode ID that completed.
     episode_id: String,
@@ -503,6 +616,7 @@ impl EpisodeCompleted {
 /// This allows storing heterogeneous episode events in a single collection
 /// while preserving type information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum EpisodeEvent {
     /// An episode started.
@@ -757,5 +871,265 @@ mod tests {
         let json = serde_json::to_string(&completed).unwrap();
         let deserialized: EpisodeCompleted = serde_json::from_str(&json).unwrap();
         assert_eq!(completed, deserialized);
+    }
+
+    /// SECURITY TEST: Verify `EpisodeStarted` rejects unknown fields.
+    ///
+    /// Finding: MEDIUM - Permissive Parsing
+    /// Fix: Added `#[serde(deny_unknown_fields)]` to prevent
+    /// malicious/corrupted data from being silently accepted.
+    #[test]
+    fn test_episode_started_rejects_unknown_fields() {
+        let json_with_unknown_field = r#"{
+            "episode_id": "ep-001",
+            "work_id": "work-123",
+            "lease_id": "lease-456",
+            "episode_number": 1,
+            "started_at_ns": 1000000000,
+            "parent_episode_id": null,
+            "remaining_tokens": null,
+            "remaining_time_ms": null,
+            "goal_spec": null,
+            "malicious_field": "should_be_rejected"
+        }"#;
+
+        let result: Result<EpisodeStarted, _> = serde_json::from_str(json_with_unknown_field);
+        assert!(
+            result.is_err(),
+            "EpisodeStarted should reject JSON with unknown fields"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "Error should mention 'unknown field': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `EpisodeCompleted` rejects unknown fields.
+    #[test]
+    fn test_episode_completed_rejects_unknown_fields() {
+        let json_with_unknown_field = r#"{
+            "episode_id": "ep-001",
+            "reason": "GoalSatisfied",
+            "completed_at_ns": 1500000000,
+            "tokens_consumed": 100,
+            "time_consumed_ms": 500,
+            "artifact_count": 1,
+            "progress_update": null,
+            "error_message": null,
+            "extra_field": "should_be_rejected"
+        }"#;
+
+        let result: Result<EpisodeCompleted, _> = serde_json::from_str(json_with_unknown_field);
+        assert!(
+            result.is_err(),
+            "EpisodeCompleted should reject JSON with unknown fields"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "Error should mention 'unknown field': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `EpisodeCompletionReason` rejects unknown fields.
+    #[test]
+    fn test_episode_completion_reason_rejects_unknown_fields() {
+        // Test a variant with fields
+        let json_with_unknown_field = r#"{
+            "BudgetExhausted": {
+                "resource": "tokens",
+                "extra_field": "should_be_rejected"
+            }
+        }"#;
+
+        let result: Result<EpisodeCompletionReason, _> =
+            serde_json::from_str(json_with_unknown_field);
+        assert!(
+            result.is_err(),
+            "EpisodeCompletionReason should reject JSON with unknown fields"
+        );
+    }
+
+    /// SECURITY TEST: Verify `EpisodeEvent` rejects unknown fields.
+    #[test]
+    fn test_episode_event_rejects_unknown_fields() {
+        let json_with_unknown_field = r#"{
+            "Started": {
+                "episode_id": "ep-001",
+                "work_id": "work-123",
+                "lease_id": "lease-456",
+                "episode_number": 1,
+                "started_at_ns": 1000000000,
+                "parent_episode_id": null,
+                "remaining_tokens": null,
+                "remaining_time_ms": null,
+                "goal_spec": null,
+                "malicious_field": "should_be_rejected"
+            }
+        }"#;
+
+        let result: Result<EpisodeEvent, _> = serde_json::from_str(json_with_unknown_field);
+        assert!(
+            result.is_err(),
+            "EpisodeEvent should reject JSON with unknown fields in inner struct"
+        );
+    }
+
+    // ========================================================================
+    // SECURITY TESTS: ID Validation (Finding 3 - Unvalidated Input)
+    // ========================================================================
+
+    /// SECURITY TEST: Verify `try_new` accepts valid IDs.
+    #[test]
+    fn test_try_new_accepts_valid_ids() {
+        let result = EpisodeStarted::try_new("ep-001", "work-123", "lease-456", 1, 1_000_000_000);
+        assert!(result.is_ok(), "try_new should accept valid IDs");
+    }
+
+    /// SECURITY TEST: Verify `try_new` rejects empty `episode_id`.
+    ///
+    /// Finding: MEDIUM - Unvalidated Input
+    /// Fix: Added `try_new()` with ID validation.
+    #[test]
+    fn test_try_new_rejects_empty_episode_id() {
+        let result = EpisodeStarted::try_new(
+            "", // Empty episode_id
+            "work-123",
+            "lease-456",
+            1,
+            1_000_000_000,
+        );
+        assert!(result.is_err(), "try_new should reject empty episode_id");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("episode_id") && err.contains("empty"),
+            "Error should mention 'episode_id' and 'empty': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `try_new` rejects empty `work_id`.
+    #[test]
+    fn test_try_new_rejects_empty_work_id() {
+        let result = EpisodeStarted::try_new(
+            "ep-001",
+            "", // Empty work_id
+            "lease-456",
+            1,
+            1_000_000_000,
+        );
+        assert!(result.is_err(), "try_new should reject empty work_id");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_id") && err.contains("empty"),
+            "Error should mention 'work_id' and 'empty': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `try_new` rejects empty `lease_id`.
+    #[test]
+    fn test_try_new_rejects_empty_lease_id() {
+        let result = EpisodeStarted::try_new(
+            "ep-001",
+            "work-123",
+            "", // Empty lease_id
+            1,
+            1_000_000_000,
+        );
+        assert!(result.is_err(), "try_new should reject empty lease_id");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lease_id") && err.contains("empty"),
+            "Error should mention 'lease_id' and 'empty': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `try_new` rejects IDs containing slash.
+    ///
+    /// Slashes in IDs could enable path traversal attacks if IDs are used
+    /// as part of file paths or storage keys.
+    #[test]
+    fn test_try_new_rejects_id_with_slash() {
+        let result = EpisodeStarted::try_new(
+            "ep-001",
+            "work/../../etc/passwd", // Path traversal attempt
+            "lease-456",
+            1,
+            1_000_000_000,
+        );
+        assert!(result.is_err(), "try_new should reject IDs with '/'");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_id") && err.contains('/'),
+            "Error should mention 'work_id' and '/': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `try_new` rejects IDs exceeding max length.
+    #[test]
+    fn test_try_new_rejects_overly_long_id() {
+        let long_id = "x".repeat(MAX_ID_LENGTH + 1);
+        let result = EpisodeStarted::try_new(
+            "ep-001",
+            &long_id, // Too long
+            "lease-456",
+            1,
+            1_000_000_000,
+        );
+        assert!(
+            result.is_err(),
+            "try_new should reject IDs exceeding max length"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_id") && err.contains("maximum length"),
+            "Error should mention 'work_id' and 'maximum length': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `try_new` rejects IDs containing null bytes.
+    #[test]
+    fn test_try_new_rejects_id_with_null_byte() {
+        let result = EpisodeStarted::try_new(
+            "ep-001",
+            "work-\0-123", // Null byte in ID
+            "lease-456",
+            1,
+            1_000_000_000,
+        );
+        assert!(result.is_err(), "try_new should reject IDs with null bytes");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("work_id") && err.contains("null"),
+            "Error should mention 'work_id' and 'null': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `validate_id` function directly.
+    #[test]
+    fn test_validate_id_accepts_valid_ids() {
+        assert!(validate_id("simple-id", "test").is_ok());
+        assert!(validate_id("id_with_underscores", "test").is_ok());
+        assert!(validate_id("id-with-hyphens", "test").is_ok());
+        assert!(validate_id("id.with.dots", "test").is_ok());
+        assert!(validate_id("123", "test").is_ok());
+        assert!(validate_id("a", "test").is_ok()); // Single char
+        assert!(validate_id(&"x".repeat(MAX_ID_LENGTH), "test").is_ok()); // Max length
+    }
+
+    /// SECURITY TEST: Verify `validate_id` rejects invalid IDs.
+    #[test]
+    fn test_validate_id_rejects_invalid_ids() {
+        // Empty
+        assert!(validate_id("", "test").is_err());
+
+        // Too long
+        assert!(validate_id(&"x".repeat(MAX_ID_LENGTH + 1), "test").is_err());
+
+        // Contains slash
+        assert!(validate_id("path/to/id", "test").is_err());
+
+        // Contains null
+        assert!(validate_id("id\0with\0nulls", "test").is_err());
     }
 }

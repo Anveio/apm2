@@ -47,4 +47,7 @@
 
 mod events;
 
-pub use events::{EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted};
+pub use events::{
+    EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted, MAX_ID_LENGTH,
+    validate_id,
+};

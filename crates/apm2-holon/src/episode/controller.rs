@@ -20,6 +20,7 @@ use crate::traits::Holon;
 /// This struct controls the behavior of the episode execution loop,
 /// including limits, timeouts, and event emission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EpisodeControllerConfig {
     /// Maximum number of episodes to execute in a single loop.
     /// This acts as a safety limit even if the holon doesn't signal completion.
@@ -82,6 +83,7 @@ impl EpisodeControllerConfig {
 /// This enum captures why the episode loop terminated, providing context
 /// for the caller to decide what to do next.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum EpisodeLoopOutcome {
     /// The goal was satisfied; work is complete.
@@ -432,6 +434,9 @@ impl EpisodeController {
     /// * `lease` - The lease authorizing execution (mutable for budget
     ///   deduction)
     /// * `goal_spec` - Optional goal specification
+    /// * `initial_episode_number` - Starting episode number (1-indexed). Use a
+    ///   value > 1 when resuming from a previous execution to ensure
+    ///   monotonically increasing episode numbers across restarts.
     /// * `clock` - Function to get current timestamp in nanoseconds
     ///
     /// # Returns
@@ -451,6 +456,7 @@ impl EpisodeController {
         work_id: &str,
         lease: &mut Lease,
         goal_spec: Option<&str>,
+        initial_episode_number: u64,
         mut clock: F,
     ) -> Result<EpisodeLoopResult<H::Output>, HolonError>
     where
@@ -458,7 +464,7 @@ impl EpisodeController {
         F: FnMut() -> u64,
     {
         let mut events = Vec::new();
-        let mut episode_number: u64 = 1;
+        let mut episode_number: u64 = initial_episode_number.max(1);
         let mut total_tokens_consumed: u64 = 0;
         let mut progress_state: Option<String> = None;
         let mut final_output: Option<H::Output> = None;
@@ -837,6 +843,52 @@ mod tests {
         assert!(!config.strict_budget_enforcement);
     }
 
+    /// SECURITY TEST: Verify `EpisodeControllerConfig` rejects unknown fields.
+    ///
+    /// Finding: MEDIUM - Permissive Parsing
+    /// Fix: Added `#[serde(deny_unknown_fields)]` to prevent
+    /// malicious/corrupted data from being silently accepted.
+    #[test]
+    fn test_config_rejects_unknown_fields() {
+        let json_with_unknown_field = r#"{
+            "max_episodes": 100,
+            "episode_timeout_ms": 60000,
+            "emit_events": true,
+            "strict_budget_enforcement": true,
+            "malicious_config": "should_be_rejected"
+        }"#;
+
+        let result: Result<EpisodeControllerConfig, _> =
+            serde_json::from_str(json_with_unknown_field);
+        assert!(
+            result.is_err(),
+            "EpisodeControllerConfig should reject JSON with unknown fields"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field"),
+            "Error should mention 'unknown field': {err}"
+        );
+    }
+
+    /// SECURITY TEST: Verify `EpisodeLoopOutcome` rejects unknown fields.
+    #[test]
+    fn test_outcome_rejects_unknown_fields() {
+        let json_with_unknown_field = r#"{
+            "Completed": {
+                "episodes_executed": 5,
+                "tokens_consumed": 1000,
+                "extra_field": "should_be_rejected"
+            }
+        }"#;
+
+        let result: Result<EpisodeLoopOutcome, _> = serde_json::from_str(json_with_unknown_field);
+        assert!(
+            result.is_err(),
+            "EpisodeLoopOutcome should reject JSON with unknown fields"
+        );
+    }
+
     #[test]
     fn test_build_context() {
         let controller = EpisodeController::with_defaults();
@@ -940,6 +992,7 @@ mod tests {
                 "work-123",
                 &mut lease,
                 Some("Complete task"),
+                1, // initial_episode_number
                 clock,
             )
             .unwrap();
@@ -965,7 +1018,7 @@ mod tests {
 
         let clock = mock_clock();
         let result = controller
-            .run_episode_loop(&mut holon, "work-123", &mut lease, None, clock)
+            .run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock)
             .unwrap();
 
         assert!(!result.is_successful());
@@ -999,7 +1052,7 @@ mod tests {
 
         let clock = mock_clock();
         let result = controller
-            .run_episode_loop(&mut holon, "work-123", &mut lease, None, clock)
+            .run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock)
             .unwrap();
 
         assert!(!result.is_successful());
@@ -1023,7 +1076,7 @@ mod tests {
 
         let clock = mock_clock();
         let result = controller
-            .run_episode_loop(&mut holon, "work-123", &mut lease, None, clock)
+            .run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock)
             .unwrap();
 
         assert!(!result.is_successful());
@@ -1047,7 +1100,8 @@ mod tests {
         let mut lease = test_lease();
 
         let clock = mock_clock();
-        let result = controller.run_episode_loop(&mut holon, "work-123", &mut lease, None, clock);
+        let result =
+            controller.run_episode_loop(&mut holon, "work-123", &mut lease, None, 1, clock);
 
         // Should succeed (return result) even with error because
         // strict_budget_enforcement=false
@@ -1099,5 +1153,144 @@ mod tests {
             tokens_consumed: 500,
         };
         assert!(budget.to_string().contains("tokens"));
+    }
+
+    /// SECURITY TEST: Verify episode numbers increase monotonically across
+    /// restarts.
+    ///
+    /// This test proves that when `run_episode_loop` is called twice for the
+    /// same work ID with an appropriate `initial_episode_number`, episode
+    /// numbers continue from where they left off (e.g., 1..3 then 4..6).
+    ///
+    /// Finding: HIGH - Restart/Resume Vulnerability
+    /// Fix: Accept `initial_episode_number` parameter to enable monotonic
+    /// numbering.
+    #[test]
+    fn test_episode_numbers_increase_monotonically_across_restarts() {
+        let controller = EpisodeController::new(
+            EpisodeControllerConfig::default()
+                .with_max_episodes(100) // High limit so we don't hit it
+                .with_emit_events(true),
+        );
+
+        // First run: episodes 1-3
+        let mut holon = MockHolon::new("test-holon").with_episodes_until_complete(3);
+        let mut lease = Lease::builder()
+            .lease_id("test-lease")
+            .issuer_id("registrar")
+            .holder_id("agent")
+            .scope(LeaseScope::unlimited())
+            .budget(Budget::new(20, 200, 20_000, 120_000))
+            .expires_at_ns(u64::MAX)
+            .build()
+            .unwrap();
+
+        let clock = mock_clock();
+        let result1 = controller
+            .run_episode_loop(
+                &mut holon, "work-123", &mut lease, None, 1, // Start from episode 1
+                clock,
+            )
+            .unwrap();
+
+        // Collect episode numbers from first run
+        let first_run_episodes: Vec<u64> = result1
+            .events
+            .iter()
+            .filter_map(|e| {
+                if let crate::ledger::EpisodeEvent::Started(started) = e {
+                    Some(started.episode_number())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(first_run_episodes, vec![1, 2, 3]);
+        let last_episode_first_run = *first_run_episodes.last().unwrap();
+
+        // Second run: episodes 4-6 (simulating restart/resume)
+        let mut holon2 = MockHolon::new("test-holon").with_episodes_until_complete(3);
+        let clock2 = mock_clock();
+        let result2 = controller
+            .run_episode_loop(
+                &mut holon2,
+                "work-123",
+                &mut lease,
+                None,
+                last_episode_first_run + 1, // Continue from episode 4
+                clock2,
+            )
+            .unwrap();
+
+        // Collect episode numbers from second run
+        let second_run_episodes: Vec<u64> = result2
+            .events
+            .iter()
+            .filter_map(|e| {
+                if let crate::ledger::EpisodeEvent::Started(started) = e {
+                    Some(started.episode_number())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(second_run_episodes, vec![4, 5, 6]);
+
+        // Verify all episode numbers across both runs are unique and monotonic
+        let all_episodes: Vec<u64> = first_run_episodes
+            .into_iter()
+            .chain(second_run_episodes)
+            .collect();
+        let mut sorted_episodes = all_episodes.clone();
+        sorted_episodes.sort_unstable();
+        sorted_episodes.dedup();
+
+        assert_eq!(
+            all_episodes, sorted_episodes,
+            "Episode numbers must be unique and monotonically increasing across restarts"
+        );
+        assert_eq!(all_episodes, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// SECURITY TEST: Verify `initial_episode_number` of 0 is clamped to 1.
+    #[test]
+    fn test_initial_episode_number_clamped_to_one() {
+        let controller = EpisodeController::new(
+            EpisodeControllerConfig::default()
+                .with_max_episodes(5)
+                .with_emit_events(true),
+        );
+
+        let mut holon = MockHolon::new("test-holon").with_episodes_until_complete(1);
+        let mut lease = test_lease();
+
+        let clock = mock_clock();
+        let result = controller
+            .run_episode_loop(
+                &mut holon, "work-123", &mut lease, None,
+                0, // Invalid: should be clamped to 1
+                clock,
+            )
+            .unwrap();
+
+        // First episode should be numbered 1, not 0
+        let first_episode_number = result
+            .events
+            .iter()
+            .find_map(|e| {
+                if let crate::ledger::EpisodeEvent::Started(started) = e {
+                    Some(started.episode_number())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            first_episode_number, 1,
+            "Episode number 0 should be clamped to 1"
+        );
     }
 }
