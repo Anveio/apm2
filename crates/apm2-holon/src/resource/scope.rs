@@ -154,15 +154,38 @@ impl LeaseScope {
     /// "project/src/main.rs", but NOT "project/src\_backup" or
     /// "project/srcfile".
     ///
+    /// # Security
+    ///
+    /// Paths containing traversal sequences (`..`) are rejected to prevent
+    /// scope escape attacks. A scope allowing "project" will NOT authorize
+    /// "project/../secret" even though it starts with the allowed prefix.
+    ///
     /// The path separator is `/`.
     #[must_use]
     pub fn allows_namespace(&self, path: &str) -> bool {
+        // SECURITY: Always reject paths with traversal sequences first,
+        // even for unlimited scopes (defense in depth)
+        if Self::contains_path_traversal(path) {
+            return false;
+        }
         if self.unlimited {
             return true;
         }
         self.namespaces
             .iter()
             .any(|ns| Self::is_namespace_prefix(ns, path))
+    }
+
+    /// Checks if a path contains traversal sequences (`..`).
+    ///
+    /// Returns true if the path contains:
+    /// - `..` at the start (e.g., `../foo`)
+    /// - `..` at the end (e.g., `foo/..`)
+    /// - `..` in the middle (e.g., `foo/../bar`)
+    /// - Just `..`
+    fn contains_path_traversal(path: &str) -> bool {
+        // Check for exact ".." or paths starting/ending/containing "/.." or "../"
+        path == ".." || path.starts_with("../") || path.ends_with("/..") || path.contains("/../")
     }
 
     /// Checks if `prefix` is a valid namespace prefix of `path`.
@@ -469,6 +492,36 @@ mod tests {
         assert!(auth_scope.allows_namespace("auth/tokens"));
         assert!(!auth_scope.allows_namespace("authority"));
         assert!(!auth_scope.allows_namespace("authorize"));
+    }
+
+    #[test]
+    fn test_path_traversal_rejection() {
+        // SECURITY: Verify that paths containing ".." traversal sequences
+        // are rejected to prevent scope escape attacks
+        let scope = LeaseScope::builder().namespace("project").build();
+
+        // Normal paths should work
+        assert!(scope.allows_namespace("project"));
+        assert!(scope.allows_namespace("project/src"));
+        assert!(scope.allows_namespace("project/src/main.rs"));
+
+        // Path traversal attempts must be rejected
+        assert!(!scope.allows_namespace("project/../secret"));
+        assert!(!scope.allows_namespace("project/src/../../../etc/passwd"));
+        assert!(!scope.allows_namespace("../project"));
+        assert!(!scope.allows_namespace("project/.."));
+        assert!(!scope.allows_namespace(".."));
+
+        // Paths that look similar but don't have traversal should work
+        // (e.g., a file literally named "..." or "..x")
+        assert!(scope.allows_namespace("project/.../file"));
+        assert!(scope.allows_namespace("project/..hidden"));
+
+        // Even unlimited scopes must reject traversal (defense in depth)
+        let unlimited = LeaseScope::unlimited();
+        assert!(!unlimited.allows_namespace("anything/../secret"));
+        // But normal paths still work
+        assert!(unlimited.allows_namespace("anything/normal/path"));
     }
 
     #[test]
