@@ -60,6 +60,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::work::WorkLifecycle;
 
+// =============================================================================
+// Validation limits to prevent unbounded deserialization (DoS protection)
+// =============================================================================
+
+/// Maximum length for string fields (IDs, titles, descriptions, reasons).
+const MAX_STRING_LEN: usize = 4096;
+
+/// Maximum number of evidence IDs in a single event.
+const MAX_EVIDENCE_IDS: usize = 1000;
+
+/// Maximum signature size (Ed25519 signatures are 64 bytes).
+const MAX_SIGNATURE_LEN: usize = 128;
+
 /// SHA-256 hash of an event, represented as a 32-byte array.
 ///
 /// The hash is computed over the canonical (deterministic) serialization
@@ -425,7 +438,185 @@ impl EventType {
             Self::WorkCompleted { .. } | Self::WorkFailed { .. } | Self::WorkCancelled { .. }
         )
     }
+
+    /// Validates that all string and vector fields are within size limits.
+    ///
+    /// This is a defense-in-depth check to prevent unbounded deserialization
+    /// from causing out-of-memory conditions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LedgerValidationError`] if any field exceeds the allowed
+    /// limits.
+    #[allow(clippy::too_many_lines)]
+    pub fn validate(&self) -> Result<(), LedgerValidationError> {
+        self.validate_strings()?;
+        self.validate_collections()
+    }
+
+    /// Validates string fields in the event type.
+    fn validate_strings(&self) -> Result<(), LedgerValidationError> {
+        match self {
+            Self::WorkCreated { title } => validate_string_len(title, "title"),
+            Self::WorkProgressed { description, .. } => {
+                validate_string_len(description, "description")
+            },
+            Self::WorkEscalated {
+                to_holon_id,
+                reason,
+            } => {
+                validate_string_len(to_holon_id, "to_holon_id")?;
+                validate_string_len(reason, "reason")
+            },
+            Self::WorkFailed { reason, .. } | Self::WorkCancelled { reason } => {
+                validate_string_len(reason, "reason")
+            },
+            Self::WorkClaimed { lease_id }
+            | Self::LeaseRenewed { lease_id, .. }
+            | Self::LeaseExpired { lease_id } => validate_string_len(lease_id, "lease_id"),
+            Self::EpisodeStarted { episode_id, .. } | Self::EpisodeCompleted { episode_id, .. } => {
+                validate_string_len(episode_id, "episode_id")
+            },
+            Self::ArtifactEmitted {
+                artifact_id,
+                artifact_kind,
+                content_hash,
+            } => {
+                validate_string_len(artifact_id, "artifact_id")?;
+                validate_string_len(artifact_kind, "artifact_kind")?;
+                if let Some(hash) = content_hash {
+                    validate_string_len(hash, "content_hash")?;
+                }
+                Ok(())
+            },
+            Self::EvidencePublished {
+                evidence_id,
+                requirement_id,
+                content_hash,
+            } => {
+                validate_string_len(evidence_id, "evidence_id")?;
+                validate_string_len(requirement_id, "requirement_id")?;
+                validate_string_len(content_hash, "content_hash")
+            },
+            Self::LeaseIssued {
+                lease_id,
+                holder_id,
+                ..
+            } => {
+                validate_string_len(lease_id, "lease_id")?;
+                validate_string_len(holder_id, "holder_id")
+            },
+            Self::LeaseReleased { lease_id, reason } => {
+                validate_string_len(lease_id, "lease_id")?;
+                validate_string_len(reason, "reason")
+            },
+            Self::BudgetConsumed { resource_type, .. }
+            | Self::BudgetExhausted { resource_type, .. } => {
+                validate_string_len(resource_type, "resource_type")
+            },
+            Self::WorkCompleted { .. } => Ok(()),
+        }
+    }
+
+    /// Validates collection fields (evidence IDs) in the event type.
+    fn validate_collections(&self) -> Result<(), LedgerValidationError> {
+        if let Self::WorkCompleted { evidence_ids } = self {
+            validate_evidence_ids(evidence_ids)?;
+        }
+        Ok(())
+    }
 }
+
+/// Validates that a string is within the maximum allowed length.
+fn validate_string_len(s: &str, field_name: &str) -> Result<(), LedgerValidationError> {
+    if s.len() > MAX_STRING_LEN {
+        return Err(LedgerValidationError::StringTooLong {
+            field: field_name.to_string(),
+            max_len: MAX_STRING_LEN,
+            actual_len: s.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates that evidence IDs are within limits.
+fn validate_evidence_ids(ids: &[String]) -> Result<(), LedgerValidationError> {
+    if ids.len() > MAX_EVIDENCE_IDS {
+        return Err(LedgerValidationError::TooManyEvidenceIds {
+            max_count: MAX_EVIDENCE_IDS,
+            actual_count: ids.len(),
+        });
+    }
+    for (i, id) in ids.iter().enumerate() {
+        if id.len() > MAX_STRING_LEN {
+            return Err(LedgerValidationError::StringTooLong {
+                field: format!("evidence_ids[{i}]"),
+                max_len: MAX_STRING_LEN,
+                actual_len: id.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validation error for ledger events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerValidationError {
+    /// A string field exceeds the maximum allowed length.
+    StringTooLong {
+        /// Name of the field that is too long.
+        field: String,
+        /// Maximum allowed length.
+        max_len: usize,
+        /// Actual length of the string.
+        actual_len: usize,
+    },
+    /// Too many evidence IDs in a single event.
+    TooManyEvidenceIds {
+        /// Maximum allowed count.
+        max_count: usize,
+        /// Actual count.
+        actual_count: usize,
+    },
+    /// Signature is too large.
+    SignatureTooLong {
+        /// Maximum allowed length.
+        max_len: usize,
+        /// Actual length.
+        actual_len: usize,
+    },
+}
+
+impl fmt::Display for LedgerValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StringTooLong {
+                field,
+                max_len,
+                actual_len,
+            } => {
+                write!(
+                    f,
+                    "field '{field}' exceeds maximum length: {actual_len} > {max_len}"
+                )
+            },
+            Self::TooManyEvidenceIds {
+                max_count,
+                actual_count,
+            } => {
+                write!(f, "too many evidence IDs: {actual_count} > {max_count}")
+            },
+            Self::SignatureTooLong {
+                max_len,
+                actual_len,
+            } => {
+                write!(f, "signature too long: {actual_len} > {max_len}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for LedgerValidationError {}
 
 impl fmt::Display for EventType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -640,6 +831,34 @@ impl LedgerEvent {
     #[must_use]
     pub fn verify_previous(&self, previous_event: &Self) -> bool {
         self.previous_hash == previous_event.compute_hash()
+    }
+
+    /// Validates that this event's fields are within size limits.
+    ///
+    /// This is a defense-in-depth check to prevent unbounded deserialization
+    /// from causing out-of-memory conditions. Call this after deserializing
+    /// an event from untrusted sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LedgerValidationError`] if any field exceeds the allowed
+    /// limits.
+    pub fn validate(&self) -> Result<(), LedgerValidationError> {
+        // Validate top-level string fields
+        validate_string_len(&self.id, "id")?;
+        validate_string_len(&self.work_id, "work_id")?;
+        validate_string_len(&self.holon_id, "holon_id")?;
+
+        // Validate signature size
+        if self.signature.len() > MAX_SIGNATURE_LEN {
+            return Err(LedgerValidationError::SignatureTooLong {
+                max_len: MAX_SIGNATURE_LEN,
+                actual_len: self.signature.len(),
+            });
+        }
+
+        // Delegate to EventType validation
+        self.event_type.validate()
     }
 }
 
@@ -1608,6 +1827,150 @@ mod unit_tests {
         // Verify that modifying any event breaks the chain
         // (We can't easily test this without mutation, but the principle is
         // demonstrated)
+    }
+
+    // =========================================================================
+    // Validation Tests (DoS protection)
+    // =========================================================================
+
+    #[test]
+    fn test_event_validation_valid_event() {
+        let event = LedgerEvent::builder()
+            .event_id("evt-001")
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCreated {
+                title: "Test".into(),
+            })
+            .build();
+
+        assert!(event.validate().is_ok());
+    }
+
+    #[test]
+    fn test_event_validation_string_too_long() {
+        let long_title = "x".repeat(MAX_STRING_LEN + 1);
+        let event = LedgerEvent::builder()
+            .event_id("evt-001")
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCreated { title: long_title })
+            .build();
+
+        let result = event.validate();
+        assert!(matches!(
+            result,
+            Err(LedgerValidationError::StringTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_event_validation_too_many_evidence_ids() {
+        let many_ids: Vec<String> = (0..=MAX_EVIDENCE_IDS)
+            .map(|i| format!("evid-{i:04}"))
+            .collect();
+
+        let event = LedgerEvent::builder()
+            .event_id("evt-001")
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCompleted {
+                evidence_ids: many_ids,
+            })
+            .build();
+
+        let result = event.validate();
+        assert!(matches!(
+            result,
+            Err(LedgerValidationError::TooManyEvidenceIds { .. })
+        ));
+    }
+
+    #[test]
+    fn test_event_validation_signature_too_long() {
+        let long_signature = vec![0u8; MAX_SIGNATURE_LEN + 1];
+        let event = LedgerEvent::builder()
+            .event_id("evt-001")
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCreated {
+                title: "Test".into(),
+            })
+            .signature(long_signature)
+            .build();
+
+        let result = event.validate();
+        assert!(matches!(
+            result,
+            Err(LedgerValidationError::SignatureTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_event_validation_work_id_too_long() {
+        let long_id = "x".repeat(MAX_STRING_LEN + 1);
+        let event = LedgerEvent::builder()
+            .event_id("evt-001")
+            .work_id(long_id)
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCreated {
+                title: "Test".into(),
+            })
+            .build();
+
+        let result = event.validate();
+        assert!(matches!(
+            result,
+            Err(LedgerValidationError::StringTooLong { field, .. }) if field == "work_id"
+        ));
+    }
+
+    #[test]
+    fn test_event_validation_evidence_id_too_long() {
+        let long_id = "x".repeat(MAX_STRING_LEN + 1);
+        let event = LedgerEvent::builder()
+            .event_id("evt-001")
+            .work_id("work-001")
+            .holon_id("holon-001")
+            .event_type(EventType::WorkCompleted {
+                evidence_ids: vec![long_id],
+            })
+            .build();
+
+        let result = event.validate();
+        assert!(matches!(
+            result,
+            Err(LedgerValidationError::StringTooLong { field, .. }) if field.starts_with("evidence_ids")
+        ));
+    }
+
+    #[test]
+    fn test_validation_error_display() {
+        let err = LedgerValidationError::StringTooLong {
+            field: "title".to_string(),
+            max_len: 4096,
+            actual_len: 10000,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("title"));
+        assert!(msg.contains("10000"));
+        assert!(msg.contains("4096"));
+
+        let err = LedgerValidationError::TooManyEvidenceIds {
+            max_count: 1000,
+            actual_count: 2000,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("2000"));
+        assert!(msg.contains("1000"));
+
+        let err = LedgerValidationError::SignatureTooLong {
+            max_len: 128,
+            actual_len: 256,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("256"));
+        assert!(msg.contains("128"));
     }
 }
 
