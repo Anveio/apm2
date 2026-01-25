@@ -307,6 +307,7 @@ fn run_ai_review(
                 log_file: log_path.clone(),
                 pr_url: pr_url.to_string(),
                 head_sha: head_sha.to_string(),
+                restart_count: 0,
             };
             state.set_reviewer(reviewer_type_key, entry);
             let _ = state.save();

@@ -334,6 +334,10 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
 ///
 /// Creates a log file for output capture and spawns the Gemini process
 /// in the background using `script` for PTY allocation.
+///
+/// Note: The command is spawned WITHOUT a trailing `&` so that the tracked
+/// PID (the `sh` process) remains valid. `Command::spawn()` already makes
+/// the process run asynchronously relative to the main thread.
 fn spawn_reviewer(
     reviewer_type: &str,
     prompt_file_path: &str,
@@ -353,7 +357,7 @@ fn spawn_reviewer(
         .tempfile()
         .ok()?;
 
-    // Keep the log file (don't delete on drop)
+    // Keep the log file (don't delete on drop) - cleanup happens on completion
     let (_, log_path) = log_file.keep().ok()?;
     let log_path_str = log_path.display().to_string();
 
@@ -372,8 +376,11 @@ fn spawn_reviewer(
     //
     // The log file's mtime updates whenever new output is written, enabling
     // health monitoring via mtime checking.
+    //
+    // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
+    // the sh process to stay alive so the tracked PID remains valid.
     let shell_cmd = format!(
-        "(script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}' '{log_path_str}') &"
+        "script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}'"
     );
 
     let child = std::process::Command::new("sh")
@@ -390,6 +397,7 @@ fn spawn_reviewer(
         log_file: log_path,
         pr_url: pr_url.to_string(),
         head_sha: head_sha.to_string(),
+        restart_count: 0,
     })
 }
 

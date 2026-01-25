@@ -24,7 +24,8 @@ use serde::Deserialize;
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{
-    HealthStatus, ReviewerStateFile, acquire_remediation_lock, kill_process,
+    HealthStatus, MAX_RESTART_ATTEMPTS, ReviewerEntry, ReviewerStateFile, acquire_remediation_lock,
+    kill_process,
 };
 use crate::util::{current_branch, validate_ticket_branch};
 
@@ -540,7 +541,7 @@ fn capitalize(s: &str) -> String {
 fn remediate_reviewer(
     sh: &Shell,
     reviewer_type: &str,
-    entry: &crate::reviewer_state::ReviewerEntry,
+    entry: &ReviewerEntry,
     health: HealthStatus,
 ) -> Result<()> {
     // Try to acquire lock to prevent concurrent remediation
@@ -548,6 +549,30 @@ fn remediate_reviewer(
         println!("      Skipping remediation (another remediation in progress)");
         return Ok(());
     };
+
+    // IMPORTANT: Reload state after acquiring lock to avoid race conditions
+    // Between reading state in display_reviewer_health and acquiring the lock,
+    // another process may have already remediated this reviewer
+    let mut state = ReviewerStateFile::load()?;
+    let Some(current_entry) = state.get_reviewer(reviewer_type) else {
+        // Entry was already removed by another process
+        println!(
+            "      {} reviewer already cleaned up",
+            capitalize(reviewer_type)
+        );
+        return Ok(());
+    };
+
+    // Verify the PID matches to ensure we're acting on the right entry
+    if current_entry.pid != entry.pid {
+        println!(
+            "      {} reviewer PID changed ({}->{}), skipping",
+            capitalize(reviewer_type),
+            entry.pid,
+            current_entry.pid
+        );
+        return Ok(());
+    }
 
     // Check if the GitHub status is already completed (success or failure)
     // If so, the reviewer finished successfully and we don't need to restart
@@ -557,9 +582,11 @@ fn remediate_reviewer(
         _ => return Ok(()),
     };
 
-    if is_review_completed(sh, &entry.head_sha, status_context) {
-        // Review completed, just clean up the state entry
-        let mut state = ReviewerStateFile::load()?;
+    if is_review_completed(sh, &current_entry.head_sha, status_context) {
+        // Review completed, clean up the state entry and log file
+        if current_entry.log_file.exists() {
+            let _ = std::fs::remove_file(&current_entry.log_file);
+        }
         state.remove_reviewer(reviewer_type);
         state.save()?;
         println!(
@@ -569,41 +596,63 @@ fn remediate_reviewer(
         return Ok(());
     }
 
-    let elapsed = entry
+    // Check restart count limit
+    if current_entry.restart_count >= MAX_RESTART_ATTEMPTS {
+        println!(
+            "      {} reviewer exceeded max restart attempts ({}), giving up",
+            capitalize(reviewer_type),
+            MAX_RESTART_ATTEMPTS
+        );
+        // Clean up but don't restart
+        if current_entry.log_file.exists() {
+            let _ = std::fs::remove_file(&current_entry.log_file);
+        }
+        state.remove_reviewer(reviewer_type);
+        state.save()?;
+        return Ok(());
+    }
+
+    let elapsed = current_entry
         .get_log_mtime_elapsed()
         .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
 
     println!(
-        "      {} reviewer {} ({}), restarting...",
+        "      {} reviewer {} ({}), restarting (attempt {}/{})...",
         capitalize(reviewer_type),
         if health == HealthStatus::Stale {
             "stale"
         } else {
             "dead"
         },
-        elapsed
+        elapsed,
+        current_entry.restart_count + 1,
+        MAX_RESTART_ATTEMPTS
     );
 
     // Kill the stale/dead process
     if health == HealthStatus::Stale {
-        let killed = kill_process(entry.pid);
+        let killed = kill_process(current_entry.pid);
         if killed {
-            println!("      Killed process {}", entry.pid);
+            println!("      Killed process {}", current_entry.pid);
         }
     }
 
     // Remove old log file
-    if entry.log_file.exists() {
-        let _ = std::fs::remove_file(&entry.log_file);
+    if current_entry.log_file.exists() {
+        let _ = std::fs::remove_file(&current_entry.log_file);
     }
 
-    // Load state, remove entry, save
-    let mut state = ReviewerStateFile::load()?;
+    // Save the PR URL and HEAD SHA before removing the entry
+    let pr_url = current_entry.pr_url.clone();
+    let head_sha = current_entry.head_sha.clone();
+    let restart_count = current_entry.restart_count + 1;
+
+    // Remove old entry
     state.remove_reviewer(reviewer_type);
     state.save()?;
 
     // Re-trigger the review using the saved PR URL and HEAD SHA
-    restart_review(sh, reviewer_type, &entry.pr_url, &entry.head_sha)?;
+    restart_review(sh, reviewer_type, &pr_url, &head_sha, restart_count)?;
 
     Ok(())
 }
@@ -669,7 +718,13 @@ fn parse_owner_repo_for_check(url: &str) -> String {
 }
 
 /// Restart a review using the PR URL and HEAD SHA from the state file.
-fn restart_review(sh: &Shell, reviewer_type: &str, pr_url: &str, head_sha: &str) -> Result<()> {
+fn restart_review(
+    sh: &Shell,
+    reviewer_type: &str,
+    pr_url: &str,
+    head_sha: &str,
+    restart_count: u32,
+) -> Result<()> {
     let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
         .read()
         .context("Failed to get repository root")?
@@ -719,8 +774,10 @@ fn restart_review(sh: &Shell, reviewer_type: &str, pr_url: &str, head_sha: &str)
     let log_path_str = log_path.display().to_string();
 
     // Spawn the reviewer process
+    // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
+    // the sh process to stay alive so the tracked PID remains valid.
     let shell_cmd = format!(
-        "(script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}') &"
+        "script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}'"
     );
 
     let child = std::process::Command::new("sh")
@@ -728,23 +785,21 @@ fn restart_review(sh: &Shell, reviewer_type: &str, pr_url: &str, head_sha: &str)
         .spawn();
 
     match child {
-        Ok(mut child) => {
+        Ok(child) => {
             // Get the PID of the shell process
             let pid = child.id();
-
-            // Wait briefly to let the shell start the script command
-            std::thread::sleep(std::time::Duration::from_millis(100));
 
             // Record the new entry in state file
             let mut state = ReviewerStateFile::load()?;
             state.set_reviewer(
                 reviewer_type,
-                crate::reviewer_state::ReviewerEntry {
+                ReviewerEntry {
                     pid,
                     started_at: chrono::Utc::now(),
                     log_file: log_path,
                     pr_url: pr_url.to_string(),
                     head_sha: head_sha.to_string(),
+                    restart_count,
                 },
             );
             state.save()?;
@@ -755,8 +810,8 @@ fn restart_review(sh: &Shell, reviewer_type: &str, pr_url: &str, head_sha: &str)
                 pid
             );
 
-            // Don't wait for the child - it's running in background
-            let _ = child.wait();
+            // Don't wait for the child - it runs in background via
+            // Command::spawn()
         },
         Err(e) => {
             println!("      Failed to restart review: {e}");

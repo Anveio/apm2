@@ -38,9 +38,15 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-/// Stale threshold in seconds. A reviewer is considered stale if its log file
-/// has not been modified for this many seconds.
-pub const STALE_THRESHOLD_SECS: u64 = 60;
+/// Stale threshold in seconds.
+///
+/// A reviewer is considered stale if its log file has not been modified for
+/// this many seconds. 300s (5 minutes) allows for AI tool startup, large PR
+/// analysis, and network latency.
+pub const STALE_THRESHOLD_SECS: u64 = 300;
+
+/// Maximum number of restart attempts before giving up on a reviewer.
+pub const MAX_RESTART_ATTEMPTS: u32 = 3;
 
 /// Timeout for SIGTERM before escalating to SIGKILL.
 pub const SIGTERM_TIMEOUT_SECS: u64 = 5;
@@ -84,6 +90,9 @@ pub struct ReviewerEntry {
     pub pr_url: String,
     /// The HEAD SHA being reviewed.
     pub head_sha: String,
+    /// Number of times this reviewer has been restarted.
+    #[serde(default)]
+    pub restart_count: u32,
 }
 
 impl ReviewerEntry {
@@ -149,7 +158,7 @@ impl ReviewerEntry {
     ///
     /// Uses `/proc/<pid>/cmdline` to verify the process is a reviewer agent.
     /// We check for:
-    /// - "gemini" binary in argv[0] or the command line (the AI tool)
+    /// - "gemini" binary in argv\[0\] or the command line (the AI tool)
     /// - "script" binary (the PTY wrapper we use)
     ///
     /// We specifically avoid matching editor processes like "vim script.rs"
@@ -443,6 +452,7 @@ mod tests {
             log_file: PathBuf::from("/tmp/test.log"),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
+            restart_count: 0,
         };
 
         state.set_reviewer("security", entry);
@@ -461,6 +471,7 @@ mod tests {
             log_file: PathBuf::from("/tmp/test.log"),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
+            restart_count: 0,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -483,6 +494,7 @@ mod tests {
                 log_file: PathBuf::from("/tmp/security.log"),
                 pr_url: "https://github.com/owner/repo/pull/123".to_string(),
                 head_sha: "abc123".to_string(),
+                restart_count: 0,
             },
         );
 
@@ -494,6 +506,7 @@ mod tests {
                 log_file: PathBuf::from("/tmp/quality.log"),
                 pr_url: "https://github.com/owner/repo/pull/123".to_string(),
                 head_sha: "abc123".to_string(),
+                restart_count: 0,
             },
         );
 
@@ -524,6 +537,7 @@ mod tests {
             log_file: PathBuf::from("/tmp/nonexistent.log"),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
+            restart_count: 0,
         };
 
         assert_eq!(entry.check_health(), HealthStatus::Dead);
@@ -537,6 +551,7 @@ mod tests {
             log_file: PathBuf::from("/tmp/definitely_does_not_exist_12345.log"),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
+            restart_count: 0,
         };
 
         assert!(entry.get_log_mtime_elapsed().is_none());
@@ -554,6 +569,7 @@ mod tests {
             log_file: path,
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
+            restart_count: 0,
         };
 
         let elapsed = entry.get_log_mtime_elapsed();
@@ -572,6 +588,7 @@ mod tests {
             log_file: PathBuf::from("/tmp/test.log"),
             pr_url: "https://github.com/owner/repo/pull/123".to_string(),
             head_sha: "abc123".to_string(),
+            restart_count: 0,
         };
 
         // Should return Dead without attempting to signal PID -1
