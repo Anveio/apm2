@@ -637,7 +637,7 @@ temp.write_all(prompt.as_bytes())?;
 let temp_path = temp.path();
 
 // Redirect from file instead of passing as argument
-cmd!("sh", "-c", format!("gemini --yolo < {}", temp_path.display())).run()?;
+cmd!("sh", "-c", format!("gemini --yolo < '{}'", temp_path.display())).run()?;
 ```
 
 **When this matters:**
