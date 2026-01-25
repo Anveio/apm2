@@ -38,6 +38,12 @@ pub enum ValidationError {
         /// The outcome text that failed validation.
         outcome: String,
     },
+
+    /// Evidence script path attempts path traversal.
+    PathTraversalDetected {
+        /// The suspicious path.
+        path: String,
+    },
 }
 
 impl ValidationError {
@@ -67,6 +73,12 @@ impl ValidationError {
                 format!(
                     "Expected outcome missing When/Then format: {outcome}\n\
                      Fix: Use format like: \"When X, then Y\""
+                )
+            },
+            Self::PathTraversalDetected { path } => {
+                format!(
+                    "Evidence script path traversal detected: {path}\n\
+                     Fix: Use a path relative to the repository root (no '..' or absolute paths)"
                 )
             },
         }
@@ -160,6 +172,17 @@ pub fn validate_evidence_script(
         .to_string();
 
     if clean_path.is_empty() {
+        return errors;
+    }
+
+    // Check for path traversal attempts
+    let path_obj = Path::new(&clean_path);
+    if path_obj.is_absolute()
+        || path_obj
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        errors.push(ValidationError::PathTraversalDetected { path: clean_path });
         return errors;
     }
 
@@ -418,6 +441,25 @@ mod tests {
     // =========================================================================
     // validate_usage_section tests
     // =========================================================================
+
+    #[test]
+    fn test_validate_evidence_script_path_traversal() {
+        let temp_dir = TempDir::new().unwrap();
+        let parsed = ParsedPRDescription {
+            usage: "test".to_string(),
+            expected_outcomes: vec![],
+            evidence_script: Some("../secret_file".to_string()),
+            known_limitations: vec![],
+        };
+
+        let errors = validate_evidence_script(&parsed, temp_dir.path());
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            ValidationError::PathTraversalDetected { path } if path == "../secret_file"
+        ));
+    }
 
     #[test]
     fn test_validate_usage_with_code_block() {
