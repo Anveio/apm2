@@ -10,11 +10,13 @@
 //!   - `-W clippy::missing_const_for_fn` (const promotion opportunities)
 //! - Runs `cargo test` for xtask crate
 //! - Runs `cargo semver-checks` (if installed)
+//! - Runs documentation example linting with `cargo xtask lint --include-docs`
 //! - Stages all changes and creates a commit
 
 use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
+use crate::tasks::lint::{LintArgs, LintFinding};
 use crate::util::{current_branch, validate_ticket_branch};
 
 /// Run checks and create a commit.
@@ -93,18 +95,20 @@ pub fn run(message: &str, skip_checks: bool) -> Result<()> {
 
 /// Run all pre-commit checks.
 ///
-/// Runs fmt, clippy, test, and semver-checks. All checks except semver-checks
-/// are required to pass. semver-checks will only warn if not installed.
+/// Runs fmt, clippy, test, semver-checks, and doc linting. All checks except
+/// semver-checks and doc linting are required to pass. semver-checks will
+/// only warn if not installed. Doc linting displays warnings but does not
+/// block the commit.
 fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
     // Run cargo fmt --check
-    println!("\n[1/4] Running cargo fmt --check...");
+    println!("\n[1/5] Running cargo fmt --check...");
     cmd!(sh, "cargo fmt --check")
         .run()
         .context("cargo fmt --check failed. Run 'cargo fmt' to fix formatting.")?;
     println!("  Formatting check passed.");
 
     // Run cargo clippy with enhanced lints
-    println!("\n[2/4] Running cargo clippy...");
+    println!("\n[2/5] Running cargo clippy...");
     cmd!(
         sh,
         "cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D clippy::match_same_arms -W clippy::missing_const_for_fn"
@@ -115,14 +119,14 @@ fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
     println!("  Tip: Use `..` in struct patterns to ignore new fields (e.g., `Foo {{ x, .. }}`).");
 
     // Run cargo test for xtask
-    println!("\n[3/4] Running cargo test -p xtask...");
+    println!("\n[3/5] Running cargo test -p xtask...");
     cmd!(sh, "cargo test -p xtask")
         .run()
         .context("cargo test -p xtask failed. Fix the tests before committing.")?;
     println!("  Tests passed.");
 
     // Run cargo semver-checks (optional - warn if not installed)
-    println!("\n[4/4] Running cargo semver-checks...");
+    println!("\n[4/5] Running cargo semver-checks...");
     let semver_installed = cmd!(sh, "cargo semver-checks --version")
         .ignore_status()
         .read()
@@ -152,8 +156,241 @@ fn run_pre_commit_checks(sh: &Shell) -> Result<()> {
         );
     }
 
+    // Run documentation example linting (warnings only, does not block commit)
+    println!("\n[5/5] Running documentation example linting...");
+    run_doc_lint_check()?;
+
     println!("\nAll checks passed.");
     Ok(())
+}
+
+/// Run documentation example linting.
+///
+/// Calls the lint command with `--include-docs` to check markdown code blocks
+/// for anti-patterns. Findings are displayed as warnings but do not block the
+/// commit.
+fn run_doc_lint_check() -> Result<()> {
+    let lint_args = LintArgs {
+        fix: false,
+        include_docs: true,
+    };
+
+    // Run the lint check and collect findings
+    let findings = run_lint_for_commit(lint_args)?;
+
+    if findings.is_empty() {
+        println!("  No anti-patterns found in documentation examples.");
+    } else {
+        println!(
+            "  Warning: Found {} anti-pattern(s) in documentation examples:\n",
+            findings.len()
+        );
+        for finding in &findings {
+            println!("  {finding}\n");
+        }
+        println!("  Consider fixing these documentation examples to avoid teaching bad patterns.");
+    }
+
+    Ok(())
+}
+
+/// Run lint checks and return findings without printing.
+///
+/// This is a helper for the commit command to run lint checks and capture
+/// findings programmatically instead of printing to stdout.
+fn run_lint_for_commit(args: LintArgs) -> Result<Vec<LintFinding>> {
+    let mut findings: Vec<LintFinding> = Vec::new();
+
+    // Find all Rust source files in crates/ and xtask/src/
+    let patterns = ["crates/**/*.rs", "xtask/src/**/*.rs"];
+
+    for pattern in patterns {
+        let glob_pattern = glob::glob(pattern).context("Invalid glob pattern")?;
+
+        for entry in glob_pattern {
+            let path = entry.context("Failed to read glob entry")?;
+            check_file_for_commit(&path, &mut findings)?;
+        }
+    }
+
+    // Check markdown files if --include-docs is passed
+    if args.include_docs {
+        let md_patterns = ["documents/skills/**/*.md", "documents/rfcs/**/*.md"];
+
+        for pattern in md_patterns {
+            let glob_pattern = glob::glob(pattern).context("Invalid glob pattern for markdown")?;
+
+            for entry in glob_pattern {
+                let path = entry.context("Failed to read markdown glob entry")?;
+                check_markdown_file_for_commit(&path, &mut findings)?;
+            }
+        }
+    }
+
+    Ok(findings)
+}
+
+/// Check a single Rust file for anti-patterns (for commit check).
+fn check_file_for_commit(path: &std::path::Path, findings: &mut Vec<LintFinding>) -> Result<()> {
+    // Skip lint.rs itself to avoid false positives from test code
+    if path.ends_with("lint.rs") {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+
+    let file_path = path.display().to_string();
+
+    for (line_idx, line) in content.lines().enumerate() {
+        let line_number = line_idx + 1;
+
+        // Skip comments
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+
+        // Check for temp_dir usage
+        if line.contains("temp_dir()")
+            && !line.contains("tempfile")
+            && !line.contains("// lint:ignore")
+            && !is_in_string_literal(trimmed, "temp_dir()")
+        {
+            findings.push(LintFinding {
+                file_path: file_path.clone(),
+                line_number,
+                pattern: trimmed.to_string(),
+                message: "Direct temp_dir() usage creates predictable paths".to_string(),
+                suggestion: "Use tempfile::NamedTempFile instead".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Check a single markdown file for anti-patterns (for commit check).
+fn check_markdown_file_for_commit(
+    path: &std::path::Path,
+    findings: &mut Vec<LintFinding>,
+) -> Result<()> {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser as MdParser, Tag, TagEnd};
+
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read markdown file: {}", path.display()))?;
+
+    let file_path = path.display().to_string();
+
+    // Extract code blocks using pulldown-cmark
+    let parser = MdParser::new(&content);
+    let mut current_block: Option<(String, String, usize)> = None;
+
+    // Track line numbers
+    let line_offsets: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    let byte_to_line = |byte_offset: usize| -> usize {
+        line_offsets
+            .iter()
+            .position(|&offset| offset > byte_offset)
+            .unwrap_or(line_offsets.len())
+    };
+
+    for (event, range) in parser.into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(lang))) => {
+                let start_line = byte_to_line(range.start);
+                current_block = Some((lang.to_string(), String::new(), start_line + 1));
+            },
+            Event::Text(text) => {
+                if let Some((_, ref mut block_content, _)) = current_block {
+                    block_content.push_str(&text);
+                }
+            },
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((lang, block_content, start_line)) = current_block.take() {
+                    // Only check Rust code blocks
+                    if lang != "rust" && !lang.is_empty() {
+                        continue;
+                    }
+
+                    // Check each line of the code block
+                    for (line_offset, line) in block_content.lines().enumerate() {
+                        let line_number = start_line + line_offset;
+                        let trimmed = line.trim();
+
+                        // Skip comments
+                        if trimmed.starts_with("//")
+                            || trimmed.starts_with("/*")
+                            || trimmed.starts_with('*')
+                        {
+                            continue;
+                        }
+
+                        // Check for std::env::temp_dir in docs
+                        if line.contains("std::env::temp_dir")
+                            && !line.contains("// lint:ignore")
+                            && !line.contains("UNSAFE")
+                            && !line.contains("BROKEN")
+                            && !line.contains("VULNERABLE")
+                        {
+                            findings.push(LintFinding {
+                                file_path: file_path.clone(),
+                                line_number,
+                                pattern: trimmed.to_string(),
+                                message: "Documentation example uses insecure temp file pattern"
+                                    .to_string(),
+                                suggestion: "Use tempfile::NamedTempFile in examples".to_string(),
+                            });
+                        }
+
+                        // Check for unquoted shell paths
+                        if line.contains("format!") && line.contains(".display()") {
+                            let shell_indicators =
+                                ["sh", "bash", "cmd", "Command", "script", "shell"];
+                            if shell_indicators.iter().any(|ind| line.contains(ind))
+                                && !line.contains("quote_path")
+                                && !line.contains("shell_escape")
+                                && !line.contains("// lint:ignore")
+                                && !line.contains("UNSAFE")
+                                && !line.contains("BROKEN")
+                                && !line.contains("VULNERABLE")
+                            {
+                                findings.push(LintFinding {
+                                    file_path: file_path.clone(),
+                                    line_number,
+                                    pattern: trimmed.to_string(),
+                                    message: "Documentation example has unquoted shell path"
+                                        .to_string(),
+                                    suggestion: "Use quote_path() for shell paths".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a pattern is likely inside a string literal.
+fn is_in_string_literal(line: &str, pattern: &str) -> bool {
+    if let Some(pattern_pos) = line.find(pattern) {
+        let before_pattern = &line[..pattern_pos];
+        let quote_count = before_pattern.matches('"').count();
+        if quote_count % 2 == 1 {
+            return true;
+        }
+        if before_pattern.contains("assert") || before_pattern.contains("expect") {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -191,14 +428,15 @@ mod tests {
 
     #[test]
     fn test_pre_commit_check_count() {
-        // Document that we run exactly 4 pre-commit checks:
+        // Document that we run exactly 5 pre-commit checks:
         // 1. cargo fmt --check
         // 2. cargo clippy --all-targets -- -D warnings -D clippy::doc_markdown -D
         //    clippy::match_same_arms -W clippy::missing_const_for_fn
         // 3. cargo test -p xtask
         // 4. cargo semver-checks (optional)
-        const CHECK_COUNT: usize = 4;
-        assert_eq!(CHECK_COUNT, 4);
+        // 5. documentation example linting (warnings only)
+        const CHECK_COUNT: usize = 5;
+        assert_eq!(CHECK_COUNT, 5);
     }
 
     #[test]
