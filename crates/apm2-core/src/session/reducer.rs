@@ -99,6 +99,11 @@ impl SessionReducer {
     /// (Terminated or Quarantined), a new `SessionStarted` event can
     /// reinitialize it. This supports crash recovery scenarios where the
     /// same session ID is reused.
+    ///
+    /// **Monotonicity Enforcement**: When restarting a session, the new
+    /// `restart_attempt` must be strictly greater than the previous attempt.
+    /// This prevents replay attacks that could reset a session to a fresh
+    /// state.
     fn handle_started(
         &mut self,
         event: crate::events::SessionStarted,
@@ -112,7 +117,16 @@ impl SessionReducer {
             if existing.is_active() {
                 return Err(SessionError::SessionAlreadyExists { session_id });
             }
-            // Terminal state (Terminated/Quarantined) can be restarted
+
+            // Enforce monotonicity: new restart_attempt must be > previous
+            let last_attempt = existing.last_restart_attempt();
+            if event.restart_attempt <= last_attempt {
+                return Err(SessionError::RestartAttemptNotMonotonic {
+                    session_id,
+                    previous_attempt: last_attempt,
+                    new_attempt: event.restart_attempt,
+                });
+            }
         }
 
         // Create new running state with restart tracking
@@ -186,8 +200,12 @@ impl SessionReducer {
                 })?;
 
         // Can only terminate from Running state
-        let started_at = match current_state {
-            SessionState::Running { started_at, .. } => *started_at,
+        let (started_at, restart_attempt) = match current_state {
+            SessionState::Running {
+                started_at,
+                restart_attempt,
+                ..
+            } => (*started_at, *restart_attempt),
             other => {
                 return Err(SessionError::InvalidTransition {
                     from_state: other.state_name().to_string(),
@@ -196,13 +214,14 @@ impl SessionReducer {
             },
         };
 
-        // Transition to Terminated state
+        // Transition to Terminated state (preserving restart_attempt for monotonicity)
         let new_state = SessionState::Terminated {
             started_at,
             terminated_at: timestamp,
             exit_classification: ExitClassification::parse(&event.exit_classification),
             rationale_code: event.rationale_code,
             final_entropy: event.final_entropy,
+            last_restart_attempt: restart_attempt,
         };
 
         self.state.sessions.insert(session_id.clone(), new_state);
@@ -226,8 +245,12 @@ impl SessionReducer {
                 })?;
 
         // Can only quarantine from Running state
-        let started_at = match current_state {
-            SessionState::Running { started_at, .. } => *started_at,
+        let (started_at, restart_attempt) = match current_state {
+            SessionState::Running {
+                started_at,
+                restart_attempt,
+                ..
+            } => (*started_at, *restart_attempt),
             other => {
                 return Err(SessionError::InvalidTransition {
                     from_state: other.state_name().to_string(),
@@ -236,12 +259,13 @@ impl SessionReducer {
             },
         };
 
-        // Transition to Quarantined state
+        // Transition to Quarantined state (preserving restart_attempt for monotonicity)
         let new_state = SessionState::Quarantined {
             started_at,
             quarantined_at: timestamp,
             reason: event.reason,
             quarantine_until: event.quarantine_until,
+            last_restart_attempt: restart_attempt,
         };
 
         self.state.sessions.insert(session_id.clone(), new_state);
@@ -782,6 +806,7 @@ mod unit_tests {
                 exit_classification,
                 rationale_code,
                 final_entropy,
+                ..
             } => {
                 assert_eq!(*started_at, 1_000_000_000);
                 assert_eq!(*terminated_at, 2_000_000_000);
@@ -825,6 +850,7 @@ mod unit_tests {
                 quarantined_at,
                 reason,
                 quarantine_until,
+                ..
             } => {
                 assert_eq!(*started_at, 1_000_000_000);
                 assert_eq!(*quarantined_at, 2_000_000_000);
@@ -918,6 +944,72 @@ mod unit_tests {
             },
             _ => panic!("Expected Running state"),
         }
+    }
+
+    /// Tests that `restart_attempt` must be strictly monotonically increasing.
+    /// Gemini security review requirement: `Start(0) -> Terminate -> Start(0)`
+    /// should fail.
+    #[test]
+    fn test_restart_monotonicity() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session with attempt=0
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let start_event = create_event("session.started", "session-1", start_payload);
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Terminate session
+        let term_payload =
+            helpers::session_terminated_payload("session-1", "FAILURE", "crashed", 500);
+        let term_event = create_event("session.terminated", "session-1", term_payload);
+        reducer.apply(&term_event, &ctx).unwrap();
+
+        // Verify last_restart_attempt is preserved in Terminated state
+        let state = reducer.state().get("session-1").unwrap();
+        assert_eq!(state.last_restart_attempt(), 0);
+
+        // Try to restart with same attempt (0) - should FAIL
+        let bad_restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500, // resume_cursor
+            0,   // restart_attempt (NOT greater than previous)
+        );
+        let bad_restart_event = create_event("session.started", "session-1", bad_restart_payload);
+        let result = reducer.apply(&bad_restart_event, &ctx);
+        assert!(matches!(
+            result,
+            Err(SessionError::RestartAttemptNotMonotonic { .. })
+        ));
+
+        // Restart with attempt=1 - should succeed
+        let good_restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            500, // resume_cursor
+            1,   // restart_attempt (greater than previous 0)
+        );
+        let good_restart_event = create_event("session.started", "session-1", good_restart_payload);
+        reducer.apply(&good_restart_event, &ctx).unwrap();
+
+        // Session should be running now
+        assert!(reducer.state().get("session-1").unwrap().is_active());
     }
 
     #[test]
