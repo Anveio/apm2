@@ -51,12 +51,15 @@
 //!
 //! The adapter follows **default-deny, least-privilege, fail-closed**:
 //!
-//! - All tool requests are validated before emission
+//! - All tool requests are validated against an allowlist before emission
 //! - Session credentials are never logged or exposed
+//! - CLI arguments are redacted to prevent secret leakage
 //! - Invalid hook payloads cause session termination (fail-closed)
 //! - Tool responses are validated before delivery
+//! - Maximum line length enforced (1MB) to prevent memory exhaustion
+//! - JSON parsing errors are reported as diagnostic events
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -64,16 +67,121 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
+
+/// Maximum line length allowed from stdout (1 MiB).
+///
+/// This prevents memory exhaustion attacks where a malicious or buggy child
+/// process could emit extremely long lines.
+const MAX_LINE_LENGTH: usize = 1024 * 1024;
+
+/// Known valid tool names from Claude Code.
+///
+/// Tools not in this list are rejected at the adapter boundary per the
+/// default-deny security model. This prevents injection of unauthorized
+/// tool requests through the hook interface.
+const ALLOWED_TOOL_NAMES: &[&str] = &[
+    // File operations
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "Glob",
+    "Grep",
+    "NotebookEdit",
+    // Shell operations
+    "Bash",
+    // Web operations
+    "WebFetch",
+    "WebSearch",
+    // Agent operations
+    "Task",
+    "TodoRead",
+    "TodoWrite",
+    // Utility operations
+    "Skill",
+    "TaskOutput",
+];
+
+/// Patterns that indicate a CLI argument may contain secrets.
+///
+/// Arguments matching these patterns are redacted in events to prevent
+/// accidental exposure of credentials in logs and telemetry.
+const SECRET_ARG_PATTERNS: &[&str] = &[
+    "--api-key",
+    "--token",
+    "--secret",
+    "--password",
+    "--credential",
+    "-k", // common shorthand for API key
+    "--anthropic-api-key",
+    "--openai-api-key",
+    "--github-token",
+    "--auth",
+];
+
+/// Reads a line from the reader with a maximum length limit.
+///
+/// This prevents memory exhaustion attacks from extremely long lines.
+/// Returns the number of bytes read (0 indicates EOF).
+async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max_len: usize,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+
+    buf.clear();
+    let mut total_read = 0;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // EOF
+            return Ok(total_read);
+        }
+
+        // Find newline or end of buffer
+        let (used, done) = memchr::memchr(b'\n', available)
+            .map_or((available.len(), false), |pos| (pos + 1, true));
+
+        // Calculate how much we can safely consume
+        let remaining_capacity = max_len.saturating_sub(total_read);
+        let to_consume = used.min(remaining_capacity);
+
+        // Append to buffer (only valid UTF-8)
+        if to_consume > 0 {
+            if let Ok(s) = std::str::from_utf8(&available[..to_consume]) {
+                buf.push_str(s);
+            } else {
+                // Invalid UTF-8 - skip this segment but consume it
+                reader.consume(used);
+                total_read += used;
+                if done {
+                    return Ok(total_read);
+                }
+                continue;
+            }
+        }
+
+        reader.consume(used);
+        total_read += used;
+
+        if done || total_read >= max_len {
+            return Ok(total_read);
+        }
+    }
+}
 
 use super::BoxFuture;
 use super::config::EnvironmentConfig;
 use super::error::AdapterError;
 use super::event::{
-    AdapterEvent, AdapterEventPayload, DetectionMethod, ExitClassification, ProcessExited,
-    ProcessStarted, ProgressSignal, ProgressType, StallDetected, ToolRequestDetected,
+    AdapterEvent, AdapterEventPayload, DetectionMethod, Diagnostic, DiagnosticCategory,
+    DiagnosticSeverity, ExitClassification, ProcessExited, ProcessStarted, ProgressSignal,
+    ProgressType, StallDetected, ToolRequestDetected,
 };
 use super::traits::Adapter;
 
@@ -325,6 +433,25 @@ impl Default for HookResponse {
 enum InternalEvent {
     /// A hook event was received from Claude Code.
     HookEvent(HookEvent),
+    /// A JSON parse error occurred (reported as diagnostic).
+    ParseError {
+        /// The line that failed to parse.
+        line: String,
+        /// The parse error message.
+        error: String,
+    },
+    /// An unauthorized tool was detected (blocked per allowlist).
+    UnauthorizedTool {
+        /// The unauthorized tool name.
+        tool_name: String,
+        /// The tool use ID for correlation.
+        tool_use_id: String,
+    },
+    /// A line exceeded the maximum length limit.
+    LineTooLong {
+        /// Number of bytes read before truncation.
+        bytes_read: usize,
+    },
     /// The stdout reader encountered an error.
     ReaderError(String),
     /// The stdout reader reached EOF.
@@ -454,6 +581,7 @@ impl ClaudeCodeAdapter {
     /// Returns an error if:
     /// - The adapter is already running
     /// - Claude Code fails to spawn
+    #[allow(clippy::too_many_lines)]
     pub async fn start(&mut self) -> Result<(), AdapterError> {
         if matches!(self.state, AdapterState::Running(_)) {
             return Err(AdapterError::AlreadyRunning);
@@ -511,36 +639,102 @@ impl ClaudeCodeAdapter {
         let stdin_writer = Arc::new(Mutex::new(StdinWriter::new(stdin)));
         self.stdin_writer = Some(Arc::clone(&stdin_writer));
 
-        // Spawn the stdout reader task
+        // Spawn the stdout reader task with bounded line reading
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
 
+        // Build the tool allowlist for the reader task
+        let allowed_tools: HashSet<&'static str> = ALLOWED_TOOL_NAMES.iter().copied().collect();
+
         tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
+            let mut reader = BufReader::new(stdout);
 
             loop {
                 if shutdown_clone.load(Ordering::SeqCst) {
                     break;
                 }
 
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        // Try to parse as a hook event; skip non-JSON output
-                        if let Ok(event) = serde_json::from_str::<HookEvent>(&line) {
-                            if internal_tx
-                                .send(InternalEvent::HookEvent(event))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    },
-                    Ok(None) => {
+                // Read line with bounded buffer to prevent memory exhaustion
+                let mut line = String::new();
+                match read_line_bounded(&mut reader, &mut line, MAX_LINE_LENGTH).await {
+                    Ok(0) => {
                         // EOF reached
                         let _ = internal_tx.send(InternalEvent::ReaderEof).await;
                         break;
+                    },
+                    Ok(bytes_read) if bytes_read >= MAX_LINE_LENGTH => {
+                        // Line was truncated due to length limit
+                        let _ = internal_tx
+                            .send(InternalEvent::LineTooLong { bytes_read })
+                            .await;
+                        // Continue reading - don't break on this error
+                    },
+                    Ok(_) => {
+                        // Remove trailing newline
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+
+                        // Skip empty lines
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        // Try to parse as JSON - report parse errors for JSON-looking
+                        // lines
+                        match serde_json::from_str::<HookEvent>(&line) {
+                            Ok(event) => {
+                                // Validate tool name against allowlist for PreToolUse
+                                // events
+                                if let HookEvent::PreToolUse(ref tool_event) = event {
+                                    if !allowed_tools.contains(tool_event.tool_name.as_str()) {
+                                        // Unauthorized tool - send security event
+                                        if internal_tx
+                                            .send(InternalEvent::UnauthorizedTool {
+                                                tool_name: tool_event.tool_name.clone(),
+                                                tool_use_id: tool_event.tool_use_id.clone(),
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                if internal_tx
+                                    .send(InternalEvent::HookEvent(event))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                // Only report parse errors for lines that look like JSON
+                                // (start with '{' or '[')
+                                let trimmed = line.trim();
+                                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                                    // Truncate line for safety in the error message
+                                    let truncated = if line.len() > 200 {
+                                        format!("{}...", &line[..200])
+                                    } else {
+                                        line.clone()
+                                    };
+                                    let _ = internal_tx
+                                        .send(InternalEvent::ParseError {
+                                            line: truncated,
+                                            error: e.to_string(),
+                                        })
+                                        .await;
+                                }
+                                // Continue reading - parse errors aren't fatal
+                            },
+                        }
                     },
                     Err(e) => {
                         let _ = internal_tx
@@ -601,6 +795,7 @@ impl ClaudeCodeAdapter {
     /// # Errors
     ///
     /// Returns an error if the adapter is not running.
+    #[allow(clippy::too_many_lines)]
     pub async fn poll(&mut self) -> Result<Option<AdapterEvent>, AdapterError> {
         let running = match &mut self.state {
             AdapterState::Running(state) => state,
@@ -664,16 +859,87 @@ impl ClaudeCodeAdapter {
 
                     return Ok(Some(adapter_event));
                 },
+                Ok(InternalEvent::ParseError { line, error }) => {
+                    // Report JSON parsing failure as a diagnostic event
+                    let mut context = BTreeMap::new();
+                    context.insert("line".to_string(), line);
+                    context.insert("error".to_string(), error);
+
+                    let diagnostic =
+                        self.create_event(AdapterEventPayload::Diagnostic(Diagnostic {
+                            severity: DiagnosticSeverity::Warning,
+                            category: DiagnosticCategory::ProtocolViolation,
+                            message: "Failed to parse JSON from child process".to_string(),
+                            context,
+                        }));
+
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(diagnostic.clone()).await;
+                    }
+
+                    return Ok(Some(diagnostic));
+                },
+                Ok(InternalEvent::UnauthorizedTool {
+                    tool_name,
+                    tool_use_id,
+                }) => {
+                    // Report unauthorized tool as a security violation
+                    let mut context = BTreeMap::new();
+                    context.insert("tool_name".to_string(), tool_name.clone());
+                    context.insert("tool_use_id".to_string(), tool_use_id);
+
+                    let diagnostic =
+                        self.create_event(AdapterEventPayload::Diagnostic(Diagnostic {
+                            severity: DiagnosticSeverity::Error,
+                            category: DiagnosticCategory::SecurityViolation,
+                            message: format!(
+                                "Unauthorized tool '{tool_name}' rejected by allowlist"
+                            ),
+                            context,
+                        }));
+
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(diagnostic.clone()).await;
+                    }
+
+                    return Ok(Some(diagnostic));
+                },
+                Ok(InternalEvent::LineTooLong { bytes_read }) => {
+                    // Report line length limit exceeded as a resource limit violation
+                    let mut context = BTreeMap::new();
+                    context.insert("bytes_read".to_string(), bytes_read.to_string());
+                    context.insert("max_length".to_string(), MAX_LINE_LENGTH.to_string());
+
+                    let diagnostic =
+                        self.create_event(AdapterEventPayload::Diagnostic(Diagnostic {
+                            severity: DiagnosticSeverity::Error,
+                            category: DiagnosticCategory::ResourceLimit,
+                            message: "Line from child process exceeded maximum length limit"
+                                .to_string(),
+                            context,
+                        }));
+
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(diagnostic.clone()).await;
+                    }
+
+                    return Ok(Some(diagnostic));
+                },
                 Ok(InternalEvent::ReaderError(msg)) => {
                     // Reader encountered an error - this is likely fatal
                     return Err(AdapterError::Internal(format!(
                         "stdout reader error: {msg}"
                     )));
                 },
-                // EOF, empty channel, or disconnected: fall through to stall check
-                Ok(InternalEvent::ReaderEof)
-                | Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) =>
-                    {},
+                // EOF or empty channel - fall through to stall check
+                Ok(InternalEvent::ReaderEof) | Err(mpsc::error::TryRecvError::Empty) => {},
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Reader task has disconnected while process may still be running.
+                    // This is an internal error condition.
+                    return Err(AdapterError::Internal(
+                        "stdout reader task disconnected unexpectedly".to_string(),
+                    ));
+                },
             }
         }
 
@@ -872,7 +1138,7 @@ impl ClaudeCodeAdapter {
         }
     }
 
-    /// Emits a process started event.
+    /// Emits a process started event with redacted arguments.
     async fn emit_process_started(&self, pid: u32) -> Result<(), AdapterError> {
         let working_dir = self
             .config
@@ -889,10 +1155,13 @@ impl ClaudeCodeAdapter {
             .cloned()
             .collect();
 
+        // Redact sensitive CLI arguments to prevent secret leakage
+        let redacted_args = Self::redact_sensitive_args(&self.config.args);
+
         let event = self.create_event(AdapterEventPayload::ProcessStarted(ProcessStarted {
             pid,
             command: self.config.claude_binary.clone(),
-            args: self.config.args.clone(),
+            args: redacted_args,
             working_dir,
             env,
             adapter_type: "claude-code".to_string(),
@@ -905,6 +1174,55 @@ impl ClaudeCodeAdapter {
         }
 
         Ok(())
+    }
+
+    /// Redacts sensitive CLI arguments to prevent secret leakage in events.
+    ///
+    /// Arguments that match known secret patterns (e.g., `--api-key`,
+    /// `--token`) are redacted. The pattern itself is preserved but the
+    /// value is replaced with `[REDACTED]`.
+    fn redact_sensitive_args(args: &[String]) -> Vec<String> {
+        let mut result = Vec::with_capacity(args.len());
+        let mut skip_next = false;
+
+        for (i, arg) in args.iter().enumerate() {
+            if skip_next {
+                // Previous arg was a secret flag, redact this value
+                result.push("[REDACTED]".to_string());
+                skip_next = false;
+                continue;
+            }
+
+            // Check if this arg matches a secret pattern
+            let lower_arg = arg.to_lowercase();
+            let is_secret_flag = SECRET_ARG_PATTERNS
+                .iter()
+                .any(|pattern| lower_arg.starts_with(pattern));
+
+            if is_secret_flag {
+                // Check if it's a `--key=value` style or `--key value` style
+                if arg.contains('=') {
+                    // --key=value style - split and redact the value
+                    if let Some(eq_pos) = arg.find('=') {
+                        let key = &arg[..=eq_pos];
+                        result.push(format!("{key}[REDACTED]"));
+                    } else {
+                        result.push(arg.clone());
+                    }
+                } else {
+                    // --key value style - keep the flag, mark next arg for redaction
+                    result.push(arg.clone());
+                    // Only skip next if there's actually a next argument
+                    if i + 1 < args.len() {
+                        skip_next = true;
+                    }
+                }
+            } else {
+                result.push(arg.clone());
+            }
+        }
+
+        result
     }
 
     /// Extracts the signal number from an exit status (Unix only).
@@ -1370,5 +1688,346 @@ mod tests {
         if let AdapterEventPayload::Progress(progress) = adapter_event.payload {
             assert_eq!(progress.signal_type, ProgressType::Heartbeat);
         }
+    }
+
+    // =========================================================================
+    // Security tests for security review findings
+    // =========================================================================
+
+    #[test]
+    fn test_max_line_length_constant() {
+        // Verify MAX_LINE_LENGTH is 1 MiB as required
+        assert_eq!(MAX_LINE_LENGTH, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_allowed_tools_allowlist() {
+        // Verify known Claude Code tools are in the allowlist
+        let allowed: HashSet<&str> = ALLOWED_TOOL_NAMES.iter().copied().collect();
+
+        // Core tools that must be allowed
+        assert!(allowed.contains("Read"));
+        assert!(allowed.contains("Write"));
+        assert!(allowed.contains("Edit"));
+        assert!(allowed.contains("Bash"));
+        assert!(allowed.contains("Glob"));
+        assert!(allowed.contains("Grep"));
+        assert!(allowed.contains("WebFetch"));
+        assert!(allowed.contains("WebSearch"));
+        assert!(allowed.contains("Task"));
+
+        // Unknown tools should not be allowed
+        assert!(!allowed.contains("MaliciousTool"));
+        assert!(!allowed.contains("UnknownTool"));
+        assert!(!allowed.contains("")); // Empty string
+    }
+
+    #[test]
+    fn test_redact_sensitive_args_key_value_style() {
+        // Test --key=value style redaction
+        let args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--api-key=secret123".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        let redacted = ClaudeCodeAdapter::redact_sensitive_args(&args);
+
+        assert_eq!(redacted.len(), 4);
+        assert_eq!(redacted[0], "--model");
+        assert_eq!(redacted[1], "opus");
+        assert_eq!(redacted[2], "--api-key=[REDACTED]");
+        assert_eq!(redacted[3], "--verbose");
+    }
+
+    #[test]
+    fn test_redact_sensitive_args_space_separated_style() {
+        // Test --key value style redaction
+        let args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--token".to_string(),
+            "my-secret-token".to_string(),
+            "--verbose".to_string(),
+        ];
+
+        let redacted = ClaudeCodeAdapter::redact_sensitive_args(&args);
+
+        assert_eq!(redacted.len(), 5);
+        assert_eq!(redacted[0], "--model");
+        assert_eq!(redacted[1], "opus");
+        assert_eq!(redacted[2], "--token");
+        assert_eq!(redacted[3], "[REDACTED]");
+        assert_eq!(redacted[4], "--verbose");
+    }
+
+    #[test]
+    fn test_redact_sensitive_args_all_patterns() {
+        // Test all secret patterns
+        let patterns_with_values: Vec<String> = vec![
+            "--api-key=val".to_string(),
+            "--token=val".to_string(),
+            "--secret=val".to_string(),
+            "--password=val".to_string(),
+            "--credential=val".to_string(),
+            "-k=val".to_string(),
+            "--anthropic-api-key=val".to_string(),
+            "--openai-api-key=val".to_string(),
+            "--github-token=val".to_string(),
+            "--auth=val".to_string(),
+        ];
+
+        let redacted = ClaudeCodeAdapter::redact_sensitive_args(&patterns_with_values);
+
+        for arg in &redacted {
+            assert!(arg.ends_with("[REDACTED]"), "Expected {arg} to be redacted");
+        }
+    }
+
+    #[test]
+    fn test_redact_sensitive_args_case_insensitive() {
+        // Test case insensitivity
+        let args = vec![
+            "--API-KEY=secret".to_string(),
+            "--Token=secret".to_string(),
+            "--SECRET=secret".to_string(),
+        ];
+
+        let redacted = ClaudeCodeAdapter::redact_sensitive_args(&args);
+
+        for arg in &redacted {
+            assert!(
+                arg.ends_with("[REDACTED]"),
+                "Expected {arg} to be redacted (case insensitive)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_sensitive_args_no_false_positives() {
+        // Test that normal args are not redacted
+        let args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            "-p".to_string(), // Not -k
+            "--verbose".to_string(),
+        ];
+
+        let redacted = ClaudeCodeAdapter::redact_sensitive_args(&args);
+
+        assert_eq!(redacted, args);
+    }
+
+    #[test]
+    fn test_redact_sensitive_args_trailing_secret_flag() {
+        // Test when secret flag is at the end with no value
+        let args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--token".to_string(),
+        ];
+
+        let redacted = ClaudeCodeAdapter::redact_sensitive_args(&args);
+
+        assert_eq!(redacted.len(), 3);
+        assert_eq!(redacted[0], "--model");
+        assert_eq!(redacted[1], "opus");
+        assert_eq!(redacted[2], "--token");
+        // No [REDACTED] at the end since there's no value to redact
+    }
+
+    #[test]
+    fn test_internal_event_new_variants() {
+        // Test ParseError variant
+        let parse_error = InternalEvent::ParseError {
+            line: "invalid json".to_string(),
+            error: "expected value".to_string(),
+        };
+        assert!(matches!(parse_error, InternalEvent::ParseError { .. }));
+
+        // Test UnauthorizedTool variant
+        let unauthorized = InternalEvent::UnauthorizedTool {
+            tool_name: "MaliciousTool".to_string(),
+            tool_use_id: "tool-123".to_string(),
+        };
+        assert!(matches!(
+            unauthorized,
+            InternalEvent::UnauthorizedTool { .. }
+        ));
+
+        // Test LineTooLong variant
+        let too_long = InternalEvent::LineTooLong {
+            bytes_read: 2_000_000,
+        };
+        assert!(matches!(too_long, InternalEvent::LineTooLong { .. }));
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_line_bounded_normal_line() {
+        use std::io::Cursor;
+
+        use tokio::io::BufReader;
+
+        let data = "hello world\n";
+        let cursor = Cursor::new(data.as_bytes().to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut buf = String::new();
+
+        let bytes_read = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes_read, 12);
+        assert_eq!(buf, "hello world\n");
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_line_bounded_truncates_long_line() {
+        use std::io::Cursor;
+
+        use tokio::io::BufReader;
+
+        // Create a line that exceeds the limit (no newline, so it reads until EOF or
+        // limit)
+        let long_line = "x".repeat(100);
+        let cursor = Cursor::new(long_line.as_bytes().to_vec());
+        // Use a smaller buffer to ensure multiple reads are needed
+        let mut reader = BufReader::with_capacity(20, cursor);
+        let mut buf = String::new();
+
+        // Use a small limit for testing
+        let small_limit = 50;
+        let bytes_read = read_line_bounded(&mut reader, &mut buf, small_limit)
+            .await
+            .unwrap();
+
+        // The function stops at the limit, but may read slightly more due to buffer
+        // alignment
+        assert!(
+            bytes_read >= small_limit,
+            "Should read at least {small_limit} bytes, got {bytes_read}"
+        );
+        // Buffer should be truncated to the limit
+        let buf_len = buf.len();
+        assert!(
+            buf_len <= small_limit,
+            "Buffer should be at most {small_limit} bytes, got {buf_len}"
+        );
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_line_bounded_eof() {
+        use std::io::Cursor;
+
+        use tokio::io::BufReader;
+
+        let data = "";
+        let cursor = Cursor::new(data.as_bytes().to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut buf = String::new();
+
+        let bytes_read = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes_read, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
+    async fn test_read_line_bounded_multiple_lines() {
+        use std::io::Cursor;
+
+        use tokio::io::BufReader;
+
+        let data = "line1\nline2\nline3\n";
+        let cursor = Cursor::new(data.as_bytes().to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut buf = String::new();
+
+        // Read first line
+        let bytes = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+        assert_eq!(bytes, 6);
+        assert_eq!(buf, "line1\n");
+
+        // Read second line
+        let bytes = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+        assert_eq!(bytes, 6);
+        assert_eq!(buf, "line2\n");
+
+        // Read third line
+        let bytes = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+        assert_eq!(bytes, 6);
+        assert_eq!(buf, "line3\n");
+
+        // Read EOF
+        let bytes = read_line_bounded(&mut reader, &mut buf, MAX_LINE_LENGTH)
+            .await
+            .unwrap();
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn test_tool_allowlist_rejects_unknown_tool() {
+        let allowed: HashSet<&str> = ALLOWED_TOOL_NAMES.iter().copied().collect();
+
+        // Test various potentially malicious tool names
+        let malicious_names = vec![
+            "Shell",          // Not "Bash"
+            "Execute",        // Not a real tool
+            "ReadFile",       // Not "Read"
+            "WriteFile",      // Not "Write"
+            "SystemCommand",  // Not a real tool
+            "../Bash",        // Path traversal attempt
+            "Bash\x00Inject", // Null byte injection
+            "",               // Empty string
+            " ",              // Whitespace
+            "Read ",          // Trailing space
+            " Read",          // Leading space
+        ];
+
+        for name in malicious_names {
+            assert!(
+                !allowed.contains(name),
+                "Tool '{name}' should not be in allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secret_arg_patterns_coverage() {
+        // Verify the patterns cover common secret argument formats
+        let patterns: Vec<&str> = SECRET_ARG_PATTERNS.to_vec();
+
+        // Common API key patterns
+        assert!(patterns.contains(&"--api-key"));
+        assert!(patterns.contains(&"--anthropic-api-key"));
+        assert!(patterns.contains(&"--openai-api-key"));
+
+        // Token patterns
+        assert!(patterns.contains(&"--token"));
+        assert!(patterns.contains(&"--github-token"));
+
+        // Auth patterns
+        assert!(patterns.contains(&"--auth"));
+        assert!(patterns.contains(&"--password"));
+        assert!(patterns.contains(&"--secret"));
+        assert!(patterns.contains(&"--credential"));
+
+        // Short flag
+        assert!(patterns.contains(&"-k"));
     }
 }
