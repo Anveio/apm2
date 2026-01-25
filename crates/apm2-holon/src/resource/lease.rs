@@ -176,6 +176,64 @@ impl Lease {
         !self.signature.is_empty()
     }
 
+    /// Returns the canonical byte representation used for signing.
+    ///
+    /// This method produces a deterministic serialization of the lease data
+    /// that is suitable for signing and verification. The signature field
+    /// itself is excluded from the canonical representation.
+    ///
+    /// # Canonicalization Rules
+    ///
+    /// The canonical form is JSON with fields in a deterministic order:
+    /// 1. `id`
+    /// 2. `issuer_id`
+    /// 3. `holder_id`
+    /// 4. `scope` (serialized recursively)
+    /// 5. `budget` (with all 8 fields in order)
+    /// 6. `issued_at_ns`
+    /// 7. `expires_at_ns`
+    /// 8. `parent_lease_id` (if present)
+    ///
+    /// # Security
+    ///
+    /// Consumers MUST use this method to obtain the bytes for signing or
+    /// verification. Using arbitrary serialization methods may lead to
+    /// verification failures or security vulnerabilities.
+    ///
+    /// # Panics
+    ///
+    /// This method will not panic under normal circumstances. The internal
+    /// JSON serialization uses only types that are guaranteed to serialize
+    /// successfully (strings, integers, Option, and serde-compatible structs).
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        // Create a canonical representation without the signature field
+        // Using serde_json ensures deterministic field ordering (BTreeMap in scope)
+        let canonical = serde_json::json!({
+            "id": self.id,
+            "issuer_id": self.issuer_id,
+            "holder_id": self.holder_id,
+            "scope": self.scope,
+            "budget": {
+                "initial_episodes": self.budget.initial_episodes(),
+                "remaining_episodes": self.budget.remaining_episodes(),
+                "initial_tool_calls": self.budget.initial_tool_calls(),
+                "remaining_tool_calls": self.budget.remaining_tool_calls(),
+                "initial_tokens": self.budget.initial_tokens(),
+                "remaining_tokens": self.budget.remaining_tokens(),
+                "initial_duration_ms": self.budget.initial_duration_ms(),
+                "remaining_duration_ms": self.budget.remaining_duration_ms(),
+            },
+            "issued_at_ns": self.issued_at_ns,
+            "expires_at_ns": self.expires_at_ns,
+            "parent_lease_id": self.parent_lease_id,
+        });
+
+        // serde_json::to_vec produces deterministic output for objects
+        // because we're using serde_json::Value which preserves key order
+        serde_json::to_vec(&canonical).expect("serialization cannot fail")
+    }
+
     /// Returns `true` if this lease is expired at the given time.
     ///
     /// # Arguments
@@ -845,5 +903,90 @@ mod tests {
 
         lease.budget_mut().deduct_tokens(1000).unwrap();
         assert_eq!(lease.budget().remaining_tokens(), 9_000);
+    }
+
+    #[test]
+    fn test_signing_bytes_deterministic() {
+        // Create two identical leases
+        let lease1 = test_lease();
+        let lease2 = test_lease();
+
+        // signing_bytes should produce identical output for identical leases
+        assert_eq!(lease1.signing_bytes(), lease2.signing_bytes());
+    }
+
+    #[test]
+    fn test_signing_bytes_excludes_signature() {
+        // Create a lease without signature
+        let unsigned = test_lease();
+
+        // Create a lease with signature
+        let signed = Lease::builder()
+            .lease_id("lease-001")
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(
+                LeaseScope::builder()
+                    .work_ids(["work-001", "work-002"])
+                    .tools(["read_file", "write_file"])
+                    .namespaces(["project/src"])
+                    .build(),
+            )
+            .budget(Budget::new(10, 100, 10_000, 60_000))
+            .issued_at_ns(1_000_000_000)
+            .expires_at_ns(2_000_000_000)
+            .signature(vec![1, 2, 3, 4, 5]) // Different signature
+            .build()
+            .unwrap();
+
+        // signing_bytes should be the same regardless of signature
+        assert_eq!(unsigned.signing_bytes(), signed.signing_bytes());
+    }
+
+    #[test]
+    fn test_signing_bytes_differs_with_content() {
+        let lease1 = test_lease();
+
+        // Create a lease with different content
+        let lease2 = Lease::builder()
+            .lease_id("lease-002") // Different ID
+            .issuer_id("registrar-001")
+            .holder_id("agent-001")
+            .scope(
+                LeaseScope::builder()
+                    .work_ids(["work-001", "work-002"])
+                    .tools(["read_file", "write_file"])
+                    .namespaces(["project/src"])
+                    .build(),
+            )
+            .budget(Budget::new(10, 100, 10_000, 60_000))
+            .issued_at_ns(1_000_000_000)
+            .expires_at_ns(2_000_000_000)
+            .build()
+            .unwrap();
+
+        // signing_bytes should differ when content differs
+        assert_ne!(lease1.signing_bytes(), lease2.signing_bytes());
+    }
+
+    #[test]
+    fn test_signing_bytes_is_valid_json() {
+        let lease = test_lease();
+        let bytes = lease.signing_bytes();
+
+        // Should be valid JSON
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Should not contain signature field
+        assert!(json.get("signature").is_none());
+
+        // Should contain all other expected fields
+        assert!(json.get("id").is_some());
+        assert!(json.get("issuer_id").is_some());
+        assert!(json.get("holder_id").is_some());
+        assert!(json.get("scope").is_some());
+        assert!(json.get("budget").is_some());
+        assert!(json.get("issued_at_ns").is_some());
+        assert!(json.get("expires_at_ns").is_some());
     }
 }
