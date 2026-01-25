@@ -1,3 +1,8 @@
+---
+name: review-rust
+description: Comprehensive Rust code review protocol with state machine and holonic constraints.
+---
+
 # Rust ChangeSet Assessment Protocol v2.0
 
 ```yaml
