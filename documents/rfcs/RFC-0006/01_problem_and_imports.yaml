@@ -396,3 +396,119 @@ rfc_problem_and_imports:
         verification:
           command: "cargo xtask lint --include-docs"
           pass_condition: "No anti-pattern warnings in documentation"
+
+      # Phase 5: AAT Completion and Check Watch Fix
+      - id: AAT-001
+        type: ENHANCEMENT
+        title: "AAT MUST support configurable AI tool backend"
+        statement: |
+          The AAT command MUST support configuring the AI tool backend via
+          environment variable (AAT_AI_TOOL) with CLI flag override (--ai-tool).
+          Supported values: gemini, claude-code. Default: gemini.
+        acceptance_criteria:
+          - "AAT_AI_TOOL environment variable selects backend"
+          - "Supported values: gemini, claude-code"
+          - "--ai-tool CLI flag overrides environment variable"
+          - "Default is gemini when neither set"
+        verification:
+          command: "AAT_AI_TOOL=claude-code cargo xtask aat --dry-run <URL>"
+          pass_condition: "Uses claude-code backend"
+
+      - id: AAT-002
+        type: ENHANCEMENT
+        title: "Hypothesis generation MUST use AI tool"
+        statement: |
+          The AAT hypothesis generation MUST invoke the configured AI tool
+          with PR description and diff to generate testable hypotheses.
+          The stub implementation MUST be replaced with real AI invocation.
+        acceptance_criteria:
+          - "AI tool invoked for hypothesis generation"
+          - "PR description and diff passed to AI"
+          - "At least 3 hypotheses generated"
+          - "At least 1 hypothesis tests error handling"
+        verification:
+          command: "cargo xtask aat <PR_URL> --dry-run"
+          pass_condition: "AI-generated hypotheses in output"
+
+      - id: AAT-003
+        type: ENHANCEMENT
+        title: "Hypotheses MUST be executed and verified"
+        statement: |
+          Each generated hypothesis MUST be executed by running its
+          verification_method command. The stdout, stderr, exit code,
+          and executed_at timestamp MUST be captured and stored.
+        acceptance_criteria:
+          - "Verification commands are executed"
+          - "stdout and stderr captured"
+          - "exit_code captured"
+          - "executed_at set AFTER command execution"
+          - "Result marked PASSED/FAILED based on exit code"
+        verification:
+          command: "cargo xtask aat <PR_URL>"
+          pass_condition: "Hypotheses show execution results with stdout/stderr"
+
+      - id: AAT-004
+        type: ENHANCEMENT
+        title: "AAT MUST test input variations to detect invariance"
+        statement: |
+          For each CLI command in hypotheses, AAT MUST generate at least 3
+          input variations, execute each, and detect invariance (identical
+          output for different inputs) as an anti-gaming violation.
+        acceptance_criteria:
+          - "At least 3 input variations per CLI command"
+          - "Each variation executed with output captured"
+          - "Invariance detected when all outputs identical"
+          - "Invariance flagged as anti-gaming violation"
+        verification:
+          command: "cargo xtask aat <PR_URL>"
+          pass_condition: "Input variations tested and invariance checked"
+
+      - id: AAT-005
+        type: BUG_FIX
+        title: "Anti-gaming MUST detect ISO timestamps"
+        statement: |
+          The anti-gaming analysis MUST detect hardcoded ISO 8601 timestamps
+          (e.g., 2026-01-25T10:00:00Z) in PR diffs as potential gaming.
+        acceptance_criteria:
+          - "TIMESTAMP_REGEX matches ISO 8601 format"
+          - "HardcodedTimestamp violation variant exists"
+          - "Timestamps in added lines detected"
+          - "Tests for timestamp detection pass"
+        verification:
+          command: "cargo test -p xtask test_timestamp"
+          pass_condition: "Timestamp detection tests pass"
+
+      - id: AAT-006
+        type: ENHANCEMENT
+        title: "Evidence script MUST be validated; PR format MUST be verified"
+        statement: |
+          AAT MUST validate that evidence scripts exist and are executable,
+          Usage sections contain code blocks, and Expected Outcomes follow
+          When/Then format. Actionable errors MUST be returned for failures.
+        acceptance_criteria:
+          - "Evidence script path validated for existence"
+          - "Evidence script validated for executable permission"
+          - "Usage section requires at least 1 code block"
+          - "Expected outcomes checked for When/Then keywords"
+          - "Actionable error messages for each failure"
+        verification:
+          command: "cargo xtask aat <PR_URL> --dry-run"
+          pass_condition: "Validation errors shown with fix suggestions"
+
+      - id: CHECK-001
+        type: BUG_FIX
+        title: "Watch mode MUST exit on terminal states with 180s timeout"
+        statement: |
+          The check --watch command MUST exit immediately on terminal states
+          (Closed, CI Failure, Changes Requested) with exit code 1, and MUST
+          timeout after 180 seconds with exit code 2 and remediation suggestion.
+        acceptance_criteria:
+          - "Exits on PrState::Closed with exit code 1"
+          - "Exits on CiStatus::Failure with exit code 1"
+          - "Exits on ReviewStatus::ChangesRequested with exit code 1"
+          - "Exits after 180s timeout with exit code 2"
+          - "Timeout message suggests manually restarting slow checks"
+          - "Clear message printed for each exit condition"
+        verification:
+          command: "cargo xtask check --watch"
+          pass_condition: "Exits on terminal states instead of hanging"
