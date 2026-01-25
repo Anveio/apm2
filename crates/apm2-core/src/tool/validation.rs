@@ -93,6 +93,10 @@ const MAX_TOKENS: u64 = 1_000_000;
 /// Expected hash size (BLAKE3 = 32 bytes).
 const HASH_SIZE: usize = 32;
 
+/// Maximum number of items in repeated fields (prevents DoS via unbounded
+/// lists).
+const MAX_REPEATED_ITEMS: usize = 1000;
+
 /// Known git operations.
 const KNOWN_GIT_OPS: &[&str] = &[
     "CLONE", "FETCH", "PULL", "DIFF", "COMMIT", "PUSH", "STATUS", "LOG", "BRANCH", "CHECKOUT",
@@ -183,6 +187,9 @@ fn validate_optional_id(value: &str, field: &str, errors: &mut Vec<ValidationErr
 }
 
 /// Validate a file path.
+///
+/// Defense-in-depth: Rejects path traversal attempts (`..`) even though
+/// the policy/execution layers must also enforce sandboxing.
 fn validate_path(path: &str, field: &str, errors: &mut Vec<ValidationError>) {
     if path.is_empty() {
         errors.push(ValidationError {
@@ -202,7 +209,28 @@ fn validate_path(path: &str, field: &str, errors: &mut Vec<ValidationError>) {
             rule: "no_null_bytes".to_string(),
             message: format!("{field} must not contain null bytes"),
         });
+    } else if contains_path_traversal(path) {
+        errors.push(ValidationError {
+            field: field.to_string(),
+            rule: "no_path_traversal".to_string(),
+            message: format!("{field} must not contain path traversal sequences (..)"),
+        });
     }
+}
+
+/// Check if a path contains path traversal sequences.
+///
+/// This is a defense-in-depth measure. Returns true if the path:
+/// - Contains `..` as a path component (e.g., `foo/../bar`, `../secret`)
+/// - Starts with `..` (e.g., `../etc/passwd`)
+fn contains_path_traversal(path: &str) -> bool {
+    // Split by both forward and back slashes for cross-platform safety
+    for component in path.split(['/', '\\']) {
+        if component == ".." {
+            return true;
+        }
+    }
+    false
 }
 
 /// Validate a file read request.
@@ -298,6 +326,15 @@ fn validate_shell_exec(req: &ShellExec, errors: &mut Vec<ValidationError>) {
         });
     }
 
+    // Prevent DoS via unbounded repeated fields
+    if req.env.len() > MAX_REPEATED_ITEMS {
+        errors.push(ValidationError {
+            field: "shell_exec.env".to_string(),
+            rule: "max_items".to_string(),
+            message: format!("env must have at most {MAX_REPEATED_ITEMS} items"),
+        });
+    }
+
     for (i, env) in req.env.iter().enumerate() {
         if env.len() > MAX_ARG_LEN {
             errors.push(ValidationError {
@@ -329,6 +366,15 @@ fn validate_git_operation(req: &GitOperation, errors: &mut Vec<ValidationError>)
             field: "git_op.operation".to_string(),
             rule: "known_operation".to_string(),
             message: format!("operation must be one of: {}", KNOWN_GIT_OPS.join(", ")),
+        });
+    }
+
+    // Prevent DoS via unbounded repeated fields
+    if req.args.len() > MAX_REPEATED_ITEMS {
+        errors.push(ValidationError {
+            field: "git_op.args".to_string(),
+            rule: "max_items".to_string(),
+            message: format!("args must have at most {MAX_REPEATED_ITEMS} items"),
         });
     }
 
@@ -392,6 +438,15 @@ fn validate_artifact_publish(req: &ArtifactPublish, errors: &mut Vec<ValidationE
             field: "artifact_publish.content_hash".to_string(),
             rule: "hash_size".to_string(),
             message: format!("content_hash must be exactly {HASH_SIZE} bytes"),
+        });
+    }
+
+    // Prevent DoS via unbounded repeated fields
+    if req.metadata.len() > MAX_REPEATED_ITEMS {
+        errors.push(ValidationError {
+            field: "artifact_publish.metadata".to_string(),
+            rule: "max_items".to_string(),
+            message: format!("metadata must have at most {MAX_REPEATED_ITEMS} items"),
         });
     }
 
@@ -739,5 +794,64 @@ mod validation_tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.field == "file_edit.old_content"));
+    }
+
+    #[test]
+    fn test_file_read_path_traversal() {
+        // Test ".." segment
+        let req = ToolRequest {
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::FileRead(FileRead {
+                path: "/path/to/../secret.txt".to_string(),
+                offset: 0,
+                limit: 0,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
+
+        // Test start with ".."
+        let req2 = ToolRequest {
+            request_id: "req-002".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::FileRead(FileRead {
+                path: "../etc/passwd".to_string(),
+                offset: 0,
+                limit: 0,
+            })),
+        };
+        let result2 = req2.validate();
+        assert!(result2.is_err());
+        let errors2 = result2.unwrap_err();
+        assert!(errors2.iter().any(|e| e.rule == "no_path_traversal"));
+    }
+
+    #[test]
+    fn test_shell_exec_too_many_env_vars() {
+        let env_vars: Vec<String> = (0..MAX_REPEATED_ITEMS + 1)
+            .map(|i| format!("VAR{i}=val"))
+            .collect();
+        
+        let req = ToolRequest {
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ShellExec(ShellExec {
+                command: "env".to_string(),
+                cwd: String::new(),
+                timeout_ms: 1000,
+                network_access: false,
+                env: env_vars,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "max_items"));
     }
 }
