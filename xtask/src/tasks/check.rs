@@ -23,6 +23,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use xshell::{Shell, cmd};
 
+use crate::reviewer_state::{
+    HealthStatus, MAX_RESTART_ATTEMPTS, ReviewerEntry, ReviewerStateFile, acquire_remediation_lock,
+    kill_process,
+};
 use crate::util::{current_branch, validate_ticket_branch};
 
 /// A single check run from GitHub's API.
@@ -30,9 +34,8 @@ use crate::util::{current_branch, validate_ticket_branch};
 /// The `gh pr checks --json` command returns these fields:
 /// - `state`: PENDING, `IN_PROGRESS`, SUCCESS, FAILURE, etc.
 /// - `bucket`: pending, pass, fail
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct CheckRun {
-    #[allow(dead_code)]
     name: String,
     #[serde(default)]
     state: Option<String>,
@@ -74,6 +77,7 @@ pub fn run(watch: bool) -> Result<()> {
         loop {
             let status = check_status(&sh, &branch_name)?;
             print_status(&status);
+            display_reviewer_health(&sh)?;
 
             // If merged, no need to keep watching
             if status.pr_state == Some(PrState::Merged) {
@@ -98,6 +102,7 @@ pub fn run(watch: bool) -> Result<()> {
     } else {
         let status = check_status(&sh, &branch_name)?;
         print_status(&status);
+        display_reviewer_health(&sh)?;
     }
 
     Ok(())
@@ -133,8 +138,8 @@ enum CiStatus {
     Pending,
     /// All checks passed
     Success,
-    /// One or more checks failed
-    Failure,
+    /// One or more checks failed, with the names of failed checks
+    Failure(Vec<String>),
 }
 
 /// Review status.
@@ -146,6 +151,33 @@ enum ReviewStatus {
     Approved,
     /// Changes requested
     ChangesRequested,
+}
+
+/// Get the remediation command for a specific check type.
+///
+/// Returns `Some(command)` if a known remediation command exists for the check
+/// name, or `None` if no specific fix is known.
+fn get_remediation_command(check_name: &str) -> Option<&'static str> {
+    // Normalize the check name for case-insensitive matching
+    let name_lower = check_name.to_lowercase();
+
+    // Match against known check types
+    if name_lower.contains("clippy") {
+        Some("cargo clippy --fix --allow-dirty")
+    } else if name_lower.contains("fmt") || name_lower.contains("format") {
+        Some("cargo fmt")
+    } else if name_lower.contains("test") {
+        Some("cargo test --workspace")
+    } else if name_lower.contains("review")
+        && (name_lower.contains("security") || name_lower.contains("quality"))
+    {
+        // Both security and quality review failures have the same fix
+        Some("cargo xtask push --force-review")
+    } else if name_lower.contains("semver") {
+        Some("cargo semver-checks")
+    } else {
+        None
+    }
 }
 
 /// Check the current status.
@@ -245,7 +277,8 @@ fn get_ci_status(sh: &Shell, branch_name: &str) -> Result<CiStatus> {
 /// determines the overall CI status:
 /// - If any check has bucket=pending or state is PENDING/`IN_PROGRESS`: return
 ///   Pending
-/// - If any check has bucket=fail or state is FAILURE: return Failure
+/// - If any check has bucket=fail or state is FAILURE: return Failure with
+///   names
 /// - Otherwise: return Success
 fn parse_ci_status(output: &str) -> CiStatus {
     let trimmed = output.trim();
@@ -269,22 +302,26 @@ fn parse_ci_status(output: &str) -> CiStatus {
         return CiStatus::Pending;
     }
 
-    // Check for any failures first (bucket=fail/cancel or state=FAILURE)
+    // Collect failed check names
     // Per gh pr checks --help: bucket can be pass, fail, pending, skipping, or
     // cancel
-    for check in &checks {
-        if let Some(bucket) = &check.bucket {
-            // Both "fail" and "cancel" should be treated as failures
-            if bucket == "fail" || bucket == "cancel" {
-                return CiStatus::Failure;
-            }
-        }
-        if let Some(state) = &check.state {
-            let state_upper = state.to_uppercase();
-            if state_upper == "FAILURE" {
-                return CiStatus::Failure;
-            }
-        }
+    let failed_checks: Vec<String> = checks
+        .iter()
+        .filter(|check| {
+            check.bucket.as_ref().is_some_and(|bucket| {
+                // Both "fail" and "cancel" should be treated as failures
+                bucket == "fail" || bucket == "cancel"
+            }) || check
+                .state
+                .as_ref()
+                .is_some_and(|state| state.to_uppercase() == "FAILURE")
+        })
+        .map(|check| check.name.clone())
+        .collect();
+
+    // If any failures found, return Failure with the check names
+    if !failed_checks.is_empty() {
+        return CiStatus::Failure(failed_checks);
     }
 
     // Check for any pending/in-progress checks
@@ -355,7 +392,15 @@ fn print_status(status: &Status) {
             match &status.ci {
                 Some(CiStatus::Pending) => println!("  [..] CI checks running"),
                 Some(CiStatus::Success) => println!("  [ok] CI checks passed"),
-                Some(CiStatus::Failure) => println!("  [X] CI checks failed"),
+                Some(CiStatus::Failure(failed_checks)) => {
+                    // Display each failed check with its remediation hint
+                    for check_name in failed_checks {
+                        println!("  [X] {check_name} failed");
+                        if let Some(fix_cmd) = get_remediation_command(check_name) {
+                            println!("      Fix: {fix_cmd}");
+                        }
+                    }
+                },
                 None => {},
             }
 
@@ -393,7 +438,7 @@ fn print_status(status: &Status) {
         match &status.pr_state {
             Some(PrState::Open) => {
                 // Check CI first
-                if matches!(&status.ci, Some(CiStatus::Failure)) {
+                if matches!(&status.ci, Some(CiStatus::Failure(_))) {
                     println!("  Fix CI failures, then commit and push:");
                     println!("    cargo xtask commit '<fix message>'");
                     println!("    cargo xtask push");
@@ -426,6 +471,354 @@ fn print_status(status: &Status) {
             },
         }
     }
+}
+
+/// Display the health status of active reviewers and auto-remediate if needed.
+///
+/// For each active reviewer in the state file, this function:
+/// 1. Checks the health status (Healthy, Stale, or Dead)
+/// 2. Displays the status with PID, last activity elapsed time
+/// 3. Auto-remediates unhealthy reviewers (Stale or Dead) by killing the
+///    process and restarting the review
+fn display_reviewer_health(sh: &Shell) -> Result<()> {
+    let state = ReviewerStateFile::load()?;
+
+    if state.reviewers.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!("Reviewer Health:");
+    println!("----------------");
+
+    // Process reviewers in a consistent order (security first, then quality)
+    let reviewer_order = ["security", "quality"];
+
+    for reviewer_type in &reviewer_order {
+        if let Some(entry) = state.reviewers.get(*reviewer_type) {
+            let health = entry.check_health();
+            let elapsed = entry
+                .get_log_mtime_elapsed()
+                .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
+
+            let status_display = match health {
+                HealthStatus::Healthy => format!(
+                    "  [ok] {}: PID {} | Last activity: {} ago | Status: {}",
+                    capitalize(reviewer_type),
+                    entry.pid,
+                    elapsed,
+                    health.as_str()
+                ),
+                HealthStatus::Stale | HealthStatus::Dead => format!(
+                    "  [!] {}: PID {} | Last activity: {} ago | Status: {}",
+                    capitalize(reviewer_type),
+                    entry.pid,
+                    elapsed,
+                    health.as_str()
+                ),
+            };
+            println!("{status_display}");
+
+            // Auto-remediate unhealthy reviewers
+            if health != HealthStatus::Healthy {
+                remediate_reviewer(sh, reviewer_type, entry, health)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Capitalize the first letter of a string.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// Remediate an unhealthy reviewer by killing it and restarting the review.
+fn remediate_reviewer(
+    sh: &Shell,
+    reviewer_type: &str,
+    entry: &ReviewerEntry,
+    health: HealthStatus,
+) -> Result<()> {
+    // Try to acquire lock to prevent concurrent remediation
+    let Ok(_lock) = acquire_remediation_lock() else {
+        println!("      Skipping remediation (another remediation in progress)");
+        return Ok(());
+    };
+
+    // IMPORTANT: Reload state after acquiring lock to avoid race conditions
+    // Between reading state in display_reviewer_health and acquiring the lock,
+    // another process may have already remediated this reviewer
+    let mut state = ReviewerStateFile::load()?;
+    let Some(current_entry) = state.get_reviewer(reviewer_type) else {
+        // Entry was already removed by another process
+        println!(
+            "      {} reviewer already cleaned up",
+            capitalize(reviewer_type)
+        );
+        return Ok(());
+    };
+
+    // Verify the PID matches to ensure we're acting on the right entry
+    if current_entry.pid != entry.pid {
+        println!(
+            "      {} reviewer PID changed ({}->{}), skipping",
+            capitalize(reviewer_type),
+            entry.pid,
+            current_entry.pid
+        );
+        return Ok(());
+    }
+
+    // Check if the GitHub status is already completed (success or failure)
+    // If so, the reviewer finished successfully and we don't need to restart
+    let status_context = match reviewer_type {
+        "security" => "ai-review/security",
+        "quality" => "ai-review/code-quality",
+        _ => return Ok(()),
+    };
+
+    if is_review_completed(sh, &current_entry.head_sha, status_context) {
+        // Review completed, clean up the state entry and log file
+        if current_entry.log_file.exists() {
+            let _ = std::fs::remove_file(&current_entry.log_file);
+        }
+        state.remove_reviewer(reviewer_type);
+        state.save()?;
+        println!(
+            "      {} review completed, cleaning up state",
+            capitalize(reviewer_type)
+        );
+        return Ok(());
+    }
+
+    // Check restart count limit
+    if current_entry.restart_count >= MAX_RESTART_ATTEMPTS {
+        println!(
+            "      {} reviewer exceeded max restart attempts ({}), giving up",
+            capitalize(reviewer_type),
+            MAX_RESTART_ATTEMPTS
+        );
+        // Clean up but don't restart
+        if current_entry.log_file.exists() {
+            let _ = std::fs::remove_file(&current_entry.log_file);
+        }
+        state.remove_reviewer(reviewer_type);
+        state.save()?;
+        return Ok(());
+    }
+
+    let elapsed = current_entry
+        .get_log_mtime_elapsed()
+        .map_or_else(|| "unknown".to_string(), |s| format!("{s}s"));
+
+    println!(
+        "      {} reviewer {} ({}), restarting (attempt {}/{})...",
+        capitalize(reviewer_type),
+        if health == HealthStatus::Stale {
+            "stale"
+        } else {
+            "dead"
+        },
+        elapsed,
+        current_entry.restart_count + 1,
+        MAX_RESTART_ATTEMPTS
+    );
+
+    // Kill the stale/dead process
+    if health == HealthStatus::Stale {
+        let killed = kill_process(current_entry.pid);
+        if killed {
+            println!("      Killed process {}", current_entry.pid);
+        }
+    }
+
+    // Remove old log file
+    if current_entry.log_file.exists() {
+        let _ = std::fs::remove_file(&current_entry.log_file);
+    }
+
+    // Save the PR URL and HEAD SHA before removing the entry
+    let pr_url = current_entry.pr_url.clone();
+    let head_sha = current_entry.head_sha.clone();
+    let restart_count = current_entry.restart_count + 1;
+
+    // Remove old entry
+    state.remove_reviewer(reviewer_type);
+    state.save()?;
+
+    // Re-trigger the review using the saved PR URL and HEAD SHA
+    restart_review(sh, reviewer_type, &pr_url, &head_sha, restart_count)?;
+
+    Ok(())
+}
+
+/// Check if a review status on GitHub is already completed (success or
+/// failure).
+///
+/// Returns true if the status is not pending, false otherwise.
+fn is_review_completed(sh: &Shell, head_sha: &str, status_context: &str) -> bool {
+    // Get owner/repo from git remote
+    let remote_url = cmd!(sh, "git remote get-url origin")
+        .read()
+        .unwrap_or_default();
+
+    let owner_repo = parse_owner_repo_for_check(&remote_url);
+    if owner_repo.is_empty() {
+        return false;
+    }
+
+    // Build the jq filter
+    let jq_filter = format!(".statuses[] | select(.context == \"{status_context}\") | .state");
+
+    // Get the status from GitHub
+    let api_path = format!("/repos/{owner_repo}/commits/{head_sha}/status");
+    let output = cmd!(sh, "gh api {api_path} --jq {jq_filter}")
+        .ignore_status()
+        .read();
+
+    // Couldn't check, assume not completed
+    output.is_ok_and(|state| {
+        let state = state.trim();
+        // If state is "success" or "failure", the review is completed
+        state == "success" || state == "failure"
+    })
+}
+
+/// Parse owner/repo from a GitHub remote URL (for check module).
+fn parse_owner_repo_for_check(url: &str) -> String {
+    // Parse formats like:
+    // - git@github.com:owner/repo.git
+    // - https://github.com/owner/repo.git
+    // - https://github.com/owner/repo
+    let url = url.trim();
+
+    // Extract the owner/repo part
+    let owner_repo = if url.contains("github.com:") {
+        // SSH format: git@github.com:owner/repo.git
+        url.split("github.com:")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(".git")
+    } else if url.contains("github.com/") {
+        // HTTPS format: https://github.com/owner/repo.git
+        url.split("github.com/")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(".git")
+    } else {
+        ""
+    };
+
+    owner_repo.to_string()
+}
+
+/// Restart a review using the PR URL and HEAD SHA from the state file.
+fn restart_review(
+    sh: &Shell,
+    reviewer_type: &str,
+    pr_url: &str,
+    head_sha: &str,
+    restart_count: u32,
+) -> Result<()> {
+    let repo_root = cmd!(sh, "git rev-parse --show-toplevel")
+        .read()
+        .context("Failed to get repository root")?
+        .trim()
+        .to_string();
+
+    let prompt_path = match reviewer_type {
+        "security" => format!("{repo_root}/documents/reviews/SECURITY_REVIEW_PROMPT.md"),
+        "quality" => format!("{repo_root}/documents/reviews/CODE_QUALITY_PROMPT.md"),
+        _ => return Ok(()),
+    };
+
+    if !std::path::Path::new(&prompt_path).exists() {
+        println!("      Warning: Review prompt not found at {prompt_path}");
+        return Ok(());
+    }
+
+    // Read and substitute variables in the prompt
+    let prompt_content =
+        std::fs::read_to_string(&prompt_path).context("Failed to read review prompt")?;
+
+    let prompt = prompt_content
+        .replace("$PR_URL", pr_url)
+        .replace("$HEAD_SHA", head_sha);
+
+    // Create log file using tempfile
+    let log_file = tempfile::Builder::new()
+        .prefix(&format!("apm2_review_{reviewer_type}_"))
+        .suffix(".log")
+        .tempfile()
+        .context("Failed to create log file")?;
+
+    // Keep the log file (don't delete on drop)
+    let (_, log_path) = log_file.keep().context("Failed to persist log file")?;
+
+    // Create prompt temp file
+    let mut prompt_file =
+        tempfile::NamedTempFile::new().context("Failed to create prompt temp file")?;
+    std::io::Write::write_all(&mut prompt_file, prompt.as_bytes())
+        .context("Failed to write prompt")?;
+
+    let (_, prompt_path) = prompt_file
+        .keep()
+        .context("Failed to persist prompt file")?;
+
+    let prompt_path_str = prompt_path.display().to_string();
+    let log_path_str = log_path.display().to_string();
+
+    // Spawn the reviewer process
+    // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
+    // the sh process to stay alive so the tracked PID remains valid.
+    let shell_cmd = format!(
+        "script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}'"
+    );
+
+    let child = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
+        .spawn();
+
+    match child {
+        Ok(child) => {
+            // Get the PID of the shell process
+            let pid = child.id();
+
+            // Record the new entry in state file
+            let mut state = ReviewerStateFile::load()?;
+            state.set_reviewer(
+                reviewer_type,
+                ReviewerEntry {
+                    pid,
+                    started_at: chrono::Utc::now(),
+                    log_file: log_path,
+                    pr_url: pr_url.to_string(),
+                    head_sha: head_sha.to_string(),
+                    restart_count,
+                },
+            );
+            state.save()?;
+
+            println!(
+                "      Restarted {} review (PID: {})",
+                capitalize(reviewer_type),
+                pid
+            );
+
+            // Don't wait for the child - it runs in background via
+            // Command::spawn()
+        },
+        Err(e) => {
+            println!("      Failed to restart review: {e}");
+        },
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -487,7 +880,10 @@ mod tests {
             {"name": "build", "state": "SUCCESS", "bucket": "pass"},
             {"name": "test", "state": "FAILURE", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["test".to_string()])
+        );
     }
 
     #[test]
@@ -495,7 +891,10 @@ mod tests {
         let json = r#"[
             {"name": "build", "state": "SUCCESS", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["build".to_string()])
+        );
     }
 
     #[test]
@@ -519,7 +918,10 @@ mod tests {
         let json = r#"[
             {"name": "build", "state": "FAILURE", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["build".to_string()])
+        );
     }
 
     #[test]
@@ -543,7 +945,10 @@ mod tests {
             {"name": "lint", "state": "IN_PROGRESS", "bucket": "pending"},
             {"name": "test", "state": "FAILURE", "bucket": "fail"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["test".to_string()])
+        );
     }
 
     #[test]
@@ -562,7 +967,10 @@ mod tests {
         let json = r#"[
             {"name": "build", "state": "COMPLETED", "bucket": "cancel"}
         ]"#;
-        assert_eq!(parse_ci_status(json), CiStatus::Failure);
+        assert_eq!(
+            parse_ci_status(json),
+            CiStatus::Failure(vec!["build".to_string()])
+        );
     }
 
     #[test]
@@ -606,5 +1014,104 @@ mod tests {
         assert_eq!(status.pr_state, Some(PrState::Open));
         assert_eq!(status.ci, Some(CiStatus::Success));
         assert_eq!(status.review, Some(ReviewStatus::Approved));
+    }
+
+    #[test]
+    fn test_get_remediation_command_clippy() {
+        assert_eq!(
+            get_remediation_command("Clippy"),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+        assert_eq!(
+            get_remediation_command("clippy-checks"),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+        assert_eq!(
+            get_remediation_command("Run Clippy"),
+            Some("cargo clippy --fix --allow-dirty")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_fmt() {
+        assert_eq!(get_remediation_command("Fmt"), Some("cargo fmt"));
+        assert_eq!(get_remediation_command("Format Check"), Some("cargo fmt"));
+        assert_eq!(get_remediation_command("rust-fmt"), Some("cargo fmt"));
+    }
+
+    #[test]
+    fn test_get_remediation_command_test() {
+        assert_eq!(
+            get_remediation_command("Test"),
+            Some("cargo test --workspace")
+        );
+        assert_eq!(
+            get_remediation_command("Unit Tests"),
+            Some("cargo test --workspace")
+        );
+        assert_eq!(
+            get_remediation_command("integration-test"),
+            Some("cargo test --workspace")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_security_review() {
+        assert_eq!(
+            get_remediation_command("Security Review"),
+            Some("cargo xtask push --force-review")
+        );
+        assert_eq!(
+            get_remediation_command("security-review-check"),
+            Some("cargo xtask push --force-review")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_quality_review() {
+        assert_eq!(
+            get_remediation_command("Quality Review"),
+            Some("cargo xtask push --force-review")
+        );
+        assert_eq!(
+            get_remediation_command("code-quality-review"),
+            Some("cargo xtask push --force-review")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_semver() {
+        assert_eq!(
+            get_remediation_command("SemverCheck"),
+            Some("cargo semver-checks")
+        );
+        assert_eq!(
+            get_remediation_command("semver-checks"),
+            Some("cargo semver-checks")
+        );
+    }
+
+    #[test]
+    fn test_get_remediation_command_unknown() {
+        assert_eq!(get_remediation_command("Unknown Check"), None);
+        assert_eq!(get_remediation_command("build"), None);
+        assert_eq!(get_remediation_command("deploy"), None);
+    }
+
+    #[test]
+    fn test_parse_ci_status_multiple_failures() {
+        let json = r#"[
+            {"name": "Clippy", "state": "FAILURE", "bucket": "fail"},
+            {"name": "Test", "state": "FAILURE", "bucket": "fail"}
+        ]"#;
+        let result = parse_ci_status(json);
+        match result {
+            CiStatus::Failure(failed) => {
+                assert_eq!(failed.len(), 2);
+                assert!(failed.contains(&"Clippy".to_string()));
+                assert!(failed.contains(&"Test".to_string()));
+            },
+            _ => panic!("Expected CiStatus::Failure"),
+        }
     }
 }

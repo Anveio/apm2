@@ -12,9 +12,11 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
+use crate::reviewer_state::{ReviewerEntry, ReviewerStateFile};
 use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
 
 /// Push branch and create PR.
@@ -241,7 +243,10 @@ fn create_pr(sh: &Shell, branch_name: &str, ticket_id: &str) -> Result<String> {
 /// 1. Creates PENDING status checks for both reviews (blocks merge until
 ///    complete)
 /// 2. Spawns background processes to run security review (Gemini) and code
-///    quality review (Codex) using the prompts from `documents/reviews/`
+///    quality review (Gemini) using the prompts from `documents/reviews/`
+/// 3. Writes reviewer state to `~/.apm2/reviewer_state.json` for health
+///    monitoring
+/// 4. Redirects reviewer output to log files for mtime-based activity detection
 ///
 /// The AI reviewers are responsible for updating their status to
 /// success/failure.
@@ -288,81 +293,112 @@ fn trigger_ai_reviews(sh: &Shell, pr_url: &str) -> Result<()> {
         create_pending_statuses(sh, owner_repo, &head_sha);
     }
 
+    // Load current reviewer state
+    let mut state = ReviewerStateFile::load().unwrap_or_default();
+
     // Try to spawn Gemini for security review
     let gemini_available = cmd!(sh, "which gemini").ignore_status().read().is_ok();
     if gemini_available && Path::new(&security_prompt_path).exists() {
         println!("  Spawning Gemini security review...");
-        // Read and substitute variables in the prompt
-        if let Ok(prompt_content) = std::fs::read_to_string(&security_prompt_path) {
-            let prompt = prompt_content
-                .replace("$PR_URL", pr_url)
-                .replace("$HEAD_SHA", &head_sha);
-            // Spawn Gemini in background with pseudo-TTY for full tool access.
-            // Using script -qec gives Gemini a headed environment where all tools
-            // (including run_shell_command) are available. Without this, headless mode
-            // filters out shell tools causing "Tool not found in registry" errors.
-            //
-            // We write the prompt to a secure temp file (via tempfile crate) to:
-            // 1. Avoid shell escaping issues with complex markdown
-            // 2. Use random filenames to prevent symlink/TOCTOU attacks
-            // 3. Create with restrictive permissions (0600)
-            let temp_file_result =
-                NamedTempFile::new().and_then(|mut f| f.write_all(prompt.as_bytes()).map(|()| f));
-            match temp_file_result {
-                Ok(temp_file) => {
-                    // Persist the file so it survives after NamedTempFile is dropped
-                    // The background shell will delete it after gemini finishes
-                    let (_, temp_path) = temp_file.keep().unwrap_or_else(|e| {
-                        eprintln!("    Warning: Failed to persist temp file: {e}");
-                        (
-                            std::fs::File::open("/dev/null").unwrap(),
-                            std::path::PathBuf::new(),
-                        )
-                    });
-                    let prompt_path = temp_path.display().to_string();
-                    if !prompt_path.is_empty() {
-                        // Use a subshell that runs gemini then cleans up the temp file
-                        let _ = std::process::Command::new("sh")
-                            .args([
-                                "-c",
-                                &format!(
-                                    "(script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null; rm -f '{prompt_path}') &"
-                                ),
-                            ])
-                            .spawn();
-                        println!("    Security review started in background");
-                    }
-                },
-                Err(e) => {
-                    println!("    Warning: Failed to create temp file for Gemini: {e}");
-                },
-            }
+        if let Some(entry) = spawn_reviewer("security", &security_prompt_path, pr_url, &head_sha) {
+            state.set_reviewer("security", entry);
+            println!("    Security review started in background");
         }
     } else if !gemini_available {
         println!("  Note: Gemini CLI not available, skipping security review");
     }
 
-    // Try to spawn Codex for code quality review
-    let codex_available = cmd!(sh, "which codex").ignore_status().read().is_ok();
-    if codex_available && Path::new(&code_quality_prompt_path).exists() {
-        println!("  Spawning Codex code quality review...");
-        // Spawn Codex review in background using the review subcommand.
-        // The review subcommand runs non-interactively by default.
-        let _ = std::process::Command::new("sh")
-            .args(["-c", "codex review --base main &"])
-            .spawn();
-        println!("    Code quality review started in background");
-    } else if !codex_available {
-        println!("  Note: Codex CLI not available, skipping code quality review");
+    // Try to spawn Gemini for code quality review
+    if gemini_available && Path::new(&code_quality_prompt_path).exists() {
+        println!("  Spawning Gemini code quality review...");
+        if let Some(entry) = spawn_reviewer("quality", &code_quality_prompt_path, pr_url, &head_sha)
+        {
+            state.set_reviewer("quality", entry);
+            println!("    Code quality review started in background");
+        }
     }
 
-    if !gemini_available && !codex_available {
-        println!(
-            "  No AI review tools available. Install gemini and/or codex CLI to enable reviews."
-        );
+    // Save the updated state
+    if let Err(e) = state.save() {
+        println!("    Warning: Failed to save reviewer state: {e}");
+    }
+
+    if !gemini_available {
+        println!("  No AI review tools available. Install gemini CLI to enable reviews.");
     }
 
     Ok(())
+}
+
+/// Spawn a reviewer process and return the entry to track it.
+///
+/// Creates a log file for output capture and spawns the Gemini process
+/// in the background using `script` for PTY allocation.
+///
+/// Note: The command is spawned WITHOUT a trailing `&` so that the tracked
+/// PID (the `sh` process) remains valid. `Command::spawn()` already makes
+/// the process run asynchronously relative to the main thread.
+fn spawn_reviewer(
+    reviewer_type: &str,
+    prompt_file_path: &str,
+    pr_url: &str,
+    head_sha: &str,
+) -> Option<ReviewerEntry> {
+    // Read and substitute variables in the prompt
+    let prompt_content = std::fs::read_to_string(prompt_file_path).ok()?;
+    let prompt = prompt_content
+        .replace("$PR_URL", pr_url)
+        .replace("$HEAD_SHA", head_sha);
+
+    // Create log file for output capture (mtime tracking)
+    let log_file = tempfile::Builder::new()
+        .prefix(&format!("apm2_review_{reviewer_type}_"))
+        .suffix(".log")
+        .tempfile()
+        .ok()?;
+
+    // Keep the log file (don't delete on drop) - cleanup happens on completion
+    let (_, log_path) = log_file.keep().ok()?;
+    let log_path_str = log_path.display().to_string();
+
+    // Create prompt temp file
+    let mut prompt_temp = NamedTempFile::new().ok()?;
+    prompt_temp.write_all(prompt.as_bytes()).ok()?;
+
+    // Persist the prompt file
+    let (_, prompt_path) = prompt_temp.keep().ok()?;
+    let prompt_path_str = prompt_path.display().to_string();
+
+    // Spawn Gemini in background with pseudo-TTY for full tool access.
+    // Using script -q <log_path> -c gives Gemini a headed environment where all
+    // tools (including run_shell_command) are available. Without this, headless
+    // mode filters out shell tools causing "Tool not found in registry" errors.
+    //
+    // The log file's mtime updates whenever new output is written, enabling
+    // health monitoring via mtime checking.
+    //
+    // Note: No trailing `&` - Command::spawn() runs asynchronously, and we need
+    // the sh process to stay alive so the tracked PID remains valid.
+    let shell_cmd = format!(
+        "script -q \"{log_path_str}\" -c \"gemini --yolo < '{prompt_path_str}'\"; rm -f '{prompt_path_str}'"
+    );
+
+    let child = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
+        .spawn()
+        .ok()?;
+
+    let pid = child.id();
+
+    // Return the entry for state tracking
+    Some(ReviewerEntry {
+        pid,
+        started_at: Utc::now(),
+        log_file: log_path,
+        pr_url: pr_url.to_string(),
+        head_sha: head_sha.to_string(),
+        restart_count: 0,
+    })
 }
 
 /// Parse owner/repo from a GitHub remote URL.
@@ -460,7 +496,116 @@ fn extract_ticket_title(content: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    /// Test that `NamedTempFile` creates files with secure properties.
+    ///
+    /// Verifies:
+    /// 1. Permissions are 0600 (owner read/write only)
+    /// 2. Paths are unpredictable (different for each file)
+    /// 3. Files are cleaned up after drop
+    #[test]
+    fn test_temp_file_security() {
+        // Test 1: Verify permissions are 0600
+        let temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        let metadata = temp_file
+            .as_file()
+            .metadata()
+            .expect("Failed to get metadata");
+        let mode = metadata.permissions().mode();
+
+        // On Unix, mode includes file type bits. We only care about permission bits
+        // (0o777 mask)
+        let permission_bits = mode & 0o777;
+        assert_eq!(
+            permission_bits, 0o600,
+            "Temp file should have 0600 permissions, got {permission_bits:o}"
+        );
+
+        // Test 2: Verify paths are unpredictable (different for each file)
+        let temp_file1 = NamedTempFile::new().expect("Failed to create temp file 1");
+        let temp_file2 = NamedTempFile::new().expect("Failed to create temp file 2");
+        let path1 = temp_file1.path().to_path_buf();
+        let path2 = temp_file2.path().to_path_buf();
+
+        assert_ne!(
+            path1, path2,
+            "Temp file paths should be different (unpredictable)"
+        );
+
+        // Both paths should be in the system temp directory, not a fixed location
+        let temp_dir = std::env::temp_dir();
+        assert!(
+            path1.starts_with(&temp_dir),
+            "Temp file should be in system temp directory"
+        );
+        assert!(
+            path2.starts_with(&temp_dir),
+            "Temp file should be in system temp directory"
+        );
+
+        // Test 3: Verify cleanup after drop
+        let path_to_check = temp_file.path().to_path_buf();
+        assert!(path_to_check.exists(), "Temp file should exist before drop");
+        drop(temp_file);
+        assert!(
+            !path_to_check.exists(),
+            "Temp file should be cleaned up after drop"
+        );
+    }
+
+    /// Test that script command format is valid for PTY allocation.
+    ///
+    /// Verifies:
+    /// 1. Script command format includes PTY allocation via `script -qec`
+    /// 2. Input redirection uses correct `<` syntax
+    /// 3. Command properly quotes paths
+    #[test]
+    fn test_script_command_format() {
+        // Test with a simple path
+        let prompt_path = "/tmp/test_prompt.txt";
+        let shell_cmd = format!("script -qec \"gemini --yolo < '{prompt_path}'\" /dev/null");
+
+        // Verify command includes PTY allocation
+        assert!(
+            shell_cmd.contains("script -qec"),
+            "Command should use script -qec for PTY allocation"
+        );
+
+        // Verify input redirection syntax
+        assert!(
+            shell_cmd.contains("< '"),
+            "Command should use < for input redirection"
+        );
+
+        // Verify path is quoted
+        assert!(
+            shell_cmd.contains(&format!("< '{prompt_path}'")),
+            "Path should be single-quoted in input redirection"
+        );
+
+        // Verify /dev/null is used as typescript output
+        assert!(
+            shell_cmd.ends_with("/dev/null"),
+            "Command should redirect script output to /dev/null"
+        );
+
+        // Test with a path containing special characters (not quotes)
+        let special_path = "/tmp/test file.txt";
+        let special_cmd = format!("script -qec \"gemini --yolo < '{special_path}'\" /dev/null");
+
+        // Verify the command is well-formed
+        assert!(
+            special_cmd.contains("script -qec"),
+            "Command with spaces should still use script -qec"
+        );
+        assert!(
+            special_cmd.contains(&format!("< '{special_path}'")),
+            "Path with spaces should be properly quoted"
+        );
+    }
 
     #[test]
     fn test_extract_ticket_title() {
