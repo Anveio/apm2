@@ -899,6 +899,16 @@ impl ClaudeCodeAdapter {
                     tool_name,
                     tool_use_id,
                 }) => {
+                    // Send a deny response to unblock the child process waiting for hook
+                    // response. Without this, the child would hang indefinitely.
+                    let deny_response = HookResponse {
+                        continue_execution: false,
+                        message: Some(format!("Tool '{tool_name}' is not in the allowlist")),
+                        modified_input: None,
+                    };
+                    // Best-effort: send response, don't fail if it errors
+                    let _ = self.send_hook_response(&deny_response).await;
+
                     // Report unauthorized tool as a security violation
                     let mut context = BTreeMap::new();
                     context.insert("tool_name".to_string(), tool_name.clone());
@@ -921,17 +931,25 @@ impl ClaudeCodeAdapter {
                     return Ok(Some(diagnostic));
                 },
                 Ok(InternalEvent::LineTooLong { bytes_read }) => {
+                    // Fail-closed: terminate the session when line limit is exceeded.
+                    // Since we cannot reliably parse the truncated JSON to extract
+                    // event/command IDs, the child would be left in an undefined state.
+                    // Terminating is the safest option.
+                    let _ = self.stop().await;
+
                     // Report line length limit exceeded as a resource limit violation
                     let mut context = BTreeMap::new();
                     context.insert("bytes_read".to_string(), bytes_read.to_string());
                     context.insert("max_length".to_string(), MAX_LINE_LENGTH.to_string());
+                    context.insert("action".to_string(), "session_terminated".to_string());
 
                     let diagnostic =
                         self.create_event(AdapterEventPayload::Diagnostic(Diagnostic {
                             severity: DiagnosticSeverity::Error,
                             category: DiagnosticCategory::ResourceLimit,
-                            message: "Line from child process exceeded maximum length limit"
-                                .to_string(),
+                            message:
+                                "Line from child process exceeded maximum length limit - session terminated"
+                                    .to_string(),
                             context,
                         }));
 
