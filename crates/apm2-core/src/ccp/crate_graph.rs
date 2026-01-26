@@ -24,11 +24,16 @@
 //!   variables (`PATH`, `HOME`, `CARGO_HOME`, `RUSTUP_HOME`) are passed through
 //! - [SEC-0002] Cargo metadata is parsed with strict typed schemas to prevent
 //!   fail-open on malformed input
+//! - [SEC-0003] Subprocess has 30-second timeout to prevent denial-of-service via hanging process
+//! - [SEC-0004] JSON is parsed directly from `BufReader` for memory efficiency
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use wait_timeout::ChildExt;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -100,6 +105,10 @@ struct CargoTarget {
 /// Prevents denial-of-service via unbounded reads from subprocess.
 const MAX_CARGO_METADATA_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Timeout for cargo metadata subprocess (30 seconds).
+/// SEC-0003: Prevents denial-of-service via hanging subprocess.
+const CARGO_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Errors that can occur during crate graph generation.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -139,6 +148,13 @@ pub enum CrateGraphError {
     CargoError {
         /// The stderr output from cargo.
         stderr: String,
+    },
+
+    /// Cargo subprocess timed out.
+    #[error("cargo metadata timed out after {timeout_secs} seconds")]
+    SubprocessTimeout {
+        /// The timeout in seconds.
+        timeout_secs: u64,
     },
 }
 
@@ -315,55 +331,55 @@ fn invoke_cargo_metadata(repo_root: &Path) -> Result<CargoMetadata, CrateGraphEr
             reason: e.to_string(),
         })?;
 
-    // Read stdout with size limit
-    let mut stdout_content = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        stdout
-            .take(MAX_CARGO_METADATA_SIZE)
-            .read_to_end(&mut stdout_content)
-            .map_err(|e| CrateGraphError::CargoInvocationError {
-                reason: format!("failed to read stdout: {e}"),
-            })?;
+    // Take stdout handle for parsing
+    let stdout = child.stdout.take();
 
-        if stdout_content.len() as u64 >= MAX_CARGO_METADATA_SIZE {
-            return Err(CrateGraphError::OutputTooLarge {
-                size: stdout_content.len() as u64,
-                max_size: MAX_CARGO_METADATA_SIZE,
-            });
-        }
-    }
-
-    // Read stderr for error messages
-    let mut stderr_content = String::new();
-    if let Some(stderr) = child.stderr.take() {
-        // Limit stderr read to prevent DoS
-        stderr
-            .take(1024 * 1024) // 1 MB limit for stderr
-            .read_to_string(&mut stderr_content)
-            .map_err(|e| CrateGraphError::CargoInvocationError {
-                reason: format!("failed to read stderr: {e}"),
-            })?;
-    }
-
-    let status = child
-        .wait()
+    // SEC-0003: Wait with timeout to prevent denial-of-service via hanging subprocess
+    let Some(status) = child
+        .wait_timeout(CARGO_METADATA_TIMEOUT)
         .map_err(|e| CrateGraphError::CargoInvocationError {
             reason: format!("failed to wait for cargo: {e}"),
-        })?;
+        })?
+    else {
+        // Timeout - kill the process
+        let _ = child.kill();
+        let _ = child.wait(); // Reap the zombie
+        return Err(CrateGraphError::SubprocessTimeout {
+            timeout_secs: CARGO_METADATA_TIMEOUT.as_secs(),
+        });
+    };
 
+    // Read stderr for error messages (only needed if command failed)
     if !status.success() {
+        let mut stderr_content = String::new();
+        if let Some(stderr) = child.stderr.take() {
+            // Limit stderr read to prevent DoS
+            stderr
+                .take(1024 * 1024) // 1 MB limit for stderr
+                .read_to_string(&mut stderr_content)
+                .map_err(|e| CrateGraphError::CargoInvocationError {
+                    reason: format!("failed to read stderr: {e}"),
+                })?;
+        }
         return Err(CrateGraphError::CargoError {
             stderr: stderr_content,
         });
     }
 
-    let stdout_str =
-        String::from_utf8(stdout_content).map_err(|e| CrateGraphError::MetadataParseError {
-            reason: format!("invalid UTF-8 in output: {e}"),
-        })?;
+    // SEC-0004: Parse JSON directly from BufReader for memory efficiency
+    // Instead of reading entire output into a string, parse streaming from reader
+    let Some(stdout) = stdout else {
+        return Err(CrateGraphError::CargoInvocationError {
+            reason: "stdout was not captured".to_string(),
+        });
+    };
 
-    // SEC-0002: Parse with strict typed schema
-    serde_json::from_str::<CargoMetadata>(&stdout_str).map_err(|e| {
+    // Wrap in BufReader with size limit for efficiency and DoS prevention
+    let limited_reader = stdout.take(MAX_CARGO_METADATA_SIZE);
+    let buf_reader = BufReader::new(limited_reader);
+
+    // SEC-0002: Parse with strict typed schema directly from reader
+    serde_json::from_reader::<_, CargoMetadata>(buf_reader).map_err(|e| {
         CrateGraphError::MetadataParseError {
             reason: format!("failed to parse cargo metadata schema: {e}"),
         }
