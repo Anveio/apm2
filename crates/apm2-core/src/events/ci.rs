@@ -103,6 +103,7 @@ use crate::webhook::WorkflowConclusion;
 /// assert_eq!(event.source, "github_webhook");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CIWorkflowCompleted {
     /// Unique identifier for this event (UUID v4).
     pub event_id: Uuid,
@@ -173,11 +174,23 @@ impl CIWorkflowCompleted {
 
 /// The payload of a CI workflow completion event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CIWorkflowPayload {
     /// The pull request number, if any.
     pub pr_number: Option<u64>,
 
     /// The commit SHA that triggered the workflow.
+    ///
+    /// # Trust Model
+    ///
+    /// This value comes from the GitHub webhook payload which is authenticated
+    /// via HMAC-SHA256 signature verification. The signature proves the payload
+    /// originated from GitHub and was not tampered with in transit. Therefore,
+    /// `commit_sha` is trusted data from GitHub and is not independently
+    /// validated as a 40-character hex string.
+    ///
+    /// If you need to use this SHA for security-critical operations (e.g., as a
+    /// Git ref), validate the format before use.
     pub commit_sha: String,
 
     /// The conclusion of the workflow run.
@@ -257,6 +270,7 @@ impl std::fmt::Display for CheckConclusion {
 
 /// The result of an individual check within a workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckResult {
     /// The name of the check.
     pub name: String,
@@ -446,8 +460,11 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
             if now.duration_since(entry.inserted_at) < self.config.ttl {
                 return false; // Another thread inserted it
             }
-            // Entry expired, remove from insertion_order (will be re-added)
-            state.insertion_order.retain(|id| id != delivery_id);
+            // Entry expired - remove from entries map but leave ghost key in
+            // insertion_order. The cleanup() function handles ghost keys in O(1)
+            // by checking if the key exists in the map before evicting.
+            // This avoids an O(N) scan of insertion_order.
+            state.entries.remove(delivery_id);
         }
 
         // Enforce max_entries limit with O(1) eviction ([INV-CI004])
@@ -895,6 +912,83 @@ mod tests {
             assert_eq!(payload["conclusion"], "success");
             assert_eq!(payload["workflow_name"], "CI");
             assert_eq!(payload["workflow_run_id"], 12345);
+        }
+
+        /// Tests that unknown fields in JSON cause deserialization to fail.
+        ///
+        /// This ensures that malicious or misconfigured payloads with extra
+        /// fields are rejected, preventing potential injection attacks
+        /// via unhandled data.
+        #[test]
+        fn test_deny_unknown_fields_ci_workflow_completed() {
+            let json = r#"{
+                "event_id": "00000000-0000-0000-0000-000000000000",
+                "event_type": "CIWorkflowCompleted",
+                "timestamp": "2024-01-01T00:00:00Z",
+                "source": "github_webhook",
+                "payload": {
+                    "pr_number": 42,
+                    "commit_sha": "abc123",
+                    "conclusion": "success",
+                    "workflow_name": "CI",
+                    "workflow_run_id": 12345,
+                    "checks": []
+                },
+                "signature_verified": true,
+                "delivery_id": "test-delivery",
+                "unknown_field": "malicious_data"
+            }"#;
+
+            let result: Result<CIWorkflowCompleted, _> = serde_json::from_str(json);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("unknown field"),
+                "Error should mention unknown field: {err}"
+            );
+        }
+
+        /// Tests that unknown fields in payload cause deserialization to fail.
+        #[test]
+        fn test_deny_unknown_fields_ci_workflow_payload() {
+            let json = r#"{
+                "pr_number": 42,
+                "commit_sha": "abc123",
+                "conclusion": "success",
+                "workflow_name": "CI",
+                "workflow_run_id": 12345,
+                "checks": [],
+                "injected_field": "attack_payload"
+            }"#;
+
+            let result: Result<CIWorkflowPayload, _> = serde_json::from_str(json);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("unknown field"),
+                "Error should mention unknown field: {err}"
+            );
+        }
+
+        /// Tests that unknown fields in check result cause deserialization to
+        /// fail.
+        #[test]
+        fn test_deny_unknown_fields_check_result() {
+            let json = r#"{
+                "name": "build",
+                "conclusion": "success",
+                "started_at": "2024-01-01T00:00:00Z",
+                "completed_at": "2024-01-01T00:01:00Z",
+                "extra_data": "should_be_rejected"
+            }"#;
+
+            let result: Result<CheckResult, _> = serde_json::from_str(json);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("unknown field"),
+                "Error should mention unknown field: {err}"
+            );
         }
 
         #[test]

@@ -68,8 +68,28 @@ pub struct WebhookHandler {
 
 impl WebhookHandler {
     /// Creates a new webhook handler with the given configuration.
+    ///
+    /// # Warning
+    ///
+    /// This constructor uses ephemeral in-memory stores for delivery ID
+    /// deduplication and event storage. These stores are cleared on process
+    /// restart, which means:
+    ///
+    /// - **Replay attacks**: Delivery IDs seen before restart will be accepted
+    ///   again after restart.
+    /// - **Event loss**: Persisted events are lost on restart.
+    ///
+    /// For production deployments, use [`with_event_emitter`] to inject
+    /// persistent stores backed by a database.
+    ///
+    /// [`with_event_emitter`]: Self::with_event_emitter
     #[must_use]
     pub fn new(config: WebhookConfig) -> Self {
+        tracing::warn!(
+            "WebhookHandler initialized with ephemeral in-memory stores. \
+             Delivery IDs and events will be lost on restart. \
+             For production, inject persistent stores via with_event_emitter()."
+        );
         Self::with_event_emitter(config, CIEventEmitter::new())
     }
 
