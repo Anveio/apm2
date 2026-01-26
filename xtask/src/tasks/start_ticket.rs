@@ -109,10 +109,8 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
 
     // Merge GitHub completions with local status overrides
     let local_completed = get_locally_completed_tickets(&tickets);
-    let completed: std::collections::HashSet<String> = github_completed
-        .union(&local_completed)
-        .cloned()
-        .collect();
+    let completed: std::collections::HashSet<String> =
+        github_completed.union(&local_completed).cloned().collect();
 
     let in_progress =
         get_in_progress_tickets(&sh, &completed).context("Failed to get in-progress tickets")?;
@@ -332,9 +330,7 @@ fn scan_tickets(tickets_dir: &PathBuf) -> Result<Vec<TicketInfo>> {
 ///
 /// This allows overriding GitHub PR detection for tickets whose PRs
 /// used incorrect branch naming (e.g., TCK-00035 merged via TCK-00034 branch).
-fn get_locally_completed_tickets(
-    tickets: &[TicketInfo],
-) -> std::collections::HashSet<String> {
+fn get_locally_completed_tickets(tickets: &[TicketInfo]) -> std::collections::HashSet<String> {
     tickets
         .iter()
         .filter(|t| t.status.as_deref() == Some("completed"))
