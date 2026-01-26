@@ -373,12 +373,23 @@ struct DeliveryIdEntry {
     inserted_at: Instant,
 }
 
+/// Queue entry tracking both key and insertion timestamp for ghost detection.
+///
+/// When a key is reinserted after expiration, a "ghost" entry remains in the
+/// queue with the old timestamp. During eviction, we compare timestamps to
+/// detect and skip ghost entries.
+struct QueueEntry {
+    key: String,
+    inserted_at: Instant,
+}
+
 /// Internal state for the delivery ID store, protected by `RwLock`.
 struct DeliveryIdState {
     /// Map from delivery ID to entry (for O(1) lookup).
     entries: HashMap<String, DeliveryIdEntry>,
     /// Queue tracking insertion order for O(1) eviction ([INV-CI004]).
-    insertion_order: VecDeque<String>,
+    /// Entries include timestamps to detect ghost keys.
+    insertion_order: VecDeque<QueueEntry>,
 }
 
 impl DeliveryIdState {
@@ -434,22 +445,30 @@ impl InMemoryDeliveryIdStore {
         // O(1) amortized: pop expired entries from the front of the queue
         // Since entries are inserted in chronological order, expired entries
         // will be at the front. We stop as soon as we find a non-expired entry.
-        while let Some(oldest_key) = state.insertion_order.front() {
-            if let Some(entry) = state.entries.get(oldest_key) {
+        while let Some(queue_entry) = state.insertion_order.front() {
+            if let Some(map_entry) = state.entries.get(&queue_entry.key) {
+                // Check if this queue entry matches the current map entry's timestamp
+                // (detects ghost entries from reused keys)
+                if queue_entry.inserted_at != map_entry.inserted_at {
+                    // Ghost entry - different timestamp means key was reinserted
+                    state.insertion_order.pop_front();
+                    continue;
+                }
+
                 // Use checked_duration_since for robustness against clock issues
                 let elapsed = now
-                    .checked_duration_since(entry.inserted_at)
+                    .checked_duration_since(map_entry.inserted_at)
                     .unwrap_or(Duration::ZERO);
                 if elapsed >= ttl {
                     // Entry expired, remove it
-                    let key = state.insertion_order.pop_front().unwrap();
-                    state.entries.remove(&key);
+                    let entry = state.insertion_order.pop_front().unwrap();
+                    state.entries.remove(&entry.key);
                 } else {
                     // Found a non-expired entry, stop cleanup
                     break;
                 }
             } else {
-                // Key in queue but not in map (ghost key), remove from queue
+                // Key not in map (already removed), remove ghost from queue
                 state.insertion_order.pop_front();
             }
         }
@@ -512,9 +531,9 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
                 .checked_duration_since(entry.inserted_at)
                 .unwrap_or(Duration::ZERO);
             if elapsed >= self.config.ttl {
-                // Entry expired - remove from entries map but leave ghost key in
-                // insertion_order. The cleanup() function handles ghost keys in O(1)
-                // by checking if the key exists in the map before evicting.
+                // Entry expired - remove from entries map.
+                // Leave ghost entry in insertion_order - cleanup() and eviction
+                // will detect it via timestamp mismatch.
                 state.entries.remove(delivery_id);
             } else {
                 // Entry exists and not expired - nothing to do
@@ -523,21 +542,34 @@ impl DeliveryIdStore for InMemoryDeliveryIdStore {
         }
 
         // Enforce max_entries limit with O(1) eviction ([INV-CI004])
+        // Note: insertion_order may contain "ghost" entries from reused keys.
+        // We detect these by comparing timestamps.
         while state.entries.len() >= self.config.max_entries {
             // Pop oldest from the front of the queue
-            if let Some(oldest_key) = state.insertion_order.pop_front() {
-                state.entries.remove(&oldest_key);
+            if let Some(queue_entry) = state.insertion_order.pop_front() {
+                // Check if this is a ghost entry (timestamp mismatch) or key removed
+                if let Some(map_entry) = state.entries.get(&queue_entry.key) {
+                    if queue_entry.inserted_at == map_entry.inserted_at {
+                        // Valid entry - remove it
+                        state.entries.remove(&queue_entry.key);
+                    }
+                    // else: ghost entry - skip and continue
+                }
+                // else: key not in map - skip and continue
             } else {
                 break; // Queue empty, shouldn't happen if invariants hold
             }
         }
 
-        // Insert the new entry
+        // Insert the new entry with timestamp
         state.entries.insert(
             delivery_id.to_string(),
             DeliveryIdEntry { inserted_at: now },
         );
-        state.insertion_order.push_back(delivery_id.to_string());
+        state.insertion_order.push_back(QueueEntry {
+            key: delivery_id.to_string(),
+            inserted_at: now,
+        });
     }
 
     fn len(&self) -> usize {
@@ -1236,6 +1268,48 @@ mod tests {
             // This should use contains (returns true) and NOT call mark
             assert!(!store.check_and_mark("delivery-1"));
             assert_eq!(store.len(), 1); // Still 1, not added again
+        }
+
+        #[test]
+        fn test_reused_key_with_max_entries_eviction() {
+            // Regression test for ghost key bug: when a key is reused after
+            // expiration, the eviction logic must not remove the new valid entry.
+            let config = DeliveryIdConfig {
+                ttl: Duration::from_millis(50),
+                max_entries: 2,
+                cleanup_interval: 1000, // Disable probabilistic cleanup
+            };
+            let store = InMemoryDeliveryIdStore::with_config(config);
+
+            // Add first entry
+            store.mark("key-a");
+            assert_eq!(store.len(), 1);
+
+            // Wait for key-a to expire
+            thread::sleep(Duration::from_millis(60));
+
+            // Reuse key-a (creates ghost in queue with old timestamp)
+            store.mark("key-a");
+            assert_eq!(store.len(), 1);
+
+            // Now add key-b - this should NOT evict the new key-a
+            store.mark("key-b");
+            assert_eq!(store.len(), 2);
+
+            // Both keys should still be present
+            assert!(store.contains("key-a"), "key-a should still exist");
+            assert!(store.contains("key-b"), "key-b should exist");
+
+            // Add key-c - now we need to evict something
+            // The ghost entry for key-a should be skipped, and either
+            // the new key-a or key-b should be evicted
+            store.mark("key-c");
+            assert_eq!(store.len(), 2);
+
+            // key-c is definitely there (just added)
+            assert!(store.contains("key-c"), "key-c should exist");
+            // And we should have exactly 2 entries
+            assert_eq!(store.len(), 2);
         }
     }
 
