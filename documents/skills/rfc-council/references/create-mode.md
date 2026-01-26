@@ -5,7 +5,7 @@ decision_tree:
   nodes[1]:
     - id: CREATE_FLOW
       purpose: "Generate RFC and tickets from PRD."
-      steps[5]:
+      steps[6]:
         - id: NOTE_VARIABLE_SUBSTITUTION
           action: "References do not interpolate variables; replace <PRD_ID> and <RFC_ID> placeholders before running commands."
         - id: PHASE_1_GENESIS_CREATION
@@ -40,6 +40,24 @@ decision_tree:
 
             Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
             (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
+
+        - id: PHASE_3_TICKET_CREATION
+          action: |
+            Generate engineering tickets from approved RFC v4:
+            (This phase is invoked directly by DECOMPOSE mode via rfc-council-workflow.md)
+
+            1. Read `06_ticket_decomposition.yaml` for planned ticket structure.
+            2. For each planned ticket:
+               a. Create `documents/work/tickets/TCK-XXXXX.yaml`
+               b. Populate from RFC design decisions and requirements
+               c. Ensure GATE-TCK-ATOMICITY criteria (single PR completable)
+               d. Ensure GATE-TCK-IMPLEMENTABILITY criteria (agent can implement)
+            3. Set `depends_on` relationships between tickets.
+            4. Stage and commit:
+               ```bash
+               git add documents/work/tickets/TCK-*.yaml
+               git commit -m "docs(RFC-XXXX): Generate engineering tickets from v4"
+               ```
 
         - id: PHASE_4_SELF_REVIEW
           action: |
