@@ -29,7 +29,7 @@ pub mod exit;
 
 // Re-export main types for convenience
 pub use exit::{
-    AgentExitConfig, AgentSessionCompleted, ExitReason, ExitSignal, ExitSignalError, WorkPhase,
-    is_agent_exit_protocol_enabled, AGENT_EXIT_PROTOCOL_ENABLED_ENV, EXIT_SIGNAL_PROTOCOL,
-    EXIT_SIGNAL_VERSION,
+    AGENT_EXIT_PROTOCOL_ENABLED_ENV, AgentExitConfig, AgentSessionCompleted, EXIT_SIGNAL_PROTOCOL,
+    EXIT_SIGNAL_VERSION, ExitReason, ExitSignal, ExitSignalError, WorkPhase,
+    is_agent_exit_protocol_enabled,
 };

@@ -91,8 +91,8 @@ impl WorkPhase {
     ///
     /// # Errors
     ///
-    /// Returns `ExitSignalError::InvalidPhase` if the string is not a recognized
-    /// work phase.
+    /// Returns `ExitSignalError::InvalidPhase` if the string is not a
+    /// recognized work phase.
     pub fn parse(s: &str) -> Result<Self, ExitSignalError> {
         match s.to_uppercase().as_str() {
             "DRAFT" => Ok(Self::Draft),
@@ -240,14 +240,12 @@ pub const EXIT_SIGNAL_VERSION: &str = "1.0.0";
 /// # Example
 ///
 /// ```rust
-/// use apm2_core::agent::exit::{ExitSignal, ExitReason, WorkPhase};
+/// use apm2_core::agent::exit::{ExitReason, ExitSignal, WorkPhase};
 ///
-/// let signal = ExitSignal::new(
-///     WorkPhase::Implementation,
-///     ExitReason::Completed,
-/// )
-/// .with_pr_url("https://github.com/org/repo/pull/123")
-/// .with_notes("Implementation complete, all tests passing");
+/// let signal =
+///     ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+///         .with_pr_url("https://github.com/org/repo/pull/123")
+///         .with_notes("Implementation complete, all tests passing");
 ///
 /// // Validate the signal
 /// assert!(signal.validate().is_ok());
@@ -332,7 +330,8 @@ impl ExitSignal {
     /// # Errors
     ///
     /// Returns `ExitSignalError::UnknownProtocol` if the protocol is wrong.
-    /// Returns `ExitSignalError::UnsupportedVersion` if the version is incompatible.
+    /// Returns `ExitSignalError::UnsupportedVersion` if the version is
+    /// incompatible.
     pub fn validate(&self) -> Result<(), ExitSignalError> {
         // [CTR-EXIT002] Validate protocol
         if self.protocol != EXIT_SIGNAL_PROTOCOL {
@@ -355,7 +354,8 @@ impl ExitSignal {
     ///
     /// Returns `ExitSignalError::InvalidJson` if the JSON is malformed.
     /// Returns `ExitSignalError::UnknownProtocol` if the protocol is wrong.
-    /// Returns `ExitSignalError::UnsupportedVersion` if the version is incompatible.
+    /// Returns `ExitSignalError::UnsupportedVersion` if the version is
+    /// incompatible.
     pub fn from_json(json: &str) -> Result<Self, ExitSignalError> {
         let signal: Self =
             serde_json::from_str(json).map_err(|e| ExitSignalError::InvalidJson(e.to_string()))?;
@@ -370,8 +370,9 @@ impl ExitSignal {
     ///
     /// # Errors
     ///
-    /// Returns `ExitSignalError::ValidationDisabled` if the feature is disabled.
-    /// Returns other `ExitSignalError` variants for validation failures.
+    /// Returns `ExitSignalError::ValidationDisabled` if the feature is
+    /// disabled. Returns other `ExitSignalError` variants for validation
+    /// failures.
     pub fn from_json_if_enabled(json: &str) -> Result<Self, ExitSignalError> {
         if !is_agent_exit_protocol_enabled() {
             return Err(ExitSignalError::ValidationDisabled);
@@ -386,7 +387,10 @@ impl ExitSignal {
     #[must_use]
     pub fn next_expected_phase(&self) -> WorkPhase {
         match self.exit_reason {
-            ExitReason::Completed => self.phase_completed.next_phase().unwrap_or(WorkPhase::Completed),
+            ExitReason::Completed => self
+                .phase_completed
+                .next_phase()
+                .unwrap_or(WorkPhase::Completed),
             ExitReason::Blocked | ExitReason::Error => WorkPhase::Blocked,
         }
     }
@@ -405,7 +409,8 @@ pub const AGENT_EXIT_PROTOCOL_ENABLED_ENV: &str = "AGENT_EXIT_PROTOCOL_ENABLED";
 /// avoiding hot-path `env::var` calls which are relatively expensive.
 static AGENT_EXIT_PROTOCOL_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 
-/// Parses the agent exit protocol enabled flag from an environment variable value.
+/// Parses the agent exit protocol enabled flag from an environment variable
+/// value.
 ///
 /// Returns `false` (disabled) by default for fail-closed security.
 /// Only returns `true` if explicitly set to "true", "1", or "yes".
@@ -482,8 +487,9 @@ impl AgentExitConfig {
 ///     AgentSessionCompleted, ExitReason, ExitSignal, WorkPhase,
 /// };
 ///
-/// let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
-///     .with_pr_url("https://github.com/org/repo/pull/123");
+/// let signal =
+///     ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+///         .with_pr_url("https://github.com/org/repo/pull/123");
 ///
 /// let event = AgentSessionCompleted::from_exit_signal(
 ///     "session-123",
@@ -593,7 +599,8 @@ impl AgentSessionCompleted {
         }
     }
 
-    /// Returns true if this completion represents a successful phase transition.
+    /// Returns true if this completion represents a successful phase
+    /// transition.
     #[must_use]
     pub const fn is_success(&self) -> bool {
         self.exit_reason.is_success()
@@ -619,7 +626,10 @@ mod tests {
                 WorkPhase::parse("IMPLEMENTATION").unwrap(),
                 WorkPhase::Implementation
             );
-            assert_eq!(WorkPhase::parse("CI_PENDING").unwrap(), WorkPhase::CiPending);
+            assert_eq!(
+                WorkPhase::parse("CI_PENDING").unwrap(),
+                WorkPhase::CiPending
+            );
             assert_eq!(
                 WorkPhase::parse("READY_FOR_REVIEW").unwrap(),
                 WorkPhase::ReadyForReview
