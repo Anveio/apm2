@@ -35,11 +35,11 @@ impl FilesystemTool {
         // but cleaner to enforce relative paths in API).
         // For now, treat all paths as relative to workspace.
         let path = Path::new(path_str);
-        
+
         // Prevent simple traversal at string level (already done by validation,
         // but good defense in depth).
         if path_str.contains("..") {
-             return Err(ToolError {
+            return Err(ToolError {
                 error_code: "PATH_TRAVERSAL".to_string(),
                 message: "Path traversal sequences (..) are not allowed".to_string(),
                 retryable: false,
@@ -68,14 +68,17 @@ impl FilesystemTool {
                         retry_after_ms: 0,
                     });
                 }
-            }
+            },
             Err(e) => return Err(Self::map_io_error(&e)),
         };
 
         // Verify it is still within workspace
         // We need to canonicalize workspace root too for comparison
-        let canonical_root = self.workspace_root.canonicalize().map_err(|e| Self::map_io_error(&e))?;
-        
+        let canonical_root = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|e| Self::map_io_error(&e))?;
+
         if !canonical.starts_with(&canonical_root) {
             return Err(ToolError {
                 error_code: "ACCESS_DENIED".to_string(),
@@ -110,12 +113,12 @@ impl FilesystemTool {
     ///
     /// # Errors
     ///
-    /// Returns a `ToolError` if the file cannot be read, if the path is invalid,
-    /// or if the offset is out of bounds.
+    /// Returns a `ToolError` if the file cannot be read, if the path is
+    /// invalid, or if the offset is out of bounds.
     pub fn read(&self, req: &FileRead) -> Result<Vec<u8>, ToolError> {
         let path = self.resolve_path(&req.path)?;
         debug!("Reading file: {:?}", path);
-        
+
         let mut file = fs::File::open(&path).map_err(|e| Self::map_io_error(&e))?;
         let metadata = file.metadata().map_err(|e| Self::map_io_error(&e))?;
         let len = metadata.len();
@@ -131,14 +134,18 @@ impl FilesystemTool {
 
         if req.offset > 0 {
             use std::io::Seek;
-            file.seek(io::SeekFrom::Start(req.offset)).map_err(|e| Self::map_io_error(&e))?;
+            file.seek(io::SeekFrom::Start(req.offset))
+                .map_err(|e| Self::map_io_error(&e))?;
         }
 
         let mut buffer = Vec::new();
         if req.limit > 0 {
-            file.take(req.limit).read_to_end(&mut buffer).map_err(|e| Self::map_io_error(&e))?;
+            file.take(req.limit)
+                .read_to_end(&mut buffer)
+                .map_err(|e| Self::map_io_error(&e))?;
         } else {
-            file.read_to_end(&mut buffer).map_err(|e| Self::map_io_error(&e))?;
+            file.read_to_end(&mut buffer)
+                .map_err(|e| Self::map_io_error(&e))?;
         }
 
         Ok(buffer)
@@ -148,8 +155,8 @@ impl FilesystemTool {
     ///
     /// # Errors
     ///
-    /// Returns a `ToolError` if the file cannot be written, if the path is invalid,
-    /// or if file creation flags conflict with existing state.
+    /// Returns a `ToolError` if the file cannot be written, if the path is
+    /// invalid, or if file creation flags conflict with existing state.
     pub fn write(&self, req: &FileWrite) -> Result<(), ToolError> {
         let path = self.resolve_path(&req.path)?;
         info!("Writing to file: {:?}", path);
@@ -161,7 +168,7 @@ impl FilesystemTool {
 
         let mut options = fs::OpenOptions::new();
         options.write(true);
-        
+
         if req.create_only {
             options.create_new(true);
         } else if req.append {
@@ -171,7 +178,8 @@ impl FilesystemTool {
         }
 
         let mut file = options.open(path).map_err(|e| Self::map_io_error(&e))?;
-        file.write_all(&req.content).map_err(|e| Self::map_io_error(&e))?;
+        file.write_all(&req.content)
+            .map_err(|e| Self::map_io_error(&e))?;
         file.flush().map_err(|e| Self::map_io_error(&e))?;
 
         Ok(())
@@ -181,13 +189,14 @@ impl FilesystemTool {
     ///
     /// # Errors
     ///
-    /// Returns a `ToolError` if the file cannot be read/written, if the old content
-    /// is not found, or if multiple matches are found.
+    /// Returns a `ToolError` if the file cannot be read/written, if the old
+    /// content is not found, or if multiple matches are found.
     pub fn edit(&self, req: &FileEdit) -> Result<(), ToolError> {
         let path = self.resolve_path(&req.path)?;
         info!("Editing file: {:?}", path);
 
-        // Read entire file (enforce limit via validation/policy, here we assume it fits in memory)
+        // Read entire file (enforce limit via validation/policy, here we assume it fits
+        // in memory)
         let content = fs::read_to_string(&path).map_err(|e| Self::map_io_error(&e))?;
 
         match content.match_indices(&req.old_content).count() {
@@ -215,68 +224,99 @@ impl FilesystemTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
 
+    use super::*;
+
     #[test]
+
     fn test_file_read_write() {
         let temp_dir = TempDir::new().unwrap();
+
         let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
 
         let write_req = FileWrite {
             path: "test.txt".to_string(),
+
             content: b"Hello".to_vec(),
+
             create_only: false,
+
             append: false,
         };
+
         tool.write(&write_req).unwrap();
 
         let read_req = FileRead {
             path: "test.txt".to_string(),
+
             offset: 0,
+
             limit: 0,
         };
+
         let content = tool.read(&read_req).unwrap();
+
         assert_eq!(content, b"Hello");
     }
 
     #[test]
+
     fn test_file_edit() {
         let temp_dir = TempDir::new().unwrap();
+
         let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
 
         tool.write(&FileWrite {
             path: "code.rs".to_string(),
+
             content: b"fn main() { println!(\"Hello\"); }".to_vec(),
+
             create_only: false,
+
             append: false,
-        }).unwrap();
+        })
+        .unwrap();
 
         tool.edit(&FileEdit {
             path: "code.rs".to_string(),
-            old_content: "println!(\"Hello\")".to_string(),
-            new_content: "println!(\"World\")".to_string(),
-        }).unwrap();
 
-        let content = tool.read(&FileRead {
-            path: "code.rs".to_string(),
-            offset: 0,
-            limit: 0,
-        }).unwrap();
+            old_content: "println!(\"Hello\")".to_string(),
+
+            new_content: "println!(\"World\")".to_string(),
+        })
+        .unwrap();
+
+        let content = tool
+            .read(&FileRead {
+                path: "code.rs".to_string(),
+
+                offset: 0,
+
+                limit: 0,
+            })
+            .unwrap();
+
         assert_eq!(content, b"fn main() { println!(\"World\"); }");
     }
 
     #[test]
+
     fn test_path_traversal_blocked() {
         let temp_dir = TempDir::new().unwrap();
+
         let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
 
-        let err = tool.read(&FileRead {
-            path: "../outside.txt".to_string(),
-            offset: 0,
-            limit: 0,
-        }).unwrap_err();
-        
+        let err = tool
+            .read(&FileRead {
+                path: "../outside.txt".to_string(),
+
+                offset: 0,
+
+                limit: 0,
+            })
+            .unwrap_err();
+
         assert_eq!(err.error_code, "PATH_TRAVERSAL");
     }
 }
