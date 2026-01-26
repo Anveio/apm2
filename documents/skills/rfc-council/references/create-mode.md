@@ -33,12 +33,13 @@ decision_tree:
 
         - id: PHASE_2_DISCOVERY_COUNCIL
           action: |
-            Invoke COUNCIL_PROTOCOL with specialized SA roles for v0:
+            Invoke COUNCIL_PROTOCOL with lifecycle-adaptive SA roles for v0:
             - SA-1: Focus on mapping PRD requirements to potential architecture.
             - SA-2: Identify implementability risks and missing codebase knowledge.
             - SA-3: Identify trust boundary gaps and security unknowns.
 
-            Constraint: Each SA selects 3 RANDOM reasoning modes + 5 specialized modes.
+            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
+            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
 
         - id: PHASE_4_SELF_REVIEW
           action: |
