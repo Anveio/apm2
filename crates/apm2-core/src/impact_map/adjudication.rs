@@ -266,6 +266,7 @@ fn classify_as_net_new(mapping: &MappedRequirement) -> Option<NetNewClassificati
     None
 }
 
+/// Test utilities for the adjudication module.
 #[cfg(test)]
 pub mod tests {
     use super::super::mapper::{CandidateComponent, FitScore, MappedRequirement};

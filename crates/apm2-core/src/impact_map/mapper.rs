@@ -820,6 +820,7 @@ pub fn load_components_from_ccp(
     Ok(components)
 }
 
+/// Test utilities for the requirement mapper module.
 #[cfg(test)]
 pub mod tests {
     use tempfile::TempDir;
@@ -827,6 +828,10 @@ pub mod tests {
     use super::*;
 
     /// Creates a test requirements directory with sample files.
+    ///
+    /// # Panics
+    ///
+    /// Panics if directory creation or file writes fail.
     pub fn create_test_requirements(root: &Path) {
         let req_dir = root.join("documents/prds/PRD-TEST/requirements");
         fs::create_dir_all(&req_dir).unwrap();
@@ -873,6 +878,10 @@ pub mod tests {
     }
 
     /// Creates a test CCP component atlas.
+    ///
+    /// # Panics
+    ///
+    /// Panics if directory creation or file writes fail.
     pub fn create_test_ccp_atlas(root: &Path) {
         let ccp_dir = root.join("evidence/prd/PRD-TEST/ccp");
         fs::create_dir_all(&ccp_dir).unwrap();
@@ -992,11 +1001,11 @@ pub mod tests {
     fn test_jaccard_similarity() {
         let set1: HashSet<String> = ["hello", "world", "test"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         let set2: HashSet<String> = ["hello", "world", "foo"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
 
         let sim = jaccard_similarity(&set1, &set2);
@@ -1007,8 +1016,8 @@ pub mod tests {
 
         // Test empty sets
         let empty: HashSet<String> = HashSet::new();
-        assert_eq!(jaccard_similarity(&empty, &set1), 0.0);
-        assert_eq!(jaccard_similarity(&set1, &empty), 0.0);
+        assert!((jaccard_similarity(&empty, &set1) - 0.0).abs() < f64::EPSILON);
+        assert!((jaccard_similarity(&set1, &empty) - 0.0).abs() < f64::EPSILON);
     }
 
     /// Test word extraction.
@@ -1025,14 +1034,14 @@ pub mod tests {
         assert!(!words.contains("a"));
     }
 
-    /// Test FitScore ordering.
+    /// Test `FitScore` ordering.
     #[test]
     fn test_fit_score_ordering() {
         assert!(FitScore::High.value() > FitScore::Medium.value());
         assert!(FitScore::Medium.value() > FitScore::Low.value());
     }
 
-    /// Test FitScore from similarity.
+    /// Test `FitScore` from similarity.
     #[test]
     fn test_fit_score_from_similarity() {
         assert_eq!(FitScore::from_similarity(0.7, false), Some(FitScore::High));
