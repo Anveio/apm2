@@ -177,11 +177,33 @@ impl Default for TicketValidationResult {
     }
 }
 
+/// Validates a PRD ID against the strict project pattern.
+///
+/// PRD IDs must match the pattern `PRD-NNNN` (where N is a digit, minimum 4
+/// digits). This prevents path traversal attacks (e.g., `PRD-../../../etc`).
+fn validate_prd_id(prd_id: &str) -> Result<(), TicketValidationError> {
+    // Strict pattern: PRD- followed by at least 4 digits
+    let is_valid = prd_id.len() >= 8
+        && prd_id.starts_with("PRD-")
+        && prd_id[4..].chars().all(|c| c.is_ascii_digit())
+        && prd_id.len() <= 12; // Reasonable upper bound: PRD-99999999
+
+    if !is_valid {
+        return Err(TicketValidationError::CcpIndexParseError {
+            reason: format!("PRD ID must match pattern PRD-NNNN (e.g., PRD-0001), got: {prd_id}"),
+        });
+    }
+    Ok(())
+}
+
 /// Loads the CCP file inventory.
 fn load_ccp_inventory(
     repo_root: &Path,
     prd_id: &str,
 ) -> Result<HashSet<String>, TicketValidationError> {
+    // Validate PRD ID to prevent path traversal
+    validate_prd_id(prd_id)?;
+
     let ccp_index_path = repo_root
         .join("evidence")
         .join("prd")
@@ -446,7 +468,7 @@ mod tests {
 
     /// Creates test CCP index.
     fn create_test_ccp_index(root: &Path) {
-        let ccp_dir = root.join("evidence/prd/PRD-TEST/ccp");
+        let ccp_dir = root.join("evidence/prd/PRD-0001/ccp");
         fs::create_dir_all(&ccp_dir).unwrap();
 
         fs::write(
@@ -480,7 +502,7 @@ mod tests {
             vec![],
         )];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(result.is_valid(), "Should validate existing file");
         assert_eq!(result.validated_existing.len(), 1);
@@ -499,7 +521,7 @@ mod tests {
             vec![],
         )];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(!result.is_valid(), "Should fail for missing file");
         assert!(matches!(
@@ -522,7 +544,7 @@ mod tests {
             vec!["crates/apm2-core/src/lib.rs".to_string()],
         )];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(!result.is_valid(), "Should fail for existing file");
         assert!(matches!(
@@ -544,7 +566,7 @@ mod tests {
             vec!["crates/apm2-core/src/ticket_emitter/mod.rs".to_string()],
         )];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(result.is_valid(), "Should validate new file path");
         assert_eq!(result.validated_new.len(), 1);
@@ -559,7 +581,7 @@ mod tests {
 
         let tickets = vec![("TCK-00001", vec!["../../../etc/passwd".to_string()], vec![])];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(!result.is_valid());
         assert!(matches!(
@@ -577,7 +599,7 @@ mod tests {
 
         let tickets = vec![("TCK-00001", vec!["/etc/passwd".to_string()], vec![])];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(!result.is_valid());
         assert!(matches!(
@@ -596,7 +618,7 @@ mod tests {
 
         let tickets = vec![("TCK-00001", vec![], vec!["/tmp/malicious.rs".to_string()])];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(!result.is_valid());
         assert!(matches!(
@@ -626,7 +648,7 @@ mod tests {
             ),
         ];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(result.is_valid());
         assert_eq!(result.validated_existing.len(), 2);
@@ -671,7 +693,7 @@ mod tests {
             vec![],
         )];
 
-        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets).unwrap();
 
         assert!(!result.is_valid());
         assert_eq!(result.errors.len(), 2);
@@ -704,5 +726,72 @@ mod tests {
 
         assert_eq!(result1.validated_existing.len(), 1);
         assert_eq!(result1.validated_new.len(), 1);
+    }
+
+    /// Test PRD ID validation rejects path traversal.
+    ///
+    /// This prevents an attacker from reading arbitrary `ccp_index.json` files
+    /// via malicious PRD IDs like `PRD-../../../etc`.
+    #[test]
+    fn test_prd_id_validation_rejects_traversal() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let tickets = vec![("TCK-00001", vec!["some/file.rs".to_string()], vec![])];
+
+        // Path traversal attempt
+        let result = validate_ticket_paths(root, Some("PRD-../../../etc"), &tickets);
+        assert!(result.is_err(), "Should reject PRD ID with path traversal");
+        assert!(
+            matches!(result, Err(TicketValidationError::CcpIndexParseError { reason }) if reason.contains("PRD ID must match pattern")),
+            "Error should indicate invalid PRD ID pattern"
+        );
+
+        // Shell injection
+        let result = validate_ticket_paths(root, Some("PRD-0001;ls"), &tickets);
+        assert!(
+            result.is_err(),
+            "Should reject PRD ID with shell metacharacter"
+        );
+
+        // Too few digits
+        let result = validate_ticket_paths(root, Some("PRD-001"), &tickets);
+        assert!(
+            result.is_err(),
+            "Should reject PRD ID with fewer than 4 digits"
+        );
+
+        // Invalid format (letters)
+        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets);
+        assert!(result.is_err(), "Should reject PRD ID with letters");
+    }
+
+    /// Test that valid PRD IDs are accepted (though CCP may not exist).
+    #[test]
+    fn test_prd_id_validation_accepts_valid() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let tickets = vec![("TCK-00001", vec![], vec!["new/file.rs".to_string()])];
+
+        // Valid PRD ID - should not fail on ID validation
+        // (may fail on CCP not found, but that's a different error)
+        let result = validate_ticket_paths(root, Some("PRD-0001"), &tickets);
+        // If it fails, it should be CcpIndexNotFound, not a parse error
+        if let Err(e) = &result {
+            assert!(
+                matches!(e, TicketValidationError::CcpIndexNotFound { .. }),
+                "Valid PRD ID should not cause parse error, got: {e:?}"
+            );
+        }
+
+        // Valid PRD ID with more digits
+        let result = validate_ticket_paths(root, Some("PRD-99999999"), &tickets);
+        if let Err(e) = &result {
+            assert!(
+                matches!(e, TicketValidationError::CcpIndexNotFound { .. }),
+                "Valid PRD ID should not cause parse error, got: {e:?}"
+            );
+        }
     }
 }

@@ -250,12 +250,27 @@ pub struct TicketEmitResult {
     pub warnings: Vec<String>,
 }
 
-/// Validates an RFC ID for path traversal attacks.
+/// Validates an RFC ID against the strict project pattern.
+///
+/// RFC IDs must match the pattern `RFC-NNNN` (where N is a digit, minimum 4
+/// digits). This prevents:
+/// - Path traversal attacks (e.g., `RFC-../../../etc`)
+/// - Shell injection (e.g., `RFC-0010;ls`, `RFC-0010|evil`)
+///
+/// # Errors
+///
+/// Returns `TicketEmitError::PathTraversalError` if the ID is invalid.
 fn validate_rfc_id(id: &str) -> Result<(), TicketEmitError> {
-    if id.contains('/') || id.contains('\\') || id.contains("..") {
+    // Strict pattern: RFC- followed by at least 4 digits
+    let is_valid = id.len() >= 8
+        && id.starts_with("RFC-")
+        && id[4..].chars().all(|c| c.is_ascii_digit())
+        && id.len() <= 12; // Reasonable upper bound: RFC-99999999
+
+    if !is_valid {
         return Err(TicketEmitError::PathTraversalError {
             path: id.to_string(),
-            reason: "RFC ID contains invalid characters".to_string(),
+            reason: "RFC ID must match pattern RFC-NNNN (e.g., RFC-0010)".to_string(),
         });
     }
     Ok(())
@@ -814,8 +829,7 @@ pub fn emit_tickets(
     // Parse tickets from decomposition
     let mut tickets = parse_tickets_from_decomposition(&decomposition, rfc_id, &existing_ids)?;
 
-    // Path validation (optional but recommended)
-    let mut warnings = Vec::new();
+    // Path validation (required unless explicitly skipped)
     if !options.skip_validation {
         debug!("Validating ticket paths");
 
@@ -834,14 +848,14 @@ pub fn emit_tickets(
             validate_ticket_paths(repo_root, options.prd_id.as_deref(), &validation_input)?;
 
         if !validation_result.is_valid() {
-            // Convert to warnings in non-strict mode, or fail
-            for error in &validation_result.errors {
-                warnings.push(format!("Path validation warning: {error}"));
-            }
+            // Fail-closed: return error if any validation errors
+            // SEC-EMITTER-002: Never allow invalid paths through
+            let error_count = validation_result.errors.len();
             warn!(
-                warning_count = warnings.len(),
-                "Path validation produced warnings"
+                error_count = error_count,
+                "Path validation failed - aborting emission"
             );
+            return Err(validation_result.into_result().unwrap_err().into());
         }
     }
 
@@ -886,7 +900,7 @@ pub fn emit_tickets(
         rfc_id: rfc_id.to_string(),
         output_dir,
         dry_run: options.dry_run,
-        warnings,
+        warnings: Vec::new(), // No warnings - we now fail-closed on validation errors
     })
 }
 
@@ -900,7 +914,7 @@ mod tests {
 
     /// Creates test RFC with ticket decomposition.
     fn create_test_rfc(root: &Path) {
-        let rfc_dir = root.join("documents/rfcs/RFC-TEST");
+        let rfc_dir = root.join("documents/rfcs/RFC-0000");
         fs::create_dir_all(&rfc_dir).unwrap();
 
         fs::write(
@@ -971,7 +985,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -997,7 +1011,7 @@ mod tests {
         // First run
         let result1 = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1009,7 +1023,7 @@ mod tests {
         // Second run (should produce identical IDs)
         let result2 = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1032,7 +1046,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1069,7 +1083,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1105,22 +1119,68 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
-        let result = emit_tickets(root, "RFC-NONEXISTENT", &TicketEmitOptions::default());
+        let result = emit_tickets(root, "RFC-0099", &TicketEmitOptions::default());
 
         assert!(matches!(result, Err(TicketEmitError::RfcNotFound { .. })));
     }
 
-    /// Test RFC ID validation rejects traversal.
+    /// Test RFC ID validation rejects traversal and shell injection.
+    ///
+    /// SEC-EMITTER-002: Strict validation for RFC IDs prevents:
+    /// - Path traversal attacks (e.g., `RFC-../../../etc`)
+    /// - Shell injection (e.g., `RFC-0010;ls`, `RFC-0010|evil`)
     #[test]
     fn test_rfc_id_validation() {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
+        // Path traversal
         let result = emit_tickets(root, "RFC-../../../etc", &TicketEmitOptions::default());
         assert!(matches!(
             result,
             Err(TicketEmitError::PathTraversalError { .. })
         ));
+
+        // Shell injection - semicolon
+        let result = emit_tickets(root, "RFC-0010;ls", &TicketEmitOptions::default());
+        assert!(
+            matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should reject RFC ID with semicolon (shell injection)"
+        );
+
+        // Shell injection - pipe
+        let result = emit_tickets(root, "RFC-0010|evil", &TicketEmitOptions::default());
+        assert!(
+            matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should reject RFC ID with pipe (shell injection)"
+        );
+
+        // Shell injection - ampersand
+        let result = emit_tickets(root, "RFC-0010&evil", &TicketEmitOptions::default());
+        assert!(
+            matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should reject RFC ID with ampersand (shell injection)"
+        );
+
+        // Too few digits
+        let result = emit_tickets(root, "RFC-001", &TicketEmitOptions::default());
+        assert!(
+            matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should reject RFC ID with fewer than 4 digits"
+        );
+
+        // Valid RFC IDs (should fail for other reasons, not ID validation)
+        let result = emit_tickets(root, "RFC-0010", &TicketEmitOptions::default());
+        assert!(
+            !matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should accept valid RFC ID RFC-0010"
+        );
+
+        let result = emit_tickets(root, "RFC-99999999", &TicketEmitOptions::default());
+        assert!(
+            !matches!(result, Err(TicketEmitError::PathTraversalError { .. })),
+            "Should accept valid RFC ID with more digits"
+        );
     }
 
     /// Test ticket ID validation rejects path traversal and shell injection.
@@ -1176,8 +1236,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
-        // Create RFC with malicious ticket ID
-        let rfc_dir = root.join("documents/rfcs/RFC-MALICIOUS");
+        // Create RFC with malicious ticket ID (using valid RFC ID)
+        let rfc_dir = root.join("documents/rfcs/RFC-9999");
         fs::create_dir_all(&rfc_dir).unwrap();
 
         fs::write(
@@ -1197,7 +1257,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-MALICIOUS",
+            "RFC-9999",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1221,7 +1281,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1248,7 +1308,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: false,
                 skip_validation: true,
@@ -1287,7 +1347,7 @@ mod tests {
 
         let result = emit_tickets(
             root,
-            "RFC-TEST",
+            "RFC-0000",
             &TicketEmitOptions {
                 dry_run: true,
                 skip_validation: true,
@@ -1301,6 +1361,59 @@ mod tests {
         assert!(
             second_ticket.depends_on.contains(&"TCK-00001".to_string()),
             "Second ticket should depend on first"
+        );
+    }
+
+    /// SEC-EMITTER-002: Test fail-closed validation.
+    ///
+    /// When path validation fails, `emit_tickets` must return an error,
+    /// not just log warnings and continue.
+    #[test]
+    fn test_fail_closed_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create RFC with valid structure but invalid file paths
+        let rfc_dir = root.join("documents/rfcs/RFC-8888");
+        fs::create_dir_all(&rfc_dir).unwrap();
+
+        fs::write(
+            rfc_dir.join("06_ticket_decomposition.yaml"),
+            r#"rfc_ticket_decomposition:
+  tickets:
+    - ticket_id: TCK-00001
+      title: "Ticket with invalid path"
+      description: "References a file that does not exist"
+      files_to_modify:
+        - crates/nonexistent/file_that_does_not_exist.rs
+      files_to_create: []
+"#,
+        )
+        .unwrap();
+
+        // Create tickets directory but NOT the file referenced
+        let tickets_dir = root.join("documents/work/tickets");
+        fs::create_dir_all(&tickets_dir).unwrap();
+
+        // Without skip_validation, this should fail because the file doesn't exist
+        let result = emit_tickets(
+            root,
+            "RFC-8888",
+            &TicketEmitOptions {
+                dry_run: true,
+                skip_validation: false, // Enable validation
+                ..Default::default()
+            },
+        );
+
+        // Must be an error, not a success with warnings
+        assert!(
+            result.is_err(),
+            "emit_tickets must return Err when validation fails (fail-closed)"
+        );
+        assert!(
+            matches!(result, Err(TicketEmitError::PathValidation(_))),
+            "Error should be PathValidation, got: {result:?}"
         );
     }
 }
