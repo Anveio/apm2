@@ -11,17 +11,11 @@
     -   *Internal State is ephemeral and opaque.*
 -   **Autonomy:** Operates within a bounded context (`EpisodeContext`) and resource limits (`Budget`).
 
-## Codebase Implementation
+## Data Structure References
 
--   **`apm2-holon` Crate:**
-    -   Defines the `Holon` trait which all agents must implement.
-    -   Provides `EpisodeContext` to scope execution (prevent infinite loops).
-    -   Defines `WorkLifecycle` (Pending -> InProgress -> Verified).
--   **`apm2-daemon`:**
-    -   Acts as the "Kernel Holon" or Supervisor.
-    -   Manages the event ledger and enforces budgets on child holons (CLI processes).
--   **Adapters:**
-    -   External agents (Claude Code, Gemini CLI) are wrapped in `Adapter` structs that normalize their I/O into the Holonic protocol.
+-   **`Holon`** (`crates/apm2-holon/src/traits.rs`): The core trait defining the contract for agents (`intake`, `execute_episode`, `should_stop`).
+-   **`HolonError`** (`crates/apm2-holon/src/error.rs`): The error type for holonic operations (e.g., `InvalidLease`, `BudgetExhausted`).
+-   **`EpisodeContext`** (`crates/apm2-holon/src/context.rs`): The bounded context provided to a holon during execution.
 
 ## SDLC Interaction
 
