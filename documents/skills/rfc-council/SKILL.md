@@ -1,8 +1,7 @@
 ---
 name: rfc-council
 description: Unified skill for RFC creation and ticket quality review with multi-agent council deliberation and anti-cousin enforcement.
-argument-hint: "[create | review] [PRD-XXXX | RFC-XXXX]"
-user-invocable: true
+argument-hint: "[create | review | refine] [PRD-XXXX | RFC-XXXX]"
 holon:
   # ============================================================================
   # Contract Definition
@@ -18,7 +17,8 @@ holon:
   stop_conditions:
     # Maximum episodes: RFC work involves multiple phases
     #   - CREATE mode: RFC generation + ticket decomposition ~ 15-20 episodes
-    #   - REVIEW mode: Consolidated review + remediation ~ 20-25 episodes
+    #   - REVIEW mode: 3 review cycles with 7 gates ~ 10-15 episodes
+    #   - REFINE mode: Review + remediation ~ 15-20 episodes
     max_episodes: 25
 
     # Timeout: 30 minutes for complete RFC operations
@@ -63,13 +63,15 @@ variables:
   MODE_OPTIONAL: "$1"
   TARGET_ID: "$2"
 
-references[9]:
+references[7]:
   - path: references/rfc-council-workflow.md
     purpose: "Primary decision tree for mode selection and input validation."
   - path: references/create-mode.md
     purpose: "Logic for generating RFC and tickets from PRD."
   - path: references/review-mode.md
-    purpose: "Logic for formal ticket review and depth computation (includes refinement)."
+    purpose: "Logic for formal ticket review and depth computation."
+  - path: references/refine-mode.md
+    purpose: "Logic for iterative review and remediation."
   - path: references/REVIEW_RUBRIC.md
     purpose: "Formal gate definitions and evidence contracts."
   - path: references/FINDING_CATEGORIES.md
@@ -78,10 +80,6 @@ references[9]:
     purpose: "Multi-agent deliberation protocol for COUNCIL reviews."
   - path: references/commands.md
     purpose: "CLI command reference."
-  - path: ../agent-native-software/SKILL.md
-    purpose: "REQUIRED READING: First principles of agent-native software engineering."
-  - path: ../../security/AGENTS.md
-    purpose: "REQUIRED READING: Security policy, threat models, and incident response."
 
 decision_tree:
   entrypoint: WORKFLOW
@@ -89,78 +87,6 @@ decision_tree:
     - id: WORKFLOW
       action: invoke_reference
       reference: references/rfc-council-workflow.md
-
-# RFC Council Skill
-
-Orchestrates RFC creation and ticket quality review with multi-agent council deliberation and
-anti-cousin enforcement.
-
-## Prerequisites
-
-1. **CCP Required**: Codebase Context Pack must exist at `evidence/prd/{PRD_ID}/ccp/` (CREATE)
-   or be referenced by RFC (REVIEW)
-2. **Input**: PRD-XXXX (CREATE) or RFC-XXXX (REVIEW) must exist
-3. **Required Reading**: Load `agent-native-software` skill and `AGENTS.md` security policy
-
-## Modes
-
-| Mode | Input | Output | Purpose |
-|------|-------|--------|---------|
-| CREATE | PRD-XXXX | RFC + Tickets | Generate RFC and tickets from PRD |
-| REVIEW | RFC-XXXX | Findings Bundle + Remediation | Formal gate review with iterative refinement |
-
-## Gate Structure
-
-| Gate | Type | Purpose |
-|------|------|---------|
-| GATE-TCK-SCHEMA | TRUSTED | YAML parsing |
-| GATE-TCK-DEPENDENCY-ACYCLICITY | DETERMINISTIC | No cycles |
-| GATE-TCK-SCOPE-COVERAGE | DETERMINISTIC | Requirements covered |
-| GATE-TCK-CCP-MAPPING | DETERMINISTIC | Files exist in CCP |
-| GATE-TCK-ATOMICITY | LLM-ASSISTED | Single-PR completable |
-| GATE-TCK-IMPLEMENTABILITY | LLM-ASSISTED | Agent can implement |
-| GATE-TCK-ANTI-COUSIN | LLM-ASSISTED | No cousin abstractions |
-
-## Council Subagents
-
-| Agent | Role | Focus |
-|-------|------|-------|
-| SA-1 | Structural Rigorist | Dependencies, type safety |
-| SA-2 | Implementation Feasibility | Execution planning |
-| SA-3 | Anti-Cousin Guardian | CCP alignment, reuse |
-
-## Review Cycles
-
-1. **CYCLE_1 (STRUCTURAL)**: Schema, dependencies, coverage, CCP mapping
-2. **CYCLE_2 (FEASIBILITY)**: Atomicity, implementability, anti-cousin
-3. **CYCLE_3 (CONVERGE)**: 2/3 quorum vote on contested findings
-
-## Holon Configuration
-
-### Stop Conditions
-
-| Condition | Value | Rationale |
-|-----------|-------|-----------|
-| max_episodes | 25 | Multi-phase RFC work |
-| timeout_ms | 1,800,000 | 30 minutes |
-| budget.tokens | 500,000 | Token limit |
-| budget.tool_calls | 500 | Tool limit |
-| max_stall_episodes | 5 | Stall detection |
-
-### Tool Permissions
-
-- `Read` - Read RFCs, tickets, CCP, codebase
-- `Write` - Create RFC/ticket files
-- `Edit` - Modify during review
-- `Glob` - Find files
-- `Grep` - Search contents
-- `Bash` - Git operations
-- `Task` - Spawn subagents
-
-PRD-0005 Alignment
-
-The ## Prerequisites section documents CCP as mandatory input, aligning with PRD-0005's core
-requirement. The ## Gate Structure includes GATE-TCK-CCP-MAPPING for anti-cousin enforcement.
 
 ## Verdict Rules
 

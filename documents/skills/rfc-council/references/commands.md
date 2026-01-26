@@ -1,18 +1,21 @@
 # RFC Council Commands
 
-commands[4]:
+commands[5]:
   - name: create
     command: "/rfc-council create PRD-XXXX"
     purpose: "Generate RFC and tickets from PRD."
   - name: review
     command: "/rfc-council review RFC-XXXX"
-    purpose: "Consolidated review and refinement. Checks for existing evidence, runs gates, remediates MAJOR findings, and emits a new evidence bundle."
+    purpose: "Review RFC tickets and emit findings (no edits)."
   - name: review-council
     command: "/rfc-council review RFC-XXXX --council"
-    purpose: "Run full council review with 3 subagents (includes refinement)."
+    purpose: "Run full council review with 3 subagents."
+  - name: refine
+    command: "/rfc-council refine RFC-XXXX"
+    purpose: "Review and iteratively improve RFC tickets."
   - name: implicit-review
     command: "/rfc-council RFC-XXXX"
-    purpose: "Runs the consolidated review mode for the given RFC."
+    purpose: "Select mode interactively for the given RFC."
 
 ---
 
@@ -32,25 +35,41 @@ commands[4]:
 # 5. Commit and push
 ```
 
-### Consolidated Review & Refinement
+### Standard Review
 
 ```bash
-# Review and iteratively improve RFC-0009 tickets
+# Review RFC-0009 tickets (single agent, all 7 gates)
 /rfc-council review RFC-0009
 
-# This will:
-# 1. Check for pre-existing evidence bundles at evidence/rfc/RFC-0009/reviews/
-# 2. Run all 7 gates
-# 3. Apply remediations for BLOCKER/MAJOR findings
-# 4. Re-run gates to verify fixes
-# 5. Emit a NEW evidence bundle at evidence/rfc/RFC-0009/reviews/rfc_review_{timestamp}.yaml
+# Output:
+# - Findings bundle at evidence/rfc/RFC-0009/reviews/rfc_review_{timestamp}.yaml
+# - Verdict: APPROVED | APPROVED_WITH_REMEDIATION | REJECTED
 ```
 
 ### Council Review
 
 ```bash
-# Full council review with 3 subagents and refinement
+# Full council review with 3 subagents
 /rfc-council review RFC-0009 --council
+
+# This will:
+# 1. Spawn 3 specialized subagents
+# 2. Execute 3 review cycles
+# 3. Vote on contested findings
+# 4. Produce consensus verdict
+```
+
+### Refine Mode
+
+```bash
+# Review and fix issues
+/rfc-council refine RFC-0009
+
+# This will:
+# 1. Run review gates
+# 2. Apply remediations for MAJOR/MINOR findings
+# 3. Re-run gates to verify fixes
+# 4. Commit improvements
 ```
 
 ---
@@ -71,6 +90,7 @@ commands[4]:
 |------|-------------|
 | create | `documents/rfcs/RFC-XXXX/`, `documents/work/tickets/TCK-*.yaml` |
 | review | `evidence/rfc/RFC-XXXX/reviews/rfc_review_{timestamp}.yaml` |
+| refine | Same as review + modified ticket files |
 
 ---
 
