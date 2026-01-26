@@ -49,12 +49,30 @@
 //! - [INV-EXIT002] Invalid exit signals never modify work state.
 //! - [INV-EXIT003] Feature flag is cached on first access.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+// ============================================================================
+// Validation Constants
+// ============================================================================
+
+/// Maximum length for URL and path fields (2KB).
+/// Prevents memory exhaustion from oversized payloads.
+const MAX_URL_PATH_LENGTH: usize = 2 * 1024;
+
+/// Maximum length for notes field (10KB).
+/// Allows for detailed notes while preventing memory exhaustion attacks.
+const MAX_NOTES_LENGTH: usize = 10 * 1024;
+
+/// Regex for validating semver 1.x.y version strings.
+/// Compiled once at first use to avoid repeated compilation.
+static VERSION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^1\.\d+\.\d+$").expect("version regex is valid"));
 
 // ============================================================================
 // Work Phase (for exit signal)
@@ -206,7 +224,7 @@ pub enum ExitSignalError {
     UnknownProtocol(String),
 
     /// Version is not compatible with 1.x.
-    #[error("unsupported version: expected '1.x', got '{0}'")]
+    #[error("unsupported version: expected '1.x.y' format, got '{0}'")]
     UnsupportedVersion(String),
 
     /// Work phase is not valid.
@@ -220,6 +238,24 @@ pub enum ExitSignalError {
     /// Exit signal validation is disabled.
     #[error("exit signal validation is disabled (AGENT_EXIT_PROTOCOL_ENABLED=false)")]
     ValidationDisabled,
+
+    /// String field exceeds maximum allowed length.
+    #[error("{field} exceeds maximum length: {actual} bytes > {max} bytes")]
+    FieldTooLong {
+        /// Name of the field that exceeded the limit.
+        field: String,
+        /// Actual length of the field.
+        actual: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Path contains traversal characters or is absolute.
+    #[error("path traversal detected in {field}: paths cannot contain '..' or start with '/'")]
+    PathTraversal {
+        /// Name of the field containing the invalid path.
+        field: String,
+    },
 }
 
 // ============================================================================
@@ -325,22 +361,69 @@ impl ExitSignal {
     /// # Contracts
     ///
     /// - [CTR-EXIT002] Protocol field must be `apm2_agent_exit`.
-    /// - [CTR-EXIT003] Version must be semver-compatible with 1.x.
+    /// - [CTR-EXIT003] Version must be semver-compatible with 1.x (format:
+    ///   1.MINOR.PATCH).
+    /// - [CTR-EXIT006] String fields must not exceed length limits (memory
+    ///   exhaustion prevention).
+    /// - [CTR-EXIT007] Path fields must not contain traversal sequences.
     ///
     /// # Errors
     ///
     /// Returns `ExitSignalError::UnknownProtocol` if the protocol is wrong.
     /// Returns `ExitSignalError::UnsupportedVersion` if the version is
-    /// incompatible.
+    /// incompatible or malformed.
+    /// Returns `ExitSignalError::FieldTooLong` if a string field exceeds
+    /// limits. Returns `ExitSignalError::PathTraversal` if a path contains
+    /// `..` or starts with `/`.
     pub fn validate(&self) -> Result<(), ExitSignalError> {
         // [CTR-EXIT002] Validate protocol
         if self.protocol != EXIT_SIGNAL_PROTOCOL {
             return Err(ExitSignalError::UnknownProtocol(self.protocol.clone()));
         }
 
-        // [CTR-EXIT003] Validate version (must be 1.x)
-        if !self.version.starts_with("1.") {
+        // [CTR-EXIT003] Validate version (must be 1.x.y format)
+        // Use strict regex to prevent malformed versions like "1.", "1.bad",
+        // "1.99.99.extra"
+        if !VERSION_REGEX.is_match(&self.version) {
             return Err(ExitSignalError::UnsupportedVersion(self.version.clone()));
+        }
+
+        // [CTR-EXIT006] Validate string field lengths (DoS prevention)
+        if let Some(ref pr_url) = self.pr_url {
+            if pr_url.len() > MAX_URL_PATH_LENGTH {
+                return Err(ExitSignalError::FieldTooLong {
+                    field: "pr_url".to_string(),
+                    actual: pr_url.len(),
+                    max: MAX_URL_PATH_LENGTH,
+                });
+            }
+        }
+
+        if let Some(ref evidence_ref) = self.evidence_bundle_ref {
+            if evidence_ref.len() > MAX_URL_PATH_LENGTH {
+                return Err(ExitSignalError::FieldTooLong {
+                    field: "evidence_bundle_ref".to_string(),
+                    actual: evidence_ref.len(),
+                    max: MAX_URL_PATH_LENGTH,
+                });
+            }
+
+            // [CTR-EXIT007] Validate path does not contain traversal sequences
+            if evidence_ref.contains("..") || evidence_ref.starts_with('/') {
+                return Err(ExitSignalError::PathTraversal {
+                    field: "evidence_bundle_ref".to_string(),
+                });
+            }
+        }
+
+        if let Some(ref notes) = self.notes {
+            if notes.len() > MAX_NOTES_LENGTH {
+                return Err(ExitSignalError::FieldTooLong {
+                    field: "notes".to_string(),
+                    actual: notes.len(),
+                    max: MAX_NOTES_LENGTH,
+                });
+            }
         }
 
         Ok(())
@@ -938,6 +1021,153 @@ mod tests {
         fn test_exit_signal_next_expected_phase_error() {
             let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Error);
             assert_eq!(signal.next_expected_phase(), WorkPhase::Blocked);
+        }
+
+        // ====================================================================
+        // Security validation tests (TCK-00088)
+        // ====================================================================
+
+        #[test]
+        fn test_exit_signal_validate_huge_input() {
+            // Test pr_url exceeds 2KB limit
+            let huge_pr_url = "https://github.com/".to_string() + &"x".repeat(3000);
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url(&huge_pr_url);
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::FieldTooLong { field, max, .. })
+                if field == "pr_url" && max == 2 * 1024
+            ));
+
+            // Test evidence_bundle_ref exceeds 2KB limit
+            let huge_evidence_ref = "evidence/".to_string() + &"x".repeat(3000);
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_evidence_bundle_ref(&huge_evidence_ref);
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::FieldTooLong { field, max, .. })
+                if field == "evidence_bundle_ref" && max == 2 * 1024
+            ));
+
+            // Test notes exceeds 10KB limit
+            let huge_notes = "x".repeat(11 * 1024);
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_notes(&huge_notes);
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::FieldTooLong { field, max, .. })
+                if field == "notes" && max == 10 * 1024
+            ));
+
+            // Test that values at the limit are accepted
+            let max_url = "https://".to_string() + &"x".repeat(2 * 1024 - 8);
+            assert_eq!(max_url.len(), 2 * 1024);
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_pr_url(&max_url);
+            assert!(signal.validate().is_ok());
+
+            let max_notes = "x".repeat(10 * 1024);
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_notes(&max_notes);
+            assert!(signal.validate().is_ok());
+        }
+
+        #[test]
+        fn test_exit_signal_validate_version_strict() {
+            let mut signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed);
+
+            // Valid versions
+            signal.version = "1.0.0".to_string();
+            assert!(signal.validate().is_ok());
+
+            signal.version = "1.1.0".to_string();
+            assert!(signal.validate().is_ok());
+
+            signal.version = "1.99.99".to_string();
+            assert!(signal.validate().is_ok());
+
+            // Invalid versions that would have passed with starts_with("1.")
+            signal.version = "1.".to_string();
+            assert!(matches!(
+                signal.validate(),
+                Err(ExitSignalError::UnsupportedVersion(v)) if v == "1."
+            ));
+
+            signal.version = "1.bad".to_string();
+            assert!(matches!(
+                signal.validate(),
+                Err(ExitSignalError::UnsupportedVersion(v)) if v == "1.bad"
+            ));
+
+            signal.version = "1.99.99.extra".to_string();
+            assert!(matches!(
+                signal.validate(),
+                Err(ExitSignalError::UnsupportedVersion(v)) if v == "1.99.99.extra"
+            ));
+
+            signal.version = "1.0".to_string();
+            assert!(matches!(
+                signal.validate(),
+                Err(ExitSignalError::UnsupportedVersion(v)) if v == "1.0"
+            ));
+
+            signal.version = "1.0.0-beta".to_string();
+            assert!(matches!(
+                signal.validate(),
+                Err(ExitSignalError::UnsupportedVersion(v)) if v == "1.0.0-beta"
+            ));
+        }
+
+        #[test]
+        fn test_exit_signal_validate_path_traversal() {
+            // Test path with ".." traversal
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_evidence_bundle_ref("evidence/../../../etc/passwd");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::PathTraversal { field })
+                if field == "evidence_bundle_ref"
+            ));
+
+            // Test path with ".." in the middle
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_evidence_bundle_ref("evidence/work/W-00042/../secret.yaml");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::PathTraversal { field })
+                if field == "evidence_bundle_ref"
+            ));
+
+            // Test absolute path starting with "/"
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_evidence_bundle_ref("/etc/passwd");
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::PathTraversal { field })
+                if field == "evidence_bundle_ref"
+            ));
+
+            // Test valid relative path (should pass)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_evidence_bundle_ref("evidence/work/W-00042/phase_implementation.yaml");
+            assert!(signal.validate().is_ok());
+
+            // Test path with "..." (not a traversal, should pass)
+            let signal = ExitSignal::new(WorkPhase::Implementation, ExitReason::Completed)
+                .with_evidence_bundle_ref("evidence/file...name.yaml");
+            // "..." contains ".." so this should fail
+            let result = signal.validate();
+            assert!(matches!(
+                result,
+                Err(ExitSignalError::PathTraversal { field })
+                if field == "evidence_bundle_ref"
+            ));
         }
     }
 
