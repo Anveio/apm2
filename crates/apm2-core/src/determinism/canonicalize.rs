@@ -104,19 +104,22 @@ enum TypedKey {
     Bool(bool),
     /// Integer key (i64)
     Int(i64),
+    /// Unsigned integer key (u64 values > `i64::MAX`)
+    Uint(u64),
     /// String key
     String(String),
 }
 
 impl TypedKey {
     /// Returns the type tag for ordering different types.
-    /// Types are ordered: Null < Bool < Int < String
+    /// Types are ordered: Null < Bool < Int < Uint < String
     const fn type_order(&self) -> u8 {
         match self {
             Self::Null => 0,
             Self::Bool(_) => 1,
             Self::Int(_) => 2,
-            Self::String(_) => 3,
+            Self::Uint(_) => 3,
+            Self::String(_) => 4,
         }
     }
 
@@ -126,6 +129,7 @@ impl TypedKey {
             Self::Null => Value::Null,
             Self::Bool(b) => Value::Bool(*b),
             Self::Int(n) => Value::Number((*n).into()),
+            Self::Uint(n) => Value::Number((*n).into()),
             Self::String(s) => Value::String(s.clone()),
         }
     }
@@ -143,6 +147,7 @@ impl Ord for TypedKey {
         match (self, other) {
             (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
             (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::Uint(a), Self::Uint(b)) => a.cmp(b),
             (Self::String(a), Self::String(b)) => a.cmp(b),
             // Null == Null, and any other combinations should never happen
             // due to type_order check above
@@ -249,8 +254,11 @@ fn yaml_key_to_typed(key: &Value) -> Result<TypedKey, CanonicalizeError> {
     match key {
         Value::String(s) => Ok(TypedKey::String(s.clone())),
         Value::Number(n) => {
-            // Reject floats - they cannot be reliably normalized
-            if n.is_f64() && !n.is_i64() && !n.is_u64() {
+            // Strictly reject floats - they cannot be reliably normalized.
+            // This rejects all float representations including integral floats
+            // like 1.0 to avoid normalization ambiguity where 1.0 could collide
+            // with integer 1.
+            if n.is_f64() {
                 return Err(CanonicalizeError::UnsupportedFloatKey);
             }
             // Handle integers: try i64 first, then u64
@@ -261,8 +269,9 @@ fn yaml_key_to_typed(key: &Value) -> Result<TypedKey, CanonicalizeError> {
                             // u64 values that fit in i64
                             i64::try_from(u).map_or_else(
                                 |_| {
-                                    // Large u64 values - convert to string representation
-                                    Ok(TypedKey::String(u.to_string()))
+                                    // Large u64 values (> i64::MAX) - use Uint variant
+                                    // to prevent collision with string representation
+                                    Ok(TypedKey::Uint(u))
                                 },
                                 |i| Ok(TypedKey::Int(i)),
                             )
@@ -1023,6 +1032,80 @@ level1:
         assert_eq!(
             result.unwrap_err(),
             CanonicalizeError::RecursionLimitExceeded { max_depth: 128 }
+        );
+    }
+
+    // =========================================================================
+    // Security review fix tests (TCK-00110 - review findings)
+    // =========================================================================
+
+    /// BLOCKER/HIGH: Test that `u64::MAX` as number and its string
+    /// representation are both preserved (no collision). This guards
+    /// against data loss where large integers would collide with their
+    /// string representations.
+    #[test]
+    fn test_large_uint_vs_string_no_collision() {
+        // u64::MAX = 18446744073709551615
+        let large_uint = u64::MAX;
+        let large_uint_str = large_uint.to_string();
+
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            Value::Number(large_uint.into()),
+            Value::String("uint_value".to_string()),
+        );
+        map.insert(
+            Value::String(large_uint_str),
+            Value::String("string_value".to_string()),
+        );
+        let value = Value::Mapping(map);
+
+        let canonical = canonicalize_yaml(&value).unwrap();
+
+        // Both keys must be present - no collision/data loss
+        assert!(
+            canonical.contains("uint_value") && canonical.contains("string_value"),
+            "Both u64::MAX as number and its string representation must be preserved. \
+             Got:\n{canonical}"
+        );
+
+        // Verify the output can be reparsed and contains both entries
+        let reparsed: Value = serde_yaml::from_str(&canonical).unwrap();
+        if let Value::Mapping(m) = reparsed {
+            assert_eq!(
+                m.len(),
+                2,
+                "Reparsed mapping should have 2 entries (both keys preserved), got {}. \
+                 This indicates a key collision occurred.",
+                m.len()
+            );
+        } else {
+            panic!("Expected mapping after reparse");
+        }
+    }
+
+    /// MAJOR/MEDIUM: Test that integral floats (e.g., 1.0) are rejected as
+    /// keys. This prevents ambiguity where 1.0 could be normalized to
+    /// integer 1, causing a collision with an explicit integer 1 key.
+    #[test]
+    fn test_integral_float_key_rejected() {
+        let mut map = serde_yaml::Mapping::new();
+        // 1.0 is an integral float - should still be rejected
+        map.insert(
+            Value::Number(serde_yaml::Number::from(1.0)),
+            Value::String("value".to_string()),
+        );
+        let value = Value::Mapping(map);
+
+        let result = canonicalize_yaml(&value);
+        assert!(
+            result.is_err(),
+            "Integral float key 1.0 should be rejected to prevent collision with integer 1"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            CanonicalizeError::UnsupportedFloatKey,
+            "Expected UnsupportedFloatKey error for integral float 1.0"
         );
     }
 }
