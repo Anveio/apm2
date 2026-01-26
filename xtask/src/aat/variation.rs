@@ -39,6 +39,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
 /// Maximum time allowed for a single command variation (30 seconds).
@@ -56,9 +57,17 @@ const MAX_OUTPUT_SIZE: usize = 1024 * 1024;
 ///
 /// This allowlist ensures that sensitive environment variables (API keys,
 /// tokens, credentials) are not leaked to variation test commands.
+///
+/// # Security
+///
+/// Note: HOME is intentionally NOT in this list. Instead, we create an
+/// isolated temporary HOME directory to prevent access to host credentials
+/// (e.g., `~/.config/gh/hosts.yml`, `~/.gitconfig`).
+///
+/// XDG directories are also excluded to prevent credential access via
+/// `$XDG_CONFIG_HOME/gh/hosts.yml` and similar paths.
 const ALLOWED_ENV_VARS: &[&str] = &[
     "PATH",           // Required for command execution
-    "HOME",           // Required for many tools (cargo, git, etc.)
     "USER",           // User identity
     "LANG",           // Locale settings
     "LC_ALL",         // Locale settings
@@ -66,6 +75,8 @@ const ALLOWED_ENV_VARS: &[&str] = &[
     "RUST_BACKTRACE", // Useful for debugging test failures
     "CARGO_HOME",     // Cargo installation directory
     "RUSTUP_HOME",    // Rustup installation directory
+    // NOTE: HOME is explicitly NOT included - we set an isolated temp HOME
+    // NOTE: XDG_* vars are explicitly NOT included - they could leak credentials
 ];
 
 /// A structured command variation that avoids shell injection.
@@ -285,6 +296,15 @@ impl InputVariationGenerator {
     /// This method executes commands directly without a shell, preventing
     /// shell injection attacks.
     ///
+    /// # Security
+    ///
+    /// Commands run in an isolated environment:
+    /// - Environment is cleared except for an allowlist of safe variables
+    /// - HOME is set to an empty temporary directory to prevent credential
+    ///   access
+    /// - XDG directories are not passed, preventing `~/.config/gh/hosts.yml`
+    ///   access
+    ///
     /// # Arguments
     ///
     /// * `variation` - The command variation to execute
@@ -299,7 +319,15 @@ impl InputVariationGenerator {
     /// Returns an error if:
     /// - The command cannot be spawned
     /// - The command times out
+    /// - Failed to create isolated HOME directory
     pub fn execute_variation(variation: &CommandVariation) -> Result<SingleVariationResult> {
+        // Create an isolated temporary HOME directory to prevent credential access.
+        // This prevents commands like `gh auth token` from reading
+        // ~/.config/gh/hosts.yml [SECURITY: CTR-2401 - Treat external input as
+        // adversarial]
+        let isolated_home =
+            TempDir::new().context("Failed to create isolated HOME directory for variation")?;
+
         // Build command without shell
         let mut command = Command::new(&variation.executable);
         command
@@ -314,6 +342,10 @@ impl InputVariationGenerator {
                 command.env(var_name, value);
             }
         }
+
+        // Set isolated HOME directory - this prevents access to host credentials
+        // like ~/.config/gh/hosts.yml, ~/.gitconfig, ~/.ssh/*, etc.
+        command.env("HOME", isolated_home.path());
 
         // Add extra environment variables for this variation
         for (key, value) in &variation.extra_env {
@@ -350,6 +382,8 @@ impl InputVariationGenerator {
         } else {
             String::new()
         };
+
+        // isolated_home is dropped here, cleaning up the temp directory
 
         Ok(SingleVariationResult {
             input: display_str,
@@ -403,13 +437,43 @@ impl InputVariationGenerator {
     }
 
     /// Read output from a pipe with a size limit.
+    ///
+    /// Uses loop-based reading to ensure complete capture up to
+    /// `MAX_OUTPUT_SIZE`. A single `read()` call may return partial data
+    /// even when more is available, leading to non-deterministic capture
+    /// and flaky invariance detection.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - The reader (typically a process stdout/stderr pipe)
+    ///
+    /// # Returns
+    ///
+    /// The captured output as a String, with a truncation marker if the output
+    /// exceeded `MAX_OUTPUT_SIZE`.
     fn read_bounded<R: std::io::Read>(reader: &mut R) -> Result<String> {
-        let mut buffer = vec![0u8; MAX_OUTPUT_SIZE + 1];
-        let bytes_read = reader.read(&mut buffer)?;
+        use std::io::Read as _;
 
-        let truncated = bytes_read > MAX_OUTPUT_SIZE;
-        let actual_bytes = bytes_read.min(MAX_OUTPUT_SIZE);
-        buffer.truncate(actual_bytes);
+        // Use `take` to limit the read to MAX_OUTPUT_SIZE + 1 bytes.
+        // The +1 allows us to detect truncation (if we read exactly MAX_OUTPUT_SIZE+1,
+        // we know there was more data).
+        let mut limited_reader = reader.take((MAX_OUTPUT_SIZE + 1) as u64);
+
+        // Pre-allocate a reasonable buffer, not the full max (64KB is reasonable)
+        // This prevents allocation of 1MB for small outputs
+        let mut buffer = Vec::with_capacity(64 * 1024);
+
+        // Read all available data up to the limit
+        // read_to_end loops internally until EOF or error, unlike a single read()
+        limited_reader
+            .read_to_end(&mut buffer)
+            .context("Failed to read process output")?;
+
+        // Check if we hit the limit (indicates truncation)
+        let truncated = buffer.len() > MAX_OUTPUT_SIZE;
+        if truncated {
+            buffer.truncate(MAX_OUTPUT_SIZE);
+        }
 
         let mut output = String::from_utf8_lossy(&buffer).to_string();
 
@@ -946,6 +1010,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_isolated_home_prevents_credential_access() {
+        // SECURITY TEST: Verify that variations cannot access host HOME directory.
+        // This prevents secret exfiltration via commands like `gh auth token`.
+        //
+        // The test verifies that:
+        // 1. HOME is set to an isolated temporary directory
+        // 2. The isolated HOME is different from the actual host HOME
+        // 3. XDG_CONFIG_HOME is not set (preventing ~/.config/ access)
+
+        let variation = CommandVariation {
+            executable: "env".to_string(),
+            args: vec![],
+            extra_env: HashMap::new(),
+            description: "credential isolation test".to_string(),
+        };
+
+        let result = InputVariationGenerator::execute_variation(&variation).unwrap();
+
+        // Get the host HOME for comparison
+        let host_home = std::env::var("HOME").unwrap_or_default();
+
+        // Parse the HOME from the env output
+        let env_home = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("HOME="))
+            .map_or("", |line| line.strip_prefix("HOME=").unwrap_or(""));
+
+        // HOME should be set (not empty)
+        assert!(
+            !env_home.is_empty(),
+            "HOME should be set to isolated directory"
+        );
+
+        // HOME should NOT be the host HOME (credential isolation)
+        assert_ne!(
+            env_home, host_home,
+            "Isolated HOME should differ from host HOME to prevent credential access"
+        );
+
+        // HOME should point to a temp directory (contains /tmp/ or similar)
+        assert!(
+            env_home.contains("/tmp")
+                || env_home.contains("/var/folders")
+                || env_home.contains("\\Temp"),
+            "Isolated HOME should be in temp directory, got: {env_home}"
+        );
+
+        // XDG_CONFIG_HOME should NOT be set (another credential access vector)
+        let has_xdg_config = result
+            .output
+            .lines()
+            .any(|line| line.starts_with("XDG_CONFIG_HOME="));
+        assert!(
+            !has_xdg_config,
+            "XDG_CONFIG_HOME should not be set to prevent credential access"
+        );
+    }
+
     // =========================================================================
     // Constant verification tests
     // =========================================================================
@@ -966,5 +1090,85 @@ mod tests {
     #[test]
     fn test_max_output_is_reasonable() {
         assert_eq!(MAX_OUTPUT_SIZE, 1024 * 1024); // 1 MB
+    }
+
+    // =========================================================================
+    // Bounded read tests
+    // =========================================================================
+
+    #[test]
+    fn test_read_bounded_small_output() {
+        let data = b"hello world";
+        let mut cursor = std::io::Cursor::new(data);
+
+        let result = InputVariationGenerator::read_bounded(&mut cursor).unwrap();
+        assert_eq!(result, "hello world");
+        assert!(
+            !result.contains("TRUNCATED"),
+            "Small output should not be truncated"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_read_bounded_large_output_over_64kb() {
+        // Create output larger than 64KB to test loop-based reading
+        // A single read() call typically returns at most 64KB
+        // The truncation here is intentional: we want bytes 0-255 repeating
+        let large_data: Vec<u8> = (0u32..100_000).map(|i| (i % 256) as u8).collect();
+        let mut cursor = std::io::Cursor::new(&large_data);
+
+        let result = InputVariationGenerator::read_bounded(&mut cursor).unwrap();
+
+        // Should capture all data (100KB is under 1MB limit)
+        assert!(
+            !result.contains("TRUNCATED"),
+            "100KB output should not be truncated"
+        );
+        // Verify we got the expected size (may differ slightly due to UTF-8 lossy
+        // conversion)
+        assert!(
+            result.len() >= 90_000,
+            "Should capture most of the 100KB output, got {} bytes",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_truncation_at_limit() {
+        // Create output that exceeds MAX_OUTPUT_SIZE
+        let over_limit_data: Vec<u8> = vec![b'x'; MAX_OUTPUT_SIZE + 100];
+        let mut cursor = std::io::Cursor::new(&over_limit_data);
+
+        let result = InputVariationGenerator::read_bounded(&mut cursor).unwrap();
+
+        // Should be truncated
+        assert!(
+            result.contains("TRUNCATED"),
+            "Output over limit should be truncated"
+        );
+        // The base content (before truncation marker) should be at most MAX_OUTPUT_SIZE
+        let truncation_marker = "\n[TRUNCATED: output exceeded size limit]";
+        let content_len = result.len() - truncation_marker.len();
+        assert!(
+            content_len <= MAX_OUTPUT_SIZE,
+            "Truncated content should not exceed MAX_OUTPUT_SIZE"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_exactly_at_limit() {
+        // Create output exactly at MAX_OUTPUT_SIZE - should NOT be truncated
+        let exact_data: Vec<u8> = vec![b'y'; MAX_OUTPUT_SIZE];
+        let mut cursor = std::io::Cursor::new(&exact_data);
+
+        let result = InputVariationGenerator::read_bounded(&mut cursor).unwrap();
+
+        // Should NOT be truncated (exactly at limit, not over)
+        assert!(
+            !result.contains("TRUNCATED"),
+            "Output exactly at limit should not be truncated"
+        );
+        assert_eq!(result.len(), MAX_OUTPUT_SIZE);
     }
 }

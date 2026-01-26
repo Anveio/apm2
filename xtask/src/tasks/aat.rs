@@ -624,6 +624,13 @@ fn truncate_for_error(s: &str) -> String {
 // Input Variation Testing
 // =============================================================================
 
+/// Maximum number of commands to extract from a PR description.
+///
+/// This limit prevents denial-of-service attacks where a malicious PR
+/// description contains hundreds of commands, each requiring execution
+/// with 3 variations. 10 commands * 3 variations = 30 executions max.
+const MAX_COMMANDS_PER_PR: usize = 10;
+
 /// Extract CLI commands from the PR description usage section.
 ///
 /// Parses the usage section to find shell commands in code blocks.
@@ -634,6 +641,7 @@ fn truncate_for_error(s: &str) -> String {
 /// 1. Extract content from fenced code blocks (bash, shell, or plain)
 /// 2. Filter to lines that look like CLI commands (start with common prefixes)
 /// 3. Skip comment lines and empty lines
+/// 4. Limit to `MAX_COMMANDS_PER_PR` to prevent abuse
 ///
 /// # Arguments
 ///
@@ -641,7 +649,8 @@ fn truncate_for_error(s: &str) -> String {
 ///
 /// # Returns
 ///
-/// A vector of command strings extracted from the usage section.
+/// A vector of command strings extracted from the usage section,
+/// limited to `MAX_COMMANDS_PER_PR` entries.
 fn extract_commands_from_usage(parsed_pr: &ParsedPRDescription) -> Vec<String> {
     let usage = &parsed_pr.usage;
     let mut commands = Vec::new();
@@ -650,9 +659,14 @@ fn extract_commands_from_usage(parsed_pr: &ParsedPRDescription) -> Vec<String> {
     let code_block_re = Regex::new(r"(?s)```(?:bash|shell|sh)?\s*\n(.*?)```").expect("valid regex");
 
     // Extract commands from code blocks
-    for cap in code_block_re.captures_iter(usage) {
+    'outer: for cap in code_block_re.captures_iter(usage) {
         if let Some(block_content) = cap.get(1) {
             for line in block_content.as_str().lines() {
+                // SECURITY: Enforce limit to prevent DoS via bloated usage sections
+                if commands.len() >= MAX_COMMANDS_PER_PR {
+                    break 'outer;
+                }
+
                 let line = line.trim();
 
                 // Skip empty lines and comments
@@ -673,6 +687,11 @@ fn extract_commands_from_usage(parsed_pr: &ParsedPRDescription) -> Vec<String> {
     // (lines starting with $ or common command names)
     if commands.is_empty() {
         for line in usage.lines() {
+            // SECURITY: Enforce limit to prevent DoS via bloated usage sections
+            if commands.len() >= MAX_COMMANDS_PER_PR {
+                break;
+            }
+
             let line = line.trim();
 
             // Skip empty lines and comments
@@ -697,10 +716,27 @@ fn extract_commands_from_usage(parsed_pr: &ParsedPRDescription) -> Vec<String> {
 /// Check if a line looks like a CLI command.
 ///
 /// Returns true if the line starts with a common command prefix.
+///
+/// # Security
+///
+/// This allowlist is security-sensitive. The following are intentionally
+/// EXCLUDED:
+/// - `gh ` - Could expose reviewer tokens via `gh auth token`
+/// - `git ` - Could access credentials via `git config` or credential helpers
+/// - `./` - Could execute arbitrary scripts from untrusted PR branches
+///
+/// Commands on this list will be executed in an isolated environment with
+/// credential isolation (isolated HOME), but reducing the attack surface
+/// is still important.
 fn is_cli_command(line: &str) -> bool {
+    // Security: DO NOT add `gh `, `git `, or `./` to this list.
+    // See security review findings for rationale:
+    // - gh: Could expose tokens via `gh auth token`
+    // - git: Could access credentials via git-credential helpers
+    // - ./: Could execute arbitrary scripts from untrusted PR branches
     let command_prefixes = [
-        "cargo ", "cargo-", "rustc ", "rustup ", "git ", "gh ", "npm ", "npx ", "yarn ", "pnpm ",
-        "python ", "python3 ", "pip ", "pip3 ", "./", "make ", "cmake ", "docker ", "kubectl ",
+        "cargo ", "cargo-", "rustc ", "rustup ", "npm ", "npx ", "yarn ", "pnpm ", "python ",
+        "python3 ", "pip ", "pip3 ", "make ", "cmake ", "docker ", "kubectl ",
     ];
 
     // Strip leading $ if present
@@ -1444,21 +1480,33 @@ These hypotheses cover the main scenarios."#;
     }
 
     #[test]
-    fn test_is_cli_command_git() {
-        assert!(is_cli_command("git status"));
-        assert!(is_cli_command("git commit -m 'message'"));
+    fn test_is_cli_command_git_excluded() {
+        // SECURITY: git is excluded from allowlist to prevent credential access
+        // via git-credential helpers and git config
+        assert!(!is_cli_command("git status"));
+        assert!(!is_cli_command("git commit -m 'message'"));
     }
 
     #[test]
     fn test_is_cli_command_shell_prompt() {
         assert!(is_cli_command("$ cargo test"));
-        assert!(is_cli_command("$ git status"));
+        // SECURITY: git is excluded even with shell prompt prefix
+        assert!(!is_cli_command("$ git status"));
     }
 
     #[test]
-    fn test_is_cli_command_relative_path() {
-        assert!(is_cli_command("./run_tests.sh"));
-        assert!(is_cli_command("./scripts/verify.sh"));
+    fn test_is_cli_command_relative_path_excluded() {
+        // SECURITY: ./ paths are excluded to prevent RCE via local scripts
+        // from untrusted PR branches
+        assert!(!is_cli_command("./run_tests.sh"));
+        assert!(!is_cli_command("./scripts/verify.sh"));
+    }
+
+    #[test]
+    fn test_is_cli_command_gh_excluded() {
+        // SECURITY: gh is excluded to prevent token exfiltration via `gh auth token`
+        assert!(!is_cli_command("gh auth token"));
+        assert!(!is_cli_command("gh pr view 123"));
     }
 
     #[test]
@@ -1553,5 +1601,56 @@ $ cargo test
         assert_eq!(commands.len(), 2);
         assert!(commands[0].contains("cargo build"));
         assert!(commands[1].contains("cargo test"));
+    }
+
+    #[test]
+    fn test_extract_commands_enforces_limit() {
+        use crate::aat::types::ParsedPRDescription;
+
+        // Create a usage section with more commands than MAX_COMMANDS_PER_PR
+        // to test DoS protection
+        let many_commands: String = (0..20)
+            .map(|i| format!("cargo test --test test_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let parsed = ParsedPRDescription {
+            usage: format!(
+                r"
+Run the tests:
+
+```bash
+{many_commands}
+```
+"
+            ),
+            expected_outcomes: vec![],
+            evidence_script: None,
+            known_limitations: vec![],
+        };
+
+        let commands = extract_commands_from_usage(&parsed);
+
+        // Should be limited to MAX_COMMANDS_PER_PR
+        assert_eq!(
+            commands.len(),
+            MAX_COMMANDS_PER_PR,
+            "Should enforce limit of {} commands, got {}",
+            MAX_COMMANDS_PER_PR,
+            commands.len()
+        );
+    }
+
+    /// Compile-time assertion that `MAX_COMMANDS_PER_PR` is reasonable.
+    const _: () = {
+        assert!(MAX_COMMANDS_PER_PR >= 5); // Allow reasonable use cases
+        assert!(MAX_COMMANDS_PER_PR <= 20); // Prevent excessive execution
+    };
+
+    #[test]
+    fn test_max_commands_constant_value() {
+        // Document and verify the constant value at runtime:
+        // 10 commands * 3 variations * 30s timeout = 15 minutes max execution
+        assert_eq!(MAX_COMMANDS_PER_PR, 10);
     }
 }
