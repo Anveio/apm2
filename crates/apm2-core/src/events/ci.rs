@@ -58,6 +58,7 @@
 //! - [INV-CI004] Eviction is O(1) for both stores.
 
 use std::collections::{HashMap, VecDeque};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -88,7 +89,7 @@ use crate::webhook::WorkflowConclusion;
 ///
 /// let event = CIWorkflowCompleted::new(
 ///     CIWorkflowPayload {
-///         pr_number: Some(42),
+///         pr_numbers: vec![42],
 ///         commit_sha: "abc123def456".to_string(),
 ///         conclusion: CIConclusion::Success,
 ///         workflow_name: "CI".to_string(),
@@ -326,8 +327,9 @@ impl Default for DeliveryIdConfig {
 
 /// Trait for delivery ID stores (idempotency tracking).
 ///
-/// Implementations must be thread-safe ([INV-CI001]).
-pub trait DeliveryIdStore: Send + Sync {
+/// Implementations must be thread-safe ([INV-CI001]) and unwind-safe
+/// to preserve API compatibility with types that require panic safety.
+pub trait DeliveryIdStore: Send + Sync + UnwindSafe + RefUnwindSafe {
     /// Checks if a delivery ID has been seen.
     ///
     /// Returns `true` if the delivery ID is new (not seen before),
@@ -582,8 +584,9 @@ pub enum EventStoreError {
 
 /// Trait for event persistence.
 ///
-/// Implementations must be thread-safe ([INV-CI002]).
-pub trait EventStore: Send + Sync {
+/// Implementations must be thread-safe ([INV-CI002]) and unwind-safe
+/// to preserve API compatibility with types that require panic safety.
+pub trait EventStore: Send + Sync + UnwindSafe + RefUnwindSafe {
     /// Persists an event to the store.
     ///
     /// # Errors

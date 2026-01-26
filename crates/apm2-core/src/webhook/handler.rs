@@ -282,12 +282,21 @@ fn log_completed_event(event: &WorkflowRunCompleted, ip: IpAddr, delivery_id: Op
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::panic::{RefUnwindSafe, UnwindSafe};
 
     use axum::http::HeaderMap;
     use bytes::Bytes;
     use secrecy::SecretString;
 
     use super::*;
+
+    // Static assertions for auto-trait implementations.
+    // These are compile-time checks that ensure WebhookHandler maintains
+    // API compatibility with code that requires panic safety.
+    const _: fn() = || {
+        fn assert_unwind_safe<T: UnwindSafe + RefUnwindSafe>() {}
+        assert_unwind_safe::<WebhookHandler>();
+    };
 
     fn test_config(enabled: bool) -> WebhookConfig {
         WebhookConfig::builder()
