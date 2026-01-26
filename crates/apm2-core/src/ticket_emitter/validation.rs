@@ -61,6 +61,15 @@ pub enum TicketValidationError {
         ticket_id: String,
     },
 
+    /// Path is absolute (must be relative to repo root).
+    #[error("absolute path not allowed: {path}")]
+    AbsolutePath {
+        /// The offending path.
+        path: String,
+        /// Ticket ID that references this path.
+        ticket_id: String,
+    },
+
     /// CCP index not found.
     #[error("CCP index not found: {path}")]
     CcpIndexNotFound {
@@ -252,6 +261,11 @@ fn contains_traversal(path: &str) -> bool {
     path.contains("..")
 }
 
+/// Checks if a path is absolute (not allowed in ticket file references).
+fn is_absolute_path(path: &str) -> bool {
+    Path::new(path).is_absolute()
+}
+
 /// Checks if a path exists in the repository.
 fn path_exists_in_repo(repo_root: &Path, relative_path: &str) -> bool {
     if contains_traversal(relative_path) {
@@ -300,6 +314,15 @@ fn validate_ticket_file_paths(
             continue;
         }
 
+        // Check for absolute path
+        if is_absolute_path(path) {
+            result.errors.push(TicketValidationError::AbsolutePath {
+                path: path.clone(),
+                ticket_id: ticket_id.to_string(),
+            });
+            continue;
+        }
+
         let normalized = normalize_path(path);
         let exists_in_ccp = ccp_inventory.is_some_and(|inv| inv.contains(&normalized));
         let exists_in_repo = path_exists_in_repo(repo_root, &normalized);
@@ -323,6 +346,15 @@ fn validate_ticket_file_paths(
         // Check for traversal
         if contains_traversal(path) {
             result.errors.push(TicketValidationError::PathTraversal {
+                path: path.clone(),
+                ticket_id: ticket_id.to_string(),
+            });
+            continue;
+        }
+
+        // Check for absolute path
+        if is_absolute_path(path) {
+            result.errors.push(TicketValidationError::AbsolutePath {
                 path: path.clone(),
                 ticket_id: ticket_id.to_string(),
             });
@@ -533,6 +565,44 @@ mod tests {
         assert!(matches!(
             &result.errors[0],
             TicketValidationError::PathTraversal { .. }
+        ));
+    }
+
+    /// Test absolute path rejection in `files_to_modify`.
+    #[test]
+    fn test_validation_rejects_absolute_path_modify() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        create_test_ccp_index(root);
+
+        let tickets = vec![("TCK-00001", vec!["/etc/passwd".to_string()], vec![])];
+
+        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+
+        assert!(!result.is_valid());
+        assert!(matches!(
+            &result.errors[0],
+            TicketValidationError::AbsolutePath { path, ticket_id }
+            if path == "/etc/passwd" && ticket_id == "TCK-00001"
+        ));
+    }
+
+    /// Test absolute path rejection in `files_to_create`.
+    #[test]
+    fn test_validation_rejects_absolute_path_create() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        create_test_ccp_index(root);
+
+        let tickets = vec![("TCK-00001", vec![], vec!["/tmp/malicious.rs".to_string()])];
+
+        let result = validate_ticket_paths(root, Some("PRD-TEST"), &tickets).unwrap();
+
+        assert!(!result.is_valid());
+        assert!(matches!(
+            &result.errors[0],
+            TicketValidationError::AbsolutePath { path, ticket_id }
+            if path == "/tmp/malicious.rs" && ticket_id == "TCK-00001"
         ));
     }
 
