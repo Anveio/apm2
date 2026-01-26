@@ -21,7 +21,8 @@
 //!   module
 
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -29,6 +30,15 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
+
+/// Maximum file size for AGENTS.md files (10 MB).
+/// Prevents denial-of-service via unbounded reads.
+const MAX_AGENTS_MD_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Maximum file size for Cargo.toml files (1 MB).
+/// Prevents denial-of-service via unbounded reads.
+const MAX_CARGO_TOML_SIZE: u64 = 1024 * 1024;
 
 /// Errors that can occur during CCP operations.
 #[derive(Debug, Error)]
@@ -66,6 +76,17 @@ pub enum CcpError {
     InvalidRepoRoot {
         /// The invalid path.
         path: String,
+    },
+
+    /// File is too large to read.
+    #[error("file {path} is too large ({size} bytes, max {max_size} bytes)")]
+    FileTooLarge {
+        /// Path to the file.
+        path: String,
+        /// Actual file size.
+        size: u64,
+        /// Maximum allowed size.
+        max_size: u64,
     },
 }
 
@@ -186,6 +207,48 @@ pub fn generate_component_id(crate_name: &str) -> String {
     format!("COMP-{upper_snake}")
 }
 
+/// Reads a file with a size limit to prevent denial-of-service via unbounded
+/// reads.
+///
+/// # Errors
+///
+/// Returns an error if the file is too large or cannot be read.
+fn read_file_bounded(path: &Path, max_size: u64) -> Result<String, CcpError> {
+    let metadata = fs::metadata(path).map_err(|e| CcpError::ReadError {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+
+    if metadata.len() > max_size {
+        return Err(CcpError::FileTooLarge {
+            path: path.display().to_string(),
+            size: metadata.len(),
+            max_size,
+        });
+    }
+
+    let file = File::open(path).map_err(|e| CcpError::ReadError {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+
+    // Use take() to enforce the size limit even if metadata was wrong
+    let mut content = String::new();
+    file.take(max_size)
+        .read_to_string(&mut content)
+        .map_err(|e| CcpError::ReadError {
+            path: path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+
+    Ok(content)
+}
+
+/// Escapes a path for use in glob patterns to prevent glob injection.
+fn escape_path_for_glob(path: &Path) -> String {
+    glob::Pattern::escape(&path.to_string_lossy())
+}
+
 /// Discovers all AGENTS.md files in the repository.
 ///
 /// Searches for:
@@ -195,10 +258,11 @@ pub fn generate_component_id(crate_name: &str) -> String {
 /// Returns paths sorted alphabetically for determinism.
 fn discover_agents_md(repo_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    let escaped_root = escape_path_for_glob(repo_root);
 
     // Pattern 1: crates/*/AGENTS.md
-    let pattern1 = repo_root.join("crates/*/AGENTS.md");
-    if let Ok(entries) = glob::glob(pattern1.to_string_lossy().as_ref()) {
+    let pattern1 = format!("{escaped_root}/crates/*/AGENTS.md");
+    if let Ok(entries) = glob::glob(&pattern1) {
         for entry in entries.flatten() {
             paths.push(entry);
         }
@@ -206,8 +270,8 @@ fn discover_agents_md(repo_root: &Path) -> Vec<PathBuf> {
 
     // Pattern 2: crates/*/*/AGENTS.md (for nested modules like
     // src/adapter/AGENTS.md)
-    let pattern2 = repo_root.join("crates/*/*/AGENTS.md");
-    if let Ok(entries) = glob::glob(pattern2.to_string_lossy().as_ref()) {
+    let pattern2 = format!("{escaped_root}/crates/*/*/AGENTS.md");
+    if let Ok(entries) = glob::glob(&pattern2) {
         for entry in entries.flatten() {
             paths.push(entry);
         }
@@ -215,8 +279,8 @@ fn discover_agents_md(repo_root: &Path) -> Vec<PathBuf> {
 
     // Pattern 3: crates/*/*/*/AGENTS.md (for deeper nesting like
     // src/adapter/foo/AGENTS.md)
-    let pattern3 = repo_root.join("crates/*/*/*/AGENTS.md");
-    if let Ok(entries) = glob::glob(pattern3.to_string_lossy().as_ref()) {
+    let pattern3 = format!("{escaped_root}/crates/*/*/*/AGENTS.md");
+    if let Ok(entries) = glob::glob(&pattern3) {
         for entry in entries.flatten() {
             paths.push(entry);
         }
@@ -232,14 +296,14 @@ fn discover_agents_md(repo_root: &Path) -> Vec<PathBuf> {
 /// Returns crate directories (containing Cargo.toml) sorted alphabetically.
 fn discover_crates(repo_root: &Path) -> Result<Vec<PathBuf>, CcpError> {
     let mut crates = Vec::new();
+    let escaped_root = escape_path_for_glob(repo_root);
 
     // Pattern: crates/*/Cargo.toml
-    let pattern = repo_root.join("crates/*/Cargo.toml");
-    let entries =
-        glob::glob(pattern.to_string_lossy().as_ref()).map_err(|e| CcpError::DiscoveryError {
-            path: pattern.display().to_string(),
-            reason: e.to_string(),
-        })?;
+    let pattern = format!("{escaped_root}/crates/*/Cargo.toml");
+    let entries = glob::glob(&pattern).map_err(|e| CcpError::DiscoveryError {
+        path: pattern.clone(),
+        reason: e.to_string(),
+    })?;
 
     for entry in entries.flatten() {
         // Get the crate directory (parent of Cargo.toml)
@@ -421,18 +485,27 @@ fn determine_component_type(crate_path: &Path) -> ComponentType {
 
     // Check Cargo.toml for binary targets
     let cargo_toml = crate_path.join("Cargo.toml");
-    if let Ok(content) = fs::read_to_string(&cargo_toml) {
-        // Simple heuristic: if it has [[bin]] section, it's a binary
-        if content.contains("[[bin]]") {
-            return ComponentType::Binary;
-        }
-        // If it's a daemon or CLI crate, it's binary
-        if let Some(name) = crate_path.file_name() {
-            let name_str = name.to_string_lossy();
-            if name_str.contains("daemon") || name_str.contains("cli") {
+    match read_file_bounded(&cargo_toml, MAX_CARGO_TOML_SIZE) {
+        Ok(content) => {
+            // Simple heuristic: if it has [[bin]] section, it's a binary
+            if content.contains("[[bin]]") {
                 return ComponentType::Binary;
             }
-        }
+            // If it's a daemon or CLI crate, it's binary
+            if let Some(name) = crate_path.file_name() {
+                let name_str = name.to_string_lossy();
+                if name_str.contains("daemon") || name_str.contains("cli") {
+                    return ComponentType::Binary;
+                }
+            }
+        },
+        Err(e) => {
+            warn!(
+                path = %cargo_toml.display(),
+                error = %e,
+                "Failed to read Cargo.toml for component type detection, defaulting to Library"
+            );
+        },
     }
 
     ComponentType::Library
@@ -525,11 +598,8 @@ pub fn build_component_atlas(repo_root: &Path) -> Result<ComponentAtlas, CcpErro
 
         let (description, invariants, contracts, extension_points, agents_md_path) =
             if let Some(agents_path) = agents_md_map.get(&crate_path) {
-                // Parse AGENTS.md
-                let content = fs::read_to_string(agents_path).map_err(|e| CcpError::ReadError {
-                    path: agents_path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
+                // Parse AGENTS.md with bounded read to prevent DoS
+                let content = read_file_bounded(agents_path, MAX_AGENTS_MD_SIZE)?;
 
                 let parsed = parse_agents_md(&content);
 
@@ -1097,5 +1167,41 @@ More description here without any invariants or contracts.
         assert_eq!(parsed.contracts.len(), 2);
         assert_eq!(parsed.contracts[0].id, "CTR-0101");
         assert_eq!(parsed.contracts[1].id, "CTR-0102");
+    }
+
+    #[test]
+    fn test_read_file_bounded() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a small file (should succeed)
+        let small_file = root.join("small.md");
+        fs::write(&small_file, "# Small file\n").unwrap();
+        let result = read_file_bounded(&small_file, MAX_AGENTS_MD_SIZE);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "# Small file\n");
+
+        // Test with a small max size (should fail for same file)
+        let result = read_file_bounded(&small_file, 5);
+        assert!(matches!(result, Err(CcpError::FileTooLarge { .. })));
+
+        // Test with nonexistent file (should fail)
+        let nonexistent = root.join("nonexistent.md");
+        let result = read_file_bounded(&nonexistent, MAX_AGENTS_MD_SIZE);
+        assert!(matches!(result, Err(CcpError::ReadError { .. })));
+    }
+
+    #[test]
+    fn test_escape_path_for_glob() {
+        // Normal path should remain unchanged
+        assert_eq!(escape_path_for_glob(Path::new("/foo/bar")), "/foo/bar");
+
+        // Path with glob special characters should be escaped
+        assert_eq!(
+            escape_path_for_glob(Path::new("/foo/[bar]")),
+            "/foo/[[]bar[]]"
+        );
+        assert_eq!(escape_path_for_glob(Path::new("/foo/*")), "/foo/[*]");
+        assert_eq!(escape_path_for_glob(Path::new("/foo/?")), "/foo/[?]");
     }
 }
