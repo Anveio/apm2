@@ -14,10 +14,13 @@
 //!
 //! # Security Model
 //!
-//! All syscall handlers implement **default-deny, least-privilege, fail-closed**:
+//! All syscall handlers implement **default-deny, least-privilege,
+//! fail-closed**:
 //!
-//! - **Workspace restriction**: File operations are confined to the workspace root
-//! - **Path validation**: Paths are normalized and checked for traversal attacks
+//! - **Workspace restriction**: File operations are confined to the workspace
+//!   root
+//! - **Path validation**: Paths are normalized and checked for traversal
+//!   attacks
 //! - **Symlink resolution**: Symlinks are resolved to prevent escape
 //! - **Content hashing**: File modifications are tracked via BLAKE3 hashes
 //! - **Audit logging**: All operations are logged to the ledger

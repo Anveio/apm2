@@ -1,8 +1,8 @@
 //! Filesystem mediation handler for file operations.
 //!
 //! This module implements the execution layer for filesystem tool requests
-//! (`FileRead`, `FileWrite`, `FileEdit`). All operations are confined to a workspace
-//! root directory with strict path validation.
+//! (`FileRead`, `FileWrite`, `FileEdit`). All operations are confined to a
+//! workspace root directory with strict path validation.
 //!
 //! # Security Model
 //!
@@ -10,7 +10,8 @@
 //!
 //! 1. **Path validation**: All paths are checked for traversal sequences
 //! 2. **Workspace confinement**: Paths must resolve within the workspace root
-//! 3. **Symlink resolution**: Symlinks are followed and verified to stay in workspace
+//! 3. **Symlink resolution**: Symlinks are followed and verified to stay in
+//!    workspace
 //! 4. **Content hashing**: All modifications are tracked with BLAKE3 hashes
 //! 5. **Atomic operations**: Edits are atomic to prevent partial modifications
 //!
@@ -67,11 +68,12 @@ const DEFAULT_MAX_EDIT_SIZE: usize = 10 * 1024 * 1024;
 
 /// Converts a Duration to milliseconds as u64, saturating at `u64::MAX`.
 ///
-/// This is safe because typical operation durations will never approach `u64::MAX` milliseconds
-/// (which would be approximately 584 million years).
+/// This is safe because typical operation durations will never approach
+/// `u64::MAX` milliseconds (which would be approximately 584 million years).
 #[allow(clippy::cast_possible_truncation)]
 fn duration_to_millis(duration: std::time::Duration) -> u64 {
-    // Use saturating conversion for safety, though overflow is impossible in practice
+    // Use saturating conversion for safety, though overflow is impossible in
+    // practice
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
@@ -89,8 +91,8 @@ pub struct FilesystemConfig {
     max_edit_size: usize,
 
     /// Whether to follow symlinks (default: true).
-    /// When true, symlinks are resolved and the target must be within workspace.
-    /// When false, operations on symlinks are denied.
+    /// When true, symlinks are resolved and the target must be within
+    /// workspace. When false, operations on symlinks are denied.
     follow_symlinks: bool,
 }
 
@@ -197,12 +199,13 @@ impl FilesystemConfigBuilder {
     ///
     /// Returns an error if the workspace root cannot be canonicalized.
     pub fn build(self) -> Result<FilesystemConfig, SyscallError> {
-        let workspace_root = self.workspace_root.canonicalize().map_err(|e| {
-            SyscallError::Io {
+        let workspace_root = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|e| SyscallError::Io {
                 path: self.workspace_root.clone(),
                 source: e,
-            }
-        })?;
+            })?;
 
         Ok(FilesystemConfig {
             workspace_root,
@@ -339,10 +342,12 @@ impl FilesystemHandler {
             resolve_path_with_symlinks(&resolved, MAX_SYMLINK_DEPTH)?
         } else {
             // For non-existent files, canonicalize the parent and append the filename
-            let parent = resolved.parent().ok_or_else(|| SyscallError::PathValidation {
-                path: resolved.clone(),
-                reason: "path has no parent directory".to_string(),
-            })?;
+            let parent = resolved
+                .parent()
+                .ok_or_else(|| SyscallError::PathValidation {
+                    path: resolved.clone(),
+                    reason: "path has no parent directory".to_string(),
+                })?;
 
             let parent_canonical = if parent.exists() {
                 resolve_path_with_symlinks(parent, MAX_SYMLINK_DEPTH)?
@@ -353,12 +358,12 @@ impl FilesystemHandler {
                 });
             };
 
-            let filename = resolved.file_name().ok_or_else(|| {
-                SyscallError::PathValidation {
+            let filename = resolved
+                .file_name()
+                .ok_or_else(|| SyscallError::PathValidation {
                     path: resolved.clone(),
                     reason: "path has no filename".to_string(),
-                }
-            })?;
+                })?;
 
             parent_canonical.join(filename)
         };
@@ -415,9 +420,7 @@ impl FilesystemHandler {
         })?;
 
         if !metadata.is_file() {
-            return Err(SyscallError::NotAFile {
-                path: canonical,
-            });
+            return Err(SyscallError::NotAFile { path: canonical });
         }
 
         let file_size = metadata.len();
@@ -435,17 +438,17 @@ impl FilesystemHandler {
 
         // Seek to offset
         if offset > 0 {
-            file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                SyscallError::Io {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| SyscallError::Io {
                     path: canonical.clone(),
                     source: e,
-                }
-            })?;
+                })?;
         }
 
         // Read content
-        // Note: These casts are safe for 64-bit systems. On 32-bit systems, files larger than
-        // usize::MAX bytes wouldn't be practical to hold in memory anyway.
+        // Note: These casts are safe for 64-bit systems. On 32-bit systems, files
+        // larger than usize::MAX bytes wouldn't be practical to hold in memory
+        // anyway.
         #[allow(clippy::cast_possible_truncation)]
         let read_size = if limit > 0 {
             limit as usize
@@ -646,9 +649,7 @@ impl FilesystemHandler {
         let match_count = existing.matches(old_content).count();
 
         if match_count == 0 {
-            return Err(SyscallError::EditNotFound {
-                path: canonical,
-            });
+            return Err(SyscallError::EditNotFound { path: canonical });
         }
 
         if match_count > 1 {
@@ -740,10 +741,7 @@ fn resolve_path_with_symlinks(path: &Path, max_depth: usize) -> Result<PathBuf, 
                 current = if target.is_absolute() {
                     target
                 } else {
-                    current
-                        .parent()
-                        .map(|p| p.join(&target))
-                        .unwrap_or(target)
+                    current.parent().map(|p| p.join(&target)).unwrap_or(target)
                 };
             },
             Ok(_) => {
@@ -929,7 +927,9 @@ mod tests {
         let file_path = temp_dir.path().join("new.txt");
         let content = b"New content";
 
-        let result = handler.write_file(&file_path, content, false, false).unwrap();
+        let result = handler
+            .write_file(&file_path, content, false, false)
+            .unwrap();
 
         assert_eq!(result.operation, FileOperation::Create);
         assert!(result.hash_before.is_none());
@@ -944,7 +944,9 @@ mod tests {
         fs::write(&file_path, b"old content").unwrap();
 
         let new_content = b"new content";
-        let result = handler.write_file(&file_path, new_content, false, false).unwrap();
+        let result = handler
+            .write_file(&file_path, new_content, false, false)
+            .unwrap();
 
         assert_eq!(result.operation, FileOperation::Write);
         assert!(result.hash_before.is_some());
@@ -960,7 +962,10 @@ mod tests {
 
         let result = handler.write_file(&file_path, b"new", true, false);
 
-        assert!(matches!(result, Err(SyscallError::FileAlreadyExists { .. })));
+        assert!(matches!(
+            result,
+            Err(SyscallError::FileAlreadyExists { .. })
+        ));
     }
 
     #[test]
@@ -970,7 +975,9 @@ mod tests {
         let file_path = temp_dir.path().join("append.txt");
         fs::write(&file_path, b"Hello").unwrap();
 
-        let result = handler.write_file(&file_path, b", World!", false, true).unwrap();
+        let result = handler
+            .write_file(&file_path, b", World!", false, true)
+            .unwrap();
 
         assert_eq!(result.operation, FileOperation::Append);
         assert_eq!(fs::read(&file_path).unwrap(), b"Hello, World!");
@@ -1114,7 +1121,9 @@ mod tests {
         let initial_hash = handler.read_file(&file_path, 0, 0).unwrap().content_hash;
 
         // Modify the file
-        let record = handler.write_file(&file_path, b"modified", false, false).unwrap();
+        let record = handler
+            .write_file(&file_path, b"modified", false, false)
+            .unwrap();
 
         // Before hash should match initial read
         assert_eq!(record.hash_before.unwrap(), initial_hash);

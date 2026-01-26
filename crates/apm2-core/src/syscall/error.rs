@@ -248,22 +248,28 @@ mod tests {
         assert!(SyscallError::Timeout { timeout_ms: 1000 }.is_retryable());
 
         // I/O errors are retryable
-        assert!(SyscallError::Io {
-            path: PathBuf::new(),
-            source: std::io::Error::other("test"),
-        }
-        .is_retryable());
+        assert!(
+            SyscallError::Io {
+                path: PathBuf::new(),
+                source: std::io::Error::other("test"),
+            }
+            .is_retryable()
+        );
 
         // Path errors are not retryable
-        assert!(!SyscallError::PathOutsideWorkspace {
-            path: PathBuf::new(),
-            workspace: PathBuf::new(),
-        }
-        .is_retryable());
+        assert!(
+            !SyscallError::PathOutsideWorkspace {
+                path: PathBuf::new(),
+                workspace: PathBuf::new(),
+            }
+            .is_retryable()
+        );
 
-        assert!(!SyscallError::FileNotFound {
-            path: PathBuf::new(),
-        }
-        .is_retryable());
+        assert!(
+            !SyscallError::FileNotFound {
+                path: PathBuf::new(),
+            }
+            .is_retryable()
+        );
     }
 }
