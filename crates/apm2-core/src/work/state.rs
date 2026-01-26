@@ -284,6 +284,18 @@ pub struct Work {
     ///
     /// A value of `None` indicates no PR has been created yet.
     pub pr_number: Option<u64>,
+
+    /// Commit SHA associated with the PR (for CI event verification).
+    ///
+    /// # CI Gating
+    ///
+    /// When an agent associates a PR with this work, the commit SHA is recorded
+    /// here. This enables `process_ci_event` to verify that CI results match
+    /// the specific commit pushed by the agent, preventing stale CI results
+    /// from incorrectly transitioning work items.
+    ///
+    /// A value of `None` indicates no PR has been associated yet.
+    pub commit_sha: Option<String>,
 }
 
 impl Work {
@@ -314,6 +326,7 @@ impl Work {
             gate_receipt_id: None,
             abort_reason: None,
             pr_number: None,
+            commit_sha: None,
         }
     }
 

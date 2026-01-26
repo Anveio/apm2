@@ -349,11 +349,38 @@ impl WorkReducer {
     ///
     /// Associates a PR number with a work item, enabling CI event matching
     /// for phase transitions.
+    ///
+    /// # Security Constraints
+    ///
+    /// - **State Restriction**: PR association is only allowed when the work
+    ///   item is in `InProgress` state. This prevents agents from bypassing CI
+    ///   gating by associating a work item with a PR that has already passed CI
+    ///   while in `CiPending` or `Blocked` state.
+    ///
+    /// - **Uniqueness Constraint (CTR-CIQ002)**: A PR number cannot be
+    ///   associated with a work item if it is already associated with another
+    ///   active (non-terminal) work item. This prevents CI result confusion.
     fn handle_pr_associated(
         &mut self,
         event: &crate::events::WorkPrAssociated,
     ) -> Result<(), WorkError> {
         let work_id = &event.work_id;
+        let pr_number = event.pr_number;
+        let commit_sha = &event.commit_sha;
+
+        // Security check: Verify PR number is not already associated with another
+        // active work item (CTR-CIQ002 uniqueness constraint)
+        if let Some(existing_work) = self
+            .state
+            .work_items
+            .values()
+            .find(|w| w.pr_number == Some(pr_number) && w.is_active() && w.work_id != *work_id)
+        {
+            return Err(WorkError::PrNumberAlreadyAssociated {
+                pr_number,
+                existing_work_id: existing_work.work_id.clone(),
+            });
+        }
 
         let work =
             self.state
@@ -363,16 +390,19 @@ impl WorkReducer {
                     work_id: work_id.clone(),
                 })?;
 
-        // Cannot associate PR with terminal work
-        if work.is_terminal() {
-            return Err(WorkError::InvalidTransition {
-                from_state: work.state.as_str().to_string(),
-                event_type: "work.pr_associated".to_string(),
+        // Security check: PR association only allowed from InProgress state.
+        // This prevents bypassing CI gating by associating with a PR that has
+        // already passed CI while in CiPending or Blocked state.
+        if work.state != WorkState::InProgress {
+            return Err(WorkError::PrAssociationNotAllowed {
+                work_id: work_id.clone(),
+                current_state: work.state,
             });
         }
 
-        // Set the PR number
-        work.pr_number = Some(event.pr_number);
+        // Set the PR number and commit SHA for CI event matching
+        work.pr_number = Some(pr_number);
+        work.commit_sha = Some(commit_sha.clone());
 
         Ok(())
     }

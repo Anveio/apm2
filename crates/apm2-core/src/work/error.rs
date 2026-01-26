@@ -77,4 +77,35 @@ pub enum WorkError {
     /// Protocol buffer decode error.
     #[error("protobuf decode error: {0}")]
     ProtobufDecode(#[from] prost::DecodeError),
+
+    /// PR association only allowed from `InProgress` state.
+    ///
+    /// # Security
+    ///
+    /// Restricting PR association to `InProgress` prevents an agent from
+    /// bypassing CI gating by associating a work item with a PR that has
+    /// already passed CI while the work is in `CiPending` or `Blocked` state.
+    #[error(
+        "PR association only allowed from InProgress state, work {work_id} is in {current_state}"
+    )]
+    PrAssociationNotAllowed {
+        /// The work ID.
+        work_id: String,
+        /// The current state of the work item.
+        current_state: WorkState,
+    },
+
+    /// PR number already associated with another active work item.
+    ///
+    /// # Security
+    ///
+    /// Enforces uniqueness of PR numbers across active work items to prevent
+    /// CI result confusion (contract CTR-CIQ002).
+    #[error("PR number {pr_number} is already associated with active work item {existing_work_id}")]
+    PrNumberAlreadyAssociated {
+        /// The PR number that is already in use.
+        pr_number: u64,
+        /// The work ID that already has this PR number.
+        existing_work_id: String,
+    },
 }

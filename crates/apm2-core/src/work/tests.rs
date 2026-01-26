@@ -1521,12 +1521,13 @@ fn test_work_pr_associated() {
     // Setup: Open -> Claimed -> InProgress
     setup_in_progress_work(&mut reducer, &ctx, "work-1");
 
-    // Verify no PR number initially
+    // Verify no PR number or commit_sha initially
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.pr_number, None);
+    assert_eq!(work.commit_sha, None);
 
     // Associate PR number
-    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "abc123");
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "abc123def456");
     reducer
         .apply(
             &create_event("work.pr_associated", "session-1", pr_payload),
@@ -1534,9 +1535,10 @@ fn test_work_pr_associated() {
         )
         .unwrap();
 
-    // Verify PR number is set
+    // Verify PR number and commit_sha are set
     let work = reducer.state().get("work-1").unwrap();
     assert_eq!(work.pr_number, Some(42));
+    assert_eq!(work.commit_sha, Some("abc123def456".to_string()));
 }
 
 #[test]
@@ -1544,16 +1546,12 @@ fn test_work_lookup_by_pr_number() {
     let mut reducer = WorkReducer::new();
     let ctx = ReducerContext::new(1);
 
-    // Setup multiple work items
-    for i in 1..=3 {
-        let payload =
-            helpers::work_opened_payload(&format!("work-{i}"), "TICKET", vec![], vec![], vec![]);
-        reducer
-            .apply(&create_event("work.opened", "session-1", payload), &ctx)
-            .unwrap();
-    }
+    // Setup multiple work items in InProgress state (required for PR association)
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+    setup_in_progress_work(&mut reducer, &ctx, "work-2");
+    setup_in_progress_work(&mut reducer, &ctx, "work-3");
 
-    // Associate PR numbers
+    // Associate PR numbers with work-1 and work-2
     let pr_payload1 = helpers::work_pr_associated_payload("work-1", 100, "sha1");
     let pr_payload2 = helpers::work_pr_associated_payload("work-2", 200, "sha2");
     reducer
@@ -1779,4 +1777,247 @@ fn setup_ci_pending_work(reducer: &mut WorkReducer, ctx: &ReducerContext, work_i
             ctx,
         )
         .unwrap();
+}
+
+// =============================================================================
+// WorkPrAssociated Security Tests
+// =============================================================================
+
+#[test]
+fn test_pr_association_only_allowed_from_in_progress() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Create work in Open state
+    let open_payload = helpers::work_opened_payload("work-1", "TICKET", vec![], vec![], vec![]);
+    reducer
+        .apply(
+            &create_event("work.opened", "session-1", open_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Try to associate PR from Open state (should fail)
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "sha123");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrAssociationNotAllowed { .. })
+    ));
+
+    // Verify work is still in Open state with no PR
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Open);
+    assert_eq!(work.pr_number, None);
+}
+
+#[test]
+fn test_pr_association_fails_from_ci_pending() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+
+    // Verify work is in CiPending state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::CiPending);
+
+    // Try to associate PR from CiPending state (should fail)
+    // This prevents bypassing CI gating by associating with a PR that already
+    // passed
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 99, "sha_bypass_attempt");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrAssociationNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn test_pr_association_fails_from_blocked() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress -> CiPending -> Blocked
+    setup_ci_pending_work(&mut reducer, &ctx, "work-1");
+    let blocked_payload = helpers::work_transitioned_payload_with_sequence(
+        "work-1",
+        "CI_PENDING",
+        "BLOCKED",
+        "ci_failed",
+        3,
+    );
+    reducer
+        .apply(
+            &create_event("work.transitioned", "session-1", blocked_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Verify work is in Blocked state
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.state, WorkState::Blocked);
+
+    // Try to associate PR from Blocked state (should fail)
+    // This prevents bypassing CI gating by associating with a different PR
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 99, "sha_bypass_attempt");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrAssociationNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn test_pr_number_uniqueness_enforced() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup two work items in InProgress state
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+    setup_in_progress_work(&mut reducer, &ctx, "work-2");
+
+    // Associate PR 100 with work-1
+    let pr_payload1 = helpers::work_pr_associated_payload("work-1", 100, "sha1");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload1),
+            &ctx,
+        )
+        .unwrap();
+
+    // Try to associate the same PR 100 with work-2 (should fail - CTR-CIQ002)
+    let pr_payload2 = helpers::work_pr_associated_payload("work-2", 100, "sha2");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload2),
+        &ctx,
+    );
+    assert!(matches!(
+        result,
+        Err(WorkError::PrNumberAlreadyAssociated { .. })
+    ));
+
+    // Verify work-2 still has no PR
+    let work2 = reducer.state().get("work-2").unwrap();
+    assert_eq!(work2.pr_number, None);
+}
+
+#[test]
+fn test_pr_number_can_be_reused_after_terminal_state() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup work-1 in InProgress state
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Associate PR 100 with work-1
+    let pr_payload1 = helpers::work_pr_associated_payload("work-1", 100, "sha1");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload1),
+            &ctx,
+        )
+        .unwrap();
+
+    // Abort work-1 (terminal state)
+    let abort_payload = helpers::work_aborted_payload("work-1", "MANUAL", "cancelled");
+    reducer
+        .apply(
+            &create_event("work.aborted", "session-1", abort_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Now work-1 is in terminal state, PR 100 should be available
+
+    // Setup work-2 in InProgress state
+    setup_in_progress_work(&mut reducer, &ctx, "work-2");
+
+    // Associate PR 100 with work-2 (should succeed - work-1 is terminal)
+    let pr_payload2 = helpers::work_pr_associated_payload("work-2", 100, "sha2");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload2),
+            &ctx,
+        )
+        .unwrap();
+
+    let work2 = reducer.state().get("work-2").unwrap();
+    assert_eq!(work2.pr_number, Some(100));
+}
+
+#[test]
+fn test_commit_sha_stored_on_pr_association() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Associate PR with specific commit SHA
+    let commit_sha = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0";
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, commit_sha);
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload),
+            &ctx,
+        )
+        .unwrap();
+
+    // Verify commit_sha is stored
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.pr_number, Some(42));
+    assert_eq!(work.commit_sha, Some(commit_sha.to_string()));
+}
+
+#[test]
+fn test_pr_association_fails_for_unknown_work() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Try to associate PR with non-existent work
+    let pr_payload = helpers::work_pr_associated_payload("unknown-work", 42, "sha123");
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(matches!(result, Err(WorkError::WorkNotFound { .. })));
+}
+
+#[test]
+fn test_pr_association_idempotent_same_pr() {
+    let mut reducer = WorkReducer::new();
+    let ctx = ReducerContext::new(1);
+
+    // Setup: Open -> Claimed -> InProgress
+    setup_in_progress_work(&mut reducer, &ctx, "work-1");
+
+    // Associate PR 42 with work-1
+    let pr_payload = helpers::work_pr_associated_payload("work-1", 42, "sha1");
+    reducer
+        .apply(
+            &create_event("work.pr_associated", "session-1", pr_payload.clone()),
+            &ctx,
+        )
+        .unwrap();
+
+    // Associate the same PR again (should succeed - idempotent)
+    let result = reducer.apply(
+        &create_event("work.pr_associated", "session-1", pr_payload),
+        &ctx,
+    );
+    assert!(result.is_ok());
+
+    let work = reducer.state().get("work-1").unwrap();
+    assert_eq!(work.pr_number, Some(42));
 }
