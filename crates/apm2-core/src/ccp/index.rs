@@ -216,25 +216,33 @@ fn escape_path_for_glob(path: &Path) -> String {
     glob::Pattern::escape(&path.to_string_lossy())
 }
 
-/// Discovers all Rust source files in the repository.
+/// Discovers all source files in the repository.
 ///
-/// Searches for `*.rs` files in the `crates/` and `xtask/` directories.
+/// Searches for `*.rs`, `*.yaml`, `*.yml`, and `*.md` files in the `crates/`
+/// and `xtask/` directories, and `*.rs` files in the `fuzz/` directory.
 /// Returns paths sorted alphabetically for determinism.
 fn discover_source_files(repo_root: &Path) -> Result<Vec<PathBuf>, CcpIndexError> {
     let mut paths = Vec::new();
     let escaped_root = escape_path_for_glob(repo_root);
 
-    // Pattern 1: crates/**/*.rs
-    let pattern1 = format!("{escaped_root}/crates/**/*.rs");
-    if let Ok(entries) = glob::glob(&pattern1) {
-        for entry in entries.flatten() {
-            paths.push(entry);
+    // File extensions to scan in crates/ and xtask/
+    let extensions = ["rs", "yaml", "yml", "md"];
+    let directories = ["crates", "xtask"];
+
+    for dir in &directories {
+        for ext in &extensions {
+            let pattern = format!("{escaped_root}/{dir}/**/*.{ext}");
+            if let Ok(entries) = glob::glob(&pattern) {
+                for entry in entries.flatten() {
+                    paths.push(entry);
+                }
+            }
         }
     }
 
-    // Pattern 2: xtask/**/*.rs
-    let pattern2 = format!("{escaped_root}/xtask/**/*.rs");
-    if let Ok(entries) = glob::glob(&pattern2) {
+    // fuzz/ directory only contains Rust files
+    let fuzz_pattern = format!("{escaped_root}/fuzz/**/*.rs");
+    if let Ok(entries) = glob::glob(&fuzz_pattern) {
         for entry in entries.flatten() {
             paths.push(entry);
         }
@@ -809,10 +817,10 @@ edition = "2021"
         )
         .unwrap();
 
-        // Should capture all 3 .rs files
+        // Should capture all 3 .rs files + 1 AGENTS.md file = 4 files
         assert_eq!(
-            result.index.file_inventory.file_count, 3,
-            "Should capture all source files"
+            result.index.file_inventory.file_count, 4,
+            "Should capture all source files (3 .rs + 1 .md)"
         );
 
         // Verify paths are sorted
