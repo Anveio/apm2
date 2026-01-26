@@ -1,16 +1,17 @@
 //! Inference tool implementation.
 //!
 //! Provides the execution logic for inference calls (`InferenceCall`).
-//! Integrates with a provider abstraction and deducts token usage from the budget.
+//! Integrates with a provider abstraction and deducts token usage from the
+//! budget.
 
 use std::sync::Arc;
 
 use tracing::info;
 
+use super::{InferenceCall, ToolError};
 use crate::adapter::BoxFuture;
 use crate::budget::{BudgetTracker, BudgetType};
 use crate::evidence::{CasError, ContentAddressedStore};
-use super::{InferenceCall, ToolError};
 
 /// Trait for inference providers.
 pub trait InferenceProvider: Send + Sync + std::fmt::Debug {
@@ -18,9 +19,9 @@ pub trait InferenceProvider: Send + Sync + std::fmt::Debug {
     ///
     /// Returns the generated text and token usage.
     fn generate<'a>(
-        &'a self, 
-        prompt: &'a str, 
-        req: &'a InferenceCall
+        &'a self,
+        prompt: &'a str,
+        req: &'a InferenceCall,
     ) -> BoxFuture<'a, Result<InferenceResult, ToolError>>;
 }
 
@@ -59,10 +60,7 @@ impl std::fmt::Debug for InferenceTool {
 
 impl InferenceTool {
     /// Create a new inference tool handler.
-    pub fn new(
-        provider: Box<dyn InferenceProvider>,
-        cas: Arc<dyn ContentAddressedStore>,
-    ) -> Self {
+    pub fn new(provider: Box<dyn InferenceProvider>, cas: Arc<dyn ContentAddressedStore>) -> Self {
         Self { provider, cas }
     }
 
@@ -76,9 +74,9 @@ impl InferenceTool {
     /// - The budget is insufficient
     /// - The provider fails
     pub async fn execute(
-        &self, 
-        req: &InferenceCall, 
-        budget: &mut BudgetTracker
+        &self,
+        req: &InferenceCall,
+        budget: &mut BudgetTracker,
     ) -> Result<InferenceResult, ToolError> {
         info!("Executing inference call: {}/{}", req.provider, req.model);
 
@@ -86,7 +84,7 @@ impl InferenceTool {
         // We assume 1 input token minimum, plus max_tokens output.
         // This is a rough check to fail fast if the budget is obviously depleted.
         if !budget.can_charge(BudgetType::Token, req.max_tokens) {
-             return Err(ToolError {
+            return Err(ToolError {
                 error_code: "BUDGET_EXCEEDED".to_string(),
                 message: "Insufficient token budget for max_tokens".to_string(),
                 retryable: false,
@@ -95,12 +93,16 @@ impl InferenceTool {
         }
 
         // 2. Retrieve prompt from CAS
-        let prompt_bytes = self.cas.retrieve_hash(&req.prompt_hash).map_err(|e| ToolError {
-            error_code: "CAS_ERROR".to_string(),
-            message: format!("Failed to retrieve prompt: {e}"),
-            retryable: matches!(e, CasError::NotFound { .. }), // Maybe retryable if upload lagging?
-            retry_after_ms: 0,
-        })?;
+        let prompt_bytes = self
+            .cas
+            .retrieve_hash(&req.prompt_hash)
+            .map_err(|e| ToolError {
+                error_code: "CAS_ERROR".to_string(),
+                message: format!("Failed to retrieve prompt: {e}"),
+                retryable: matches!(e, CasError::NotFound { .. }), /* Maybe retryable if upload
+                                                                    * lagging? */
+                retry_after_ms: 0,
+            })?;
 
         let prompt = String::from_utf8(prompt_bytes).map_err(|e| ToolError {
             error_code: "INVALID_PROMPT".to_string(),
@@ -111,7 +113,7 @@ impl InferenceTool {
 
         // 3. Call provider
         let result = self.provider.generate(&prompt, req).await?;
-        
+
         // 4. Charge actual usage
         let total_tokens = result.usage.input_tokens + result.usage.output_tokens;
         // This might exceed the remaining budget if our conservative check passed
@@ -157,9 +159,9 @@ mod tests {
 
     impl InferenceProvider for MockProvider {
         fn generate<'a>(
-            &'a self, 
-            _prompt: &'a str, 
-            _req: &'a InferenceCall
+            &'a self,
+            _prompt: &'a str,
+            _req: &'a InferenceCall,
         ) -> BoxFuture<'a, Result<InferenceResult, ToolError>> {
             Box::pin(async move {
                 Ok(InferenceResult {
@@ -221,7 +223,7 @@ mod tests {
             provider: "mock".to_string(),
             model: "test".to_string(),
             prompt_hash: vec![0u8; 32], // Doesn't matter, fails before CAS
-            max_tokens: 100, // Exceeds budget
+            max_tokens: 100,            // Exceeds budget
             temperature_scaled: 0,
             system_prompt_hash: vec![],
         };
