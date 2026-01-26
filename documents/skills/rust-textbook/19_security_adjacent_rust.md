@@ -50,6 +50,12 @@
 [PROVENANCE] Determinism is a system contract; Rust does not enforce determinism.
 [VERIFICATION] Deterministic test harnesses; CI build matrix; property tests for determinism.
 
+[CONTRACT: CTR-1907] Complete Audit and Ledger Data (Anti-Information Loss).
+- Audit trails and ledger events MUST capture all possible associated values to prevent information loss.
+- REJECT IF: audit/ledger fields use `Option<T>` when multiplicity (multiple associated items) is possible.
+- ENFORCE BY: use `Vec<T>` instead of `Option<T>` for associated identifiers (e.g., `pr_numbers: Vec<u64>` instead of `pr_number: Option<u64>`).
+[PROVENANCE] APM2 Security Policy; RSK-1906 (Nondeterminism/Integrity).
+
 ## References (Normative Anchors)
 
 - Rust Reference: Behavior considered undefined: https://doc.rust-lang.org/reference/behavior-considered-undefined.html

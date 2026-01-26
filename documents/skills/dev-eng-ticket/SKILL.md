@@ -362,7 +362,154 @@ impl Handler {
 
 ---
 
-## 13. PR Checklist for Review Readiness
+## 14. Cancellation-Safe State Mutation (`CTR-ATOMIC001`)
+
+Idempotency stores with external side effects (e.g., persist to DB) MUST use a three-phase pattern to prevent data loss on cancellation:
+
+```rust
+// WRONG: check_and_mark before persist can lose data if cancelled
+fn process_once(id: &str, store: &impl DeliveryIdStore) -> Result<(), Error> {
+    if !store.check_and_mark(id) {
+        return Ok(()); // Already processed
+    }
+    persist_event()?;  // If cancelled here, ID is marked but data is lost!
+    Ok(())
+}
+
+// CORRECT: check → persist → mark (only mark after successful persist)
+fn process_once(id: &str, store: &impl DeliveryIdStore) -> Result<(), Error> {
+    if store.contains(id) {
+        return Ok(()); // Already processed
+    }
+    persist_event()?;  // Can retry if this fails
+    store.mark(id);    // Only mark after successful persist
+    Ok(())
+}
+```
+
+*   **Reject if:** Idempotency marker is set before side effect completes.
+*   **Test:** `test_retry_after_persist_failure` - verify unmarked after persist error.
+
+---
+
+## 15. Ghost Key Prevention in Queues (`CTR-QUEUE001`)
+
+When using insertion-order queues (`VecDeque`) with TTL-based eviction, keys can be reused after expiration. Store timestamps alongside keys to detect ghost entries.
+
+```rust
+// WRONG: Ghost key eviction bug - can evict NEW entry for reused key
+struct BoundedStore {
+    entries: HashMap<String, Entry>,
+    queue: VecDeque<String>,  // Ghost entries after TTL expiration
+}
+
+// CORRECT: Store timestamp to detect ghost entries
+struct QueueEntry {
+    key: String,
+    inserted_at: Instant,
+}
+
+struct BoundedStore {
+    entries: HashMap<String, Entry>,
+    queue: VecDeque<QueueEntry>,
+}
+
+impl BoundedStore {
+    fn evict_oldest(&mut self) {
+        while let Some(qe) = self.queue.pop_front() {
+            if let Some(entry) = self.entries.get(&qe.key) {
+                // Ghost detection: if timestamps differ, this is a stale queue entry
+                if entry.inserted_at == qe.inserted_at {
+                    self.entries.remove(&qe.key);
+                    break; // Evicted a real entry
+                }
+                // Skip this ghost entry, continue to next
+            }
+        }
+    }
+}
+```
+
+*   **Reject if:** Queue stores only keys without timestamps for TTL-based stores.
+*   **Test:** `test_ghost_key_eviction` - reuse key after TTL, verify new entry survives eviction.
+
+---
+
+## 16. Defensive Time Handling (`CTR-CLOCK001`)
+
+OS clocks can jump backwards. Use `checked_*` methods to avoid panics.
+
+```rust
+// WRONG: Can panic if system clock jumps backwards
+let elapsed = now.duration_since(start);
+
+// CORRECT: Handle clock anomalies gracefully
+let elapsed = now.checked_duration_since(start).unwrap_or(Duration::ZERO);
+
+// Also guard against division by zero in interval-based logic
+if cleanup_interval > 0 && count % cleanup_interval == 0 {
+    cleanup();
+}
+```
+
+*   **Reject if:** `duration_since()` used without `checked_` variant.
+*   **Reject if:** Modulo with interval without zero guard.
+
+---
+
+## 17. Query Result Limiting (`CTR-QUERY001`)
+
+Apply limits **before** collecting iterators to prevent memory exhaustion from query results.
+
+```rust
+// WRONG: Collects all results, then limits - memory DoS vector
+fn query_events(&self, limit: usize) -> Vec<Event> {
+    let results: Vec<_> = self.events
+        .iter()
+        .filter(|e| e.matches_criteria())
+        .cloned()
+        .collect();  // Unbounded allocation!
+    results.into_iter().take(limit).collect()
+}
+
+// CORRECT: Limit before collect
+fn query_events(&self, limit: usize) -> Vec<Event> {
+    self.events
+        .iter()
+        .filter(|e| e.matches_criteria())
+        .take(limit)  // Limit BEFORE collect
+        .cloned()
+        .collect()
+}
+```
+
+*   **Reject if:** `.collect()` precedes `.take(limit)` in query paths.
+*   **Test:** Query with limit=10 on 1M items, verify <1ms and O(limit) memory.
+
+---
+
+## 18. Complete Audit Data (`CTR-AUDIT001`)
+
+Use `Vec<T>` instead of `Option<T>` when multiple values are possible to prevent audit information loss.
+
+```rust
+// WRONG: Loses information when multiple PRs are associated
+pub struct CIWorkflowPayload {
+    pub pr_number: Option<u64>,  // What if workflow runs for multiple PRs?
+}
+
+// CORRECT: Preserve all associated values
+pub struct CIWorkflowPayload {
+    pub pr_numbers: Vec<u64>,  // Capture ALL PRs, never lose data
+}
+```
+
+*   **Reject if:** Audit/ledger fields use `Option<T>` when multiplicity is possible.
+*   **Consider:** Document source of truth if only one value is captured (e.g., "first PR from webhook").
+
+---
+
+## 19. PR Checklist for Review Readiness
 
 1.  **Bounded Reads:** All reads checked against `max` before allocation (`RSK-2415`).
 2.  **Atomic Writes:** State updates use `NamedTempFile` + `persist` (`CTR-1502`).
@@ -376,3 +523,8 @@ impl Handler {
 10. **Bounded Stores:** In-memory stores have `max_entries` limit with O(1) eviction (`CTR-MEM001`).
 11. **Ledger Serde:** Audit/ledger types use `#[serde(deny_unknown_fields)]` (`CTR-SERDE001`).
 12. **Fail-Closed Flags:** Security feature flags default to disabled (`CTR-FLAG001`).
+13. **Cancellation Safety:** Idempotency markers set AFTER side effects complete (`CTR-ATOMIC001`).
+14. **Ghost Key Prevention:** TTL queues store timestamps to detect stale entries (`CTR-QUEUE001`).
+15. **Defensive Time:** Use `checked_duration_since()`, guard interval divisors (`CTR-CLOCK001`).
+16. **Query Limits:** Apply `.take(limit)` BEFORE `.collect()` (`CTR-QUERY001`).
+17. **Audit Completeness:** Use `Vec<T>` not `Option<T>` when multiplicity possible (`CTR-AUDIT001`).

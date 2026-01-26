@@ -21,6 +21,13 @@
 - REJECT IF: identity assumptions are implicit (pointer address equality, index reuse without generation).
 [PROVENANCE] Stable identity is not implied by Rust collections; it is a design contract.
 
+[CONTRACT: CTR-1302] Query Result Limiting (Memory DoS Prevention).
+- Apply limits BEFORE collecting iterators to prevent memory exhaustion from query results.
+- REJECT IF: `.collect()` precedes `.take(limit)` in query paths.
+- ENFORCE BY: `.take(limit).collect()`.
+[PROVENANCE] APM2 Implementation Standard; RSK-1901 (Resource Exhaustion).
+[VERIFICATION] Query with limit=N on M>>N items, verify O(limit) memory.
+
 [HAZARD: RSK-1302] Size Math and Allocation Are Attacker-Controlled at Boundaries.
 - TRIGGER: parsing lengths from inputs; `len * size_of::<T>()` computations; `reserve`/`with_capacity` from untrusted sizes.
 - FAILURE MODE: integer overflow; oversized allocation; quadratic behavior due to repeated growth.
@@ -35,6 +42,13 @@
 - ENFORCE BY: sort keys; use ordered maps/sets for deterministic output; define ordering in the format contract.
 [PROVENANCE] std docs: hash maps do not guarantee iteration order.
 [VERIFICATION] Deterministic snapshot tests that sort before asserting.
+
+[HAZARD: RSK-1304] Ghost Key Prevention in TTL Queues.
+- When using insertion-order queues (VecDeque) with TTL-based eviction, keys can be reused after expiration.
+- REJECT IF: queue stores only keys without timestamps for TTL-based stores.
+- ENFORCE BY: store timestamps alongside keys in the queue to detect and skip stale "ghost" entries.
+[PROVENANCE] APM2 Implementation Standard.
+[VERIFICATION] Test ghost key eviction: reuse key after TTL, verify new entry survives eviction.
 
 ## References (Normative Anchors)
 
