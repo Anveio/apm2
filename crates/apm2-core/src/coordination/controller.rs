@@ -86,7 +86,7 @@
 //!     let freshness = controller.check_work_freshness(work_id, seq_id, is_claimable);
 //!
 //!     if !freshness.is_eligible {
-//!         controller.skip_work_item(work_id);
+//!         controller.skip_work_item(work_id)?;
 //!         continue;
 //!     }
 //!
@@ -124,10 +124,18 @@ use super::state::{
 /// Maximum number of attempts per work item (default).
 pub const DEFAULT_MAX_ATTEMPTS_PER_WORK: u32 = 3;
 
-/// Circuit breaker threshold: abort after this many consecutive failures.
+/// Circuit breaker threshold: abort after this many consecutive work item
+/// failures.
 ///
-/// Per AD-COORD-005: Abort after 3 consecutive session failures.
+/// Per AD-COORD-005 and AD-COORD-010: Abort after 3 consecutive work items
+/// permanently fail (exhaust their retries). Individual session failures within
+/// retries do NOT count toward this threshold.
 pub const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
+/// Maximum allowed value for `max_attempts_per_work`.
+///
+/// Prevents memory exhaustion from excessive retry tracking.
+pub const MAX_ATTEMPTS_LIMIT: u32 = 100;
 
 /// Configuration for a coordination run.
 ///
@@ -158,13 +166,15 @@ impl CoordinationConfig {
     ///
     /// * `work_ids` - Work item IDs to process
     /// * `budget` - Budget constraints
-    /// * `max_attempts_per_work` - Maximum retry attempts per work item
+    /// * `max_attempts_per_work` - Maximum retry attempts per work item (must
+    ///   be >= 1)
     ///
     /// # Errors
     ///
     /// Returns [`ControllerError::EmptyWorkQueue`] if `work_ids` is empty.
     /// Returns [`ControllerError::WorkQueueSizeExceeded`] if queue exceeds
-    /// limit.
+    /// limit. Returns [`ControllerError::InvalidBudget`] if
+    /// `max_attempts_per_work` is 0 or exceeds [`MAX_ATTEMPTS_LIMIT`].
     pub fn new(
         work_ids: Vec<String>,
         budget: CoordinationBudget,
@@ -179,7 +189,8 @@ impl CoordinationConfig {
     ///
     /// Returns [`ControllerError::EmptyWorkQueue`] if `work_ids` is empty.
     /// Returns [`ControllerError::WorkQueueSizeExceeded`] if queue exceeds
-    /// limit.
+    /// limit. Returns [`ControllerError::InvalidBudget`] if
+    /// `max_attempts_per_work` is invalid.
     pub fn with_max_queue_size(
         work_ids: Vec<String>,
         budget: CoordinationBudget,
@@ -188,6 +199,18 @@ impl CoordinationConfig {
     ) -> ControllerResult<Self> {
         if work_ids.is_empty() {
             return Err(ControllerError::EmptyWorkQueue);
+        }
+
+        // Validate max_attempts_per_work
+        if max_attempts_per_work == 0 {
+            return Err(ControllerError::InvalidBudget {
+                field: "max_attempts_per_work (must be >= 1)",
+            });
+        }
+        if max_attempts_per_work > MAX_ATTEMPTS_LIMIT {
+            return Err(ControllerError::InvalidBudget {
+                field: "max_attempts_per_work (exceeds MAX_ATTEMPTS_LIMIT)",
+            });
         }
 
         if work_ids.len() > max_work_queue_size {
@@ -309,7 +332,8 @@ pub struct CoordinationController {
     /// Per-work tracking state.
     work_tracking: Vec<WorkItemState>,
 
-    /// Active session state (enforces serial execution and `work_id` validation).
+    /// Active session state (enforces serial execution and `work_id`
+    /// validation).
     ///
     /// Set in `prepare_session_spawn`, cleared in `record_session_termination`.
     /// Having a value here means a session is currently active and no new
@@ -781,16 +805,35 @@ impl CoordinationController {
         })
     }
 
-    /// Marks a work item as skipped (e.g., due to freshness violation).
+    /// Marks the current work item as skipped (e.g., due to freshness
+    /// violation).
     ///
     /// # Arguments
     ///
-    /// * `work_id` - The work item to skip
-    pub fn skip_work_item(&mut self, work_id: &str) {
-        if let Some(tracking) = self.work_tracking.iter_mut().find(|t| t.work_id == work_id) {
-            tracking.final_outcome = Some(WorkItemOutcome::Skipped);
+    /// * `work_id` - The work item to skip (must match current work index)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `work_id` doesn't match the current work item.
+    pub fn skip_work_item(&mut self, work_id: &str) -> ControllerResult<()> {
+        // Verify work_id matches current work index (prevents state corruption)
+        let expected_work_id =
+            self.config
+                .work_ids
+                .get(self.work_index)
+                .ok_or_else(|| ControllerError::Internal {
+                    message: "work index out of bounds".to_string(),
+                })?;
+        if work_id != expected_work_id {
+            return Err(ControllerError::WorkNotFound {
+                work_id: work_id.to_string(),
+            });
         }
+
+        // Access tracking by index (handles duplicate work IDs correctly)
+        self.work_tracking[self.work_index].final_outcome = Some(WorkItemOutcome::Skipped);
         self.work_index += 1;
+        Ok(())
     }
 
     /// Checks if a stop condition is met.
@@ -1006,6 +1049,22 @@ mod tests {
     }
 
     #[test]
+    fn tck_00150_config_zero_attempts() {
+        let result = CoordinationConfig::new(vec!["work-1".to_string()], test_budget(), 0);
+        assert!(matches!(result, Err(ControllerError::InvalidBudget { .. })));
+    }
+
+    #[test]
+    fn tck_00150_config_excessive_attempts() {
+        let result = CoordinationConfig::new(
+            vec!["work-1".to_string()],
+            test_budget(),
+            MAX_ATTEMPTS_LIMIT + 1,
+        );
+        assert!(matches!(result, Err(ControllerError::InvalidBudget { .. })));
+    }
+
+    #[test]
     fn tck_00150_config_queue_size_exceeded() {
         let work_ids: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
             .map(|i| format!("work-{i}"))
@@ -1153,7 +1212,7 @@ mod tests {
         controller.start(1_000_000_000).unwrap();
 
         // Skip work-1 due to freshness violation
-        controller.skip_work_item("work-1");
+        controller.skip_work_item("work-1").unwrap();
 
         // Verify work index advanced
         assert_eq!(controller.work_index(), 1);
@@ -1162,6 +1221,21 @@ mod tests {
         // Verify work-1 marked as skipped
         let tracking = &controller.work_tracking[0];
         assert_eq!(tracking.final_outcome, Some(WorkItemOutcome::Skipped));
+    }
+
+    #[test]
+    fn tck_00150_skip_mismatch_fails() {
+        let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Try to skip work-2 when current is work-1
+        let result = controller.skip_work_item("work-2");
+        assert!(matches!(result, Err(ControllerError::WorkNotFound { .. })));
+
+        // Verify work_index did NOT advance
+        assert_eq!(controller.work_index(), 0);
+        assert_eq!(controller.current_work_id(), Some("work-1"));
     }
 
     // =========================================================================
