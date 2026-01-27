@@ -140,10 +140,45 @@ rfc_design_decisions:
         Prevents race conditions where work state changes during spawn.
       constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
 
-  v0_discovery_notes: |
-    This is RFC v0 (Discovery phase). Design decisions are initial hypotheses.
-    Codebase investigation in v2 (Exploration) phase will:
-    - Verify reducer pattern compatibility with existing reducers
-    - Identify specific integration points in SessionReducer/WorkReducer
-    - Validate CAS storage patterns for receipt artifacts
-    - Confirm CLI extension patterns for apm2 coordinate command
+  v2_exploration_findings: |
+    RFC v2 (Grounded phase). Design decisions validated through codebase investigation.
+
+    ## Session Integration Points (OQ-COORD-001 - RESOLVED)
+    Evidence from crates/apm2-core/src/session/reducer.rs:
+    - SessionReducer maintains state via HashMap<String, SessionState>
+    - Session lifecycle: Running -> Terminated/Quarantined (terminal states)
+    - Events emitted: SessionStarted (with work_id, entropy_budget, restart_attempt),
+      SessionProgress, SessionTerminated, SessionQuarantined, SessionRestartScheduled
+    - Integration points identified:
+      * SessionReducer::apply() processes session.* events from EventRecord
+      * SessionReducerState.get(session_id) for observation
+      * SessionStarted contains work_id for binding correlation
+      * Binding events (coordination.session_bound) MUST precede session.started
+      * Unbind events (coordination.session_unbound) MUST follow session.terminated
+
+    ## Checkpoint Format (OQ-COORD-002 - RESOLVED)
+    Evidence from crates/apm2-core/src/reducer/checkpoint.rs:
+    - Checkpoint structure: (reducer_name, seq_id, state_data blob, created_at_ns)
+    - CheckpointableReducer trait: serialize_state/deserialize_state via serde_json
+    - CoordinationCheckpoint follows identical pattern:
+      * CoordinationReducerState: HashMap<coordination_id, CoordinationState>
+      * Serialize via serde_json (requires Serialize + Deserialize)
+      * Deterministic HashMap iteration (sorted keys)
+
+    ## Work State Interaction (OQ-COORD-003 - RESOLVED)
+    Evidence from crates/apm2-core/src/work/state.rs and reducer.rs:
+    - WorkState has 11 states; claimable states: Open, ReadyForReview only
+    - Work eligibility via WorkState::is_claimable() -> bool
+    - Sequence tracking via work.transition_count (monotonic, replay-protected)
+    - CoordinationController observes via WorkReducerState::get(work_id)
+    - CRITICAL: Coordination is READ-ONLY observer for work state
+      (single-writer invariant preserved - WorkReducer is sole writer)
+
+    ## Anti-Cousin Verification (SA-3)
+    - No existing coordination-like functionality in codebase
+    - Extension points confirmed: Reducer trait, ledger.append(), CheckpointStore
+    - Module placement: crates/apm2-core/src/coordination/ (follows session/, work/, lease/)
+    - Deontic rules enforced:
+      * MUST use Reducer trait (not custom base class)
+      * MUST use ledger.append() exclusively for event emission
+      * MUST_NOT modify Work/Session/Lease state directly

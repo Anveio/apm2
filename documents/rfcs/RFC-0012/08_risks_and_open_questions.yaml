@@ -90,11 +90,32 @@ rfc_risks_and_open_questions:
         SessionReducer has an existing session spawn mechanism. Coordination
         needs to spawn sessions and observe their outcomes. Need to understand
         the exact integration points.
-      v0_status: UNKNOWN
-      discovery_actions:
-        - "Review SessionReducer spawn implementation in v2 phase"
-        - "Identify event sequences for session lifecycle"
-        - "Determine if new events are needed or existing suffice"
+      v2_status: RESOLVED
+      v2_answer: |
+        Integration points identified via codebase investigation (SA-1 findings):
+
+        1. SESSION SPAWN FLOW:
+           - SessionStarted event contains: actor_id, work_id, lease_id, adapter_type,
+             entropy_budget, restart_attempt
+           - CoordinationController emits coordination.session_bound BEFORE session.started
+           - Session spawning uses existing spawn_holon mechanism (apm2-holon/src/spawn.rs)
+
+        2. OBSERVATION PATTERN:
+           - SessionReducerState.get(session_id) -> Option<&SessionState>
+           - SessionState::is_terminal() to detect completion
+           - SessionState::Terminated.exit_classification for outcome
+
+        3. EVENT SEQUENCE (BINDING BRACKET):
+           coordination.session_bound -> session.started -> ... -> session.terminated -> coordination.session_unbound
+
+        4. INTEGRATION API:
+           - Read: SessionReducer.state().get(session_id)
+           - Emit: ledger.append(coordination.session_bound/unbound events)
+           - NO direct session state modification (read-only observer)
+      evidence_refs:
+        - "crates/apm2-core/src/session/reducer.rs:107-152"
+        - "crates/apm2-core/src/session/reducer.rs:186-229"
+        - "crates/apm2-holon/src/spawn.rs"
       owner: AUTH_ARCHITECTURE
 
     - question_id: OQ-COORD-002
@@ -103,11 +124,48 @@ rfc_risks_and_open_questions:
         Checkpointing enables efficient state recovery without full replay.
         Need to define checkpoint structure compatible with existing
         checkpoint infrastructure.
-      v0_status: UNKNOWN
-      discovery_actions:
-        - "Review existing checkpoint patterns (SessionReducer, WorkReducer)"
-        - "Define CoordinationCheckpoint structure"
-        - "Implement checkpoint save/restore"
+      v2_status: RESOLVED
+      v2_answer: |
+        Checkpoint format defined following established patterns (SA-1 findings):
+
+        1. CHECKPOINT INFRASTRUCTURE (crates/apm2-core/src/reducer/checkpoint.rs):
+           - SQLite schema: (id, reducer_name, seq_id, state_data, created_at_ns)
+           - CheckpointableReducer trait: serialize_state() / deserialize_state()
+           - JSON serialization via serde_json
+
+        2. CoordinationReducerState STRUCTURE:
+           ```rust
+           pub struct CoordinationReducerState {
+               pub coordinations: HashMap<String, CoordinationState>,
+               // Bindings keyed by work_id for fast lookup
+               pub bindings: HashMap<String, BindingInfo>,
+           }
+
+           pub struct CoordinationState {
+               pub coordination_id: String,
+               pub work_queue: Vec<String>,
+               pub work_index: usize,
+               pub budget: CoordinationBudget,
+               pub budget_usage: BudgetUsage,
+               pub consecutive_failures: u32,
+               pub status: CoordinationStatus,
+               pub started_at: u64,
+           }
+           ```
+
+        3. SERIALIZATION REQUIREMENTS:
+           - All types derive Serialize + Deserialize (serde)
+           - Deterministic HashMap iteration via sorted keys in JSON output
+           - State must be Send + Sync for async runtime
+
+        4. CHECKPOINT SEMANTICS:
+           - Save: CoordinationReducerState serialized to JSON blob at seq_id
+           - Restore: JSON blob deserialized, reducer resumes from seq_id
+           - Determinism: replay from checkpoint == replay from genesis for same events
+      evidence_refs:
+        - "crates/apm2-core/src/reducer/checkpoint.rs:65-99"
+        - "crates/apm2-core/src/reducer/traits.rs:94-125"
+        - "crates/apm2-core/src/session/reducer.rs:14-71"
       owner: AUTH_ARCHITECTURE
 
     - question_id: OQ-COORD-003
@@ -117,11 +175,45 @@ rfc_risks_and_open_questions:
         needs to understand when work is eligible for processing and when
         to mark it complete. Does coordination emit work state events or
         just observe them?
-      v0_status: UNKNOWN
-      discovery_actions:
-        - "Review WorkReducer state machine"
-        - "Determine work eligibility criteria"
-        - "Clarify responsibility for work state transitions"
+      v2_status: RESOLVED
+      v2_answer: |
+        Work interaction model defined (SA-2 and SA-3 findings):
+
+        1. WORK STATES (crates/apm2-core/src/work/state.rs):
+           Full enum: Open, Claimed, InProgress, Review, NeedsInput,
+           NeedsAdjudication, Completed, Aborted, CiPending, ReadyForReview, Blocked
+
+        2. ELIGIBILITY CRITERIA:
+           - WorkState::is_claimable() returns true ONLY for: Open, ReadyForReview
+           - Non-claimable: Claimed, InProgress, CiPending, Blocked, Review,
+             NeedsInput, NeedsAdjudication, Completed, Aborted
+
+        3. SINGLE-WRITER INVARIANT (CRITICAL):
+           - CoordinationController is READ-ONLY observer for work state
+           - Coordination does NOT emit work.* events
+           - Work state transitions owned by WorkReducer
+           - This prevents cousin abstraction with WorkReducer
+
+        4. OBSERVATION PATTERN:
+           - Query: WorkReducerState::get(work_id) -> Option<&Work>
+           - Check: work.state.is_claimable() for eligibility
+           - Track: work.transition_count for freshness validation
+
+        5. FRESHNESS CHECK (AD-COORD-006):
+           - Controller records ledger seq_id at freshness check
+           - Spawn event references this seq_id
+           - If work.transition_count changed between check and spawn,
+             skip work item (state changed externally)
+
+        6. COORDINATION RESPONSIBILITY:
+           - Track: work-session binding (coordination.session_bound/unbound)
+           - Track: coordination-level budget consumption
+           - Track: circuit breaker state (consecutive failures)
+           - DO NOT: Directly modify work or session state
+      evidence_refs:
+        - "crates/apm2-core/src/work/state.rs:62-103"
+        - "crates/apm2-core/src/work/state.rs:225-227"
+        - "crates/apm2-core/src/work/reducer.rs:218-309"
       owner: AUTH_ARCHITECTURE
 
     - question_id: OQ-COORD-004

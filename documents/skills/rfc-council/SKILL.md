@@ -98,7 +98,7 @@ anti-cousin enforcement.
 ## Prerequisites
 
 Before RFC review or creation can proceed, the following artifacts MUST exist.
-**Fail fast if any prerequisite is missing.**
+**Auto-generate missing CCP/Impact Map; fail only if PRD/RFC input is missing.**
 
 ### Required Artifacts
 
@@ -132,13 +132,15 @@ START
       |
       v
 [Check CCP index exists?]
-  |-- NO --> STOP: "CCP missing. Run: apm2 factory ccp build --prd <PRD_ID>"
+  |-- NO --> RUN: apm2 factory ccp build --prd <PRD_ID>
+  |          (auto-generates CCP, then continues)
   |-- YES
       |
       v
 [Mode = CREATE?]
   |-- YES --> [Check Impact Map exists?]
-  |             |-- NO --> STOP: "Impact Map missing. Run: apm2 factory impact-map build --prd <PRD_ID>"
+  |             |-- NO --> RUN: apm2 factory impact-map build --prd <PRD_ID>
+  |             |          (auto-generates impact map, then continues)
   |             |-- YES --> PROCEED to CREATE workflow
   |-- NO (REVIEW)
       |
