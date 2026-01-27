@@ -87,8 +87,8 @@ pub struct ExportArgs {
     ///
     /// The index file contains artifact metadata mapping stable IDs to
     /// content hashes. Required for export operations.
-    #[arg(long)]
-    pub index: Option<PathBuf>,
+    #[arg(long, required = true)]
+    pub index: PathBuf,
 }
 
 /// Runs the export command, returning an appropriate exit code as u8.
@@ -203,7 +203,7 @@ fn run_export_inner(args: &ExportArgs) -> Result<ExportResult, ExportCliError> {
     let pack_spec = load_pack_spec(args.pack.as_ref())?;
 
     // Load DCP index
-    let index = load_dcp_index(args.index.as_ref())?;
+    let index = load_dcp_index(&args.index)?;
 
     // Compile the pack
     let compiler = ContextPackCompiler::new(&index);
@@ -370,35 +370,15 @@ fn parse_pack_spec(
 }
 
 /// Loads a `DcpIndex` from a file path.
-fn load_dcp_index(path: Option<&PathBuf>) -> Result<DcpIndex, ExportCliError> {
-    match path {
-        Some(index_path) => {
-            let content = read_bounded_file(index_path)?;
-            let index: DcpIndex = serde_json::from_str(&content).map_err(|e| {
-                ExportCliError::Validation(format!(
-                    "failed to parse index file '{}': {e}",
-                    index_path.display()
-                ))
-            })?;
-            Ok(index)
-        },
-        None => Err(ExportCliError::Validation(
-            "No DCP index provided. Use --index <path> to specify an index file.\n\n\
-             The index file should contain artifact metadata in JSON format. Example:\n\
-             {\n  \
-               \"entries\": {\n    \
-                 \"org:doc:readme\": {\n      \
-                   \"stable_id\": \"org:doc:readme\",\n      \
-                   \"content_hash\": \"<64-char-hex-blake3-hash>\",\n      \
-                   \"schema_id\": \"org:schema:doc\"\n    \
-                 }\n  \
-               }\n\
-             }\n\n\
-             In production, the daemon maintains the DCP index. This flag enables \
-             offline export and testing."
-                .to_string(),
-        )),
-    }
+fn load_dcp_index(index_path: &std::path::Path) -> Result<DcpIndex, ExportCliError> {
+    let content = read_bounded_file(index_path)?;
+    let index: DcpIndex = serde_json::from_str(&content).map_err(|e| {
+        ExportCliError::Validation(format!(
+            "failed to parse index file '{}': {e}",
+            index_path.display()
+        ))
+    })?;
+    Ok(index)
 }
 
 /// Creates a content resolver from the DCP index and compiled pack.
@@ -406,6 +386,9 @@ fn load_dcp_index(path: Option<&PathBuf>) -> Result<DcpIndex, ExportCliError> {
 /// For testing purposes, this creates a memory resolver with placeholder
 /// content. In production, this would integrate with the CAS.
 fn create_content_resolver(_index: &DcpIndex, pack: &CompiledContextPack) -> MemoryContentResolver {
+    // SECURITY: Warn users that placeholder content is being used
+    eprintln!("WARNING: Exporting using placeholder content. Real content requires daemon connection.");
+
     let mut resolver = MemoryContentResolver::new();
 
     // For each entry in the pack, we need to provide content
@@ -590,15 +573,12 @@ delivery_constraints:
         let index_path = temp_dir.path().join("index.json");
         std::fs::write(&index_path, test_index_json()).unwrap();
 
-        let index = load_dcp_index(Some(&index_path)).unwrap();
+        let index = load_dcp_index(&index_path).unwrap();
         assert!(!index.is_empty());
     }
 
-    #[test]
-    fn test_export_no_index_returns_error() {
-        let result = load_dcp_index(None);
-        assert!(matches!(result, Err(ExportCliError::Validation(_))));
-    }
+    // Note: test_export_no_index_returns_error removed because --index is now
+    // required by Clap at argument parsing time
 
     // =========================================================================
     // File Size Limit Tests
@@ -715,7 +695,7 @@ delivery_constraints:
             output_dir: output_dir.clone(),
             verify: false,
             format: OutputFormat::Json,
-            index: Some(index_path),
+            index: index_path,
         };
 
         let exit_code = run_export(&args);
@@ -752,7 +732,7 @@ delivery_constraints:
             output_dir,
             verify: true, // Enable verification
             format: OutputFormat::Yaml,
-            index: Some(index_path),
+            index: index_path,
         };
 
         let exit_code = run_export(&args);
@@ -769,44 +749,25 @@ delivery_constraints:
         let pack_path = temp_dir.path().join("pack.json");
         std::fs::write(&pack_path, minimal_pack_json()).unwrap();
 
+        // Create a dummy index file for testing (--index is required by Clap)
+        let index_path = temp_dir.path().join("index.json");
+        std::fs::write(&index_path, test_index_json()).unwrap();
+
         let args = ExportArgs {
             profile: profile_path,
             pack: Some(pack_path),
             output_dir: PathBuf::from("/nonexistent/path/12345"),
             verify: false,
             format: OutputFormat::Json,
-            index: None,
+            index: index_path,
         };
 
         let exit_code = run_export(&args);
         assert_eq!(exit_code, exit_codes::ERROR);
     }
 
-    #[test]
-    fn test_export_missing_index() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let profile_path = temp_dir.path().join("profile.json");
-        std::fs::write(&profile_path, minimal_profile_json()).unwrap();
-
-        let pack_path = temp_dir.path().join("pack.json");
-        std::fs::write(&pack_path, minimal_pack_json()).unwrap();
-
-        let output_dir = temp_dir.path().join("output");
-        std::fs::create_dir(&output_dir).unwrap();
-
-        let args = ExportArgs {
-            profile: profile_path,
-            pack: Some(pack_path),
-            output_dir,
-            verify: false,
-            format: OutputFormat::Json,
-            index: None, // No index provided
-        };
-
-        let exit_code = run_export(&args);
-        assert_eq!(exit_code, exit_codes::ERROR);
-    }
+    // Note: test_export_missing_index removed because --index is now required by Clap
+    // The error handling is done by Clap at argument parsing time, not in our code
 
     // =========================================================================
     // Output Format Tests
