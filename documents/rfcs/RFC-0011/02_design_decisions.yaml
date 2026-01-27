@@ -39,10 +39,28 @@ rfc_design_decisions:
         - EVID-0001
       requirement_ids:
         - CAC-REQ-0001
-      status: HYPOTHESIS
-      discovery_question: |
-        Q-0001: Exact canonicalization spec - strict RFC 8785 JCS vs a stricter CAC profile?
-        How to publish, pin, and version test vectors and canonicalizer IDs?
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-1
+        findings:
+          - file: crates/apm2-core/src/determinism/canonicalize.rs
+            line: 1-49
+            observation: |
+              Existing YAML canonicalizer operates on serde_yaml::Value with TypedKey ordering.
+              CAC-JSON requires new module on serde_json::Value with stricter constraints.
+          - file: crates/apm2-core/src/events/canonical.rs
+            line: 38-86
+            observation: |
+              Canonicalize trait provides extension point: impl Canonicalize for Type.
+              New CAC canonicalizer should implement this trait for integration.
+        recommended_approach: |
+          Create new crates/apm2-core/src/determinism/canonicalize_json.rs implementing:
+          1. RFC 8785 JCS profile with stricter CAC variant
+          2. Integer-only numbers (no floats)
+          3. Depth limit 128, NFC normalization
+          4. Unknown field rejection at schema validation layer
+          5. Embed canonicalizer_id and canonicalizer_version in envelopes
 
     - id: DD-0002
       title: Patch-first authoring with replay protection
@@ -65,10 +83,26 @@ rfc_design_decisions:
         - EVID-0003
       requirement_ids:
         - CAC-REQ-0002
-      status: HYPOTHESIS
-      discovery_question: |
-        Q-0007: Compaction policy - when does patch depth require snapshotting, and how
-        are ChangeSet summaries preserved across compaction?
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-1
+        findings:
+          - file: crates/apm2-core/src/events/ci.rs
+            line: 106-129
+            observation: |
+              CI event family uses separate JSON storage with EventStore trait pattern.
+              Immutability documented in CTR-CI001 contracts.
+          - file: crates/apm2-core/src/events/apm2.kernel.v1.rs
+            line: 36-57
+            observation: |
+              Kernel events use Protobuf oneof with tags 10-17 allocated.
+              Tags 18+ available for new CAC event types.
+        recommended_approach: |
+          Dual-tier event emission:
+          - Kernel events (hash-chained, signed): AdmissionAccepted, CompilationCompleted, ExportGenerated
+          - CI events (audit/observability): CACAdmissionReceipt, CACPackStatus
+          CI events reference kernel hash as source of truth.
 
     - id: DD-0003
       title: Hermetic consumption via ContextPacks
@@ -93,10 +127,26 @@ rfc_design_decisions:
       requirement_ids:
         - CAC-REQ-0003
         - CAC-REQ-0011
-      status: HYPOTHESIS
-      discovery_question: |
-        Q-0004: How to represent large binary artifacts within CAC-JSON (likely via CAS
-        refs only) and enforce policies consistently?
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-2
+        findings:
+          - file: crates/apm2-core/src/policy/engine.rs
+            line: 118-137
+            observation: |
+              RuleType enum is #[non_exhaustive] allowing ConsumptionMode extension.
+              Pattern proven with Network/Filesystem rules.
+          - file: crates/apm2-core/src/tool/apm2.tool.v1.rs
+            line: 23-46
+            observation: |
+              Tool protocol oneof has ArtifactPublish (write direction).
+              ArtifactFetch (read direction) can be added as tag 17.
+        recommended_approach: |
+          1. Add ConsumptionMode RuleType with Rule.stable_ids field
+          2. Add ArtifactFetch tool with stable_id and content_hash fields
+          3. Policy evaluates against allowlist in consumption mode
+          4. Content-hash-only denied in consumption mode per CAC-REQ-0011
 
     - id: DD-0004
       title: Bootstrap trust root with binary embedding
@@ -119,10 +169,26 @@ rfc_design_decisions:
         - EVID-0008
       requirement_ids:
         - CAC-REQ-0010
-      status: HYPOTHESIS
-      discovery_question: |
-        Recovery procedures: What happens when ledger state is incompatible with new bootstrap?
-        CNS-0006 defines emergency override and tiered recovery protocol.
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-3
+        findings:
+          - file: crates/apm2-core/build.rs
+            line: 12-35
+            observation: |
+              prost_build::Config pattern with deterministic BTreeMap already in use.
+              println!("cargo:rerun-if-changed=") tracks proto file changes.
+          - file: crates/apm2-core/src/evidence/mod.rs
+            line: 77-98
+            observation: |
+              Evidence module exports EvidencePublisher, GateReceipt patterns.
+              Bootstrap can use EvidenceCategory::BootstrapSchema.
+        recommended_approach: |
+          1. Generate bootstrap bundle in build.rs after proto compilation
+          2. Store schemas at crates/apm2-core/bootstrap/schemas/
+          3. Embed via include_bytes! with hash verification
+          4. Runtime verify_bootstrap_hash() fails startup on mismatch
 
     - id: DD-0005
       title: Target profiles for vendor compilation
@@ -147,10 +213,26 @@ rfc_design_decisions:
       requirement_ids:
         - CAC-REQ-0005
         - CAC-REQ-0013
-      status: HYPOTHESIS
-      discovery_question: |
-        Q-0006: TargetProfile schema - what is the minimal stage taxonomy (plan/implement/
-        review/ops) and which policies must be mandatory vs optional?
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-2
+        findings:
+          - file: crates/apm2-core/src/policy/schema.rs
+            line: 118-137
+            observation: |
+              Policy rules support budget, rendering, retrieval constraints.
+              TargetProfile can leverage existing rule composition patterns.
+          - file: crates/apm2-core/src/model_router/profile.rs
+            line: 1-50
+            observation: |
+              Model routing profiles exist with capability constraints.
+              TargetProfile follows same versioned profile pattern.
+        recommended_approach: |
+          TargetProfile schema requires:
+          - budget_policy (mandatory): token/artifact/byte budgets
+          - rendering_policy (mandatory): stage taxonomy (plan/implement/review/ops)
+          - retrieval_policy (optional with defaults): max_fetch_bytes, inline_threshold
 
     - id: DD-0006
       title: CapabilityManifest generated from binary selftests
@@ -172,10 +254,31 @@ rfc_design_decisions:
         - EVID-0007
       requirement_ids:
         - CAC-REQ-0014
-      status: HYPOTHESIS
-      discovery_question: |
-        Binary hash verification: AATReceipt MUST include binary_hash (BLAKE3-256).
-        How to handle binary variants (debug/release, platform-specific)?
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-3
+        findings:
+          - file: xtask/src/aat/executor.rs
+            line: 95-207
+            observation: |
+              HypothesisExecutor is stateless and generic; reusable for CAC tests.
+              execute() takes &mut Hypothesis, runs verification, captures results.
+          - file: xtask/src/aat/types.rs
+            line: 203-237
+            observation: |
+              Hypothesis struct is concrete, not trait-based.
+              CacSchemaTest can wrap as adapter without parallel hierarchy.
+          - file: crates/apm2-core/src/evidence/receipt.rs
+            line: 344-429
+            observation: |
+              GateReceipt has Ed25519 signature verification.
+              AATReceipt can follow same pattern with binary_hash binding.
+        recommended_approach: |
+          1. Extend HypothesisExecutor to handle CacSchemaTest via adapter
+          2. Add cac_harness.rs module under xtask/src/aat/ (NOT parallel hierarchy)
+          3. Binary hash included via CARGO_PKG_VERSION + target triple + profile
+          4. AATReceipt signed with Ed25519 using GateReceipt pattern
 
     - id: DD-0007
       title: Typed quantities with explicit units
@@ -220,41 +323,156 @@ rfc_design_decisions:
         - EVID-0004
       requirement_ids:
         - CAC-REQ-0001
-      status: HYPOTHESIS
-      discovery_question: |
-        Q-0002: Stable ID namespace governance - who can mint namespaces, and how are
-        collisions prevented across org/projects?
+      status: GROUNDED
+      codebase_evidence:
+        investigation_session: COUNCIL-RFC-0011-20260127-EXPLORE
+        source_agent: SA-1
+        findings:
+          - file: crates/apm2-core/src/ledger/storage.rs
+            line: 1-100
+            observation: |
+              Ledger storage uses append-only log with content-addressed entries.
+              DCP index can be rebuilt by replaying ledger events.
+          - file: crates/apm2-core/src/events/apm2.kernel.v1.rs
+            line: 580-604
+            observation: |
+              EvidencePublished events already exist with metadata fields.
+              Can include dcp_id, artifact_kind, schema_id for CAC integration.
+        recommended_approach: |
+          DCP projection over ledger:
+          1. Ledger is authoritative append-only log
+          2. DCP index rebuilt from ledger on startup/compaction
+          3. Stable-ID resolution queries projection cache
+          4. Namespace governance: hierarchical format "org:project:kind:id"
+          5. Collision detection in admission gate via namespace registry
 
   component_mapping:
-    # Known Unknowns: Impact map shows 15 unresolved requirements
-    # All requirements have no component matches (Jaccard similarity below threshold)
-    # This section documents hypothesized component locations for v2 exploration
-    hypothesis:
+    # RFC v2 (Grounded): Component mappings validated by Council investigation
+    # Session: COUNCIL-RFC-0011-20260127-EXPLORE
+    grounded:
       - requirement_id: CAC-REQ-0001
-        candidate_components:
-          - crates/apm2-core/src/determinism/canonicalize.rs
-          - crates/apm2-core/src/evidence/cas.rs
-        confidence: LOW
-        discovery_needed: true
+        title: Canonical context substrate (CAC-JSON)
+        verified_components:
+          - path: crates/apm2-core/src/determinism/canonicalize.rs
+            status: EXTEND
+            reason: "Existing YAML canonicalizer provides pattern; new JSON canonicalizer needed"
+          - path: crates/apm2-core/src/events/canonical.rs
+            status: EXTEND
+            reason: "Canonicalize trait provides integration point"
+          - path: crates/apm2-core/src/evidence/cas.rs
+            status: REUSE
+            reason: "Content-addressed storage already exists"
+        new_components:
+          - path: crates/apm2-core/src/determinism/canonicalize_json.rs
+            reason: "New CAC-JSON canonicalizer with strict profile"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-1
 
       - requirement_id: CAC-REQ-0002
-        candidate_components:
-          - crates/apm2-core/src/ledger/storage.rs
-          - crates/apm2-core/src/events/
-        confidence: LOW
-        discovery_needed: true
+        title: Patch-first machine authoring
+        verified_components:
+          - path: crates/apm2-core/src/ledger/storage.rs
+            status: REUSE
+            reason: "Append-only log for provenance"
+          - path: crates/apm2-core/src/events/apm2.kernel.v1.rs
+            status: EXTEND
+            reason: "Add ContextEvent to Payload oneof (tag 18)"
+          - path: crates/apm2-core/src/events/ci.rs
+            status: EXTEND
+            reason: "Add CACAdmissionReceipt for audit trail"
+        new_components:
+          - path: crates/apm2-core/src/cac/patch_engine.rs
+            reason: "JSON Patch/Merge Patch with replay protection"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-1
 
       - requirement_id: CAC-REQ-0003
-        candidate_components:
-          - crates/apm2-holon/src/episode/controller.rs
-          - crates/apm2-core/src/policy/engine.rs
-        confidence: LOW
-        discovery_needed: true
+        title: Hermetic consumption with deterministic reads
+        verified_components:
+          - path: crates/apm2-core/src/policy/engine.rs
+            status: EXTEND
+            reason: "Add ConsumptionMode RuleType"
+          - path: crates/apm2-core/src/policy/schema.rs
+            status: EXTEND
+            reason: "Add stable_ids field to Rule struct"
+          - path: crates/apm2-holon/src/episode/controller.rs
+            status: EXTEND
+            reason: "Emit RunReceipt at episode completion"
+        new_components:
+          - path: crates/apm2-core/src/tool/artifact_fetch.rs
+            reason: "ArtifactFetch tool implementation"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-2, SA-3
 
       - requirement_id: CAC-REQ-0010
-        candidate_components:
-          - crates/apm2-cli/src/main.rs
-          - crates/apm2-core/build.rs
-        confidence: LOW
-        discovery_needed: true
-        note: Bootstrap embedding requires build.rs integration
+        title: Bootstrap trust root immutability
+        verified_components:
+          - path: crates/apm2-core/build.rs
+            status: EXTEND
+            reason: "Add bootstrap bundle generation after proto compilation"
+          - path: crates/apm2-core/src/lib.rs
+            status: EXTEND
+            reason: "Add include_bytes! for bootstrap bundle"
+          - path: crates/apm2-core/src/evidence/mod.rs
+            status: EXTEND
+            reason: "Add EvidenceCategory::BootstrapSchema"
+        new_components:
+          - path: crates/apm2-core/bootstrap/schemas/
+            reason: "Bootstrap schema files (JSON)"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-3
+
+      - requirement_id: CAC-REQ-0011
+        title: ArtifactFetch tool protocol
+        verified_components:
+          - path: crates/apm2-core/src/tool/apm2.tool.v1.rs
+            status: EXTEND
+            reason: "Add ArtifactFetch to tool oneof (tag 17)"
+          - path: crates/apm2-core/src/tool/validation.rs
+            status: EXTEND
+            reason: "Add validate_artifact_fetch()"
+          - path: crates/apm2-core/src/policy/engine.rs
+            status: EXTEND
+            reason: "Route ArtifactFetch to ConsumptionMode rules"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-2
+
+      - requirement_id: CAC-REQ-0014
+        title: AAT/selftest gating
+        verified_components:
+          - path: xtask/src/aat/executor.rs
+            status: EXTEND
+            reason: "HypothesisExecutor handles CAC schema tests via adapter"
+          - path: xtask/src/aat/types.rs
+            status: EXTEND
+            reason: "Add CacSchemaTest struct"
+          - path: crates/apm2-core/src/evidence/receipt.rs
+            status: EXTEND
+            reason: "AATReceipt follows GateReceipt signature pattern"
+        new_components:
+          - path: xtask/src/aat/cac_harness.rs
+            reason: "CAC schema test harness (NOT parallel to xtask/src/aat)"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-3
+
+      - requirement_id: CAC-REQ-0015
+        title: RunReceipt emission
+        verified_components:
+          - path: crates/apm2-holon/src/episode/controller.rs
+            status: EXTEND
+            reason: "Emit receipt at line 647-655 (EpisodeLoopResult::new)"
+          - path: crates/apm2-holon/src/result.rs
+            status: REUSE
+            reason: "EpisodeResult already has tokens_consumed, time_consumed_ms, artifact_count"
+        new_components:
+          - path: crates/apm2-holon/src/receipt.rs
+            reason: "RunReceipt struct with episode metadata"
+        confidence: HIGH
+        discovery_needed: false
+        investigation_evidence: SA-3

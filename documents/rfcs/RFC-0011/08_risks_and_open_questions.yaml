@@ -215,43 +215,133 @@ rfc_risks_and_open_questions:
         history with periodic manual compaction.
       assigned_to: N/A
 
-  known_unknowns:
+  resolved_unknowns:
     description: |
-      This section documents areas requiring codebase investigation before design
-      can be finalized. These "Known Unknowns" will be resolved during v2 Exploration.
+      RFC v2 (Grounded): All 7 Known Unknowns resolved by Council investigation.
+      Session: COUNCIL-RFC-0011-20260127-EXPLORE
+      Subagents: SA-1 (Structural Rigorist), SA-2 (Implementation Feasibility), SA-3 (Anti-Cousin Guardian)
 
-    codebase_discovery_needed:
+    codebase_discoveries:
       - area: Canonicalizer integration
         question: How does new CAC canonicalizer relate to existing determinism/canonicalize.rs?
         investigation_target: crates/apm2-core/src/determinism/canonicalize.rs
-        hypothesis: May need to extend or replace existing canonicalization
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          New CAC-JSON canonicalizer required (YAML one inadequate for JSON-only mandate).
+          Extension point: impl Canonicalize trait (events/canonical.rs:38-86).
+          Create new canonicalize_json.rs with RFC 8785 JCS profile + CAC constraints.
+        investigator: SA-1
+        confidence: 95%
 
       - area: Ledger event emission
         question: What event families exist and how to add CAC-specific events?
         investigation_target: crates/apm2-core/src/events/
-        hypothesis: Extend existing apm2.kernel.v1 event family
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          Dual-path approach: Kernel events (hash-chained) + CI events (observability).
+          Kernel: Add ContextEvent to Payload oneof (tag 18+).
+          CI: Add CACAdmissionReceipt referencing kernel hash.
+        investigator: SA-1
+        confidence: 92%
 
       - area: Policy engine integration
         question: How to integrate consumption mode restrictions with existing policy engine?
         investigation_target: crates/apm2-core/src/policy/engine.rs
-        hypothesis: Add new policy rules for ArtifactFetch restrictions
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          RuleType enum is #[non_exhaustive] - add ConsumptionMode variant.
+          Rule struct needs stable_ids Vec<String> field (parallel to existing paths).
+          matches_consumption_rule() validates stable_id allowlist.
+        investigator: SA-2
+        confidence: 89%
 
       - area: Tool protocol extension
         question: How to add ArtifactFetch to existing tool protocol?
         investigation_target: crates/apm2-core/src/tool/
-        hypothesis: Extend apm2.tool.v1 protocol with new tool type
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          ArtifactPublish already exists (write direction); add ArtifactFetch (read direction).
+          Proto oneof tag 17 available. Validation in validation.rs validate_artifact_fetch().
+          Policy routing via get_tool_name() -> "artifact.fetch".
+        investigator: SA-2
+        confidence: 88%
 
       - area: Holon episode integration
         question: How to emit RunReceipts from holon execution?
         investigation_target: crates/apm2-holon/src/episode/controller.rs
-        hypothesis: Add receipt emission at episode completion
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          EpisodeResult already contains needed data (tokens_consumed, time_consumed_ms, artifact_count).
+          Emit receipt at line 647-655 before EpisodeLoopResult::new().
+          Use existing event framework; do NOT create parallel EpisodeReceipt event type.
+          Anti-cousin: Emit as artifact with EvidenceCategory::ExecutionReceipt.
+        investigator: SA-3
+        confidence: 91%
 
       - area: Build.rs bootstrap embedding
         question: How to embed bootstrap schema bundle at build time?
         investigation_target: crates/apm2-core/build.rs
-        hypothesis: Use include_bytes! with hash verification
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          prost_build pattern (lines 12-35) directly applicable.
+          Generate bundle in build.rs, use include_bytes! + hash verification.
+          Runtime verify_bootstrap_hash() fails startup on mismatch.
+          Use EvidenceCategory::BootstrapSchema (extend enum if needed).
+        investigator: SA-3
+        confidence: 93%
 
       - area: AAT harness integration
         question: How does new selftest harness relate to existing xtask/src/aat module?
         investigation_target: xtask/src/aat/
-        hypothesis: Extend existing AAT infrastructure with CAC-specific tests
+        status: RESOLVED
+        hypothesis_validated: true
+        resolution: |
+          HypothesisExecutor is stateless and reusable (executor.rs:81-93).
+          Create CacSchemaTest adapter, not parallel hierarchy.
+          Add cac_harness.rs under xtask/src/aat/ (NOT xtask/src/cac_test/).
+          Reuse ALLOWED_ENV_VARS allowlist for environment isolation.
+        investigator: SA-3
+        confidence: 90%
+
+  remaining_open_questions:
+    description: |
+      Post-investigation questions remaining for v4 Closure phase.
+      These are "last-mile" implementation details, not architectural blockers.
+
+    questions:
+      - id: Q-0001-v2
+        question: |
+          Canonicalizer test vector governance: How to version and pin test vectors
+          in bootstrap? Who can update vectors and when?
+        decision_needed_by: Phase 1 (Foundations)
+        priority: HIGH
+        status: DEFERRED_TO_V4
+        blocking: false
+        rationale: Implementation can proceed with initial vector set; governance follows
+
+      - id: Q-0002-v2
+        question: |
+          Stable ID namespace governance: Hierarchical format decided ("org:project:kind:id"),
+          but specific namespace minting policy needs definition.
+        decision_needed_by: Phase 2 (Admission + Provenance)
+        priority: MEDIUM
+        status: DEFERRED_TO_V4
+        blocking: false
+        rationale: "cac:" namespace sufficient for MVP; org namespaces follow
+
+      - id: Q-0006-v2
+        question: |
+          Consumption mode signal propagation: How does ToolRequest receive consumption_mode flag?
+          Protocol doesn't yet carry this metadata.
+        decision_needed_by: Phase 2 (Admission + Provenance)
+        priority: HIGH
+        status: OPEN
+        blocking: false
+        rationale: Design decision pending; options include ToolRequest header or SessionContext
+        suggested_resolution: Add consumption_mode to ToolRequest header alongside tool variant
