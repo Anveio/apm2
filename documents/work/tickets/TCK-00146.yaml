@@ -45,7 +45,7 @@ ticket_meta:
       - "Add CapabilityRequirement struct: capability_id, required (bool)"
       - "Add check_capabilities(requirements, receipt) -> Result<Vec<CapabilityStatus>>"
       - "Define CapabilityStatus enum: Available, Unavailable, Degraded"
-      - "Add CapabilityRequired event to kernel events (apm2.kernel.v1.proto)"
+      - "Add CapabilityRequired event to kernel events (proto/kernel_events.proto)"
       - "Implement emit_defect_record() for missing capabilities"
       - "Integrate with planning phase: filter plan steps by available capabilities"
       - "Add capability_ids field to EpisodeConfig for negotiation"
@@ -82,7 +82,7 @@ ticket_meta:
       extend_files:
         - path: "crates/apm2-core/src/cac/mod.rs"
           description: "Export capability_gate module"
-        - path: "protos/apm2.kernel.v1.proto"
+        - path: "proto/kernel_events.proto"
           description: "Add CapabilityRequired event (new tag)"
         - path: "crates/apm2-holon/src/episode/controller.rs"
           description: "Integrate capability check in planning phase"
