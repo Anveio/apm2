@@ -6,10 +6,11 @@
 //!
 //! # Design Principles
 //!
-//! - **Determinism**: Re-exporting the same pack with the same profile
-//!   produces byte-identical output. This is achieved by:
+//! - **Determinism**: Re-exporting the same pack with the same profile produces
+//!   byte-identical output. This is achieved by:
 //!   - Sorting all keys lexicographically in YAML frontmatter
-//!   - Using consistent formatting (2-space indentation, no trailing whitespace)
+//!   - Using consistent formatting (2-space indentation, no trailing
+//!     whitespace)
 //!   - Injecting timestamps externally (CTR-2501: Time Is an External Input)
 //!
 //! - **Provenance**: All Markdown outputs include YAML frontmatter with
@@ -198,9 +199,21 @@ impl Provenance {
         frontmatter.push_str("provenance:\n");
         // Keys in alphabetical order for determinism
         let _ = writeln!(frontmatter, "  export_profile: \"{}\"", self.export_profile);
-        let _ = writeln!(frontmatter, "  export_timestamp: \"{}\"", self.export_timestamp);
-        let _ = writeln!(frontmatter, "  exporter_version: \"{}\"", self.exporter_version);
-        let _ = writeln!(frontmatter, "  source_pack_hash: \"{}\"", self.source_pack_hash);
+        let _ = writeln!(
+            frontmatter,
+            "  export_timestamp: \"{}\"",
+            self.export_timestamp
+        );
+        let _ = writeln!(
+            frontmatter,
+            "  exporter_version: \"{}\"",
+            self.exporter_version
+        );
+        let _ = writeln!(
+            frontmatter,
+            "  source_pack_hash: \"{}\"",
+            self.source_pack_hash
+        );
         frontmatter.push_str(YAML_FRONTMATTER_DELIMITER);
         frontmatter.push('\n');
         frontmatter
@@ -560,13 +573,18 @@ impl ExportPipeline {
                     map.insert(
                         "_provenance".to_string(),
                         serde_json::to_value(provenance).map_err(|e| {
-                            ExportError::ManifestSerializationFailed { message: e.to_string() }
+                            ExportError::ManifestSerializationFailed {
+                                message: e.to_string(),
+                            }
                         })?,
                     );
                 }
 
-                serde_json::to_string_pretty(&json)
-                    .map_err(|e| ExportError::ManifestSerializationFailed { message: e.to_string() })
+                serde_json::to_string_pretty(&json).map_err(|e| {
+                    ExportError::ManifestSerializationFailed {
+                        message: e.to_string(),
+                    }
+                })
             },
             ProvenanceEmbed::Inline | ProvenanceEmbed::Footer | ProvenanceEmbed::None => {
                 Ok(content.to_string())
@@ -598,8 +616,7 @@ impl ExportPipeline {
     /// Creates provenance metadata for the export.
     fn create_provenance(&self, pack: &CompiledContextPack) -> Provenance {
         // Use the manifest hash as source pack hash
-        let manifest_json =
-            serde_json::to_string(&pack.manifest).unwrap_or_else(|_| String::new());
+        let manifest_json = serde_json::to_string(&pack.manifest).unwrap_or_else(|_| String::new());
         let hash = blake3::hash(manifest_json.as_bytes());
         let hash_hex = hex::encode(hash.as_bytes());
 
@@ -612,10 +629,7 @@ impl ExportPipeline {
     }
 
     /// Writes rendered outputs atomically to the output directory.
-    fn write_outputs(
-        &self,
-        rendered: &[RenderedOutput],
-    ) -> Result<Vec<ExportOutput>, ExportError> {
+    fn write_outputs(&self, rendered: &[RenderedOutput]) -> Result<Vec<ExportOutput>, ExportError> {
         let mut outputs = Vec::with_capacity(rendered.len());
 
         for output in rendered {
@@ -742,9 +756,11 @@ impl ExportPipelineBuilder {
     /// Returns an error if required fields are missing or the configuration
     /// is invalid.
     pub fn build(self) -> Result<ExportPipeline, ExportError> {
-        let profile = self.profile.ok_or_else(|| ExportError::ConfigurationError {
-            message: "profile is required".to_string(),
-        })?;
+        let profile = self
+            .profile
+            .ok_or_else(|| ExportError::ConfigurationError {
+                message: "profile is required".to_string(),
+            })?;
 
         let output_dir = self
             .output_dir
@@ -847,12 +863,7 @@ mod tests {
 
     #[test]
     fn test_provenance_new() {
-        let provenance = Provenance::new(
-            "abc123",
-            "claude-code-v1",
-            test_timestamp(),
-            "0.1.0",
-        );
+        let provenance = Provenance::new("abc123", "claude-code-v1", test_timestamp(), "0.1.0");
 
         assert_eq!(provenance.source_pack_hash, "sha256:abc123");
         assert_eq!(provenance.export_profile, "claude-code-v1");
@@ -862,12 +873,7 @@ mod tests {
 
     #[test]
     fn test_provenance_frontmatter_format() {
-        let provenance = Provenance::new(
-            "abc123",
-            "claude-code-v1",
-            test_timestamp(),
-            "0.1.0",
-        );
+        let provenance = Provenance::new("abc123", "claude-code-v1", test_timestamp(), "0.1.0");
 
         let frontmatter = provenance.to_frontmatter();
 
@@ -885,12 +891,7 @@ mod tests {
 
     #[test]
     fn test_provenance_frontmatter_deterministic_ordering() {
-        let provenance = Provenance::new(
-            "abc123",
-            "claude-code-v1",
-            test_timestamp(),
-            "0.1.0",
-        );
+        let provenance = Provenance::new("abc123", "claude-code-v1", test_timestamp(), "0.1.0");
 
         let frontmatter = provenance.to_frontmatter();
 

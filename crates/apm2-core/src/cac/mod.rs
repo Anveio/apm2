@@ -189,6 +189,12 @@ pub use dcp_index::{
     EVENT_TYPE_ARTIFACT_DEPRECATED, EVENT_TYPE_ARTIFACT_REGISTERED, MAX_CONTENT_HASH_LENGTH,
     MAX_STABLE_ID_LENGTH, RESERVED_PREFIXES, parse_stable_id,
 };
+// Export pipeline exports
+pub use export::{
+    ContentResolver, DEFAULT_EXPORTER_VERSION, ExportConfig, ExportError, ExportManifest,
+    ExportOutput, ExportPipeline, ExportPipelineBuilder, MAX_RENDERED_CONTENT_BYTES,
+    MemoryContentResolver, Provenance,
+};
 pub use pack_spec::{
     BudgetConstraint, BudgetConstraintBuilder, CONTEXT_PACK_SPEC_SCHEMA, CONTEXT_PACK_SPEC_VERSION,
     ContextPackSpec, ContextPackSpecBuilder, DependencyReview, PackMetadata, PackMetadataBuilder,
@@ -206,11 +212,4 @@ pub use target_profile::{
 pub use validator::{
     CacValidator, MAX_ARRAY_MEMBERS, MAX_DEPTH, MAX_OBJECT_PROPERTIES, ValidationError,
     validate_cac_artifact,
-};
-
-// Export pipeline exports
-pub use export::{
-    ContentResolver, DEFAULT_EXPORTER_VERSION, ExportConfig, ExportError, ExportManifest,
-    ExportOutput, ExportPipeline, ExportPipelineBuilder, MAX_RENDERED_CONTENT_BYTES,
-    MemoryContentResolver, Provenance,
 };
