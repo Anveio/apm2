@@ -496,7 +496,8 @@ impl ExportPipeline {
         // Track cumulative bytes for budget enforcement
         let mut cumulative_bytes: u64 = 0;
 
-        // Track used paths (normalized to lowercase) for case-insensitive collision detection
+        // Track used paths (normalized to lowercase) for case-insensitive collision
+        // detection
         let mut used_paths: HashSet<String> = HashSet::new();
 
         for entry in &pack.manifest.entries {
@@ -566,34 +567,31 @@ impl ExportPipeline {
         let (output_content, extension) = match format {
             OutputFormat::Markdown => {
                 // Validate UTF-8 for text formats to prevent silent corruption
-                let content_str = std::str::from_utf8(content).map_err(|_| {
-                    ExportError::BinaryContentAsText {
+                let content_str =
+                    std::str::from_utf8(content).map_err(|_| ExportError::BinaryContentAsText {
                         stable_id: stable_id.to_string(),
                         format: "markdown".to_string(),
-                    }
-                })?;
+                    })?;
                 let rendered = Self::embed_provenance(content_str, provenance, embed_mode);
                 (rendered.into_bytes(), "md")
             },
             OutputFormat::PlainText => {
                 // Validate UTF-8 for text formats to prevent silent corruption
-                let content_str = std::str::from_utf8(content).map_err(|_| {
-                    ExportError::BinaryContentAsText {
+                let content_str =
+                    std::str::from_utf8(content).map_err(|_| ExportError::BinaryContentAsText {
                         stable_id: stable_id.to_string(),
                         format: "plain_text".to_string(),
-                    }
-                })?;
+                    })?;
                 let rendered = Self::embed_provenance(content_str, provenance, embed_mode);
                 (rendered.into_bytes(), "txt")
             },
             OutputFormat::Json => {
                 // Validate UTF-8 for JSON format
-                let content_str = std::str::from_utf8(content).map_err(|_| {
-                    ExportError::BinaryContentAsText {
+                let content_str =
+                    std::str::from_utf8(content).map_err(|_| ExportError::BinaryContentAsText {
                         stable_id: stable_id.to_string(),
                         format: "json".to_string(),
-                    }
-                })?;
+                    })?;
                 // For JSON, provenance is embedded as metadata object
                 let rendered = Self::embed_provenance_json(content_str, provenance, embed_mode)?;
                 (rendered.into_bytes(), "json")
