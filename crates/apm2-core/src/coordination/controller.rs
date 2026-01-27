@@ -309,12 +309,13 @@ pub struct CoordinationController {
     /// Per-work tracking state.
     work_tracking: Vec<WorkItemState>,
 
-    /// Active session ID (enforces serial execution).
+    /// Active session state (enforces serial execution and `work_id` validation).
     ///
     /// Set in `prepare_session_spawn`, cleared in `record_session_termination`.
     /// Having a value here means a session is currently active and no new
     /// session can be spawned (serial execution invariant).
-    active_session_id: Option<String>,
+    /// Stores (`session_id`, `work_id`) tuple for validation.
+    active_session: Option<(String, String)>,
 
     /// Budget usage tracking.
     budget_usage: BudgetUsage,
@@ -360,7 +361,7 @@ impl CoordinationController {
             config,
             work_index: 0,
             work_tracking,
-            active_session_id: None,
+            active_session: None,
             budget_usage: BudgetUsage::new(),
             consecutive_failures: 0,
             total_sessions: 0,
@@ -568,7 +569,7 @@ impl CoordinationController {
         }
 
         // Enforce serial execution: fail if a session is already active
-        if let Some(ref active_id) = self.active_session_id {
+        if let Some((ref active_id, _)) = self.active_session {
             return Err(ControllerError::SessionAlreadyBound {
                 session_id: active_id.clone(),
             });
@@ -630,8 +631,8 @@ impl CoordinationController {
         // Increment total sessions
         self.total_sessions += 1;
 
-        // Set active session (serial execution enforcement)
-        self.active_session_id = Some(session_id.clone());
+        // Set active session (serial execution enforcement + work_id validation)
+        self.active_session = Some((session_id.clone(), work_id.to_string()));
 
         Ok(SpawnResult {
             session_id,
@@ -677,23 +678,33 @@ impl CoordinationController {
                     message: "coordination not started".to_string(),
                 })?;
 
-        // Verify session_id matches active session (serial execution enforcement)
-        match &self.active_session_id {
-            Some(active_id) if active_id != session_id => {
-                return Err(ControllerError::Internal {
-                    message: format!("session_id mismatch: expected {active_id}, got {session_id}"),
-                });
+        // Verify session_id and work_id match active session
+        match &self.active_session {
+            Some((expected_session_id, expected_work_id)) => {
+                if expected_session_id != session_id {
+                    return Err(ControllerError::Internal {
+                        message: format!(
+                            "session_id mismatch: expected {expected_session_id}, got {session_id}"
+                        ),
+                    });
+                }
+                if expected_work_id != work_id {
+                    return Err(ControllerError::Internal {
+                        message: format!(
+                            "work_id mismatch: expected {expected_work_id}, got {work_id}"
+                        ),
+                    });
+                }
             },
             None => {
                 return Err(ControllerError::Internal {
                     message: "no active session to terminate".to_string(),
                 });
             },
-            _ => {},
         }
 
         // Clear active session (serial execution: allow next spawn)
-        self.active_session_id = None;
+        self.active_session = None;
 
         // Update budget usage
         self.budget_usage.consumed_episodes = self.budget_usage.consumed_episodes.saturating_add(1);
@@ -715,9 +726,11 @@ impl CoordinationController {
         // Note: work_index hasn't been incremented yet, so it points to current work
         let tracking = &mut self.work_tracking[self.work_index];
 
-        // Handle outcome
+        // Handle outcome per AD-COORD-010 (circuit breaker tracks consecutive WORK ITEM
+        // failures)
         match outcome {
             SessionOutcome::Success => {
+                // Work item succeeded - reset circuit breaker
                 self.consecutive_failures = 0;
                 self.successful_sessions += 1;
 
@@ -728,16 +741,22 @@ impl CoordinationController {
                 self.work_index += 1;
             },
             SessionOutcome::Failure => {
-                self.consecutive_failures += 1;
                 self.failed_sessions += 1;
 
                 // Check if retries are exhausted
                 if tracking.attempt_count >= self.config.max_attempts_per_work {
-                    // Mark as failed and advance
-                    tracking.final_outcome = Some(WorkItemOutcome::Failed);
+                    // Per AD-COORD-010: Mark as SKIPPED when exhausting retries
+                    tracking.final_outcome = Some(WorkItemOutcome::Skipped);
+
+                    // Per AD-COORD-010: Increment circuit breaker only when work item
+                    // PERMANENTLY fails (exhausts retries)
+                    self.consecutive_failures += 1;
+
+                    // Advance to next work item
                     self.work_index += 1;
                 }
-                // Otherwise, stay on same work item for retry
+                // Otherwise, stay on same work item for retry (no circuit
+                // breaker increment)
             },
         }
 
@@ -1188,6 +1207,96 @@ mod tests {
     }
 
     #[test]
+    fn tck_00150_work_id_mismatch_on_termination() {
+        let config = test_config(vec!["work-1".to_string(), "work-2".to_string()]);
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Spawn session for work-1
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        // Try to terminate with wrong work_id
+        let result = controller.record_session_termination(
+            &spawn.session_id,
+            "work-2", // Wrong work_id
+            SessionOutcome::Success,
+            1000,
+            3_000_000_000,
+        );
+
+        assert!(matches!(result, Err(ControllerError::Internal { .. })));
+        if let Err(ControllerError::Internal { message }) = result {
+            assert!(message.contains("work_id mismatch"));
+        }
+    }
+
+    #[test]
+    fn tck_00150_circuit_breaker_per_work_item() {
+        // Per AD-COORD-010: Circuit breaker tracks consecutive WORK ITEM failures
+        let config = CoordinationConfig::new(
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            test_budget(),
+            2,
+        )
+        .unwrap();
+        let mut controller = CoordinationController::new(config);
+        controller.start(1_000_000_000).unwrap();
+
+        // Work A: fail 2 times (exhaust retries) -> consecutive_failures = 1
+        for i in 0u64..2 {
+            let spawn = controller
+                .prepare_session_spawn("A", 100 + i, 2_000_000_000 + i * 1_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    "A",
+                    SessionOutcome::Failure,
+                    100,
+                    3_000_000_000 + i * 1_000_000_000,
+                )
+                .unwrap();
+        }
+        assert_eq!(controller.consecutive_failures, 1);
+        assert_eq!(controller.work_index(), 1); // Advanced to B
+
+        // Work B: fail 2 times (exhaust retries) -> consecutive_failures = 2
+        for i in 0u64..2 {
+            let spawn = controller
+                .prepare_session_spawn("B", 200 + i, 10_000_000_000 + i * 1_000_000_000)
+                .unwrap();
+            controller
+                .record_session_termination(
+                    &spawn.session_id,
+                    "B",
+                    SessionOutcome::Failure,
+                    100,
+                    11_000_000_000 + i * 1_000_000_000,
+                )
+                .unwrap();
+        }
+        assert_eq!(controller.consecutive_failures, 2);
+        assert_eq!(controller.work_index(), 2); // Advanced to C
+
+        // Work C: succeed -> consecutive_failures resets to 0
+        let spawn_c = controller
+            .prepare_session_spawn("C", 300, 20_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_c.session_id,
+                "C",
+                SessionOutcome::Success,
+                100,
+                21_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures, 0); // Reset!
+    }
+
+    #[test]
     fn tck_00150_serial_execution_duplicate_work_ids() {
         // Test with duplicate work IDs in queue
         let config = CoordinationConfig::new(
@@ -1342,26 +1451,71 @@ mod tests {
 
     #[test]
     fn tck_00150_stop_condition_circuit_breaker() {
-        let config = test_config(vec!["work-1".to_string()]);
+        // Per AD-COORD-010: Circuit breaker triggers on 3 consecutive WORK ITEMS
+        // failing Each work item needs to exhaust its retries to count as a
+        // permanent failure Use max_attempts = 1 so each failure exhausts
+        // retries
+        let budget = test_budget();
+        let config = CoordinationConfig::new(
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ],
+            budget,
+            1, // max_attempts = 1, so each failure exhausts retries immediately
+        )
+        .unwrap();
         let mut controller = CoordinationController::new(config);
         controller.start(1_000_000_000).unwrap();
 
-        // Simulate 3 consecutive failures
-        for i in 0u64..3 {
-            let spawn = controller
-                .prepare_session_spawn("work-1", 100 + i, 2_000_000_000 + i * 1_000_000_000)
-                .unwrap();
-            controller
-                .record_session_termination(
-                    &spawn.session_id,
-                    "work-1",
-                    SessionOutcome::Failure,
-                    100,
-                    3_000_000_000 + i * 1_000_000_000,
-                )
-                .unwrap();
-        }
+        // Work A fails (exhausts 1 retry) -> consecutive_failures = 1
+        let spawn_a = controller
+            .prepare_session_spawn("A", 100, 2_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_a.session_id,
+                "A",
+                SessionOutcome::Failure,
+                100,
+                3_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures, 1);
 
+        // Work B fails -> consecutive_failures = 2
+        let spawn_b = controller
+            .prepare_session_spawn("B", 200, 4_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_b.session_id,
+                "B",
+                SessionOutcome::Failure,
+                100,
+                5_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures, 2);
+
+        // Work C fails -> consecutive_failures = 3 (circuit breaker threshold)
+        let spawn_c = controller
+            .prepare_session_spawn("C", 300, 6_000_000_000)
+            .unwrap();
+        controller
+            .record_session_termination(
+                &spawn_c.session_id,
+                "C",
+                SessionOutcome::Failure,
+                100,
+                7_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(controller.consecutive_failures, 3);
+
+        // Now check_stop_condition should return CircuitBreakerTriggered
         let stop = controller.check_stop_condition();
         assert!(matches!(
             stop,
@@ -1477,7 +1631,9 @@ mod tests {
 
         // Should stay on work-1 for retry
         assert_eq!(controller.work_index(), 0);
-        assert_eq!(controller.consecutive_failures, 1);
+        // Per AD-COORD-010: consecutive_failures only increments when work item
+        // PERMANENTLY fails, not on individual session failures within retries
+        assert_eq!(controller.consecutive_failures, 0);
 
         // Second attempt - success
         let spawn2 = controller
@@ -1526,7 +1682,8 @@ mod tests {
 
         // Verify work-1 marked as failed
         let tracking = &controller.work_tracking[0];
-        assert_eq!(tracking.final_outcome, Some(WorkItemOutcome::Failed));
+        // Per AD-COORD-010: work item marked as Skipped when retries exhausted
+        assert_eq!(tracking.final_outcome, Some(WorkItemOutcome::Skipped));
     }
 
     // =========================================================================
