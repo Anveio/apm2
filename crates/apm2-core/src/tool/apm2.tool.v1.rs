@@ -228,14 +228,16 @@ pub struct ArtifactFetch {
     /// If set, the kernel resolves this to a content hash.
     #[prost(string, tag = "1")]
     pub stable_id: ::prost::alloc::string::String,
-    /// Direct content hash reference (BLAKE3 hex).
+    /// Direct content hash reference (BLAKE3, 32 bytes).
     /// Policy may restrict usage in consumption mode to prevent side-channel bypass.
-    #[prost(string, tag = "2")]
-    pub content_hash: ::prost::alloc::string::String,
-    /// Expected content hash for validation when using stable_id.
+    /// Note: Changed from string (hex) to bytes for consistency with ArtifactPublish.
+    #[prost(bytes = "vec", tag = "2")]
+    pub content_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Expected content hash for validation when using stable_id (BLAKE3, 32 bytes).
     /// If resolution yields a different hash, the fetch fails.
-    #[prost(string, tag = "3")]
-    pub expected_hash: ::prost::alloc::string::String,
+    /// Note: Changed from string (hex) to bytes for consistency with content_hash.
+    #[prost(bytes = "vec", tag = "3")]
+    pub expected_hash: ::prost::alloc::vec::Vec<u8>,
     /// Maximum bytes to return (inline or total).
     #[prost(uint64, tag = "4")]
     pub max_bytes: u64,

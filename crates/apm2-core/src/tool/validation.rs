@@ -483,40 +483,22 @@ fn validate_artifact_fetch(req: &ArtifactFetch, errors: &mut Vec<ValidationError
         });
     }
 
-    // content_hash is optional, but if present must be 64 chars (hex BLAKE3)
-    if !req.content_hash.is_empty() {
-        if req.content_hash.len() != 64 {
-            errors.push(ValidationError {
-                field: "artifact_fetch.content_hash".to_string(),
-                rule: "hash_length".to_string(),
-                message: "content_hash must be exactly 64 characters (hex)".to_string(),
-            });
-        }
-        if !req.content_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            errors.push(ValidationError {
-                field: "artifact_fetch.content_hash".to_string(),
-                rule: "format".to_string(),
-                message: "content_hash must be hex characters".to_string(),
-            });
-        }
+    // content_hash is optional, but if present must be 32 bytes (BLAKE3)
+    if !req.content_hash.is_empty() && req.content_hash.len() != 32 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.content_hash".to_string(),
+            rule: "hash_length".to_string(),
+            message: "content_hash must be exactly 32 bytes (BLAKE3)".to_string(),
+        });
     }
 
     // expected_hash optional, same rules as content_hash
-    if !req.expected_hash.is_empty() {
-        if req.expected_hash.len() != 64 {
-            errors.push(ValidationError {
-                field: "artifact_fetch.expected_hash".to_string(),
-                rule: "hash_length".to_string(),
-                message: "expected_hash must be exactly 64 characters (hex)".to_string(),
-            });
-        }
-        if !req.expected_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            errors.push(ValidationError {
-                field: "artifact_fetch.expected_hash".to_string(),
-                rule: "format".to_string(),
-                message: "expected_hash must be hex characters".to_string(),
-            });
-        }
+    if !req.expected_hash.is_empty() && req.expected_hash.len() != 32 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.expected_hash".to_string(),
+            rule: "hash_length".to_string(),
+            message: "expected_hash must be exactly 32 bytes (BLAKE3)".to_string(),
+        });
     }
 
     // At least one of stable_id or content_hash must be provided
@@ -1020,8 +1002,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: "org:ticket:TCK-001".to_string(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: "json".to_string(),
             })),
@@ -1038,8 +1020,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: "a".repeat(64),
-                expected_hash: String::new(),
+                content_hash: vec![0xaa; 32], // 32 bytes = valid BLAKE3 hash
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: String::new(),
             })),
@@ -1056,8 +1038,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: String::new(),
             })),
@@ -1077,8 +1059,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: "invalid-hash".to_string(),
-                expected_hash: String::new(),
+                content_hash: vec![0xaa; 16], // 16 bytes = invalid (should be 32)
+                expected_hash: Vec::new(),
                 max_bytes: 1024,
                 format: String::new(),
             })),
@@ -1102,8 +1084,8 @@ mod artifact_fetch_tests {
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: "org:test".to_string(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: (MAX_WRITE_SIZE + 1) as u64,
                 format: String::new(),
             })),

@@ -2485,8 +2485,8 @@ policy:
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: "a".repeat(64),
-                expected_hash: String::new(),
+                content_hash: vec![0xaa; 32], // 32 bytes = valid BLAKE3 hash
+                expected_hash: Vec::new(),
                 max_bytes: 0,
                 format: String::new(),
             })),
@@ -2519,8 +2519,8 @@ policy:
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: "org:ticket:TCK-001".to_string(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: 0,
                 format: String::new(),
             })),
@@ -2552,8 +2552,8 @@ policy:
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: "org:ticket:TCK-002".to_string(),
-                content_hash: String::new(),
-                expected_hash: String::new(),
+                content_hash: Vec::new(),
+                expected_hash: Vec::new(),
                 max_bytes: 0,
                 format: String::new(),
             })),
@@ -2588,8 +2588,8 @@ policy:
             dedupe_key: String::new(),
             tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
                 stable_id: String::new(),
-                content_hash: "a".repeat(64),
-                expected_hash: String::new(),
+                content_hash: vec![0xaa; 32], // 32 bytes = valid BLAKE3 hash
+                expected_hash: Vec::new(),
                 max_bytes: 0,
                 format: String::new(),
             })),

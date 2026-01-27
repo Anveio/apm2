@@ -231,13 +231,15 @@ message ArtifactFetch {
   // If set, the kernel resolves this to a content hash.
   string stable_id = 1;
 
-  // Direct content hash reference (BLAKE3 hex).
+  // Direct content hash reference (BLAKE3, 32 bytes).
   // Policy may restrict usage in consumption mode to prevent side-channel bypass.
-  string content_hash = 2;
+  // Note: Changed from string (hex) to bytes for consistency with ArtifactPublish.
+  bytes content_hash = 2;
 
-  // Expected content hash for validation when using stable_id.
+  // Expected content hash for validation when using stable_id (BLAKE3, 32 bytes).
   // If resolution yields a different hash, the fetch fails.
-  string expected_hash = 3;
+  // Note: Changed from string (hex) to bytes for consistency with content_hash.
+  bytes expected_hash = 3;
 
   // Maximum bytes to return (inline or total).
   uint64 max_bytes = 4;
