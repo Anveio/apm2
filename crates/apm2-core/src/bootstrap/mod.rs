@@ -70,6 +70,20 @@ pub enum BootstrapError {
         actual: String,
     },
 
+    /// Schema content hash verification failed.
+    ///
+    /// This indicates the schema content does not match its expected hash,
+    /// which could indicate binary tampering. The application should not proceed.
+    #[error("schema content hash mismatch for {stable_id}: expected {expected}, computed {actual}")]
+    ContentHashMismatch {
+        /// The stable ID of the schema with mismatched content.
+        stable_id: String,
+        /// The expected content hash (stored in manifest).
+        expected: String,
+        /// The computed content hash (from actual content).
+        actual: String,
+    },
+
     /// Attempted to patch a protected bootstrap schema.
     ///
     /// Bootstrap schemas are immutable and cannot be modified through
@@ -179,7 +193,21 @@ fn get_bootstrap_cache() -> &'static HashMap<String, BootstrapSchema> {
 /// }
 /// ```
 pub fn verify_bootstrap_hash() -> Result<(), BootstrapError> {
-    // Recompute the bundle hash
+    // First, verify each schema's content matches its stored hash.
+    // This prevents binary tampering where content is modified in .rodata
+    // without updating the hash.
+    for &(stable_id, content, hash) in BOOTSTRAP_SCHEMAS {
+        let computed_content_hash = EventHasher::hash_content(content.as_bytes());
+        if computed_content_hash != hash {
+            return Err(BootstrapError::ContentHashMismatch {
+                stable_id: stable_id.to_string(),
+                expected: hex::encode(hash),
+                actual: hex::encode(computed_content_hash),
+            });
+        }
+    }
+
+    // Then verify the bundle hash (hash of all stable_ids and their hashes)
     let mut hasher = blake3::Hasher::new();
     for &(stable_id, _, hash) in BOOTSTRAP_SCHEMAS {
         hasher.update(stable_id.as_bytes());
