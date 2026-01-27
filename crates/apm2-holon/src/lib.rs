@@ -102,6 +102,7 @@ pub mod context;
 pub mod episode;
 pub mod error;
 pub mod ledger;
+pub mod receipt;
 pub mod resource;
 pub mod result;
 pub mod skill;
@@ -124,6 +125,7 @@ pub use ledger::{
     ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
     EpisodeStarted, EventHash, EventHashError, EventType, LedgerEvent, verify_chain,
 };
+pub use receipt::{BudgetDelta, PackMiss, ReceiptError, RunReceipt, RunReceiptBuilder};
 pub use resource::{Budget, Lease, LeaseScope, ResourceError};
 pub use result::EpisodeResult;
 pub use skill::{
@@ -146,6 +148,7 @@ pub mod prelude {
         ChainError, EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeOutcome,
         EpisodeStarted, EventHash, EventType, LedgerEvent, verify_chain,
     };
+    pub use crate::receipt::{BudgetDelta, PackMiss, ReceiptError, RunReceipt, RunReceiptBuilder};
     pub use crate::resource::{Budget, Lease, LeaseScope, ResourceError};
     pub use crate::result::EpisodeResult;
     pub use crate::skill::{HolonConfig, HolonContract, SkillFrontmatter, StopConditionsConfig};

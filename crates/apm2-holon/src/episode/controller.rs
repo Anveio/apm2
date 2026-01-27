@@ -11,6 +11,7 @@ use super::{DEFAULT_EPISODE_TIMEOUT_MS, DEFAULT_MAX_EPISODES};
 use crate::context::EpisodeContext;
 use crate::error::HolonError;
 use crate::ledger::{EpisodeCompleted, EpisodeCompletionReason, EpisodeEvent, EpisodeStarted};
+use crate::receipt::RunReceipt;
 use crate::resource::Lease;
 use crate::stop::StopCondition;
 use crate::traits::Holon;
@@ -267,6 +268,12 @@ pub struct EpisodeLoopResult<T> {
 
     /// The final stop condition that terminated the loop.
     pub final_stop_condition: StopCondition,
+
+    /// The run receipt capturing episode completion metadata.
+    ///
+    /// Present when a context pack is configured for the episode. Captures
+    /// pack sufficiency, misses, and budget consumption metrics.
+    pub run_receipt: Option<RunReceipt>,
 }
 
 impl<T> EpisodeLoopResult<T> {
@@ -278,7 +285,14 @@ impl<T> EpisodeLoopResult<T> {
             events: Vec::new(),
             output: None,
             final_stop_condition,
+            run_receipt: None,
         }
+    }
+
+    /// Returns a reference to the run receipt, if present.
+    #[must_use]
+    pub const fn run_receipt(&self) -> Option<&RunReceipt> {
+        self.run_receipt.as_ref()
     }
 
     /// Returns `true` if this is a successful completion.
