@@ -76,7 +76,7 @@ rfc_rollout_and_ops:
           - "crates/apm2-daemon/src/telemetry/collector.rs"
           - "crates/apm2-daemon/src/telemetry/cgroup.rs"
           - "crates/apm2-daemon/src/telemetry/frame.rs"
-        gate: "GATE-TEL-ACCURACY: Telemetry within 5% of actual consumption"
+        gate: "GATE-TEL-ACCURACY: Telemetry within 5% of actual (15% in degraded mode)"
 
       - phase_id: PHASE-3A
         name: "Evidence Economics"

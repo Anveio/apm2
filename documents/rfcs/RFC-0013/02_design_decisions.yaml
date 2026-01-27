@@ -363,7 +363,8 @@ rfc_design_decisions:
         out-of-process harness execution. No code duplication; clean extension.
       evidence_refs:
         - "crates/apm2-holon/src/episode/controller.rs"
-        - "crates/apm2-holon/src/holon/traits.rs (Holon trait)"
+        - "crates/apm2-holon/src/traits.rs (Holon trait)"
+      traces_to: [REQ-EPISODE-001, REQ-ADAPTER-001]
 
     - decision_id: AD-CGROUP-001
       title: "Per-episode cgroup hierarchy with systemd transient API"
@@ -384,7 +385,10 @@ rfc_design_decisions:
 
         **Creation Strategy:**
         1. Primary: systemd transient API (DBus: org.freedesktop.systemd1)
+           - Requires `zbus` crate for DBus communication.
         2. Fallback: Direct cgroup v2 writes via nix crate
+           - Mitigation: create frozen cgroup, assign PID, then unfreeze to prevent
+             escape/race between creation and process assignment.
 
         **Budget Mapping:**
         - episode_budget.memory_bytes → cgroup memory.max
@@ -398,7 +402,9 @@ rfc_design_decisions:
         Direct fallback ensures operation on non-systemd systems.
       evidence_refs:
         - "No existing cgroup code - implementation required"
-        - "Cargo.toml: nix = 0.30 with signal/process/fs features"
+        - "Cargo.toml: nix = 0.30 with signal/process/fs/pty features"
+        - "Cargo.toml: zbus = 4.4"
+      traces_to: [REQ-TEL-001, REQ-DAEMON-001]
 
     - decision_id: AD-ADAPT-001
       title: "HarnessAdapter implements Holon trait"
@@ -428,6 +434,11 @@ rfc_design_decisions:
         }
         ```
 
+        **Composition Pattern:**
+        `HarnessAdapter` (daemon) acts as a wrapper around existing `Adapter` trait
+        implementations (core), normalizing vendor-specific PTY output into
+        structured `HarnessEvent` streams consumed by the `Holon` execution loop.
+
         **Parser Architecture:**
         - Each vendor adapter implements deterministic parser state machine
         - Parser emits HarnessEvent::ToolRequest on detection
@@ -439,6 +450,7 @@ rfc_design_decisions:
       evidence_refs:
         - "crates/apm2-core/src/adapter/black_box.rs"
         - "crates/apm2-core/src/adapter/claude_code.rs"
+      traces_to: [REQ-ADAPTER-001]
 
     - decision_id: AD-FAIL-001
       title: "Adapter failure handling with circuit breaker pattern"
@@ -474,6 +486,7 @@ rfc_design_decisions:
         - "crates/apm2-core/src/session/crash.rs"
         - "crates/apm2-core/src/session/restart_coordinator.rs"
         - "crates/apm2-core/src/health/mod.rs"
+      traces_to: [REQ-DAEMON-001, REQ-ADAPTER-001]
 
     - decision_id: AD-CAC-001
       title: "Dual-layer CAC ContextPack enforcement"
@@ -507,9 +520,12 @@ rfc_design_decisions:
         5. Post-episode: RunReceipt includes pack_sufficiency_score
       rationale: |
         Dual-layer enforcement provides defense in depth: real-time blocking
-        (daemon) plus audit trail (holon). Both use DefectRecord for consistency.
+        (daemon) plus audit trail (holon). Both use DefectRecord (moved to apm2-core)
+        for consistency.
       evidence_refs:
         - "crates/apm2-holon/src/episode/controller.rs:record_pack_miss"
+        - "crates/apm2-core/src/cac/defect.rs (DefectRecord)"
+      traces_to: [REQ-TOOL-001, REQ-EVID-001]
 
     - decision_id: AD-EVID-003
       title: "Evidence economics as ledger events + reducers"
@@ -530,7 +546,7 @@ rfc_design_decisions:
           - Telemetry frames                        ↓
                 ↓                           All metrics derived from ledger events
           Trigger fires                     Evidence-backed, versioned, deterministic
-                ↓
+                ↓                           All metrics derived from events, versioned
           Emit events to ledger
         ```
 
@@ -545,12 +561,12 @@ rfc_design_decisions:
         **Existing Infrastructure (extend, not replace):**
         - Reducer trait: `crates/apm2-core/src/reducer/traits.rs`
         - EvidenceReducer: `crates/apm2-core/src/evidence/reducer.rs`
-        - DefectRecord: `crates/apm2-holon/src/defect.rs` (1,292 lines, production-ready)
+        - DefectRecord: `crates/apm2-core/src/cac/defect.rs` (Moved from apm2-holon)
         - ContentAddressedStore: `crates/apm2-core/src/evidence/cas.rs`
 
         **v4 Finalization Required:**
         - Event vocabulary: `telemetry.frame`, `evidence.pinned`, `evidence.ttl_expired`, `compaction.completed`
-        - EvidenceReducer extensions for pin_state/TTL event handling
+        - EvidenceReducer extensions for pin_state/TTL event handling (TODO: TCK-PEND-014)
         - MetricsReducer state schema and projections
         - DefectRecord → evidence.pinned event wiring
       rationale: |
@@ -565,9 +581,58 @@ rfc_design_decisions:
       evidence_refs:
         - "crates/apm2-core/src/reducer/traits.rs (Reducer trait)"
         - "crates/apm2-core/src/evidence/reducer.rs (EvidenceReducer)"
-        - "crates/apm2-holon/src/defect.rs (DefectRecord)"
+        - "crates/apm2-core/src/cac/defect.rs (DefectRecord)"
         - "crates/apm2-core/src/evidence/cas.rs (ContentAddressedStore)"
         - "crates/apm2-core/src/evidence/state.rs (needs pin_state field in v4)"
+      traces_to: [REQ-EVID-001, REQ-TEL-001]
+
+    - decision_id: AD-KEY-001
+      title: "Signing key lifecycle and rotation"
+      description: |
+        **v0 Finding Resolved:** SA3-F-001
+
+        Daemon signing keys follow a strict lifecycle to mitigate compromise risk:
+
+        **Lifecycle Phases:**
+        1. **Generation**: Keys generated in OS-protected keychain (Secret Service API
+           or Apple Keychain) using Ed25519.
+        2. **Versioning**: Each key has a `key_id` and `version` (monotonic).
+        3. **Rotation**: Scheduled rotation every 90 days. New key generated; old
+           key preserved for verification of historical receipts for 1 year.
+        4. **Compromise Recovery**: If compromise detected, revoke key in policy,
+           quarantine affected episodes, and rotate immediately.
+
+        **HSM Guidance**:
+        Production deployments SHOULD use hardware-backed keys (TPM/YubiKey)
+        where available via PKCS#11 or equivalent.
+      rationale: |
+        Cryptographic integrity requires managed key lifecycles. 90-day rotation
+        limits the blast radius of any undetected compromise.
+      traces_to: [REQ-RECEIPT-001]
+
+    - decision_id: AD-VERIFY-001
+      title: "Deterministic Protobuf serialization (canonical_bytes)"
+      description: |
+        **v0 Finding Resolved:** SA2-F-008, SA3-F-003
+
+        To ensure stable digests for signing, all Protobuf messages bound into
+        receipts MUST use deterministic serialization:
+
+        **Rules:**
+        1. **Field Order**: Fields MUST be serialized in tag number order (standard).
+        2. **Maps**: Maps are forbidden in signed messages (use repeated entries).
+        3. **Repeated Fields**: Order must be stable (sorted by content hash if
+           representing a set).
+        4. **Unknown Fields**: Unknown fields MUST be dropped before serialization.
+        5. **Default Values**: Explicitly serialized; no implicit default skipping.
+
+        **Verification**:
+        `canonical_bytes()` implementation must pass `kernel-testkit` golden
+        vector suite for each message type.
+      rationale: |
+        Non-deterministic serialization would result in signature verification
+        failures across platforms or library versions.
+      traces_to: [REQ-RECEIPT-001, REQ-EPISODE-001]
 
   # Original v0 open questions (now resolved, preserved for history)
   open_questions_v0:

@@ -87,7 +87,7 @@ rfc_risks_and_open_questions:
       impact: CRITICAL
       mitigation:
         - "Key stored in OS keychain (not file)"
-        - "Key rotation procedure documented"
+        - "AD-KEY-001: 90-day rotation, versioning, and recovery procedures"
         - "Transparency log for receipt verification (future)"
         - "Key compromise detection via anomaly monitoring"
       residual_risk: MEDIUM

@@ -78,7 +78,7 @@ rfc_meta:
         version: "0.12"
         purpose: "Protocol Buffers for wire encoding"
       - name: nix
-        version: "0.29"
+        version: "0.30"
         purpose: "Unix APIs for PTY, cgroups, signals"
       - name: blake3
         version: "1.x"

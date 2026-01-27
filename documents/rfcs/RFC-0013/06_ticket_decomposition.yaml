@@ -93,21 +93,30 @@ rfc_ticket_decomposition:
         Policy evaluation for allow/deny decisions.
 
     # Phase 2B: Tool Execution and Receipts
-    - ticket_id: TCK-PEND-009
-      title: "Implement tool execution with receipt generation"
+    - ticket_id: TCK-PEND-009a
+      title: "Implement tool execution and budget charging"
       phase: PHASE-2B
-      requirement_ids: [REQ-TOOL-001, REQ-RECEIPT-001]
+      requirement_ids: [REQ-TOOL-001]
       depends_on: [TCK-PEND-008]
       summary: |
         Tool executor with budget charging.
-        Receipt generation per AD-RECEIPT-001.
         CAS storage for tool results.
+        OCAP enforcement during execution.
+
+    - ticket_id: TCK-PEND-009b
+      title: "Implement tool receipt generation"
+      phase: PHASE-2B
+      requirement_ids: [REQ-RECEIPT-001]
+      depends_on: [TCK-PEND-009a]
+      summary: |
+        Receipt generation per AD-RECEIPT-001.
+        Binding to envelope and tool result hash.
 
     - ticket_id: TCK-PEND-010
       title: "Implement receipt signing and verification"
       phase: PHASE-2B
       requirement_ids: [REQ-RECEIPT-001]
-      depends_on: [TCK-PEND-009]
+      depends_on: [TCK-PEND-009b]
       summary: |
         Ed25519 signing of receipt canonical bytes.
         Verification predicate implementation.
@@ -187,15 +196,32 @@ rfc_ticket_decomposition:
         JSON output for machine readability.
         Integration with daemon via UDS.
 
-    - ticket_id: TCK-PEND-018
-      title: "Implement end-to-end integration tests"
+    - ticket_id: TCK-PEND-018a
+      title: "Implement E2E lifecycle and budget tests"
       phase: PHASE-4
-      requirement_ids: []
+      requirement_ids: [REQ-EPISODE-001, REQ-DAEMON-001]
       depends_on: [TCK-PEND-017]
       summary: |
-        E2E test suite covering episode lifecycle.
-        Receipt and evidence verification.
-        Budget exhaustion scenarios.
+        E2E test suite covering episode lifecycle (create/start/stop).
+        Budget exhaustion scenarios and termination enforcement.
+
+    - ticket_id: TCK-PEND-018b
+      title: "Implement E2E tool and telemetry tests"
+      phase: PHASE-4
+      requirement_ids: [REQ-TOOL-001, REQ-TEL-001]
+      depends_on: [TCK-PEND-017]
+      summary: |
+        E2E tests for tool mediation, deduplication, and receipt binding.
+        Telemetry frame verification against resource consumption.
+
+    - ticket_id: TCK-PEND-018c
+      title: "Implement E2E evidence and receipt verification tests"
+      phase: PHASE-4
+      requirement_ids: [REQ-EVID-001, REQ-RECEIPT-001]
+      depends_on: [TCK-PEND-017]
+      summary: |
+        Verification of evidence integrity and receipt authenticity.
+        Compaction and TTL enforcement scenarios.
 
   decomposition_gates:
     - gate: GATE-TCK-ATOMICITY

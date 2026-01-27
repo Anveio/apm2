@@ -122,6 +122,11 @@ rfc_contracts_and_versioning:
         }
 
         impl ToolBroker {
+            pub async fn initialize(
+                &self,
+                capability_manifest_hash: Hash,
+            ) -> Result<(), Error>;
+
             pub async fn request(
                 &self,
                 episode_id: EpisodeId,
@@ -220,6 +225,7 @@ rfc_contracts_and_versioning:
       type: protobuf
       description: |
         Handshake messages for client-daemon connection.
+        Defined in `proto/daemon_protocol.proto`.
       interface: |
         message Hello {
           uint32 protocol_version = 1;
@@ -385,6 +391,8 @@ rfc_contracts_and_versioning:
           repeated bytes evidence_refs = 4;
           bytes policy_hash = 5;
           bytes envelope_hash = 6;
+          optional string issuer_id = 7;
+          optional bytes issuer_signature = 8;
         }
 
         enum ReceiptKind {

@@ -91,6 +91,8 @@ rfc_trust_boundaries:
           - "Malformed input triggers parsing error event, not crash"
           - "Parsing failures are logged as defects"
           - "Adapter does not execute arbitrary content"
+          - "PTY output is sanitized (ANSI escape stripping) before parsing"
+          - "Tool request rate limited to prevent DoS via parser"
 
       - boundary_id: TB-EVIDENCE-001
         name: "Evidence Store (CAS)"
@@ -182,7 +184,10 @@ rfc_trust_boundaries:
         - "Evidence classification (ephemeral/standard/archival)"
         - "TTL enforcement for non-pinned evidence"
         - "No ambient credentials in harness"
-      residual_risk: MEDIUM
+      residual_risk: |
+        MEDIUM. Telemetry timing side channel is an acknowledged limitation 
+        (estimated 10 bps max exfiltration) that cannot be fully eliminated 
+        without disabling all high-rate telemetry.
       owner: AUTH_SECURITY
 
     - threat_id: TH-EXHAUST-001
