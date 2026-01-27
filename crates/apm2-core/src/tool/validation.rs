@@ -59,8 +59,8 @@
 //! - Each metadata entry must be ≤32KB and contain exactly one `=`
 
 use super::{
-    ArtifactPublish, FileEdit, FileRead, FileWrite, GitOperation, InferenceCall, ShellExec,
-    ToolRequest, ValidationError, tool_request,
+    ArtifactFetch, ArtifactPublish, FileEdit, FileRead, FileWrite, GitOperation, InferenceCall,
+    ShellExec, ToolRequest, ValidationError, tool_request,
 };
 
 /// Maximum length for `request_id`, `session_token`, and similar identifiers.
@@ -140,6 +140,9 @@ impl Validator for ToolRequest {
             Some(tool_request::Tool::Inference(req)) => validate_inference_call(req, &mut errors),
             Some(tool_request::Tool::ArtifactPublish(req)) => {
                 validate_artifact_publish(req, &mut errors);
+            },
+            Some(tool_request::Tool::ArtifactFetch(req)) => {
+                validate_artifact_fetch(req, &mut errors);
             },
             None => {
                 errors.push(ValidationError {
@@ -475,6 +478,7 @@ mod validation_tests {
 
     fn make_valid_file_read() -> ToolRequest {
         ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -515,6 +519,7 @@ mod validation_tests {
     #[test]
     fn test_missing_tool() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -529,6 +534,7 @@ mod validation_tests {
     #[test]
     fn test_file_read_empty_path() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -547,6 +553,7 @@ mod validation_tests {
     #[test]
     fn test_file_read_null_in_path() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -565,6 +572,7 @@ mod validation_tests {
     #[test]
     fn test_file_read_excessive_limit() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -583,6 +591,7 @@ mod validation_tests {
     #[test]
     fn test_file_write_valid() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -599,6 +608,7 @@ mod validation_tests {
     #[test]
     fn test_file_write_conflicting_flags() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -618,6 +628,7 @@ mod validation_tests {
     #[test]
     fn test_shell_exec_valid() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -635,6 +646,7 @@ mod validation_tests {
     #[test]
     fn test_shell_exec_invalid_env() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -655,6 +667,7 @@ mod validation_tests {
     #[test]
     fn test_git_op_valid() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -670,6 +683,7 @@ mod validation_tests {
     #[test]
     fn test_git_op_unknown_operation() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -688,6 +702,7 @@ mod validation_tests {
     #[test]
     fn test_inference_call_valid() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -706,6 +721,7 @@ mod validation_tests {
     #[test]
     fn test_inference_call_invalid_hash() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -727,6 +743,7 @@ mod validation_tests {
     #[test]
     fn test_artifact_publish_valid() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -743,6 +760,7 @@ mod validation_tests {
     #[test]
     fn test_artifact_publish_invalid_metadata() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -766,6 +784,7 @@ mod validation_tests {
     #[test]
     fn test_file_edit_valid() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -781,6 +800,7 @@ mod validation_tests {
     #[test]
     fn test_file_edit_empty_old_content() {
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -800,6 +820,7 @@ mod validation_tests {
     fn test_file_read_path_traversal() {
         // Test ".." segment
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -816,6 +837,7 @@ mod validation_tests {
 
         // Test start with ".."
         let req2 = ToolRequest {
+            consumption_mode: false,
             request_id: "req-002".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -838,6 +860,7 @@ mod validation_tests {
             .collect();
 
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -862,6 +885,7 @@ mod validation_tests {
             .collect();
 
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -885,6 +909,7 @@ mod validation_tests {
             .collect();
 
         let req = ToolRequest {
+            consumption_mode: false,
             request_id: "req-001".to_string(),
             session_token: "session-abc".to_string(),
             dedupe_key: String::new(),
@@ -906,3 +931,189 @@ mod validation_tests {
         );
     }
 }
+<<<<<<< Updated upstream
+=======
+
+/// Validate an artifact fetch request.
+fn validate_artifact_fetch(req: &ArtifactFetch, errors: &mut Vec<ValidationError>) {
+    // stable_id is optional, but if present must be ≤1024 chars (DCP limit)
+    if req.stable_id.len() > 1024 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.stable_id".to_string(),
+            rule: "max_length".to_string(),
+            message: "stable_id must be at most 1024 characters".to_string(),
+        });
+    }
+
+    // content_hash is optional, but if present must be 64 chars (hex BLAKE3)
+    if !req.content_hash.is_empty() {
+        if req.content_hash.len() != 64 {
+            errors.push(ValidationError {
+                field: "artifact_fetch.content_hash".to_string(),
+                rule: "hash_length".to_string(),
+                message: "content_hash must be exactly 64 characters (hex)".to_string(),
+            });
+        }
+        if !req.content_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            errors.push(ValidationError {
+                field: "artifact_fetch.content_hash".to_string(),
+                rule: "format".to_string(),
+                message: "content_hash must be hex characters".to_string(),
+            });
+        }
+    }
+
+    // expected_hash optional, same rules as content_hash
+    if !req.expected_hash.is_empty() {
+        if req.expected_hash.len() != 64 {
+            errors.push(ValidationError {
+                field: "artifact_fetch.expected_hash".to_string(),
+                rule: "hash_length".to_string(),
+                message: "expected_hash must be exactly 64 characters (hex)".to_string(),
+            });
+        }
+        if !req.expected_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            errors.push(ValidationError {
+                field: "artifact_fetch.expected_hash".to_string(),
+                rule: "format".to_string(),
+                message: "expected_hash must be hex characters".to_string(),
+            });
+        }
+    }
+
+    // At least one of stable_id or content_hash must be provided
+    if req.stable_id.is_empty() && req.content_hash.is_empty() {
+        errors.push(ValidationError {
+            field: "artifact_fetch".to_string(),
+            rule: "required".to_string(),
+            message: "either stable_id or content_hash must be provided".to_string(),
+        });
+    }
+
+    // max_bytes limit (100MB safety cap matching write size)
+    if req.max_bytes > (MAX_WRITE_SIZE as u64) {
+        errors.push(ValidationError {
+            field: "artifact_fetch.max_bytes".to_string(),
+            rule: "max_value".to_string(),
+            message: format!("max_bytes must be at most {MAX_WRITE_SIZE}"),
+        });
+    }
+
+    // format optional, max length check
+    if req.format.len() > 32 {
+        errors.push(ValidationError {
+            field: "artifact_fetch.format".to_string(),
+            rule: "max_length".to_string(),
+            message: "format must be at most 32 characters".to_string(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod artifact_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn test_artifact_fetch_valid_stable_id() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: "org:ticket:TCK-001".to_string(),
+                content_hash: String::new(),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: "json".to_string(),
+            })),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_artifact_fetch_valid_content_hash() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: "a".repeat(64),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: String::new(),
+            })),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_artifact_fetch_missing_identifiers() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: String::new(),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "artifact_fetch"));
+    }
+
+    #[test]
+    fn test_artifact_fetch_invalid_content_hash() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: String::new(),
+                content_hash: "invalid-hash".to_string(),
+                expected_hash: String::new(),
+                max_bytes: 1024,
+                format: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "artifact_fetch.content_hash")
+        );
+    }
+
+    #[test]
+    fn test_artifact_fetch_max_bytes_exceeded() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ArtifactFetch(ArtifactFetch {
+                stable_id: "org:test".to_string(),
+                content_hash: String::new(),
+                expected_hash: String::new(),
+                max_bytes: (MAX_WRITE_SIZE + 1) as u64,
+                format: String::new(),
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "artifact_fetch.max_bytes"));
+    }
+}
+>>>>>>> Stashed changes

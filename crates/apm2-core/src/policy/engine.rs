@@ -53,7 +53,7 @@
 //! let loaded = LoadedPolicy::from_yaml(yaml).unwrap();
 //! let engine = PolicyEngine::new(&loaded);
 //!
-//! let request = ToolRequest {
+//! let request = ToolRequest { consumption_mode: false,
 //!     request_id: "req-001".to_string(),
 //!     session_token: "session-abc".to_string(),
 //!     dedupe_key: String::new(),
@@ -322,7 +322,8 @@ impl PolicyEngine {
             },
             tool_request::Tool::GitOp(_)
             | tool_request::Tool::Inference(_)
-            | tool_request::Tool::ArtifactPublish(_) => {
+            | tool_request::Tool::ArtifactPublish(_)
+            | tool_request::Tool::ArtifactFetch(_) => {
                 // No path/command restrictions for these by default
             },
         }
@@ -574,6 +575,7 @@ fn get_tool_name(tool: &tool_request::Tool) -> String {
         tool_request::Tool::GitOp(op) => format!("git.{}", op.operation.to_lowercase()),
         tool_request::Tool::Inference(_) => "inference".to_string(),
         tool_request::Tool::ArtifactPublish(_) => "artifact.publish".to_string(),
+        tool_request::Tool::ArtifactFetch(_) => "artifact.fetch".to_string(),
     }
 }
 
@@ -841,6 +843,7 @@ mod tests {
 
     fn create_file_read_request(path: &str) -> ToolRequest {
         ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -854,6 +857,7 @@ mod tests {
 
     fn create_file_write_request(path: &str) -> ToolRequest {
         ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -868,6 +872,7 @@ mod tests {
 
     fn create_shell_exec_request(command: &str) -> ToolRequest {
         ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1412,6 +1417,7 @@ policy:
         let engine = PolicyEngine::new(&policy);
 
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1490,6 +1496,7 @@ policy:
         let engine = PolicyEngine::new(&policy);
 
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1533,6 +1540,7 @@ policy:
 
         // Anthropic provider should match
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1550,6 +1558,7 @@ policy:
 
         // Different provider should NOT match (fail closed)
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1590,6 +1599,7 @@ policy:
 
         // Exact match should work
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1606,6 +1616,7 @@ policy:
 
         // Subdomain of allowed host should work (api.google)
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1623,6 +1634,7 @@ policy:
         // SECURITY: Malicious domain with allowed name as prefix MUST be rejected
         // "google.malicious.com" should NOT match "google"
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1643,6 +1655,7 @@ policy:
         // SECURITY: Similar name should NOT match via contains
         // "google-proxy" should NOT match "google"
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1663,6 +1676,7 @@ policy:
         // SECURITY: Substring match should NOT work
         // "oogle" should NOT match "google"
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1703,6 +1717,7 @@ policy:
         // Shell exec with network access should NOT match because hosts are specified
         // but we can't verify the target (fail closed)
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1790,6 +1805,7 @@ policy:
         let engine = PolicyEngine::new(&policy);
 
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
@@ -1835,6 +1851,7 @@ policy:
 
         // FileEdit
         let request = ToolRequest {
+            consumption_mode: false,
             request_id: "test-req".to_string(),
             session_token: "test-session".to_string(),
             dedupe_key: String::new(),
