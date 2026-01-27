@@ -99,6 +99,7 @@
 
 pub mod artifact;
 pub mod context;
+pub mod defect;
 pub mod episode;
 pub mod error;
 pub mod ledger;
@@ -117,8 +118,12 @@ mod tests;
 // Re-export main types at crate root for convenience
 pub use artifact::Artifact;
 pub use context::EpisodeContext;
+pub use defect::{
+    DefectContext, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal, SignalType,
+};
 pub use episode::{
-    EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome, EpisodeLoopResult,
+    ContextPackConfig, EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome,
+    EpisodeLoopResult,
 };
 pub use error::HolonError;
 pub use ledger::{
@@ -140,8 +145,12 @@ pub use traits::Holon;
 pub mod prelude {
     pub use crate::artifact::Artifact;
     pub use crate::context::EpisodeContext;
+    pub use crate::defect::{
+        DefectContext, DefectRecord, DefectRecordBuilder, DefectSeverity, DefectSignal, SignalType,
+    };
     pub use crate::episode::{
-        EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome, EpisodeLoopResult,
+        ContextPackConfig, EpisodeController, EpisodeControllerConfig, EpisodeLoopOutcome,
+        EpisodeLoopResult,
     };
     pub use crate::error::HolonError;
     pub use crate::ledger::{
