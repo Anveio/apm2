@@ -749,7 +749,7 @@ delivery_constraints:
         let args = ExportArgs {
             profile: profile_path,
             pack: Some(pack_path),
-            output_dir: output_dir.clone(),
+            output_dir,
             verify: true, // Enable verification
             format: OutputFormat::Yaml,
             index: Some(index_path),
