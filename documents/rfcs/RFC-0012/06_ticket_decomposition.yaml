@@ -1,0 +1,72 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  status: PLACEHOLDER
+  v0_note: |
+    This file is a placeholder for v0 (Discovery phase).
+    Ticket decomposition will be populated in v4 (Standard phase) after:
+    - v2 (Exploration): Codebase investigation grounds design decisions
+    - v4 (Closure): All open questions resolved or deferred
+
+  planned_ticket_structure:
+    overview: |
+      Based on PRD-0008 requirements and phased rollout, expect approximately
+      6-8 tickets covering:
+      - Coordination reducer and state types (REQ-COORD-0001)
+      - Coordination events schema (REQ-COORD-0002)
+      - Budget enforcement (REQ-COORD-0003)
+      - Serial execution loop (REQ-COORD-0004)
+      - Stop conditions and circuit breaker (REQ-COORD-0005)
+      - CLI command implementation (REQ-COORD-0006)
+      - Evidence receipt builder (REQ-COORD-0007)
+      - Integration tests and documentation
+
+    preliminary_structure:
+      - ticket_group: "Core Types and Reducer"
+        requirements:
+          - REQ-COORD-0001
+        estimated_tickets: 2
+        notes: |
+          - TCK-A: CoordinationState, events, and type definitions
+          - TCK-B: CoordinationReducer with property tests
+
+      - ticket_group: "Controller and Execution Loop"
+        requirements:
+          - REQ-COORD-0002
+          - REQ-COORD-0003
+          - REQ-COORD-0004
+          - REQ-COORD-0005
+        estimated_tickets: 3
+        notes: |
+          - TCK-C: CoordinationController scaffolding and work freshness
+          - TCK-D: Budget enforcement and tracking
+          - TCK-E: Stop conditions and circuit breaker logic
+
+      - ticket_group: "CLI and Evidence"
+        requirements:
+          - REQ-COORD-0006
+          - REQ-COORD-0007
+        estimated_tickets: 2
+        notes: |
+          - TCK-F: apm2 coordinate CLI command
+          - TCK-G: CoordinationReceipt and CAS storage
+
+      - ticket_group: "Integration and Polish"
+        requirements: []
+        estimated_tickets: 1
+        notes: |
+          - TCK-H: End-to-end integration tests, documentation
+
+  decomposition_gates:
+    - gate: GATE-TCK-ATOMICITY
+      status: NOT_EVALUATED
+      notes: "Will evaluate in v4 when tickets are defined"
+
+    - gate: GATE-TCK-IMPLEMENTABILITY
+      status: NOT_EVALUATED
+      notes: "Will evaluate in v4 when tickets are defined"
+
+    - gate: GATE-TCK-ANTI-COUSIN
+      status: NOT_EVALUATED
+      notes: "Coordination is net-new; no cousin risk for core module"

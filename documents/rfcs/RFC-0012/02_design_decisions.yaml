@@ -1,0 +1,149 @@
+rfc_design_decisions:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  design_space_exploration:
+    prd_ref: "documents/prds/PRD-0008/04_solution_overview.yaml#prd_solution_overview"
+    options:
+      - option_id: OPT-A
+        name: "External orchestrator (Airflow, Temporal)"
+        description: |
+          Use an external workflow orchestrator to manage APM2 sessions.
+          The orchestrator spawns sessions, monitors outcomes, and enforces policies.
+        evaluation:
+          strengths:
+            - "Mature tools with built-in retry, timeout, and monitoring"
+            - "Separates orchestration concerns from APM2 core"
+          weaknesses:
+            - "Splits state across systems; loses ledger provenance"
+            - "Adds operational complexity and external dependency"
+            - "Coordination policies not grounded in same ledger as work/session state"
+
+      - option_id: OPT-B
+        name: "Native coordination reducer (event-sourced)"
+        description: |
+          Implement CoordinationReducer as a native event-sourced projection.
+          Coordination events are recorded in the same ledger as work/session events.
+          Controller spawns sessions and emits coordination events in a serial loop.
+        evaluation:
+          strengths:
+            - "Single source of truth in the ledger"
+            - "Coordination state is deterministically reconstructable"
+            - "Follows established reducer patterns (SessionReducer, WorkReducer)"
+            - "No external dependencies"
+          weaknesses:
+            - "Additional complexity in core crate"
+            - "Serial execution in MVP limits throughput"
+
+      - option_id: OPT-C
+        name: "Cron-based session spawning"
+        description: |
+          Use cron jobs to periodically spawn sessions for pending work items.
+          Simplest approach with minimal coordination logic.
+        evaluation:
+          strengths:
+            - "Very simple to implement"
+            - "No runtime coordination state"
+          weaknesses:
+            - "Inflexible; cannot respond to dynamic work queues"
+            - "No budget enforcement across sessions"
+            - "No circuit breaker protection"
+            - "Race conditions without freshness checks"
+
+    selected_approach:
+      choice: OPT-B
+      rationale: |
+        PRD-0008 specifies that coordination must integrate with existing reducer
+        infrastructure and maintain ledger provenance. OPT-B (native reducer) provides:
+        - Single source of truth for all state
+        - Deterministic replay and checkpointing
+        - Budget enforcement grounded in ledger events
+        - Circuit breaker with consistent state across restarts
+
+        OPT-A (external orchestrator) was rejected because it splits state across
+        systems and loses the audit trail benefits of event sourcing.
+
+        OPT-C (cron) was rejected because it lacks budget enforcement and circuit
+        breaker protection required by PRD-0008.
+
+  architecture_decisions:
+    - decision_id: AD-COORD-001
+      title: "New coordination module in apm2-core"
+      description: |
+        Create crates/apm2-core/src/coordination/ module containing:
+        - reducer.rs: CoordinationReducer implementing event-sourced projection
+        - state.rs: CoordinationState structure and types
+        - events.rs: Coordination event payloads
+        - controller.rs: CoordinationController implementing serial execution loop
+        - evidence.rs: CoordinationReceipt builder
+      rationale: |
+        Following established patterns of session/ and work/ modules.
+        Coordination is a peer reducer, not a wrapper around existing reducers.
+      impact_map_ref: "evidence/prd/PRD-0008/impact_map/impact_map.yaml"
+      net_new_justification: |
+        No existing coordination infrastructure. This is net-new but follows
+        established reducer patterns. Module is well-scoped with clear boundaries.
+
+    - decision_id: AD-COORD-002
+      title: "Coordination does NOT modify other reducer states"
+      description: |
+        CoordinationReducer observes events from Work/Session/Lease reducers.
+        It emits coordination-specific events but never directly modifies
+        work items, sessions, or leases.
+      rationale: |
+        Separation of concerns: each reducer owns its projection.
+        This preserves reducer invariants and enables independent evolution.
+        Coordination reacts to state changes; it doesn't cause them.
+      constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0001"
+
+    - decision_id: AD-COORD-003
+      title: "Binding events bracket session lifecycle"
+      description: |
+        coordination.session_bound MUST be emitted before session.started.
+        coordination.session_unbound MUST be emitted after session.terminated.
+        This ensures complete binding lifecycle tracking.
+      rationale: |
+        Binding events provide correlation between work items and sessions.
+        Bracketing ensures no orphan bindings (INV-COORD-0002).
+      invariant_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#INV-COORD-0002"
+
+    - decision_id: AD-COORD-004
+      title: "Mandatory budget parameters"
+      description: |
+        max_episodes and max_duration_ms are required for every coordination.
+        max_tokens is optional but recommended.
+        Budget exhaustion terminates coordination gracefully.
+      rationale: |
+        No coordination can run indefinitely (safety invariant).
+        Mandatory budgets prevent resource exhaustion without operator configuration.
+      constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0002"
+
+    - decision_id: AD-COORD-005
+      title: "Circuit breaker threshold of 3 consecutive failures"
+      description: |
+        Coordination aborts after 3 consecutive session failures.
+        Counter resets to 0 on any successful session completion.
+      rationale: |
+        Based on PRD-0008 tradeoff analysis (TRADEOFF-COORD-0001).
+        3 failures indicates systematic issue, not transient failure.
+        Reset on success allows recovery from temporary issues.
+      tradeoff_ref: "documents/prds/PRD-0008/08_risks_questions.yaml#TRADEOFF-COORD-0001"
+
+    - decision_id: AD-COORD-006
+      title: "Work freshness check using ledger sequence"
+      description: |
+        Before spawning a session, controller checks work state at a known
+        ledger event sequence number. Spawn proceeds only if work is still
+        in eligible state at that sequence.
+      rationale: |
+        Event ordering provides consistent view across reducers.
+        Prevents race conditions where work state changes during spawn.
+      constraint_ref: "documents/prds/PRD-0008/06_constraints_invariants.yaml#CNS-COORD-0005"
+
+  v0_discovery_notes: |
+    This is RFC v0 (Discovery phase). Design decisions are initial hypotheses.
+    Codebase investigation in v2 (Exploration) phase will:
+    - Verify reducer pattern compatibility with existing reducers
+    - Identify specific integration points in SessionReducer/WorkReducer
+    - Validate CAS storage patterns for receipt artifacts
+    - Confirm CLI extension patterns for apm2 coordinate command

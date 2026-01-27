@@ -1,0 +1,195 @@
+rfc_governance_and_gates:
+  schema_version: "2026-01-26"
+  template_version: "2026-01-26"
+
+  governance:
+    approval_requirements:
+      - authority: AUTH_ARCHITECTURE
+        scope: "Design decisions, reducer patterns, integration approach"
+        status: PENDING
+      - authority: AUTH_PRODUCT
+        scope: "Requirements coverage, success metrics, user experience"
+        status: PENDING
+      - authority: AUTH_SECURITY
+        scope: "Trust boundaries, budget enforcement, circuit breaker"
+        status: PENDING
+
+    version_history:
+      - version: v0
+        date: "2026-01-27"
+        description: "Initial RFC v0 (Discovery phase) generated from PRD-0008"
+        changes:
+          - "Created 9 RFC files from PRD-0008 content"
+          - "Documented 7 imported requirements"
+          - "Identified 5 open questions for v2 investigation"
+        author: "rfc-council CREATE mode"
+
+  gates:
+    - gate_id: GATE-TCK-SCHEMA
+      type: TRUSTED
+      status: PASS
+      evidence: "All 9 RFC YAML files parse correctly"
+      notes: "v0 schema validation complete"
+
+    - gate_id: GATE-TCK-DEPENDENCY-ACYCLICITY
+      type: DETERMINISTIC
+      status: NOT_APPLICABLE
+      evidence: "No ticket dependencies defined in v0"
+      notes: "Will evaluate in v4 when tickets are created"
+
+    - gate_id: GATE-TCK-SCOPE-COVERAGE
+      type: DETERMINISTIC
+      status: PARTIAL
+      evidence: |
+        All 7 PRD requirements imported to 01_problem_and_imports.yaml.
+        Design decisions address all requirements conceptually.
+      notes: "Full coverage verification in v4 with ticket mapping"
+
+    - gate_id: GATE-TCK-CCP-MAPPING
+      type: DETERMINISTIC
+      status: PARTIAL
+      evidence: |
+        CCP grounding documented in 00_meta.yaml and 01_problem_and_imports.yaml.
+        Impact map confirms all 7 requirements are NET-NEW.
+        Component dependencies identified (WorkReducer, SessionReducer, etc.).
+      notes: "Full CCP mapping verification in v2 after codebase investigation"
+
+    - gate_id: GATE-TCK-ATOMICITY
+      type: LLM_ASSISTED
+      status: NOT_EVALUATED
+      evidence: "No tickets defined in v0"
+      notes: "Will evaluate in v4 when tickets are decomposed"
+
+    - gate_id: GATE-TCK-IMPLEMENTABILITY
+      type: LLM_ASSISTED
+      status: NOT_EVALUATED
+      evidence: "No tickets defined in v0"
+      notes: "Will evaluate in v4 when tickets are decomposed"
+
+    - gate_id: GATE-TCK-SECURITY-AND-INTEGRITY
+      type: LLM_ASSISTED
+      status: PARTIAL
+      evidence: |
+        Trust boundaries defined in 03_trust_boundaries.yaml.
+        5 threats identified with mitigations.
+        Security controls documented in PRD-0008.
+      notes: "Full security review in v4"
+
+    - gate_id: GATE-TCK-REQUIREMENT-FIDELITY
+      type: LLM_ASSISTED
+      status: PARTIAL
+      evidence: |
+        Design decisions trace to PRD requirements and constraints.
+        Architecture decisions reference PRD invariants.
+      notes: "Full fidelity review in v4"
+
+    - gate_id: GATE-TCK-ANTI-COUSIN
+      type: LLM_ASSISTED
+      status: PASS
+      evidence: |
+        Impact map confirms all 7 requirements are NET-NEW.
+        No existing coordination module exists.
+        Design reuses existing patterns (reducer, events, CAS) without duplication.
+      notes: "Coordination is new capability, not refactoring existing code"
+
+  discovery_council_results:
+    session_id: "COUNCIL-RFC-0012-20260127-v0"
+    subagents:
+      - agent_id: SA-1
+        role: "Structural Rigorist"
+        selected_modes: [7, 19, 38, 52, 71]
+        findings_count: 5
+      - agent_id: SA-2
+        role: "Implementation Feasibility"
+        selected_modes: [11, 31, 44, 58, 77]
+        findings_count: 5
+      - agent_id: SA-3
+        role: "Security & Anti-Cousin Guardian"
+        selected_modes: [3, 25, 49, 63, 80]
+        findings_count: 5
+
+    aggregated_findings:
+      blockers:
+        - id: SA3-F-003
+          agent: SA-3
+          severity: BLOCKER
+          description: "Worst-case anti-cousin risk: OQ-COORD-003 and OQ-COORD-001 are both UNKNOWN. If coordination incorrectly emits work state events rather than observing them, it could cousin with WorkReducer and SessionReducer simultaneously."
+          recommendation: "Establish clear single-writer invariant for each state domain BEFORE v2. Coordination must be read-only observer for Work and Session state."
+
+      major:
+        - id: SA1-F-004
+          agent: SA-1
+          severity: MAJOR
+          description: "Unbounded work queue size. No limit on input work_ids count at coordination start."
+          recommendation: "Either constrain max work queue size or document intentionally unbounded with budget parameters as the only ceiling."
+
+        - id: SA2-F-001
+          agent: SA-2
+          severity: MAJOR
+          description: "Critical unknowns about SessionReducer/WorkReducer integration. Prior probability of success degraded (0.55-0.65)."
+          recommendation: "v2 Exploration MUST include concrete code snippets demonstrating exact integration surface."
+
+        - id: SA2-F-002
+          agent: SA-2
+          severity: MAJOR
+          description: "Belief consistency problem: binding events must precede session.started, but session spawn may be atomic."
+          recommendation: "Document exact event emission sequence in v2. Consider binding_initiated/binding_confirmed pattern."
+
+        - id: SA3-F-001
+          agent: SA-3
+          severity: MAJOR
+          description: "Fuzzy trust boundary between coordination observation and session control."
+          recommendation: "Define explicit interface contract between CoordinationController and SessionReducer."
+
+        - id: SA3-F-002
+          agent: SA-3
+          severity: MAJOR
+          description: "TOCTOU race condition: work state may change between freshness check and session spawn."
+          recommendation: "Implement atomic work-state reservation at freshness check time using compare-and-swap semantics."
+
+      minor:
+        - id: SA1-F-002
+          agent: SA-1
+          severity: MINOR
+          description: "Missing AD-COORD-007 for receipt schema requirements."
+        - id: SA1-F-003
+          agent: SA-1
+          severity: MINOR
+          description: "Causal mechanism implicit; needs formal state machine."
+        - id: SA2-F-003
+          agent: SA-2
+          severity: MINOR
+          description: "Missing event subscription/await mechanism in controller interface."
+        - id: SA2-F-004
+          agent: SA-2
+          severity: MINOR
+          description: "Game-theoretic misalignment between coordination and session strategies."
+        - id: SA3-F-004
+          agent: SA-3
+          severity: MINOR
+          description: "Defense-in-depth argument is defeasible if LeaseReducer has bugs."
+        - id: SA3-F-005
+          agent: SA-3
+          severity: MINOR
+          description: "Adversarial DoS via poisoned work items triggering circuit breaker."
+
+    council_verdict: NEEDS_V2_INVESTIGATION
+    verdict_reason: |
+      v0 Discovery phase complete. RFC structure is sound but 1 BLOCKER and 5 MAJOR
+      findings require codebase investigation before design convergence. Key unknowns:
+      - OQ-COORD-001: SessionReducer integration surface
+      - OQ-COORD-003: Work state interaction model
+      - Single-writer invariant verification
+
+  next_steps:
+    - step: "v0 -> v2 (Exploration phase)"
+      description: |
+        Codebase investigation to resolve:
+        - BLOCKER SA3-F-003: Single-writer invariant verification
+        - MAJOR findings on integration unknowns
+        - Open questions OQ-COORD-001 through OQ-COORD-003
+      trigger: "Invoke /rfc-council RFC-0012 to advance to EXPLORE mode"
+      priority_findings:
+        - SA3-F-003 (BLOCKER): Anti-cousin single-writer invariant
+        - SA2-F-001 (MAJOR): SessionReducer integration evidence
+        - SA3-F-002 (MAJOR): TOCTOU atomic reservation
