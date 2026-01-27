@@ -9,12 +9,42 @@
 //! - [`CoordinationStatus`]: Lifecycle status of a coordination
 //! - [`StopCondition`]: Why a coordination stopped
 //!
-//! Types follow patterns established in [`crate::session::state`] and
-//! [`crate::work::state`].
+//! Types follow patterns established in [`crate::session::state`].
 
 use std::collections::HashMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+/// Maximum number of work items allowed in a coordination queue.
+///
+/// This limit prevents denial-of-service attacks through unbounded allocation
+/// when deserializing coordination events from JSON.
+pub const MAX_WORK_QUEUE_SIZE: usize = 1000;
+
+/// Errors that can occur during coordination operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinationError {
+    /// Work queue size exceeds the maximum allowed limit.
+    WorkQueueSizeExceeded {
+        /// The actual size that was provided.
+        actual: usize,
+        /// The maximum allowed size.
+        max: usize,
+    },
+}
+
+impl fmt::Display for CoordinationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkQueueSizeExceeded { actual, max } => {
+                write!(f, "work queue size {actual} exceeds maximum allowed {max}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for CoordinationError {}
 
 /// Budget constraints for a coordination.
 ///
@@ -404,20 +434,31 @@ pub struct CoordinationSession {
 
 impl CoordinationSession {
     /// Creates a new coordination session.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinationError::WorkQueueSizeExceeded`] if the work queue
+    /// contains more than [`MAX_WORK_QUEUE_SIZE`] items.
     pub fn new(
         coordination_id: String,
         work_queue: Vec<String>,
         budget: CoordinationBudget,
         max_attempts_per_work: u32,
         started_at: u64,
-    ) -> Self {
+    ) -> Result<Self, CoordinationError> {
+        if work_queue.len() > MAX_WORK_QUEUE_SIZE {
+            return Err(CoordinationError::WorkQueueSizeExceeded {
+                actual: work_queue.len(),
+                max: MAX_WORK_QUEUE_SIZE,
+            });
+        }
+
         let work_tracking = work_queue
             .iter()
             .map(|id| (id.clone(), WorkItemTracking::new(id.clone())))
             .collect();
 
-        Self {
+        Ok(Self {
             coordination_id,
             work_queue,
             work_index: 0,
@@ -429,7 +470,7 @@ impl CoordinationSession {
             started_at,
             completed_at: None,
             max_attempts_per_work,
-        }
+        })
     }
 
     /// Returns `true` if the coordination is in a terminal state.
@@ -742,7 +783,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         assert_eq!(session.coordination_id, "coord-123");
         assert_eq!(session.work_queue.len(), 2);
@@ -764,7 +806,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         assert_eq!(session.current_work_id(), Some("work-1"));
         session.work_index = 1;
@@ -783,7 +826,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         assert!(!session.is_work_queue_exhausted());
         session.work_index = 1;
@@ -800,7 +844,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         let json = serde_json::to_string(&session).unwrap();
         let restored: CoordinationSession = serde_json::from_str(&json).unwrap();
@@ -830,7 +875,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         state.coordinations.insert("coord-123".to_string(), session);
 
@@ -845,13 +891,14 @@ mod tests {
 
         // Add an active coordination
         let mut active =
-            CoordinationSession::new("coord-1".to_string(), vec![], budget.clone(), 3, 1_000);
+            CoordinationSession::new("coord-1".to_string(), vec![], budget.clone(), 3, 1_000)
+                .unwrap();
         active.status = CoordinationStatus::Running;
         state.coordinations.insert("coord-1".to_string(), active);
 
         // Add a completed coordination
         let mut completed =
-            CoordinationSession::new("coord-2".to_string(), vec![], budget, 3, 1_000);
+            CoordinationSession::new("coord-2".to_string(), vec![], budget, 3, 1_000).unwrap();
         completed.status = CoordinationStatus::Completed(StopCondition::WorkCompleted);
         state.coordinations.insert("coord-2".to_string(), completed);
 
@@ -871,7 +918,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
         state.coordinations.insert("coord-123".to_string(), session);
 
         let binding = BindingInfo::new(
@@ -943,7 +991,8 @@ mod tests {
 
         // CoordinationSession
         let session =
-            CoordinationSession::new("c".to_string(), vec!["w".to_string()], budget, 3, 1000);
+            CoordinationSession::new("c".to_string(), vec!["w".to_string()], budget, 3, 1000)
+                .unwrap();
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(session, serde_json::from_str(&json).unwrap());
 
@@ -953,5 +1002,54 @@ mod tests {
         state.bindings.insert("s".to_string(), binding);
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(state, serde_json::from_str(&json).unwrap());
+    }
+
+    // ========================================================================
+    // Security Tests (TCK-00148)
+    // ========================================================================
+
+    /// TCK-00148: Test that work queue size limit is enforced.
+    #[test]
+    fn test_coordination_session_queue_limit() {
+        let budget = CoordinationBudget::new(10, 60_000, None);
+
+        // Create a work queue that exceeds the limit
+        let oversized_queue: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+        assert_eq!(oversized_queue.len(), MAX_WORK_QUEUE_SIZE + 1);
+
+        let result = CoordinationSession::new(
+            "coord-123".to_string(),
+            oversized_queue,
+            budget.clone(),
+            3,
+            1_000_000_000,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            CoordinationError::WorkQueueSizeExceeded {
+                actual,
+                max
+            } if actual == MAX_WORK_QUEUE_SIZE + 1 && max == MAX_WORK_QUEUE_SIZE
+        ));
+
+        // Verify exact limit works
+        let exact_queue: Vec<String> = (0..MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+        assert_eq!(exact_queue.len(), MAX_WORK_QUEUE_SIZE);
+
+        let result = CoordinationSession::new(
+            "coord-124".to_string(),
+            exact_queue,
+            budget,
+            3,
+            1_000_000_000,
+        );
+        assert!(result.is_ok());
     }
 }

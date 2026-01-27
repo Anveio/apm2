@@ -10,7 +10,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::state::{AbortReason, BudgetUsage, CoordinationBudget, SessionOutcome, StopCondition};
+use super::state::{
+    AbortReason, BudgetUsage, CoordinationBudget, CoordinationError, MAX_WORK_QUEUE_SIZE,
+    SessionOutcome, StopCondition,
+};
 
 /// Event type constant for coordination started.
 pub const EVENT_TYPE_STARTED: &str = "coordination.started";
@@ -50,21 +53,31 @@ pub struct CoordinationStarted {
 
 impl CoordinationStarted {
     /// Creates a new coordination started payload.
-    #[must_use]
-    pub const fn new(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinationError::WorkQueueSizeExceeded`] if `work_ids`
+    /// contains more than [`MAX_WORK_QUEUE_SIZE`] items.
+    pub fn new(
         coordination_id: String,
         work_ids: Vec<String>,
         budget: CoordinationBudget,
         max_attempts_per_work: u32,
         started_at: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CoordinationError> {
+        if work_ids.len() > MAX_WORK_QUEUE_SIZE {
+            return Err(CoordinationError::WorkQueueSizeExceeded {
+                actual: work_ids.len(),
+                max: MAX_WORK_QUEUE_SIZE,
+            });
+        }
+        Ok(Self {
             coordination_id,
             work_ids,
             budget,
             max_attempts_per_work,
             started_at,
-        }
+        })
     }
 }
 
@@ -167,6 +180,9 @@ impl CoordinationSessionUnbound {
     }
 }
 
+/// BLAKE3 hash size in bytes.
+pub const BLAKE3_HASH_SIZE: usize = 32;
+
 /// Payload for `coordination.completed` events.
 ///
 /// Emitted when a coordination finishes processing (success or stop condition).
@@ -190,17 +206,43 @@ pub struct CoordinationCompleted {
     /// Number of failed sessions.
     pub failed_sessions: u32,
 
-    /// BLAKE3 hash of the coordination receipt.
+    /// BLAKE3 hash of the coordination receipt (32 bytes).
     ///
     /// Per AD-COORD-012: Hash computed before event emission, stored in CAS.
-    pub receipt_hash: Vec<u8>,
+    /// BLAKE3 produces a fixed 32-byte (256-bit) hash.
+    #[serde(with = "serde_bytes_array")]
+    pub receipt_hash: [u8; BLAKE3_HASH_SIZE],
 
     /// Timestamp when coordination completed (nanoseconds since epoch).
     pub completed_at: u64,
 }
 
+/// Serde helper for fixed-size byte arrays.
+mod serde_bytes_array {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, const N: usize>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        bytes.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<u8>::deserialize(deserializer)?;
+        vec.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected {} bytes, got {}", N, v.len()))
+        })
+    }
+}
+
 impl CoordinationCompleted {
     /// Creates a new coordination completed payload.
+    ///
+    /// The `receipt_hash` must be exactly 32 bytes (BLAKE3 hash size).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -210,7 +252,7 @@ impl CoordinationCompleted {
         total_sessions: u32,
         successful_sessions: u32,
         failed_sessions: u32,
-        receipt_hash: Vec<u8>,
+        receipt_hash: [u8; BLAKE3_HASH_SIZE],
         completed_at: u64,
     ) -> Self {
         Self {
@@ -348,7 +390,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         assert_eq!(event.coordination_id, "coord-123");
         assert_eq!(event.work_ids.len(), 2);
@@ -365,7 +408,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
 
         let json = serde_json::to_string(&event).unwrap();
         let restored: CoordinationStarted = serde_json::from_str(&json).unwrap();
@@ -454,6 +498,15 @@ mod tests {
     // CoordinationCompleted Tests
     // ========================================================================
 
+    /// Helper to create a test BLAKE3 hash (32 bytes).
+    fn test_hash() -> [u8; BLAKE3_HASH_SIZE] {
+        [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ]
+    }
+
     #[test]
     fn test_coordination_completed_new() {
         let budget_usage = BudgetUsage {
@@ -461,6 +514,7 @@ mod tests {
             elapsed_ms: 30_000,
             consumed_tokens: 50_000,
         };
+        let receipt_hash = test_hash();
         let event = CoordinationCompleted::new(
             "coord-123".to_string(),
             StopCondition::WorkCompleted,
@@ -468,7 +522,7 @@ mod tests {
             5,
             4,
             1,
-            vec![1, 2, 3, 4],
+            receipt_hash,
             4_000_000_000,
         );
 
@@ -477,7 +531,7 @@ mod tests {
         assert_eq!(event.total_sessions, 5);
         assert_eq!(event.successful_sessions, 4);
         assert_eq!(event.failed_sessions, 1);
-        assert_eq!(event.receipt_hash, vec![1, 2, 3, 4]);
+        assert_eq!(event.receipt_hash, receipt_hash);
         assert_eq!(event.completed_at, 4_000_000_000);
     }
 
@@ -497,13 +551,41 @@ mod tests {
             3,
             0,
             3,
-            vec![0xde, 0xad, 0xbe, 0xef],
+            test_hash(),
             4_000_000_000,
         );
 
         let json = serde_json::to_string(&event).unwrap();
         let restored: CoordinationCompleted = serde_json::from_str(&json).unwrap();
         assert_eq!(event, restored);
+    }
+
+    /// TCK-00148: Test that invalid hash length is rejected during
+    /// deserialization.
+    #[test]
+    fn test_completed_event_invalid_hash() {
+        // This test documents that the type system prevents invalid hash lengths
+        // at compile time. The receipt_hash field is now [u8; 32], not Vec<u8>.
+        //
+        // Deserialization will fail if the JSON contains a different number of bytes.
+        let json_with_short_hash = r#"{
+            "coordination_id": "coord-123",
+            "stop_condition": "WorkCompleted",
+            "budget_usage": {"consumed_episodes": 0, "elapsed_ms": 0, "consumed_tokens": 0},
+            "total_sessions": 1,
+            "successful_sessions": 1,
+            "failed_sessions": 0,
+            "receipt_hash": [1, 2, 3, 4],
+            "completed_at": 1000
+        }"#;
+
+        let result: Result<CoordinationCompleted, _> = serde_json::from_str(json_with_short_hash);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expected 32 bytes"),
+            "Expected error about 32 bytes, got: {err}"
+        );
     }
 
     // ========================================================================
@@ -552,13 +634,16 @@ mod tests {
 
     #[test]
     fn test_coordination_event_type() {
-        let started = CoordinationEvent::Started(CoordinationStarted::new(
-            "c".to_string(),
-            vec![],
-            CoordinationBudget::new(10, 60_000, None),
-            3,
-            1000,
-        ));
+        let started = CoordinationEvent::Started(
+            CoordinationStarted::new(
+                "c".to_string(),
+                vec![],
+                CoordinationBudget::new(10, 60_000, None),
+                3,
+                1000,
+            )
+            .unwrap(),
+        );
         assert_eq!(started.event_type(), EVENT_TYPE_STARTED);
 
         let bound = CoordinationEvent::SessionBound(CoordinationSessionBound::new(
@@ -588,7 +673,7 @@ mod tests {
             1,
             1,
             0,
-            vec![],
+            [0u8; BLAKE3_HASH_SIZE],
             3000,
         ));
         assert_eq!(completed.event_type(), EVENT_TYPE_COMPLETED);
@@ -605,26 +690,25 @@ mod tests {
     #[test]
     fn test_coordination_event_coordination_id() {
         let budget = CoordinationBudget::new(10, 60_000, None);
-        let event = CoordinationEvent::Started(CoordinationStarted::new(
-            "coord-test".to_string(),
-            vec![],
-            budget,
-            3,
-            1000,
-        ));
+        let event = CoordinationEvent::Started(
+            CoordinationStarted::new("coord-test".to_string(), vec![], budget, 3, 1000).unwrap(),
+        );
         assert_eq!(event.coordination_id(), "coord-test");
     }
 
     #[test]
     fn test_coordination_event_json_roundtrip() {
         let events = vec![
-            CoordinationEvent::Started(CoordinationStarted::new(
-                "c".to_string(),
-                vec!["w1".to_string(), "w2".to_string()],
-                CoordinationBudget::new(10, 60_000, Some(100_000)),
-                3,
-                1000,
-            )),
+            CoordinationEvent::Started(
+                CoordinationStarted::new(
+                    "c".to_string(),
+                    vec!["w1".to_string(), "w2".to_string()],
+                    CoordinationBudget::new(10, 60_000, Some(100_000)),
+                    3,
+                    1000,
+                )
+                .unwrap(),
+            ),
             CoordinationEvent::SessionBound(CoordinationSessionBound::new(
                 "c".to_string(),
                 "s".to_string(),
@@ -652,7 +736,7 @@ mod tests {
                 2,
                 2,
                 0,
-                vec![0xab, 0xcd],
+                test_hash(),
                 4000,
             )),
             CoordinationEvent::Aborted(CoordinationAborted::new(
@@ -686,7 +770,8 @@ mod tests {
             CoordinationBudget::new(10, 60_000, Some(100_000)),
             3,
             1000,
-        );
+        )
+        .unwrap();
         let json = serde_json::to_string(&started).unwrap();
         assert_eq!(started, serde_json::from_str(&json).unwrap());
 
@@ -735,7 +820,7 @@ mod tests {
                 5,
                 4,
                 1,
-                vec![1, 2, 3],
+                test_hash(),
                 4000,
             );
             let json = serde_json::to_string(&completed).unwrap();
@@ -762,5 +847,55 @@ mod tests {
         let event = CoordinationEvent::Started(started);
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(event, serde_json::from_str(&json).unwrap());
+    }
+
+    // ========================================================================
+    // Security Tests (TCK-00148)
+    // ========================================================================
+
+    /// TCK-00148: Test that `work_ids` queue size limit is enforced in
+    /// `CoordinationStarted`.
+    #[test]
+    fn test_coordination_started_queue_limit() {
+        let budget = CoordinationBudget::new(10, 60_000, None);
+
+        // Create a work_ids list that exceeds the limit
+        let oversized_work_ids: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+        assert_eq!(oversized_work_ids.len(), MAX_WORK_QUEUE_SIZE + 1);
+
+        let result = CoordinationStarted::new(
+            "coord-123".to_string(),
+            oversized_work_ids,
+            budget.clone(),
+            3,
+            1_000_000_000,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            CoordinationError::WorkQueueSizeExceeded {
+                actual,
+                max
+            } if actual == MAX_WORK_QUEUE_SIZE + 1 && max == MAX_WORK_QUEUE_SIZE
+        ));
+
+        // Verify exact limit works
+        let exact_work_ids: Vec<String> = (0..MAX_WORK_QUEUE_SIZE)
+            .map(|i| format!("work-{i}"))
+            .collect();
+        assert_eq!(exact_work_ids.len(), MAX_WORK_QUEUE_SIZE);
+
+        let result = CoordinationStarted::new(
+            "coord-124".to_string(),
+            exact_work_ids,
+            budget,
+            3,
+            1_000_000_000,
+        );
+        assert!(result.is_ok());
     }
 }

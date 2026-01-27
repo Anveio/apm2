@@ -85,14 +85,14 @@ pub mod state;
 // Re-export main types from state module
 // Re-export event types
 pub use events::{
-    CoordinationAborted, CoordinationCompleted, CoordinationEvent, CoordinationSessionBound,
-    CoordinationSessionUnbound, CoordinationStarted, EVENT_TYPE_ABORTED, EVENT_TYPE_COMPLETED,
-    EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
+    BLAKE3_HASH_SIZE, CoordinationAborted, CoordinationCompleted, CoordinationEvent,
+    CoordinationSessionBound, CoordinationSessionUnbound, CoordinationStarted, EVENT_TYPE_ABORTED,
+    EVENT_TYPE_COMPLETED, EVENT_TYPE_SESSION_BOUND, EVENT_TYPE_SESSION_UNBOUND, EVENT_TYPE_STARTED,
 };
 pub use state::{
-    AbortReason, BindingInfo, BudgetType, BudgetUsage, CoordinationBudget, CoordinationSession,
-    CoordinationState, CoordinationStatus, SessionOutcome, StopCondition, WorkItemOutcome,
-    WorkItemTracking,
+    AbortReason, BindingInfo, BudgetType, BudgetUsage, CoordinationBudget, CoordinationError,
+    CoordinationSession, CoordinationState, CoordinationStatus, MAX_WORK_QUEUE_SIZE,
+    SessionOutcome, StopCondition, WorkItemOutcome, WorkItemTracking,
 };
 
 #[cfg(test)]
@@ -147,7 +147,8 @@ mod tests {
         let _ = format!("{binding:?}");
 
         let session =
-            CoordinationSession::new("c".to_string(), vec!["w".to_string()], budget, 3, 1000);
+            CoordinationSession::new("c".to_string(), vec!["w".to_string()], budget, 3, 1000)
+                .unwrap();
         let _ = format!("{session:?}");
 
         let state = CoordinationState::new();
@@ -180,7 +181,8 @@ mod tests {
             CoordinationBudget::new(10, 60_000, None),
             3,
             1000,
-        );
+        )
+        .unwrap();
         let session_clone = session2.clone();
         assert_eq!(session2, session_clone);
 
@@ -222,7 +224,8 @@ mod tests {
             budget,
             3,
             1_000_000_000,
-        );
+        )
+        .unwrap();
         session.status = CoordinationStatus::Running;
         session.budget_usage = BudgetUsage {
             consumed_episodes: 2,
