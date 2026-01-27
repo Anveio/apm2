@@ -52,6 +52,7 @@
 //! ));
 //! ```
 
+use jsonschema::error::ValidationErrorKind;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -284,54 +285,35 @@ impl CacValidator {
     fn validate_schema(&self, value: &Value) -> Result<(), ValidationError> {
         self.validator.validate(value).map_err(|error| {
             let path = error.instance_path().to_string();
+            let formatted_path = if path.is_empty() {
+                "$".to_string()
+            } else {
+                format!("${path}")
+            };
 
-            // Check if this is an unevaluatedProperties error (unknown field)
-            // The error message format is: "Unevaluated properties are not allowed ('field'
-            // was unexpected)"
-            let message = error.to_string();
-            let message_lower = message.to_lowercase();
-            if message_lower.contains("unevaluated properties")
-                || message_lower.contains("additional properties are not allowed")
-            {
-                // Extract the field name from the error message
-                // Format: "Unevaluated properties are not allowed ('fieldname' was unexpected)"
-                let field = extract_field_from_unevaluated_error(&message)
-                    .unwrap_or_else(|| "unknown".to_string());
+            // Check if this is an unevaluatedProperties or additionalProperties error
+            // by inspecting the error kind enum directly (more robust than string parsing)
+            match error.kind() {
+                ValidationErrorKind::UnevaluatedProperties { unexpected }
+                | ValidationErrorKind::AdditionalProperties { unexpected } => {
+                    // Get the first unexpected field name, or "unknown" if empty
+                    let field = unexpected
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string());
 
-                return ValidationError::UnknownField {
-                    field,
-                    path: if path.is_empty() {
-                        "$".to_string()
-                    } else {
-                        format!("${path}")
-                    },
-                };
-            }
-
-            ValidationError::SchemaValidation {
-                path: if path.is_empty() {
-                    "$".to_string()
-                } else {
-                    format!("${path}")
+                    ValidationError::UnknownField {
+                        field,
+                        path: formatted_path,
+                    }
                 },
-                message,
+                _ => ValidationError::SchemaValidation {
+                    path: formatted_path,
+                    message: error.to_string(),
+                },
             }
         })
     }
-}
-
-/// Extracts the field name from an unevaluated properties error message.
-///
-/// The message format is: "Unevaluated properties are not allowed ('fieldname'
-/// was unexpected)"
-fn extract_field_from_unevaluated_error(message: &str) -> Option<String> {
-    // Look for pattern: ('fieldname' was unexpected)
-    if let Some(start) = message.find("('") {
-        if let Some(end) = message[start + 2..].find('\'') {
-            return Some(message[start + 2..start + 2 + end].to_string());
-        }
-    }
-    None
 }
 
 /// Validates size limits on a JSON value recursively.
