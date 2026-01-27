@@ -979,7 +979,8 @@ mod tests {
         ));
     }
 
-    /// Test that `defect_class` exceeding `MAX_DEFECT_CLASS_LENGTH` is rejected.
+    /// Test that `defect_class` exceeding `MAX_DEFECT_CLASS_LENGTH` is
+    /// rejected.
     #[test]
     fn test_validation_defect_class_too_long() {
         let long_class = "x".repeat(MAX_DEFECT_CLASS_LENGTH + 1);
@@ -1092,7 +1093,8 @@ mod tests {
         ));
     }
 
-    /// Test that `context.actor_id` exceeding `MAX_ACTOR_ID_LENGTH` is rejected.
+    /// Test that `context.actor_id` exceeding `MAX_ACTOR_ID_LENGTH` is
+    /// rejected.
     #[test]
     fn test_validation_actor_id_too_long() {
         let long_actor_id = "x".repeat(MAX_ACTOR_ID_LENGTH + 1);
@@ -1137,8 +1139,8 @@ mod tests {
         ));
     }
 
-    /// Test that `context.requested_stable_id` exceeding `MAX_STABLE_ID_LENGTH` is
-    /// rejected.
+    /// Test that `context.requested_stable_id` exceeding `MAX_STABLE_ID_LENGTH`
+    /// is rejected.
     #[test]
     fn test_validation_stable_id_too_long() {
         let long_stable_id = "x".repeat(MAX_STABLE_ID_LENGTH + 1);
