@@ -79,6 +79,30 @@ pub struct CompileArgs {
     #[arg(long, required = true)]
     pub spec: PathBuf,
 
+    /// Path to a DCP index file (JSON).
+    ///
+    /// The index file should contain artifact metadata in the `DcpIndex` format.
+    /// Each entry maps a stable ID to its content hash and schema reference.
+    ///
+    /// Example index file:
+    /// ```json
+    /// {
+    ///   "entries": {
+    ///     "org:doc:readme": {
+    ///       "stable_id": "org:doc:readme",
+    ///       "content_hash": "a1b2...64hexchars...",
+    ///       "schema_id": "org:schema:doc"
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// If not provided, the command will fail with an error explaining that
+    /// an index is required. In production, the daemon maintains the index;
+    /// this flag enables offline/testing use.
+    #[arg(long)]
+    pub index: Option<PathBuf>,
+
     /// Target profile override (replaces `target_profile` in spec).
     #[arg(long)]
     pub profile: Option<String>,
@@ -192,9 +216,8 @@ fn run_compile_inner(args: &CompileArgs) -> Result<(), PackCliError> {
             .map_err(|e| PackCliError::ValidationError(e.to_string()))?;
     }
 
-    // Create DCP index (empty for now - in production this would be populated)
-    // TODO: Load DCP index from configuration or --index flag
-    let index = DcpIndex::new();
+    // Load DCP index from file or return error if not provided
+    let index = load_dcp_index(args.index.as_ref())?;
 
     // Create compiler
     let compiler = ContextPackCompiler::new(&index);
@@ -254,6 +277,41 @@ fn run_compile_inner(args: &CompileArgs) -> Result<(), PackCliError> {
     }
 
     Ok(())
+}
+
+/// Loads a `DcpIndex` from a file path.
+///
+/// If no path is provided, returns an error with a helpful message explaining
+/// that an index file is required.
+fn load_dcp_index(path: Option<&PathBuf>) -> Result<DcpIndex, PackCliError> {
+    match path {
+        Some(index_path) => {
+            let content = read_bounded_file(index_path)?;
+            let index: DcpIndex = serde_json::from_str(&content).map_err(|e| {
+                PackCliError::ValidationError(format!(
+                    "failed to parse index file '{}': {e}",
+                    index_path.display()
+                ))
+            })?;
+            Ok(index)
+        },
+        None => Err(PackCliError::ValidationError(
+            "No DCP index provided. Use --index <path> to specify an index file.\n\n\
+             The index file should contain artifact metadata in JSON format. Example:\n\
+             {\n  \
+               \"entries\": {\n    \
+                 \"org:doc:readme\": {\n      \
+                   \"stable_id\": \"org:doc:readme\",\n      \
+                   \"content_hash\": \"<64-char-hex-blake3-hash>\",\n      \
+                   \"schema_id\": \"org:schema:doc\"\n    \
+                 }\n  \
+               }\n\
+             }\n\n\
+             In production, the daemon maintains the DCP index. This flag enables \
+             offline compilation and testing."
+                .to_string(),
+        )),
+    }
 }
 
 /// Reads a file with size limit to prevent denial-of-service via memory
@@ -337,6 +395,18 @@ roots:
 budget: {}
 target_profile: "org:profile:test"
 "#
+        .to_string()
+    }
+
+    /// Creates an empty DCP index JSON for testing.
+    fn empty_index_json() -> String {
+        r#"{
+            "entries": {},
+            "content_to_stable": {},
+            "dependents": {},
+            "last_seq_id": 0,
+            "enforce_reserved": true
+        }"#
         .to_string()
     }
 
@@ -478,10 +548,14 @@ target_profile: "org:profile:test"
     fn test_pack_compile_artifact_not_found() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+        // Write an empty DCP index (artifacts exist but root is not in it)
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let args = CompileArgs {
             spec: spec_path,
+            index: Some(index_path),
             profile: None,
             budget_check: false,
             output: None,
@@ -531,10 +605,13 @@ target_profile: "org:profile:test"
     fn test_pack_compile_exit_code_validation_error() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         std::fs::write(&spec_path, "{}").unwrap(); // Empty object - invalid spec
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let args = CompileArgs {
             spec: spec_path,
+            index: Some(index_path),
             profile: None,
             budget_check: false,
             output: None,
@@ -549,6 +626,7 @@ target_profile: "org:profile:test"
     fn test_pack_compile_exit_code_file_not_found() {
         let args = CompileArgs {
             spec: PathBuf::from("/nonexistent/spec.json"),
+            index: Some(PathBuf::from("/nonexistent/index.json")),
             profile: None,
             budget_check: false,
             output: None,
@@ -654,10 +732,13 @@ target_profile: "org:profile:test"
     fn test_pack_compile_budget_check_mode() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let args = CompileArgs {
             spec: spec_path,
+            index: Some(index_path),
             profile: None,
             budget_check: true, // Budget check mode
             output: None,
@@ -674,10 +755,13 @@ target_profile: "org:profile:test"
     fn test_pack_compile_yaml_output_format() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let args = CompileArgs {
             spec: spec_path,
+            index: Some(index_path),
             profile: None,
             budget_check: false,
             output: None,
@@ -693,11 +777,14 @@ target_profile: "org:profile:test"
     fn test_pack_compile_with_output_file() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         let output_path = temp_dir.path().join("manifest.json");
         std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let args = CompileArgs {
             spec: spec_path,
+            index: Some(index_path),
             profile: None,
             budget_check: false,
             output: Some(output_path.clone()),
@@ -716,10 +803,13 @@ target_profile: "org:profile:test"
     fn test_pack_compile_with_profile_override() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let args = CompileArgs {
             spec: spec_path,
+            index: Some(index_path),
             profile: Some("org:profile:custom".to_string()),
             budget_check: false,
             output: None,
@@ -735,11 +825,14 @@ target_profile: "org:profile:test"
     fn test_run_pack_dispatches_to_compile() {
         let temp_dir = TempDir::new().unwrap();
         let spec_path = temp_dir.path().join("spec.json");
+        let index_path = temp_dir.path().join("index.json");
         std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+        std::fs::write(&index_path, empty_index_json()).unwrap();
 
         let cmd = PackCommand {
             subcommand: PackSubcommand::Compile(CompileArgs {
                 spec: spec_path,
+                index: Some(index_path),
                 profile: None,
                 budget_check: false,
                 output: None,
@@ -761,5 +854,62 @@ target_profile: "org:profile:test"
         // Just verify Debug trait is implemented
         let debug_str = format!("{err:?}");
         assert!(debug_str.contains("BudgetExceeded"));
+    }
+
+    // =========================================================================
+    // Index Loading Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pack_compile_no_index_returns_helpful_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let spec_path = temp_dir.path().join("spec.json");
+        std::fs::write(&spec_path, minimal_spec_json()).unwrap();
+
+        let args = CompileArgs {
+            spec: spec_path,
+            index: None, // No index provided
+            profile: None,
+            budget_check: false,
+            output: None,
+            format: OutputFormat::Json,
+        };
+
+        let result = run_compile(&args);
+        assert_eq!(result, exit_codes::VALIDATION_ERROR);
+    }
+
+    #[test]
+    fn test_load_dcp_index_none_returns_error() {
+        let result = load_dcp_index(None);
+        assert!(matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("No DCP index provided")));
+    }
+
+    #[test]
+    fn test_load_dcp_index_valid_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let index_path = temp_dir.path().join("index.json");
+        std::fs::write(&index_path, empty_index_json()).unwrap();
+
+        let result = load_dcp_index(Some(&index_path));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_load_dcp_index_invalid_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let index_path = temp_dir.path().join("index.json");
+        std::fs::write(&index_path, "{ invalid json }").unwrap();
+
+        let result = load_dcp_index(Some(&index_path));
+        assert!(matches!(result, Err(PackCliError::ValidationError(msg)) if msg.contains("failed to parse index file")));
+    }
+
+    #[test]
+    fn test_load_dcp_index_file_not_found() {
+        let path = PathBuf::from("/nonexistent/index.json");
+        let result = load_dcp_index(Some(&path));
+        assert!(matches!(result, Err(PackCliError::IoError(_))));
     }
 }
