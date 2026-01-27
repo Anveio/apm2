@@ -135,6 +135,22 @@ pub enum ExportError {
         /// Error message.
         message: String,
     },
+
+    /// Invalid path component in `stable_id` (path traversal attempt).
+    #[error("invalid path component in stable_id '{stable_id}': component '{component}' contains invalid characters or is a traversal attempt")]
+    InvalidPathComponent {
+        /// The `stable_id` containing the invalid component.
+        stable_id: String,
+        /// The invalid component.
+        component: String,
+    },
+
+    /// Provenance serialization failed.
+    #[error("provenance serialization failed: {message}")]
+    ProvenanceSerializationFailed {
+        /// Error message.
+        message: String,
+    },
 }
 
 // ============================================================================
@@ -422,7 +438,7 @@ impl ExportPipeline {
         let outputs = self.write_outputs(&rendered_outputs)?;
 
         // Step 4: Generate manifest
-        Ok(self.generate_manifest(pack, outputs))
+        self.generate_manifest(pack, outputs)
     }
 
     /// Validates budget constraints against the pack.
@@ -451,7 +467,7 @@ impl ExportPipeline {
         resolver: &R,
     ) -> Result<Vec<RenderedOutput>, ExportError> {
         let mut outputs = Vec::new();
-        let provenance = self.create_provenance(pack);
+        let provenance = self.create_provenance(pack)?;
 
         for entry in &pack.manifest.entries {
             // Resolve content
@@ -515,7 +531,7 @@ impl ExportPipeline {
         };
 
         // Generate deterministic path from stable_id
-        let path = Self::stable_id_to_path(stable_id, extension);
+        let path = Self::stable_id_to_path(stable_id, extension)?;
 
         Ok(RenderedOutput {
             path,
@@ -595,10 +611,34 @@ impl ExportPipeline {
     /// Converts a `stable_id` to a filesystem path.
     ///
     /// Replaces colons with directory separators for hierarchical layout.
-    fn stable_id_to_path(stable_id: &str, extension: &str) -> PathBuf {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any component:
+    /// - Is `..` (parent directory traversal)
+    /// - Contains path separators (`/` or `\`)
+    fn stable_id_to_path(stable_id: &str, extension: &str) -> Result<PathBuf, ExportError> {
         // Replace colons with path separators for hierarchical structure
         let parts: Vec<&str> = stable_id.split(':').collect();
         let mut path = PathBuf::new();
+
+        // Validate all parts to prevent path traversal
+        for part in &parts {
+            // Reject parent directory traversal
+            if *part == ".." {
+                return Err(ExportError::InvalidPathComponent {
+                    stable_id: stable_id.to_string(),
+                    component: (*part).to_string(),
+                });
+            }
+            // Reject path separators within components
+            if part.contains('/') || part.contains('\\') {
+                return Err(ExportError::InvalidPathComponent {
+                    stable_id: stable_id.to_string(),
+                    component: (*part).to_string(),
+                });
+            }
+        }
 
         // All but last part become directories
         for part in parts.iter().take(parts.len().saturating_sub(1)) {
@@ -610,22 +650,29 @@ impl ExportPipeline {
             path.push(format!("{filename}.{extension}"));
         }
 
-        path
+        Ok(path)
     }
 
     /// Creates provenance metadata for the export.
-    fn create_provenance(&self, pack: &CompiledContextPack) -> Provenance {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if manifest serialization fails.
+    fn create_provenance(&self, pack: &CompiledContextPack) -> Result<Provenance, ExportError> {
         // Use the manifest hash as source pack hash
-        let manifest_json = serde_json::to_string(&pack.manifest).unwrap_or_else(|_| String::new());
+        let manifest_json =
+            serde_json::to_string(&pack.manifest).map_err(|e| ExportError::ProvenanceSerializationFailed {
+                message: format!("failed to serialize manifest for hashing: {e}"),
+            })?;
         let hash = blake3::hash(manifest_json.as_bytes());
         let hash_hex = hex::encode(hash.as_bytes());
 
-        Provenance::new(
+        Ok(Provenance::new(
             hash_hex,
             &self.config.profile.profile_id,
             self.config.timestamp,
             &self.config.exporter_version,
-        )
+        ))
     }
 
     /// Writes rendered outputs atomically to the output directory.
@@ -668,15 +715,19 @@ impl ExportPipeline {
     }
 
     /// Generates the export manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if provenance creation fails.
     fn generate_manifest(
         &self,
         pack: &CompiledContextPack,
         outputs: Vec<ExportOutput>,
-    ) -> ExportManifest {
-        let provenance = self.create_provenance(pack);
+    ) -> Result<ExportManifest, ExportError> {
+        let provenance = self.create_provenance(pack)?;
         let total_bytes: u64 = outputs.iter().map(|o| o.size_bytes).sum();
 
-        ExportManifest {
+        Ok(ExportManifest {
             schema: ExportManifest::SCHEMA.to_string(),
             schema_version: ExportManifest::SCHEMA_VERSION.to_string(),
             source_pack_hash: provenance.source_pack_hash,
@@ -685,7 +736,7 @@ impl ExportPipeline {
             exporter_version: provenance.exporter_version,
             outputs,
             total_bytes,
-        }
+        })
     }
 
     /// Returns a reference to the export configuration.
@@ -1216,19 +1267,54 @@ mod tests {
     #[test]
     fn test_stable_id_to_path() {
         assert_eq!(
-            ExportPipeline::stable_id_to_path("org:doc:readme", "md"),
+            ExportPipeline::stable_id_to_path("org:doc:readme", "md").unwrap(),
             PathBuf::from("org/doc/readme.md")
         );
 
         assert_eq!(
-            ExportPipeline::stable_id_to_path("simple", "txt"),
+            ExportPipeline::stable_id_to_path("simple", "txt").unwrap(),
             PathBuf::from("simple.txt")
         );
 
         assert_eq!(
-            ExportPipeline::stable_id_to_path("a:b:c:d", "json"),
+            ExportPipeline::stable_id_to_path("a:b:c:d", "json").unwrap(),
             PathBuf::from("a/b/c/d.json")
         );
+    }
+
+    #[test]
+    fn test_stable_id_to_path_rejects_path_traversal() {
+        // Reject parent directory traversal
+        let result = ExportPipeline::stable_id_to_path("org:..:secret:doc", "md");
+        assert!(matches!(
+            result,
+            Err(ExportError::InvalidPathComponent { stable_id, component })
+            if stable_id == "org:..:secret:doc" && component == ".."
+        ));
+
+        // Reject forward slash in component
+        let result = ExportPipeline::stable_id_to_path("org:../secret:doc", "md");
+        assert!(matches!(
+            result,
+            Err(ExportError::InvalidPathComponent { stable_id, component })
+            if stable_id == "org:../secret:doc" && component == "../secret"
+        ));
+
+        // Reject backslash in component
+        let result = ExportPipeline::stable_id_to_path("org:..\\secret:doc", "md");
+        assert!(matches!(
+            result,
+            Err(ExportError::InvalidPathComponent { stable_id, component })
+            if stable_id == "org:..\\secret:doc" && component == "..\\secret"
+        ));
+
+        // Reject forward slash anywhere in component
+        let result = ExportPipeline::stable_id_to_path("org:foo/bar:doc", "md");
+        assert!(matches!(
+            result,
+            Err(ExportError::InvalidPathComponent { stable_id, component })
+            if stable_id == "org:foo/bar:doc" && component == "foo/bar"
+        ));
     }
 
     // =========================================================================
@@ -1273,5 +1359,242 @@ mod tests {
         assert_eq!(resolver.resolve("key1", "").unwrap(), b"value1");
         assert_eq!(resolver.resolve("key2", "").unwrap(), b"value2");
         assert!(resolver.resolve("key3", "").is_err());
+    }
+
+    // =========================================================================
+    // JSON Output Format Tests
+    // =========================================================================
+
+    #[test]
+    fn test_export_json_format_with_metadata_provenance() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("json-profile")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Json)
+                    .provenance_embed(ProvenanceEmbed::Metadata)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:doc:readme", br#"{"key": "value", "number": 42}"#);
+
+        let manifest = pipeline.export(&pack, &resolver).unwrap();
+
+        // Verify file extension is .json
+        assert_eq!(manifest.outputs.len(), 1);
+        let output_path = temp_dir.path().join("org/doc/readme.json");
+        assert!(output_path.exists(), "Output file should exist with .json extension");
+
+        // Verify _provenance is injected
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // Check original content preserved
+        assert_eq!(json["key"], "value");
+        assert_eq!(json["number"], 42);
+
+        // Check _provenance injected
+        assert!(json["_provenance"].is_object(), "_provenance should be injected");
+        assert!(json["_provenance"]["source_pack_hash"].is_string());
+        assert_eq!(json["_provenance"]["export_profile"], "json-profile");
+        assert_eq!(json["_provenance"]["export_timestamp"], "2026-01-27T12:00:00Z");
+    }
+
+    #[test]
+    fn test_export_json_format_without_provenance() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("json-no-prov")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Json)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:doc:readme", br#"{"data": "test"}"#);
+
+        pipeline.export(&pack, &resolver).unwrap();
+
+        let content = std::fs::read_to_string(temp_dir.path().join("org/doc/readme.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // Original content should be preserved
+        assert_eq!(json["data"], "test");
+        // No _provenance should be injected
+        assert!(json.get("_provenance").is_none(), "_provenance should not be injected with None embed mode");
+    }
+
+    #[test]
+    fn test_export_json_format_invalid_json_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("json-invalid")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::Json)
+                    .provenance_embed(ProvenanceEmbed::Metadata)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        // Invalid JSON content
+        resolver.insert("org:doc:readme", b"not valid json {{{");
+
+        let result = pipeline.export(&pack, &resolver);
+        assert!(matches!(
+            result,
+            Err(ExportError::ConfigurationError { message })
+            if message.contains("invalid JSON")
+        ));
+    }
+
+    // =========================================================================
+    // PlainText Output Format Tests
+    // =========================================================================
+
+    #[test]
+    fn test_export_plaintext_format_with_inline_provenance() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("text-profile")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::PlainText)
+                    .provenance_embed(ProvenanceEmbed::Inline)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:doc:readme", b"This is plain text content.\nWith multiple lines.");
+
+        let manifest = pipeline.export(&pack, &resolver).unwrap();
+
+        // Verify file extension is .txt
+        assert_eq!(manifest.outputs.len(), 1);
+        let output_path = temp_dir.path().join("org/doc/readme.txt");
+        assert!(output_path.exists(), "Output file should exist with .txt extension");
+
+        // Verify content has YAML frontmatter provenance
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.starts_with("---\n"), "Should start with YAML frontmatter");
+        assert!(content.contains("provenance:"));
+        assert!(content.contains("export_profile: \"text-profile\""));
+        assert!(content.contains("This is plain text content."));
+        assert!(content.contains("With multiple lines."));
+    }
+
+    #[test]
+    fn test_export_plaintext_format_with_footer_provenance() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("text-footer")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::PlainText)
+                    .provenance_embed(ProvenanceEmbed::Footer)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:doc:readme", b"Plain text first.");
+
+        pipeline.export(&pack, &resolver).unwrap();
+
+        let content = std::fs::read_to_string(temp_dir.path().join("org/doc/readme.txt")).unwrap();
+        assert!(content.starts_with("Plain text first."), "Content should come first");
+        assert!(content.contains("<!-- Provenance -->"));
+        assert!(content.contains("provenance:"));
+    }
+
+    #[test]
+    fn test_export_plaintext_format_without_provenance() {
+        let temp_dir = TempDir::new().unwrap();
+        let profile = TargetProfile::builder()
+            .profile_id("text-none")
+            .version("2026-01-27")
+            .delivery_constraints(
+                DeliveryConstraints::builder()
+                    .output_format(OutputFormat::PlainText)
+                    .provenance_embed(ProvenanceEmbed::None)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        let pipeline = ExportPipeline::builder()
+            .profile(profile)
+            .output_dir(temp_dir.path())
+            .timestamp(test_timestamp())
+            .build()
+            .unwrap();
+
+        let pack = test_pack();
+        let mut resolver = MemoryContentResolver::new();
+        resolver.insert("org:doc:readme", b"Just plain text.");
+
+        pipeline.export(&pack, &resolver).unwrap();
+
+        let content = std::fs::read_to_string(temp_dir.path().join("org/doc/readme.txt")).unwrap();
+        assert_eq!(content, "Just plain text.");
+        assert!(!content.contains("provenance:"));
     }
 }
