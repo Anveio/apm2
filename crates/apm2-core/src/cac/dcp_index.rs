@@ -30,7 +30,7 @@
 //! Examples:
 //! - `org:ticket:TCK-00134` (latest version)
 //! - `org:ticket:TCK-00134@v1` (specific version)
-//! - `cac:schema:ticket-v1` (reserved namespace)
+//! - `org:schema:ticket-v1` (reserved namespace)
 //!
 //! # Reserved Prefixes
 //!
@@ -46,11 +46,19 @@
 //!
 //! let mut index = DcpIndex::new();
 //!
-//! // Register an artifact
+//! // First register the schema (self-referential for bootstrap)
+//! let schema = DcpEntry::new(
+//!     "org:schema:ticket-v1",
+//!     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+//!     "org:schema:ticket-v1", // self-reference
+//! );
+//! index.register(schema).unwrap();
+//!
+//! // Register an artifact (content_hash must be 64 hex chars - BLAKE3)
 //! let entry = DcpEntry::new(
 //!     "org:ticket:TCK-00134",
-//!     "abc123def456...",      // content hash
-//!     "cac:schema:ticket-v1", // schema reference
+//!     "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+//!     "org:schema:ticket-v1", // schema reference
 //! );
 //! index.register(entry).unwrap();
 //!
@@ -75,6 +83,12 @@ pub const MAX_STABLE_ID_LENGTH: usize = 1024;
 
 /// Maximum length for content hashes (hex-encoded BLAKE3 = 64 chars).
 pub const MAX_CONTENT_HASH_LENGTH: usize = 64;
+
+/// Maximum number of dependencies an artifact can declare.
+///
+/// This limit prevents denial-of-service attacks via unbounded dependency
+/// lists.
+pub const MAX_DEPENDENCIES: usize = 128;
 
 /// Event type for artifact registration in the ledger.
 pub const EVENT_TYPE_ARTIFACT_REGISTERED: &str = "dcp.artifact.registered";
@@ -127,6 +141,29 @@ pub enum DcpIndexError {
     InvalidDependency {
         /// The dependency that doesn't exist.
         dependency: String,
+    },
+
+    /// Too many dependencies declared.
+    #[error("too many dependencies: {count} exceeds maximum of {max}")]
+    TooManyDependencies {
+        /// The number of dependencies that were declared.
+        count: usize,
+        /// The maximum allowed.
+        max: usize,
+    },
+
+    /// A dependency points to a deprecated artifact.
+    #[error("dependency on deprecated artifact: '{dependency}' is deprecated")]
+    DependencyDeprecated {
+        /// The deprecated dependency.
+        dependency: String,
+    },
+
+    /// Schema reference is invalid (not registered).
+    #[error("invalid schema reference: '{schema_id}' is not registered")]
+    InvalidSchemaRef {
+        /// The schema ID that was not found.
+        schema_id: String,
     },
 
     /// The `stable_id` was not found in the index.
@@ -310,7 +347,11 @@ impl DcpIndex {
     /// - [`DcpIndexError::ReservedPrefix`] if the `stable_id` uses a reserved
     ///   prefix without authorization
     /// - [`DcpIndexError::InvalidContentHash`] if the `content_hash` is invalid
+    /// - [`DcpIndexError::TooManyDependencies`] if dependencies exceed
+    ///   `MAX_DEPENDENCIES`
     /// - [`DcpIndexError::InvalidDependency`] if a dependency doesn't exist
+    /// - [`DcpIndexError::DependencyDeprecated`] if a dependency is deprecated
+    /// - [`DcpIndexError::InvalidSchemaRef`] if `schema_id` is not registered
     pub fn register(&mut self, entry: DcpEntry) -> Result<(), DcpIndexError> {
         // Validate stable_id format
         validate_stable_id(&entry.stable_id)?;
@@ -322,6 +363,14 @@ impl DcpIndex {
 
         // Validate content_hash format
         validate_content_hash(&entry.content_hash)?;
+
+        // Check dependency count limit (DoS prevention)
+        if entry.dependencies.len() > MAX_DEPENDENCIES {
+            return Err(DcpIndexError::TooManyDependencies {
+                count: entry.dependencies.len(),
+                max: MAX_DEPENDENCIES,
+            });
+        }
 
         // Check for collision
         if let Some(existing) = self.entries.get(&entry.stable_id) {
@@ -336,12 +385,31 @@ impl DcpIndex {
             return Ok(());
         }
 
-        // Validate dependencies exist
+        // Validate schema_id references a registered entry (if not self-referential)
+        // Skip check if schema_id matches stable_id (bootstrap case) or if empty
+        if !entry.schema_id.is_empty()
+            && entry.schema_id != entry.stable_id
+            && !self.entries.contains_key(&entry.schema_id)
+        {
+            return Err(DcpIndexError::InvalidSchemaRef {
+                schema_id: entry.schema_id,
+            });
+        }
+
+        // Validate dependencies exist and are not deprecated
         for dep in &entry.dependencies {
-            if !self.entries.contains_key(dep) {
-                return Err(DcpIndexError::InvalidDependency {
-                    dependency: dep.clone(),
-                });
+            match self.entries.get(dep) {
+                None => {
+                    return Err(DcpIndexError::InvalidDependency {
+                        dependency: dep.clone(),
+                    });
+                },
+                Some(dep_entry) if dep_entry.deprecated => {
+                    return Err(DcpIndexError::DependencyDeprecated {
+                        dependency: dep.clone(),
+                    });
+                },
+                _ => {},
             }
         }
 
@@ -689,24 +757,36 @@ mod tests {
         "b".repeat(64)
     }
 
+    /// Schema ID used in tests.
+    const TEST_SCHEMA_ID: &str = "org:schema:ticket";
+
+    /// Creates a test index with a pre-registered schema.
+    fn test_index_with_schema() -> DcpIndex {
+        let mut index = DcpIndex::new();
+        // Register schema first (self-referential)
+        let schema = DcpEntry::new(TEST_SCHEMA_ID, "c".repeat(64), TEST_SCHEMA_ID);
+        index.register(schema).unwrap();
+        index
+    }
+
     // =========================================================================
     // DcpEntry Tests
     // =========================================================================
 
     #[test]
     fn test_dcp_entry_new() {
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "org:schema:ticket");
 
         assert_eq!(entry.stable_id, "org:ticket:TCK-001");
         assert_eq!(entry.content_hash, test_hash());
-        assert_eq!(entry.schema_id, "cac:schema:ticket");
+        assert_eq!(entry.schema_id, "org:schema:ticket");
         assert!(entry.dependencies.is_empty());
         assert!(!entry.deprecated);
     }
 
     #[test]
     fn test_dcp_entry_with_dependencies() {
-        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash(), "cac:schema:ticket")
+        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash(), "org:schema:ticket")
             .with_dependencies(vec!["org:ticket:TCK-001".to_string()]);
 
         assert_eq!(entry.dependencies.len(), 1);
@@ -715,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_dcp_entry_serialization() {
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket")
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "org:schema:ticket")
             .with_timestamp(1_234_567_890);
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -739,8 +819,8 @@ mod tests {
 
     #[test]
     fn test_index_register_and_resolve() {
-        let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let mut index = test_index_with_schema();
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
 
         index.register(entry).unwrap();
 
@@ -756,8 +836,8 @@ mod tests {
 
     #[test]
     fn test_index_get_entry() {
-        let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let mut index = test_index_with_schema();
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
 
         index.register(entry.clone()).unwrap();
 
@@ -772,13 +852,13 @@ mod tests {
 
     #[test]
     fn test_index_collision_rejected() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
-        let entry1 = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let entry1 = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(entry1).unwrap();
 
         // Same stable_id, different hash = collision
-        let entry2 = DcpEntry::new("org:ticket:TCK-001", test_hash_2(), "cac:schema:ticket");
+        let entry2 = DcpEntry::new("org:ticket:TCK-001", test_hash_2(), TEST_SCHEMA_ID);
         let result = index.register(entry2);
 
         assert!(matches!(result, Err(DcpIndexError::Collision { .. })));
@@ -786,15 +866,15 @@ mod tests {
 
     #[test]
     fn test_index_idempotent_registration() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(entry.clone()).unwrap();
 
         // Same stable_id, same hash = idempotent
         let result = index.register(entry);
         assert!(result.is_ok());
-        assert_eq!(index.len(), 1);
+        assert_eq!(index.len(), 2); // schema + entry
     }
 
     // =========================================================================
@@ -831,7 +911,8 @@ mod tests {
     #[test]
     fn test_unrestricted_index_allows_reserved() {
         let mut index = DcpIndex::new_unrestricted();
-        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:meta");
+        // Self-referential schema (cac:schema:test references itself)
+        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:test");
 
         let result = index.register(entry);
         assert!(result.is_ok());
@@ -844,7 +925,7 @@ mod tests {
     #[test]
     fn test_stable_id_empty_rejected() {
         let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("", test_hash(), "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(result, Err(DcpIndexError::InvalidStableId { .. })));
@@ -854,7 +935,7 @@ mod tests {
     fn test_stable_id_too_long_rejected() {
         let mut index = DcpIndex::new();
         let long_id = format!("org:ticket:{}", "x".repeat(MAX_STABLE_ID_LENGTH));
-        let entry = DcpEntry::new(&long_id, test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new(&long_id, test_hash(), "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(result, Err(DcpIndexError::InvalidStableId { .. })));
@@ -863,7 +944,7 @@ mod tests {
     #[test]
     fn test_stable_id_control_char_rejected() {
         let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK\n001", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK\n001", test_hash(), "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(result, Err(DcpIndexError::InvalidStableId { .. })));
@@ -874,7 +955,7 @@ mod tests {
         let mut index = DcpIndex::new();
 
         // Only 2 parts
-        let entry = DcpEntry::new("org:ticket", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket", test_hash(), "org:schema:ticket");
         let result = index.register(entry);
         assert!(matches!(result, Err(DcpIndexError::InvalidStableId { .. })));
     }
@@ -882,7 +963,7 @@ mod tests {
     #[test]
     fn test_stable_id_empty_part_rejected() {
         let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org::TCK-001", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("org::TCK-001", test_hash(), "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(result, Err(DcpIndexError::InvalidStableId { .. })));
@@ -890,8 +971,8 @@ mod tests {
 
     #[test]
     fn test_stable_id_with_version_valid() {
-        let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001@v1", test_hash(), "cac:schema:ticket");
+        let mut index = test_index_with_schema();
+        let entry = DcpEntry::new("org:ticket:TCK-001@v1", test_hash(), TEST_SCHEMA_ID);
 
         let result = index.register(entry);
         assert!(result.is_ok());
@@ -904,7 +985,7 @@ mod tests {
     #[test]
     fn test_content_hash_empty_rejected() {
         let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001", "", "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK-001", "", "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(
@@ -916,7 +997,7 @@ mod tests {
     #[test]
     fn test_content_hash_wrong_length_rejected() {
         let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001", "abc123", "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK-001", "abc123", "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(
@@ -928,7 +1009,7 @@ mod tests {
     #[test]
     fn test_content_hash_non_hex_rejected() {
         let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001", "g".repeat(64), "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK-001", "g".repeat(64), "org:schema:ticket");
 
         let result = index.register(entry);
         assert!(matches!(
@@ -943,14 +1024,14 @@ mod tests {
 
     #[test]
     fn test_dependency_valid() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
         // Register dependency first
-        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(dep).unwrap();
 
         // Register dependent with valid dependency
-        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), "cac:schema:ticket")
+        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), TEST_SCHEMA_ID)
             .with_dependencies(vec!["org:ticket:TCK-001".to_string()]);
         let result = index.register(entry);
 
@@ -959,10 +1040,10 @@ mod tests {
 
     #[test]
     fn test_dependency_invalid_rejected() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
         // Try to register with non-existent dependency
-        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash(), "cac:schema:ticket")
+        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash(), TEST_SCHEMA_ID)
             .with_dependencies(vec!["org:ticket:NONEXISTENT".to_string()]);
         let result = index.register(entry);
 
@@ -974,12 +1055,12 @@ mod tests {
 
     #[test]
     fn test_get_dependents() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
-        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(dep).unwrap();
 
-        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), "cac:schema:ticket")
+        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), TEST_SCHEMA_ID)
             .with_dependencies(vec!["org:ticket:TCK-001".to_string()]);
         index.register(entry).unwrap();
 
@@ -990,12 +1071,12 @@ mod tests {
 
     #[test]
     fn test_get_dependencies() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
-        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(dep).unwrap();
 
-        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), "cac:schema:ticket")
+        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), TEST_SCHEMA_ID)
             .with_dependencies(vec!["org:ticket:TCK-001".to_string()]);
         index.register(entry).unwrap();
 
@@ -1004,14 +1085,103 @@ mod tests {
         assert_eq!(deps[0], "org:ticket:TCK-001");
     }
 
+    #[test]
+    fn test_dependencies_too_large_rejected() {
+        let mut index = test_index_with_schema();
+
+        // First register MAX_DEPENDENCIES + 1 artifacts to depend on
+        for i in 0..=MAX_DEPENDENCIES {
+            let hash = format!("{i:064x}");
+            let entry = DcpEntry::new(format!("org:ticket:DEP-{i:05}"), hash, TEST_SCHEMA_ID);
+            index.register(entry).unwrap();
+        }
+
+        // Try to register an entry with MAX_DEPENDENCIES + 1 dependencies
+        let deps: Vec<String> = (0..=MAX_DEPENDENCIES)
+            .map(|i| format!("org:ticket:DEP-{i:05}"))
+            .collect();
+
+        let entry = DcpEntry::new("org:ticket:MANY-DEPS", test_hash(), TEST_SCHEMA_ID)
+            .with_dependencies(deps);
+
+        let result = index.register(entry);
+        assert!(matches!(
+            result,
+            Err(DcpIndexError::TooManyDependencies { count, max })
+            if count == MAX_DEPENDENCIES + 1 && max == MAX_DEPENDENCIES
+        ));
+    }
+
+    #[test]
+    fn test_dependency_on_deprecated_rejected() {
+        let mut index = test_index_with_schema();
+
+        // Register and deprecate an artifact
+        let dep = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
+        index.register(dep).unwrap();
+        index.deprecate("org:ticket:TCK-001").unwrap();
+
+        // Try to depend on the deprecated artifact
+        let entry = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), TEST_SCHEMA_ID)
+            .with_dependencies(vec!["org:ticket:TCK-001".to_string()]);
+
+        let result = index.register(entry);
+        assert!(matches!(
+            result,
+            Err(DcpIndexError::DependencyDeprecated { dependency })
+            if dependency == "org:ticket:TCK-001"
+        ));
+    }
+
+    #[test]
+    fn test_invalid_schema_ref_rejected() {
+        let mut index = DcpIndex::new();
+
+        // Try to register with a schema_id that doesn't exist
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "org:schema:nonexistent");
+
+        let result = index.register(entry);
+        assert!(matches!(
+            result,
+            Err(DcpIndexError::InvalidSchemaRef { schema_id })
+            if schema_id == "org:schema:nonexistent"
+        ));
+    }
+
+    #[test]
+    fn test_self_referential_schema_allowed() {
+        // Bootstrap case: schema can reference itself
+        let mut index = DcpIndex::new();
+
+        let entry = DcpEntry::new(
+            "org:schema:ticket",
+            test_hash(),
+            "org:schema:ticket", // Self-reference
+        );
+
+        let result = index.register(entry);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_empty_schema_id_allowed() {
+        // Empty schema_id should be allowed (no referential check)
+        let mut index = DcpIndex::new();
+
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "");
+
+        let result = index.register(entry);
+        assert!(result.is_ok());
+    }
+
     // =========================================================================
     // Deprecation Tests
     // =========================================================================
 
     #[test]
     fn test_deprecate_makes_unresolvable() {
-        let mut index = DcpIndex::new();
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let mut index = test_index_with_schema();
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(entry).unwrap();
 
         // Before deprecation
@@ -1040,11 +1210,11 @@ mod tests {
 
     #[test]
     fn test_find_by_content_hash() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
         // Same content hash, different stable_ids
-        let entry1 = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
-        let entry2 = DcpEntry::new("org:ticket:TCK-001@v1", test_hash(), "cac:schema:ticket");
+        let entry1 = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
+        let entry2 = DcpEntry::new("org:ticket:TCK-001@v1", test_hash(), TEST_SCHEMA_ID);
 
         index.register(entry1).unwrap();
         index.register(entry2).unwrap();
@@ -1061,7 +1231,8 @@ mod tests {
     fn test_apply_event_register() {
         let mut index = DcpIndex::new_unrestricted();
 
-        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:meta");
+        // Self-referential schema for bootstrap
+        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:test");
         let payload = serde_json::to_vec(&entry).unwrap();
 
         let event = EventRecord::new(
@@ -1082,8 +1253,8 @@ mod tests {
     fn test_apply_event_deprecate() {
         let mut index = DcpIndex::new_unrestricted();
 
-        // First register
-        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:meta");
+        // First register (self-referential schema)
+        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:test");
         index.register(entry).unwrap();
 
         // Then deprecate via event
@@ -1152,7 +1323,8 @@ mod tests {
     fn test_reducer_apply() {
         let mut reducer = DcpIndexReducer::new();
 
-        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:meta");
+        // Self-referential schema for bootstrap
+        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:test");
         let payload = serde_json::to_vec(&entry).unwrap();
 
         let event = EventRecord::new(
@@ -1176,7 +1348,8 @@ mod tests {
     fn test_reducer_reset() {
         let mut reducer = DcpIndexReducer::new();
 
-        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:meta");
+        // Self-referential schema for bootstrap
+        let entry = DcpEntry::new("cac:schema:test", test_hash(), "cac:schema:test");
         let payload = serde_json::to_vec(&entry).unwrap();
 
         let event = EventRecord::new(
@@ -1206,15 +1379,15 @@ mod tests {
 
     #[test]
     fn test_index_iter() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
-        let entry1 = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
-        let entry2 = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), "cac:schema:ticket");
+        let entry1 = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
+        let entry2 = DcpEntry::new("org:ticket:TCK-002", test_hash_2(), TEST_SCHEMA_ID);
 
         index.register(entry1).unwrap();
         index.register(entry2).unwrap();
 
-        assert_eq!(index.iter().count(), 2);
+        assert_eq!(index.iter().count(), 3); // schema + 2 entries
     }
 
     // =========================================================================
@@ -1223,11 +1396,11 @@ mod tests {
 
     #[test]
     fn test_index_clear() {
-        let mut index = DcpIndex::new();
+        let mut index = test_index_with_schema();
 
-        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), "cac:schema:ticket");
+        let entry = DcpEntry::new("org:ticket:TCK-001", test_hash(), TEST_SCHEMA_ID);
         index.register(entry).unwrap();
-        assert_eq!(index.len(), 1);
+        assert_eq!(index.len(), 2); // schema + entry
 
         index.clear();
         assert!(index.is_empty());
