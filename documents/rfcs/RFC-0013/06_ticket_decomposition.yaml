@@ -10,10 +10,19 @@ rfc_ticket_decomposition:
     # Phase 0: Prerequisites (added by SA-1 structural review)
     - preliminary_id: TCK-PEND-000
       final_id: TCK-00156
-      title: "Scaffold apm2-daemon module structure"
+      title: "Scaffold apm2-daemon module structure and setup infrastructure"
       phase: PHASE-0
-      requirement_ids: [REQ-DAEMON-001]
+      requirement_ids: [REQ-DAEMON-001, REQ-EVID-001]
       depends_on: []
+      summary: |
+        Scaffold the apm2-daemon crate and prepare shared infrastructure:
+        1. Move DefectRecord from apm2-holon to apm2-core/src/cac/defect.rs
+           to resolve inverted dependency.
+        2. Update apm2-holon/src/lib.rs to re-export DefectRecord from apm2-core.
+        3. Add zbus and nix/pty features to workspace Cargo.toml for
+           cgroup and PTY integration.
+        4. Remove unused imports in proto/apm2d_runtime_v1.proto.
+        5. Create initial module structure for apm2-daemon.
       files_to_create:
         - crates/apm2-daemon/src/lib.rs
         - crates/apm2-daemon/src/episode/mod.rs
