@@ -8,8 +8,8 @@
 //!
 //! - **Stage Taxonomy**: Profiles define rendering policies per stage
 //!   (plan/implement/review/ops) following DD-0005
-//! - **Typed Quantities**: Budget limits use explicit units to prevent
-//!   "Mars Climate Orbiter" errors (per DD-0007)
+//! - **Typed Quantities**: Budget limits use explicit units to prevent "Mars
+//!   Climate Orbiter" errors (per DD-0007)
 //! - **Strict Serde**: All types use `#[serde(deny_unknown_fields)]` to reject
 //!   unknown fields (CTR-1604)
 //! - **Forward Compatibility**: Enums use `#[non_exhaustive]` for safe
@@ -664,7 +664,9 @@ impl RetrievalPolicyBuilder {
     pub fn build(self) -> RetrievalPolicy {
         RetrievalPolicy {
             max_fetch_bytes: self.max_fetch_bytes.unwrap_or_else(default_max_fetch_bytes),
-            inline_threshold: self.inline_threshold.unwrap_or_else(default_inline_threshold),
+            inline_threshold: self
+                .inline_threshold
+                .unwrap_or_else(default_inline_threshold),
         }
     }
 }
@@ -881,7 +883,7 @@ fn is_valid_profile_id(id: &str) -> bool {
 
     let mut chars = id.chars();
     match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => {}
+        Some(c) if c.is_ascii_lowercase() => {},
         _ => return false,
     }
 
@@ -958,12 +960,16 @@ impl TargetProfileBuilder {
     /// validation fails.
     pub fn build(self) -> Result<TargetProfile, TargetProfileError> {
         let profile = TargetProfile {
-            profile_id: self.profile_id.ok_or_else(|| TargetProfileError::MissingField {
-                field: "profile_id".to_string(),
-            })?,
-            version: self.version.ok_or_else(|| TargetProfileError::MissingField {
-                field: "version".to_string(),
-            })?,
+            profile_id: self
+                .profile_id
+                .ok_or_else(|| TargetProfileError::MissingField {
+                    field: "profile_id".to_string(),
+                })?,
+            version: self
+                .version
+                .ok_or_else(|| TargetProfileError::MissingField {
+                    field: "version".to_string(),
+                })?,
             description: self.description,
             rendering_policy: self.rendering_policy,
             budget_policy: self.budget_policy.unwrap_or_default(),
@@ -1194,7 +1200,10 @@ mod tests {
     fn test_retrieval_policy_default() {
         let policy = RetrievalPolicy::default();
         assert_eq!(policy.max_fetch_bytes.value(), DEFAULT_MAX_FETCH_BYTES);
-        assert_eq!(policy.inline_threshold.value(), DEFAULT_INLINE_THRESHOLD_BYTES);
+        assert_eq!(
+            policy.inline_threshold.value(),
+            DEFAULT_INLINE_THRESHOLD_BYTES
+        );
     }
 
     #[test]
