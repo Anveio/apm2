@@ -112,6 +112,9 @@ libc = "0.2"
 # Unicode normalization
 unicode-normalization = "0.1"
 
+# JSON Schema validation
+jsonschema = "0.40"
+
 # Internal crates
 apm2-core = { version = "0.3.0", path = "crates/apm2-core" }
 

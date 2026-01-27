@@ -52,6 +52,9 @@ glob.workspace = true
 # Unicode normalization
 unicode-normalization.workspace = true
 
+# JSON Schema validation
+jsonschema.workspace = true
+
 # Filesystem
 tempfile.workspace = true
 
