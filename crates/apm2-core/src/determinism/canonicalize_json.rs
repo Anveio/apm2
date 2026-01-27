@@ -47,6 +47,8 @@ use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::events::Canonicalize;
+
 /// Canonicalizer ID for CAC-JSON profile.
 pub const CANONICALIZER_ID: &str = "cac-json-v1";
 
@@ -153,6 +155,24 @@ impl CacJson {
         let mut output = String::new();
         emit_value(&self.value, &mut output);
         output
+    }
+}
+
+impl Canonicalize for CacJson {
+    /// Canonicalizes the JSON value in place.
+    ///
+    /// For `CacJson`, this is a no-op because:
+    /// 1. The value is already validated and constructed via
+    ///    `validate_and_parse`
+    /// 2. `serde_json::Map` preserves insertion order, and we iterate in sorted
+    ///    key order during `to_canonical_string()`
+    /// 3. Arrays are kept in original order (JCS requirement)
+    ///
+    /// This implementation exists to satisfy the `Canonicalize` trait interface
+    /// for integration with the events canonicalization system.
+    fn canonicalize(&mut self) {
+        // No-op: CacJson values are already in canonical form after validation.
+        // The actual canonical output is produced by to_canonical_string().
     }
 }
 
@@ -604,6 +624,16 @@ mod tests {
                 "Canonicalization should be idempotent for input: {input}"
             );
         }
+    }
+
+    #[test]
+    fn test_canonicalize_trait_implementation() {
+        // Test that CacJson implements Canonicalize trait
+        let mut cac = validate_and_parse(r#"{"b": 2, "a": 1}"#).unwrap();
+        let before = cac.to_canonical_string();
+        cac.canonicalize(); // Should be no-op
+        let after = cac.to_canonical_string();
+        assert_eq!(before, after, "Canonicalize trait should be idempotent");
     }
 
     #[test]
