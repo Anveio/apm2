@@ -4,10 +4,10 @@
     "classification": "INTERNAL",
     "created_at": "2026-01-27T02:14:09Z",
     "dependencies": [
-      "apm2://skills/agent-native-software",
+      "apm2://skills/laws-of-holonic-agent-systems/references/agent-native-software",
       "apm2://skills/glossary",
-      "apm2://skills/holonic-agent-network",
-      "apm2://skills/holonic-agent-system-defects",
+      "apm2://skills/laws-of-holonic-agent-systems/references/holonic-agent-network",
+      "apm2://skills/laws-of-holonic-agent-systems/references/holonic-agent-system-defects",
       "apm2://skills/laws-of-holonic-agent-systems"
     ],
     "labels": [
@@ -115,6 +115,23 @@
           "law_refs": [
             "LAW-01",
             "LAW-15"
+          ]
+        },
+        "ENF-VERIFY-01": {
+          "node_class": "NORMATIVE",
+          "statement": "Verification MUST satisfy the satisfiability predicate: Valid(Output, Receipt, Evidence) := VerifyReceipt(receipt) ∧ EvidenceSatisfies(contract, evidence) ∧ DigestBindingsHold(output, evidence).",
+          "violation_class": "MEASUREMENT_INTEGRITY",
+          "law_refs": [
+            "LAW-01",
+            "LAW-15"
+          ]
+        },
+        "ENF-OCAP-01": {
+          "node_class": "NORMATIVE",
+          "statement": "Capabilities MUST NOT be discovered; they only enter a holon via explicit delegation events/receipts (PermeabilityReceipt).",
+          "violation_class": "POLICY_VIOLATION",
+          "law_refs": [
+            "LAW-05"
           ]
         }
       },
@@ -587,10 +604,12 @@
         }
       },
       "monotone_vs_projection": {
-        "monotone_substrate": {
-          "statement": "Facts are monotone additions within a declared merge algebra; prefer commutative, monotone updates (add evidence, add edges) to reduce coordination complexity.",
+      "monotone_substrate": {
+          "statement": "Facts are monotone additions within a declared join-semilattice; truth is the least-upper-bound of all observed events and evidence.",
           "merge_algebra_requirements": [
-            "facts declare merge_operator OR conflict_rule_class",
+            "Every domain MUST define a join operator (⊔) that is idempotent, commutative, and associative.",
+            "Every fact MUST declare its merge_operator OR conflict_rule_class; unresolvable forks are recorded as ProjectionConflictState.",
+            "ProjectionConflictState blocks authoritative promotion until an AdjudicationResolved or ConflictResolutionCommitted event joins the fork.",
             "ordering dependencies must be explicit; hidden ordering is a defect",
             "periodic compaction preserves provenance while controlling replay/MDL"
           ],
@@ -811,6 +830,11 @@
           "governance ratchets policies as verifiers become cheap and reliable"
         ],
         "closure_rule": "A defect closes only with a new/strengthened verifier that would have failed on the original counterexample and now passes, with receipts and evidence captured.",
+        "countermeasure_requirements": [
+          "MUST ship with a regression corpus of historical finding signatures it eliminates.",
+          "MUST include a gate that falsifies the original counterexample in that corpus.",
+          "MUST hold out a subset of findings to prevent process-level overfitting (Goodharting)."
+        ],
         "zti": {
           "statement": "ZTI applies to scoped implementation tasks; research/discovery holons are exempt. Unplanned context discovery tool calls in scoped tasks are inefficiency defects.",
           "inputs": [
@@ -1721,6 +1745,26 @@
           "LAW-13"
         ]
       },
+      "evidence_strength": {
+        "node_class": "NORMATIVE",
+        "enum": {
+          "LOW": {
+            "meaning": "Unstructured logs or basic transcripts"
+          },
+          "MED": {
+            "meaning": "Structured tool outputs with digest bindings"
+          },
+          "HIGH": {
+            "meaning": "Verified gate outcomes with independent attestation"
+          },
+          "FORMAL": {
+            "meaning": "Machine-checked proofs or exhaustive hypothesis coverage"
+          }
+        },
+        "law_refs": [
+          "LAW-14"
+        ]
+      },
       "oracle_request": {
         "node_class": "NORMATIVE",
         "schema_id": "apm2.oracle_request.v1",
@@ -1805,6 +1849,9 @@
           },
           "compaction.receipt": {
             "purpose": "proof of compaction/snapshot equivalence"
+          },
+          "permeability.receipt": {
+            "purpose": "proof of boundary-crossing knowledge or authority delegation"
           }
         },
         "law_refs": [
@@ -1857,6 +1904,7 @@
       "gate_selection_table": {
         "T0": {
           "node_class": "NORMATIVE",
+          "required_evidence_strength": "LOW",
           "required_gates": {
             "GATE-STATIC": {
               "required": true
@@ -1865,6 +1913,7 @@
         },
         "T1": {
           "node_class": "NORMATIVE",
+          "required_evidence_strength": "MED",
           "required_gates": {
             "GATE-STATIC": {
               "required": true
@@ -1876,6 +1925,7 @@
         },
         "T2": {
           "node_class": "NORMATIVE",
+          "required_evidence_strength": "HIGH",
           "required_gates": {
             "GATE-STATIC": {
               "required": true
@@ -1896,6 +1946,7 @@
         },
         "T3": {
           "node_class": "NORMATIVE",
+          "required_evidence_strength": "FORMAL",
           "required_gates": {
             "GATE-STATIC": {
               "required": true
@@ -2514,6 +2565,16 @@
           "name": "stuck_proxies",
           "definition": "Rollbacks, retries, resets, and non-convergent loops as proxies for context poverty.",
           "node_class": "NORMATIVE"
+        },
+        "MET-CTX-05": {
+          "name": "toolcall_information_gain_proxy",
+          "definition": "Binary metric: did a discovery tool call result in a material diff in the proposed plan or patch? Measures information value of exploration.",
+          "node_class": "NORMATIVE"
+        },
+        "MET-CTX-06": {
+          "name": "counterfactual_pack_eval",
+          "definition": "Offline evaluation scoring: relative gate pass rate improvement when comparing Pack vN vs vN+1 on the same task corpus.",
+          "node_class": "NORMATIVE"
         }
       },
       "verification_economics": {
@@ -2569,6 +2630,13 @@
         "MET-SEC-03": {
           "name": "receipt_integrity_failures",
           "definition": "Missing/invalid signatures, hash mismatches, or evidence omission at required boundaries.",
+          "node_class": "NORMATIVE"
+        }
+      },
+      "search_stability": {
+        "MET-SRCH-01": {
+          "name": "progress_potential",
+          "definition": "Composite metric of windowed novelty (no plan/patch hash change), repeated action patterns, and open-obligation count delta.",
           "node_class": "NORMATIVE"
         }
       },
@@ -2866,19 +2934,19 @@
           "node_class": "BACKGROUND"
         },
         "principia-holonic": {
-          "ref": "documents/skills/holonic-agent-network/references/principia-holonic.md",
+          "ref": "documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/principia-holonic.md",
           "node_class": "BACKGROUND"
         },
         "agent-native-software (holonic-agent-network)": {
-          "ref": "documents/skills/holonic-agent-network/references/agent-native-software.md",
+          "ref": "documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-network/references/agent-native-software.md",
           "node_class": "BACKGROUND"
         },
         "agent-native-software (industry textbook)": {
-          "ref": "documents/skills/agent-native-software/SKILL.md",
+          "ref": "documents/skills/laws-of-holonic-agent-systems/references/agent-native-software/SKILL.md",
           "node_class": "BACKGROUND"
         },
         "defects textbook": {
-          "ref": "documents/skills/holonic-agent-system-defects/SKILL.md",
+          "ref": "documents/skills/laws-of-holonic-agent-systems/references/holonic-agent-system-defects/SKILL.md",
           "node_class": "BACKGROUND"
         },
         "glossary": {
