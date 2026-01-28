@@ -200,15 +200,16 @@ pub mod tier_defaults {
     ///
     /// # Returns
     ///
-    /// Buffer capacity as item count. Tier 0 returns 0 (no flight recorder for
-    /// read-only operations).
+    /// Buffer capacity as item count. Tier 0 returns 1 (minimal capacity for
+    /// read-only/experimental operations). This ensures `RingBuffer::new()`
+    /// never receives 0, which would panic.
     ///
     /// # Example
     ///
     /// ```
     /// use apm2_daemon::episode::ring_buffer::tier_defaults::buffer_capacity_for_tier;
     ///
-    /// assert_eq!(buffer_capacity_for_tier(0), 0);
+    /// assert_eq!(buffer_capacity_for_tier(0), 1);
     /// assert_eq!(buffer_capacity_for_tier(1), 256);
     /// assert_eq!(buffer_capacity_for_tier(2), 1024);
     /// assert_eq!(buffer_capacity_for_tier(3), 4096);
@@ -216,7 +217,7 @@ pub mod tier_defaults {
     #[must_use]
     pub const fn buffer_capacity_for_tier(tier: u8) -> usize {
         match tier {
-            0 => 0,
+            0 => 1, // Minimal capacity for Tier 0 (read-only/experimental)
             1 => TIER_1_CAPACITY,
             2 => TIER_2_CAPACITY,
             _ => TIER_3_PLUS_CAPACITY, // Tier 3, 4, and any future tiers
@@ -440,12 +441,33 @@ mod tests {
     fn test_buffer_capacity_for_tier() {
         use tier_defaults::*;
 
-        assert_eq!(buffer_capacity_for_tier(0), 0);
+        // Tier 0 returns 1 (minimal capacity) to avoid RingBuffer::new(0) panic
+        assert_eq!(buffer_capacity_for_tier(0), 1);
         assert_eq!(buffer_capacity_for_tier(1), TIER_1_CAPACITY);
         assert_eq!(buffer_capacity_for_tier(2), TIER_2_CAPACITY);
         assert_eq!(buffer_capacity_for_tier(3), TIER_3_PLUS_CAPACITY);
         assert_eq!(buffer_capacity_for_tier(4), TIER_3_PLUS_CAPACITY);
         assert_eq!(buffer_capacity_for_tier(255), TIER_3_PLUS_CAPACITY); // Future tiers
+    }
+
+    /// Test that Tier 0 capacity creates a valid `RingBuffer`.
+    ///
+    /// This ensures that spawning a Tier 0 episode will not panic due to
+    /// `RingBuffer::new(0)`.
+    #[test]
+    fn test_tier_0_capacity_creates_valid_ring_buffer() {
+        use tier_defaults::*;
+
+        let capacity = buffer_capacity_for_tier(0);
+        // This must not panic
+        let mut rb: RingBuffer<u32> = RingBuffer::new(capacity);
+        assert_eq!(rb.capacity(), 1);
+
+        // Verify it works as expected - single item capacity
+        assert!(rb.push(1).is_none());
+        assert!(rb.is_full());
+        assert_eq!(rb.push(2), Some(1)); // Evicts 1
+        assert_eq!(rb.front(), Some(&2));
     }
 
     #[test]

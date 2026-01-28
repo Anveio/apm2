@@ -33,7 +33,7 @@
 //!
 //! - [INV-PTY001] Child process runs in new session (setsid)
 //! - [INV-PTY002] Slave PTY becomes child's controlling terminal
-//! - [INV-PTY003] Master fd is non-blocking for async I/O
+//! - [INV-PTY003] Master fd uses `AsyncFd` with non-blocking mode for async I/O
 //! - [INV-PTY004] Output capture uses caller-provided timestamps (HARD-TIME)
 //! - [INV-PTY005] Ring buffer size is bounded per risk tier
 //!
@@ -899,10 +899,22 @@ fn get_monotonic_ns() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: clock_gettime is safe with a valid clock id and timespec pointer
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts);
-    }
+    // SAFETY: clock_gettime is safe with a valid clock id and timespec pointer.
+    //
+    // Return value check: clock_gettime() returns 0 on success and -1 on error.
+    // For CLOCK_MONOTONIC, failure is extremely unlikely because:
+    // 1. CLOCK_MONOTONIC is a standard POSIX clock supported on all Linux systems
+    // 2. The only documented failure modes are EINVAL (invalid clock_id) and EFAULT
+    //    (invalid pointer), neither of which can occur here
+    // 3. The kernel guarantees CLOCK_MONOTONIC availability
+    //
+    // We use debug_assert to catch any theoretical issues in tests while avoiding
+    // panic overhead in release builds for this hot path.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+    debug_assert!(
+        ret == 0,
+        "clock_gettime(CLOCK_MONOTONIC) failed unexpectedly"
+    );
     // Clock time should never be negative, so cast is safe
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
