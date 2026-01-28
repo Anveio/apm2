@@ -207,12 +207,14 @@ rfc_governance_and_gates:
         - "Runbooks documented"
         - "DR procedures tested"
         - "Performance meets SLO"
+        - "Security evidence artifacts (EVID-0008, EVID-0009, EVID-0011, EVID-0015) are fully populated and approved"
       evidence_required:
         - "Metrics dashboard screenshot"
         - "Alert configuration"
         - "Runbook links"
         - "DR test results"
         - "Performance benchmark"
+        - "Security evidence artifacts"
       reviewers:
         - "AUTH_ARCHITECTURE"
         - "AUTH_SECURITY"

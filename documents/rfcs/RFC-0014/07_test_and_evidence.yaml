@@ -159,6 +159,35 @@ rfc_test_and_evidence:
             2. Assert: Honest nodes reject proposal
             3. Assert: Consensus continues without event
 
+        - id: TEST-BZ-004
+          type: UNIT
+          description: "Slashing proof is replay-safe across epochs"
+          verification: "Attempt to frame validator using old-epoch conflicting messages; assert rejection of proof"
+
+    - category: "Boundary and Capability Integrity"
+      description: "Tests for cross-node capability verification and relay paths"
+      requirements_covered:
+        - DCS-REQ-0011
+        - DCS-REQ-0014
+      tests:
+        - id: TEST-BC-001
+          type: INTEGRATION
+          description: "Cross-node capability verification via signature chain"
+          verification: |
+            1. Node A grants capability to Actor
+            2. Actor presents capability proof to Node B
+            3. Assert: Node B verifies proof via Node A public key + ledger record
+
+        - id: TEST-BC-002
+          type: FAULT_INJECTION
+          description: "Relay tunnel idle timeout triggers disconnect"
+          verification: "Establish tunnel; idle for > timeout; assert tunnel closed by Relay"
+
+        - id: TEST-BC-003
+          type: INTEGRATION
+          description: "Forced relay rotation prevents squatting"
+          verification: "Establish tunnel; maintain activity; assert forced disconnect after MAX_DURATION"
+
     - category: "Schema Governance"
       description: "Tests for schema registry and fail-closed validation"
       requirements_covered:
@@ -189,6 +218,31 @@ rfc_test_and_evidence:
             1. Cluster has schema S1 registered
             2. New node without S1 attempts join
             3. Assert: Handshake fails; join rejected
+
+    - category: "Membership Admission"
+      description: "Tests for join rate limiting and bootstrap credentials"
+      requirements_covered:
+        - DCS-REQ-0013
+      tests:
+        - id: TEST-MA-001
+          type: FAULT_INJECTION
+          description: "Join attempt rate-limiting per source IP"
+          verification: "Rapid join attempts from same IP; assert rejection after N attempts"
+
+        - id: TEST-MA-002
+          type: UNIT
+          description: "Joining node MUST provide valid invitation token"
+          verification: "Attempt join with missing or invalid token; assert rejection"
+
+    - category: "Transport Security"
+      description: "Tests for control plane traffic-analysis mitigation"
+      requirements_covered:
+        - DCS-REQ-0012
+      tests:
+        - id: TEST-TS-001
+          type: UNIT
+          description: "Control plane frame padding enforced"
+          verification: "Serialize control plane message; assert frame size == configured constant"
 
     - category: "Ordering and Clock Semantics"
       description: "Tests for TotalOrder, HLC, and StrictlyOrderedEvidence"

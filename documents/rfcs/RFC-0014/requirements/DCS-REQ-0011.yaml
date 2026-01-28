@@ -30,3 +30,5 @@ requirement:
 
   test_references:
     - "07_test_and_evidence.yaml#TEST-ORD-003"
+    - "07_test_and_evidence.yaml#TEST-BC-002"
+    - "07_test_and_evidence.yaml#TEST-BC-003"

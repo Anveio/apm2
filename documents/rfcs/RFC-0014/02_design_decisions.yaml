@@ -200,16 +200,18 @@ rfc_design_decisions:
       status: DECIDED
       decision: |
         Establish four signer tiers: T0 (root/genesis), T1 (validators), T2 (holons),
-        T3 (sessions). Each tier can only delegate to lower tiers.
+        T3 (sessions). Each tier can only delegate to lower tiers. T0 actions require a
+        3-of-5 Organisational Threshold Signature.
       rationale:
         - "Clear authority separation per existing OCAP model (LAW-05)"
         - "Genesis key (T0) isolated from network operations"
+        - "Threshold signatures prevent single-entity root compromise"
         - "Validator keys (T1) support HSM integration"
         - "Actor/session keys (T2/T3) use existing KeyManager"
       trust_model: |
-        TIER 0: ROOT AUTHORITY (Air-Gapped)
+        TIER 0: ROOT AUTHORITY (3-of-5 Organisational entities)
           - Signs: Genesis block, validator set changes, emergency revocation
-          - Rotation: Offline ceremony, multi-party
+          - Rotation: Offline ceremony, multi-party (FROST/SSS)
           - Compromise: Network halt + new genesis
 
         TIER 1: VALIDATOR QUORUM (HSM Recommended)
@@ -372,6 +374,19 @@ rfc_design_decisions:
         - DCS-REQ-0007
       evidence_ids:
         - EVID-0007
+
+    - id: DD-0008
+      title: "Control Plane Traffic Analysis Mitigation"
+      status: DECIDED
+      decision: |
+        All control plane messages between consensus nodes and relay holons MUST use
+        mandatory padding or fixed-size frames to prevent information leakage via
+        message timing or size analysis.
+      rationale:
+        - "TB-0004 requirement for secure inter-node comms"
+        - "Prevents attackers from inferring proposal frequency or voter distribution"
+      requirement_ids:
+        - DCS-REQ-0012
 
   component_mapping:
     - requirement_id: DCS-REQ-0001

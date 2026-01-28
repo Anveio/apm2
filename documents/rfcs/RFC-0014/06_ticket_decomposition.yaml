@@ -3,7 +3,7 @@ rfc_ticket_decomposition:
 
   decomposition_strategy:
     overview: |
-      The implementation is decomposed into 16 tickets across 4 phases. Each ticket
+      The implementation is decomposed into 17 tickets across 4 phases. Each ticket
       is scoped to be completable in 1-3 days by a single engineer. Dependencies
       are explicit and form a partial order that maximizes parallelism.
 
@@ -24,7 +24,7 @@ rfc_ticket_decomposition:
       - id: P2
         name: "Consensus"
         description: "Full BFT consensus and anti-entropy with CRDT merge"
-        tickets: [DCS-007, DCS-008, DCS-016, DCS-014, DCS-009, DCS-015]
+        tickets: [DCS-007, DCS-008, DCS-016, DCS-014, DCS-009, DCS-015, DCS-018]
         estimated_duration: "4 weeks"
         depends_on: [P1]
 
@@ -132,6 +132,7 @@ rfc_ticket_decomposition:
       estimated_effort: "4 days"
       requirements_covered:
         - TB-0004
+        - DCS-REQ-0012
       description: |
         Implement peer discovery via bootstrap nodes and optional gossip.
         Establish mutual TLS connections between nodes using rustls.
@@ -142,6 +143,7 @@ rfc_ticket_decomposition:
         - "Certificate validation against network CA"
         - "Peer list maintained and refreshed"
         - "Connection pooling for reuse"
+        - "Control plane frames padded to fixed-size envelope"
       files_to_create:
         - path: "crates/apm2-core/src/consensus/network.rs"
           purpose: "Network transport and TLS"
@@ -182,6 +184,7 @@ rfc_ticket_decomposition:
       requirements_covered:
         - DCS-REQ-0002
         - DCS-REQ-0006
+        - DCS-REQ-0013
       description: |
         Implement consensus genesis creation that adopts the existing ledger head
         hash as the epoch-0 prev_hash. Validate genesis signatures and block
@@ -190,6 +193,8 @@ rfc_ticket_decomposition:
         - "Genesis adopts existing ledger head hash without rehashing history"
         - "Genesis signature verified against T0 key"
         - "Node rejects join on genesis mismatch"
+        - "Join attempts rate-limited per source or identity"
+        - "Join requests require quorum-signed invitation token"
       files_to_create:
         - path: "crates/apm2-core/src/consensus/genesis.rs"
       dependencies:
@@ -264,6 +269,25 @@ rfc_ticket_decomposition:
       dependencies:
         - DCS-007
         - DCS-008
+
+    - id: DCS-018
+      phase: P2
+      title: "Cross-Node Capability Verification"
+      complexity: MEDIUM
+      estimated_effort: "2 days"
+      requirements_covered:
+        - DCS-REQ-0014
+      description: |
+        Implement capability proof verification using ledger state and
+        delegation signature chains. Ensure any node can validate a capability
+        granted on another node.
+      acceptance_criteria:
+        - "Capability proof includes delegation chain signatures"
+        - "Verification uses ledger state + signature chain"
+        - "Invalid proofs are rejected deterministically"
+      dependencies:
+        - DCS-001
+        - DCS-007
 
     - id: DCS-014
       phase: P2
@@ -387,7 +411,8 @@ rfc_ticket_decomposition:
                                                      └─> DCS-015
 
       DCS-007 ─┬─> DCS-010
-               └─> DCS-011
+               ├─> DCS-011
+               └─> DCS-018
 
     Parallel Opportunities:
       - DCS-001, DCS-002, DCS-003 can be done in parallel
@@ -395,4 +420,5 @@ rfc_ticket_decomposition:
       - DCS-006 can proceed after DCS-001 (parallel with DCS-004/DCS-005)
       - DCS-009 can proceed after DCS-004 and DCS-012
       - DCS-016 can proceed after DCS-008 (parallel with DCS-014/DCS-015)
+      - DCS-018 can proceed after DCS-007
       - DCS-010, DCS-011 can be done in parallel after DCS-007
