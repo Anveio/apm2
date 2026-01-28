@@ -545,12 +545,22 @@ impl EpisodeEnvelope {
 
     /// Decodes an envelope from protobuf bytes.
     ///
+    /// This method validates the decoded data using the same rules as
+    /// [`EpisodeEnvelopeBuilder::build`], ensuring fail-closed security.
+    ///
     /// # Errors
     ///
-    /// Returns an error if decoding fails.
-    pub fn decode(buf: &[u8]) -> Result<Self, prost::DecodeError> {
-        let proto = EpisodeEnvelopeProto::decode(buf)?;
-        Ok(Self::from_proto(proto))
+    /// Returns an error if:
+    /// - Protobuf decoding fails
+    /// - Any required field is missing or invalid
+    /// - `risk_tier` or `determinism_class` values are out of range
+    /// - Hash lengths are invalid (must be 0 or 32 bytes)
+    /// - ID lengths exceed `MAX_ID_LENGTH`
+    /// - DCP refs count exceeds `MAX_DCP_REFS`
+    pub fn decode(buf: &[u8]) -> Result<Self, EnvelopeError> {
+        let proto = EpisodeEnvelopeProto::decode(buf)
+            .map_err(|e| EnvelopeError::DecodeError(e.to_string()))?;
+        Self::from_proto(proto)
     }
 
     /// Computes the BLAKE3 digest of this envelope.
@@ -620,8 +630,92 @@ impl EpisodeEnvelope {
         }
     }
 
-    /// Converts from protobuf representation.
-    fn from_proto(proto: EpisodeEnvelopeProto) -> Self {
+    /// Converts from protobuf representation with full validation.
+    ///
+    /// # Security
+    ///
+    /// This method enforces the same validation as `build()` to prevent
+    /// validation bypass attacks via crafted protobuf messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Any required field is missing or invalid
+    /// - `risk_tier` or `determinism_class` values are out of range
+    ///   (fail-closed)
+    /// - Hash lengths are invalid (must be 0 or exactly 32 bytes)
+    /// - ID lengths exceed `MAX_ID_LENGTH`
+    /// - DCP refs count exceeds `MAX_DCP_REFS`
+    fn from_proto(proto: EpisodeEnvelopeProto) -> Result<Self, EnvelopeError> {
+        // Validate required fields - same checks as build()
+        if proto.episode_id.is_empty() {
+            return Err(EnvelopeError::MissingEpisodeId);
+        }
+        if proto.actor_id.is_empty() {
+            return Err(EnvelopeError::MissingActorId);
+        }
+        if proto.lease_id.is_empty() {
+            return Err(EnvelopeError::MissingLeaseId);
+        }
+        if proto.capability_manifest_hash.is_empty() {
+            return Err(EnvelopeError::MissingCapabilityManifestHash);
+        }
+
+        // Validate ID lengths - same checks as build()
+        if proto.episode_id.len() > MAX_ID_LENGTH {
+            return Err(EnvelopeError::IdTooLong {
+                field: "episode_id",
+                max: MAX_ID_LENGTH,
+            });
+        }
+        if proto.actor_id.len() > MAX_ID_LENGTH {
+            return Err(EnvelopeError::IdTooLong {
+                field: "actor_id",
+                max: MAX_ID_LENGTH,
+            });
+        }
+        if proto.work_id.len() > MAX_ID_LENGTH {
+            return Err(EnvelopeError::IdTooLong {
+                field: "work_id",
+                max: MAX_ID_LENGTH,
+            });
+        }
+        if proto.lease_id.len() > MAX_ID_LENGTH {
+            return Err(EnvelopeError::IdTooLong {
+                field: "lease_id",
+                max: MAX_ID_LENGTH,
+            });
+        }
+
+        // Validate capability manifest hash size
+        if proto.capability_manifest_hash.len() != 32 {
+            return Err(EnvelopeError::InvalidCapabilityManifestHashSize);
+        }
+
+        // Validate risk_tier - FAIL-CLOSED: reject invalid values
+        #[allow(clippy::cast_possible_truncation)]
+        let risk_tier_value = proto.risk_tier as u8;
+        let risk_tier =
+            RiskTier::from_u8(risk_tier_value).ok_or(EnvelopeError::InvalidRiskTier {
+                value: risk_tier_value,
+            })?;
+
+        // Validate determinism_class - FAIL-CLOSED: reject invalid values
+        #[allow(clippy::cast_possible_truncation)]
+        let determinism_class_value = proto.determinism_class as u8;
+        let determinism_class = DeterminismClass::from_u8(determinism_class_value).ok_or(
+            EnvelopeError::InvalidDeterminismClass {
+                value: determinism_class_value,
+            },
+        )?;
+
+        // Validate DCP refs count
+        if let Some(ref ctx) = proto.context_refs {
+            if ctx.dcp_refs.len() > MAX_DCP_REFS {
+                return Err(EnvelopeError::TooManyDcpRefs { max: MAX_DCP_REFS });
+            }
+        }
+
         let budget = proto.budget.map(|b| {
             EpisodeBudget::builder()
                 .tokens(b.tokens)
@@ -640,42 +734,65 @@ impl EpisodeEnvelope {
             escalation_predicate: s.escalation_predicate,
         });
 
-        let pinned_snapshot = proto.pinned_snapshot.map(|s| {
-            let mut builder = PinnedSnapshot::builder();
-            if s.repo_hash.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&s.repo_hash);
-                builder = builder.repo_hash(arr);
-            }
-            if s.lockfile_hash.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&s.lockfile_hash);
-                builder = builder.lockfile_hash(arr);
-            }
-            if s.policy_hash.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&s.policy_hash);
-                builder = builder.policy_hash(arr);
-            }
-            if s.toolchain_hash.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&s.toolchain_hash);
-                builder = builder.toolchain_hash(arr);
-            }
-            if s.model_profile_hash.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&s.model_profile_hash);
-                builder = builder.model_profile_hash(arr);
-            }
-            builder.build()
-        });
+        // Validate pinned snapshot hash lengths - FAIL-CLOSED: reject invalid lengths
+        let pinned_snapshot = match proto.pinned_snapshot {
+            Some(s) => {
+                // Helper to validate hash length: must be 0 or exactly 32 bytes
+                let validate_hash =
+                    |hash: &[u8], field: &'static str| -> Result<(), EnvelopeError> {
+                        if !hash.is_empty() && hash.len() != 32 {
+                            return Err(EnvelopeError::InvalidHashLength {
+                                field,
+                                expected: 32,
+                                actual: hash.len(),
+                            });
+                        }
+                        Ok(())
+                    };
+
+                validate_hash(&s.repo_hash, "repo_hash")?;
+                validate_hash(&s.lockfile_hash, "lockfile_hash")?;
+                validate_hash(&s.policy_hash, "policy_hash")?;
+                validate_hash(&s.toolchain_hash, "toolchain_hash")?;
+                validate_hash(&s.model_profile_hash, "model_profile_hash")?;
+
+                let mut builder = PinnedSnapshot::builder();
+                if s.repo_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&s.repo_hash);
+                    builder = builder.repo_hash(arr);
+                }
+                if s.lockfile_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&s.lockfile_hash);
+                    builder = builder.lockfile_hash(arr);
+                }
+                if s.policy_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&s.policy_hash);
+                    builder = builder.policy_hash(arr);
+                }
+                if s.toolchain_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&s.toolchain_hash);
+                    builder = builder.toolchain_hash(arr);
+                }
+                if s.model_profile_hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&s.model_profile_hash);
+                    builder = builder.model_profile_hash(arr);
+                }
+                Some(builder.build())
+            },
+            None => None,
+        };
 
         let context_refs = proto.context_refs.map(|c| ContextRefs {
             context_pack_hash: c.context_pack_hash,
             dcp_refs: c.dcp_refs,
         });
 
-        Self {
+        Ok(Self {
             episode_id: proto.episode_id,
             actor_id: proto.actor_id,
             work_id: proto.work_id,
@@ -684,17 +801,14 @@ impl EpisodeEnvelope {
             stop_conditions,
             pinned_snapshot,
             capability_manifest_hash: proto.capability_manifest_hash,
-            #[allow(clippy::cast_possible_truncation)]
-            risk_tier: RiskTier::from_u8(proto.risk_tier as u8).unwrap_or_default(),
-            #[allow(clippy::cast_possible_truncation)]
-            determinism_class: DeterminismClass::from_u8(proto.determinism_class as u8)
-                .unwrap_or_default(),
+            risk_tier,
+            determinism_class,
             context_refs,
-        }
+        })
     }
 }
 
-/// Error type for envelope construction.
+/// Error type for envelope construction and decoding.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeError {
     /// Episode ID is missing or empty.
@@ -731,6 +845,35 @@ pub enum EnvelopeError {
     TooManyDcpRefs {
         /// Maximum allowed count.
         max: usize,
+    },
+
+    /// Invalid risk tier value.
+    #[error("invalid risk_tier value: {value}")]
+    InvalidRiskTier {
+        /// The invalid value.
+        value: u8,
+    },
+
+    /// Invalid determinism class value.
+    #[error("invalid determinism_class value: {value}")]
+    InvalidDeterminismClass {
+        /// The invalid value.
+        value: u8,
+    },
+
+    /// Protobuf decoding error.
+    #[error("protobuf decode error: {0}")]
+    DecodeError(String),
+
+    /// Invalid hash length in pinned snapshot.
+    #[error("{field} has invalid length {actual}, expected 0 or {expected}")]
+    InvalidHashLength {
+        /// Field name.
+        field: &'static str,
+        /// Expected length.
+        expected: usize,
+        /// Actual length.
+        actual: usize,
     },
 }
 
@@ -1278,5 +1421,303 @@ mod tests {
 
         assert_eq!(envelope.episode_id(), decoded.episode_id());
         assert_eq!(envelope.actor_id(), decoded.actor_id());
+    }
+
+    // ========================================================================
+    // Security Tests - Fail-Closed Decoding
+    // ========================================================================
+
+    /// Tests that `decode()` rejects invalid `risk_tier` values (fail-closed).
+    ///
+    /// SECURITY: Attackers must not be able to bypass sandbox requirements
+    /// by providing out-of-range tier values that default to `Tier0`.
+    #[test]
+    fn test_decode_rejects_invalid_risk_tier() {
+        // Craft a protobuf message with an invalid risk_tier value
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+            #[prost(uint32, tag = "9")]
+            risk_tier: u32,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent-007".to_string(),
+            lease_id: "lease-123".to_string(),
+            capability_manifest_hash: vec![0xab; 32],
+            risk_tier: 99, // Invalid - must fail
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::InvalidRiskTier { value: 99 })),
+            "decode() must reject invalid risk_tier values, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects invalid `determinism_class` values
+    /// (fail-closed).
+    #[test]
+    fn test_decode_rejects_invalid_determinism_class() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+            #[prost(uint32, tag = "10")]
+            determinism_class: u32,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent-007".to_string(),
+            lease_id: "lease-123".to_string(),
+            capability_manifest_hash: vec![0xab; 32],
+            determinism_class: 99, // Invalid - must fail
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::InvalidDeterminismClass { value: 99 })
+            ),
+            "decode() must reject invalid determinism_class values, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` enforces `MAX_ID_LENGTH` validation.
+    ///
+    /// SECURITY: Prevents memory exhaustion via oversized ID fields.
+    #[test]
+    fn test_decode_rejects_oversized_episode_id() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "x".repeat(MAX_ID_LENGTH + 1), // Too long
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::IdTooLong {
+                    field: "episode_id",
+                    ..
+                })
+            ),
+            "decode() must reject oversized episode_id, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` enforces `MAX_DCP_REFS` validation.
+    ///
+    /// SECURITY: Prevents memory exhaustion via excessive DCP refs.
+    #[test]
+    fn test_decode_rejects_too_many_dcp_refs() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedContextRefs {
+            #[prost(bytes = "vec", tag = "1")]
+            context_pack_hash: Vec<u8>,
+            #[prost(string, repeated, tag = "2")]
+            dcp_refs: Vec<String>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+            #[prost(message, optional, tag = "11")]
+            context_refs: Option<CraftedContextRefs>,
+        }
+
+        let dcp_refs: Vec<String> = (0..=MAX_DCP_REFS).map(|i| format!("dcp-{i}")).collect();
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            capability_manifest_hash: vec![0xab; 32],
+            context_refs: Some(CraftedContextRefs {
+                context_pack_hash: vec![],
+                dcp_refs,
+            }),
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::TooManyDcpRefs { .. })),
+            "decode() must reject excessive DCP refs, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects truncated hash in `PinnedSnapshot`
+    /// (fail-closed).
+    ///
+    /// SECURITY: Attackers must not be able to omit reproducibility anchors
+    /// by providing truncated hash values that get silently ignored.
+    #[test]
+    fn test_decode_rejects_invalid_snapshot_hash_length() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {
+            #[prost(bytes = "vec", tag = "1")]
+            repo_hash: Vec<u8>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        // Test with truncated hash (16 bytes instead of 32)
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            pinned_snapshot: Some(CraftedSnapshot {
+                repo_hash: vec![0xab; 16], // Truncated - must fail
+            }),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::InvalidHashLength {
+                    field: "repo_hash",
+                    expected: 32,
+                    actual: 16,
+                })
+            ),
+            "decode() must reject truncated snapshot hashes, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects missing required fields.
+    #[test]
+    fn test_decode_rejects_missing_episode_id() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::MissingEpisodeId)),
+            "decode() must reject missing episode_id, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects invalid `capability_manifest_hash` size.
+    #[test]
+    fn test_decode_rejects_invalid_capability_hash_size() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            capability_manifest_hash: vec![0xab; 16], // Wrong size
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::InvalidCapabilityManifestHashSize)
+            ),
+            "decode() must reject invalid capability_manifest_hash size, got: {result:?}"
+        );
     }
 }
