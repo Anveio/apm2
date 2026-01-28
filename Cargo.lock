@@ -181,6 +181,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "apm2-core",
+ "apm2-holon",
  "blake3",
  "bytes",
  "chrono",
