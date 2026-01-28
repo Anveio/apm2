@@ -491,8 +491,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                 warn!(rule_id = %rule_id, reason = %reason, "policy denied");
                 return Ok(ToolDecision::Deny {
                     request_id: request.request_id.clone(),
-                    reason: DenyReason::NoMatchingCapability {
-                        tool_class: request.tool_class,
+                    // F02: Use PolicyDenied reason instead of misleading NoMatchingCapability
+                    reason: DenyReason::PolicyDenied {
+                        rule_id: rule_id.clone(),
+                        reason,
                     },
                     rule_id: Some(rule_id),
                     policy_hash: self.policy.policy_hash(),

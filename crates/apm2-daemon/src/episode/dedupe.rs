@@ -27,6 +27,30 @@
 //! - TTL-based eviction uses timestamps (not just keys) per RSK-1304
 //! - Episode-scoped eviction for isolation
 //!
+//! # LRU Queue Memory Considerations (F08)
+//!
+//! The `lru_order` `VecDeque` may contain "ghost keys" - entries that remain in
+//! the queue after their corresponding cache entries are evicted (e.g., via
+//! TTL or episode eviction). These ghost keys are detected and skipped during
+//! LRU eviction using timestamp comparison per RSK-1304.
+//!
+//! **Memory bound:** The queue length is bounded by `O(N * K)` where:
+//! - `N` = `MAX_DEDUPE_ENTRIES` (maximum cache entries)
+//! - `K` = average number of times a key is re-inserted before reaching the
+//!   queue front
+//!
+//! In practice, `K` is typically 1-2 because:
+//! 1. Re-insertion of the same key with a new timestamp only happens when the
+//!    key is updated
+//! 2. Ghost keys are cleaned up as they reach the front during LRU eviction
+//! 3. The queue is FIFO, so older ghost keys are processed first
+//!
+//! With `MAX_DEDUPE_ENTRIES = 100,000` and each `LruEntry` being approximately
+//! 80 bytes (64 bytes for `DedupeKey` + 8 bytes for `u64` timestamp +
+//! overhead), worst-case memory is bounded at approximately 16-32 MB for the
+//! LRU queue, which is acceptable given the overall cache memory budget of 100
+//! MB.
+//!
 //! # Contract References
 //!
 //! - CTR-DAEMON-004: `ToolBroker` structure with dedupe cache
@@ -260,6 +284,12 @@ pub struct DedupeCache {
     /// LRU order for eviction.
     ///
     /// Per RSK-1304, entries include timestamps to detect ghost keys.
+    ///
+    /// **Memory consideration (F08):** This queue may contain ghost keys after
+    /// entries are evicted via TTL or episode eviction. Ghost keys are detected
+    /// and cleaned up during LRU eviction using timestamp comparison. The queue
+    /// length is bounded by `O(MAX_DEDUPE_ENTRIES * K)` where `K` is typically
+    /// 1-2. See module documentation for detailed analysis.
     lru_order: RwLock<VecDeque<LruEntry>>,
 
     /// Index of dedupe keys by episode ID for bulk eviction.

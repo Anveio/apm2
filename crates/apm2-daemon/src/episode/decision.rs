@@ -38,17 +38,20 @@
 //! - AD-TOOL-002: Capability manifests as sealed references
 //! - AD-VERIFY-001: Deterministic serialization
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use prost::Message;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::budget::EpisodeBudget;
 use super::capability::DenyReason;
 use super::envelope::RiskTier;
 use super::error::EpisodeId;
 use super::runtime::Hash;
+use super::scope::MAX_PATH_LEN;
 use super::tool_class::ToolClass;
 
 // =============================================================================
@@ -72,6 +75,12 @@ pub const MAX_TOOL_OUTPUT_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Maximum size for tool error message.
 pub const MAX_ERROR_MESSAGE_LEN: usize = 4096;
+
+/// Maximum length for network host names.
+///
+/// RFC 1035 specifies 253 characters max for fully-qualified domain names.
+/// We use 255 to allow for some flexibility while still preventing abuse.
+pub const MAX_HOST_LEN: usize = 255;
 
 // =============================================================================
 // BrokerToolRequest
@@ -157,6 +166,22 @@ pub enum RequestValidationError {
         /// Maximum allowed size.
         max: usize,
     },
+
+    /// Path exceeds maximum length.
+    PathTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Network host exceeds maximum length.
+    HostTooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for RequestValidationError {
@@ -171,6 +196,12 @@ impl std::fmt::Display for RequestValidationError {
             },
             Self::InlineArgsTooLarge { size, max } => {
                 write!(f, "inline args too large: {size} bytes (max {max})")
+            },
+            Self::PathTooLong { len, max } => {
+                write!(f, "path too long: {len} bytes (max {max})")
+            },
+            Self::HostTooLong { len, max } => {
+                write!(f, "network host too long: {len} bytes (max {max})")
             },
         }
     }
@@ -269,6 +300,25 @@ impl BrokerToolRequest {
                 });
             }
         }
+        // Validate path length (F09: boundedness check)
+        if let Some(ref path) = self.path {
+            let path_str = path.to_string_lossy();
+            if path_str.len() > MAX_PATH_LEN {
+                return Err(RequestValidationError::PathTooLong {
+                    len: path_str.len(),
+                    max: MAX_PATH_LEN,
+                });
+            }
+        }
+        // Validate network host length (F09: boundedness check)
+        if let Some((ref host, _)) = self.network {
+            if host.len() > MAX_HOST_LEN {
+                return Err(RequestValidationError::HostTooLong {
+                    len: host.len(),
+                    max: MAX_HOST_LEN,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -293,6 +343,30 @@ impl BrokerToolRequest {
 // DedupeKey
 // =============================================================================
 
+/// Error type for `DedupeKey` creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DedupeKeyError {
+    /// Key exceeds maximum length.
+    TooLong {
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+}
+
+impl std::fmt::Display for DedupeKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { len, max } => {
+                write!(f, "dedupe key too long: {len} bytes (max {max})")
+            },
+        }
+    }
+}
+
+impl std::error::Error for DedupeKeyError {}
+
 /// Key for dedupe cache lookup.
 ///
 /// The dedupe key uniquely identifies a tool invocation within an episode.
@@ -308,23 +382,113 @@ impl BrokerToolRequest {
 ///
 /// # Security
 ///
-/// Uses `deny_unknown_fields` to prevent field injection attacks when
-/// deserializing from untrusted input.
+/// Per CTR-1303, the key is bounded by `MAX_DEDUPE_KEY_LEN` (512 bytes).
+/// The constructor and `Deserialize` implementation both enforce this bound.
+///
+/// Uses a custom `Deserialize` implementation that validates length to prevent
+/// resource exhaustion from untrusted input.
 ///
 /// **IMPORTANT:** Although the dedupe key is a user-controlled string, the
 /// `DedupeCache` enforces episode isolation by verifying the `episode_id`
 /// stored with each cache entry matches the requesting episode. This
 /// prevents cross-episode cache collisions even if two episodes use the
 /// same dedupe key string. See `DedupeCache::get` for the isolation check.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct DedupeKey(String);
 
+/// Custom `Deserialize` implementation that enforces `MAX_DEDUPE_KEY_LEN`.
+///
+/// Per F01 security review finding, this prevents unbounded string allocation
+/// during deserialization from untrusted input.
+impl<'de> Deserialize<'de> for DedupeKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DedupeKeyVisitor;
+
+        impl Visitor<'_> for DedupeKeyVisitor {
+            type Value = DedupeKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    formatter,
+                    "a string with at most {MAX_DEDUPE_KEY_LEN} bytes"
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_DEDUPE_KEY_LEN {
+                    return Err(E::custom(format!(
+                        "dedupe key too long: {} bytes (max {})",
+                        value.len(),
+                        MAX_DEDUPE_KEY_LEN
+                    )));
+                }
+                Ok(DedupeKey(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_DEDUPE_KEY_LEN {
+                    return Err(E::custom(format!(
+                        "dedupe key too long: {} bytes (max {})",
+                        value.len(),
+                        MAX_DEDUPE_KEY_LEN
+                    )));
+                }
+                Ok(DedupeKey(value))
+            }
+        }
+
+        deserializer.deserialize_string(DedupeKeyVisitor)
+    }
+}
+
 impl DedupeKey {
-    /// Creates a new dedupe key.
+    /// Creates a new dedupe key with length validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key exceeds `MAX_DEDUPE_KEY_LEN` bytes.
+    pub fn try_new(key: impl Into<String>) -> Result<Self, DedupeKeyError> {
+        let key = key.into();
+        if key.len() > MAX_DEDUPE_KEY_LEN {
+            return Err(DedupeKeyError::TooLong {
+                len: key.len(),
+                max: MAX_DEDUPE_KEY_LEN,
+            });
+        }
+        Ok(Self(key))
+    }
+
+    /// Creates a new dedupe key, truncating if necessary.
+    ///
+    /// If the key exceeds `MAX_DEDUPE_KEY_LEN`, it is truncated at a valid
+    /// UTF-8 boundary. This is useful for cases where truncation is acceptable
+    /// (e.g., constructing keys from potentially long inputs).
+    ///
+    /// # Note
+    ///
+    /// Prefer `try_new()` when validation errors should be propagated.
     #[must_use]
     pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
+        let key = key.into();
+        if key.len() <= MAX_DEDUPE_KEY_LEN {
+            Self(key)
+        } else {
+            // Find a valid UTF-8 boundary at or before MAX_DEDUPE_KEY_LEN
+            let mut end = MAX_DEDUPE_KEY_LEN;
+            while end > 0 && !key.is_char_boundary(end) {
+                end -= 1;
+            }
+            Self(key[..end].to_owned())
+        }
     }
 
     /// Returns the key as a string slice.
@@ -999,5 +1163,213 @@ mod tests {
         assert_eq!(cap_request.risk_tier, RiskTier::Tier1);
         assert!(cap_request.path.is_some());
         assert_eq!(cap_request.size, Some(1024));
+    }
+
+    // =========================================================================
+    // F01: DedupeKey Boundedness Tests
+    // =========================================================================
+
+    #[test]
+    fn test_dedupe_key_try_new_valid() {
+        let key = DedupeKey::try_new("valid-key").unwrap();
+        assert_eq!(key.as_str(), "valid-key");
+    }
+
+    #[test]
+    fn test_dedupe_key_try_new_too_long() {
+        let long_key = "x".repeat(MAX_DEDUPE_KEY_LEN + 1);
+        let result = DedupeKey::try_new(long_key);
+        assert!(matches!(result, Err(DedupeKeyError::TooLong { .. })));
+    }
+
+    #[test]
+    fn test_dedupe_key_try_new_at_limit() {
+        let key = "x".repeat(MAX_DEDUPE_KEY_LEN);
+        let result = DedupeKey::try_new(&key);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), MAX_DEDUPE_KEY_LEN);
+    }
+
+    #[test]
+    fn test_dedupe_key_new_truncates() {
+        let long_key = "x".repeat(MAX_DEDUPE_KEY_LEN + 100);
+        let key = DedupeKey::new(long_key);
+        assert!(key.len() <= MAX_DEDUPE_KEY_LEN);
+    }
+
+    #[test]
+    fn test_dedupe_key_new_truncates_utf8_safe() {
+        // Create a string with multi-byte UTF-8 characters that would be split
+        // at the boundary if we naively truncate
+        let emoji = "\u{1F600}"; // 4 bytes
+        let filler = "x".repeat(MAX_DEDUPE_KEY_LEN - 2);
+        let long_key = format!("{filler}{emoji}{emoji}{emoji}");
+        let key = DedupeKey::new(long_key);
+
+        // Key should be valid UTF-8 and within bounds
+        assert!(key.len() <= MAX_DEDUPE_KEY_LEN);
+        // Verify it's valid UTF-8 by converting to str
+        let _s = key.as_str();
+    }
+
+    #[test]
+    fn test_dedupe_key_deserialize_valid() {
+        let json = r#""valid-key""#;
+        let key: DedupeKey = serde_json::from_str(json).unwrap();
+        assert_eq!(key.as_str(), "valid-key");
+    }
+
+    #[test]
+    fn test_dedupe_key_deserialize_too_long() {
+        let long_key = "x".repeat(MAX_DEDUPE_KEY_LEN + 1);
+        let json = format!(r#""{long_key}""#);
+        let result: Result<DedupeKey, _> = serde_json::from_str(&json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too long"),
+            "error should mention 'too long': {err}"
+        );
+    }
+
+    #[test]
+    fn test_dedupe_key_deserialize_at_limit() {
+        let key = "x".repeat(MAX_DEDUPE_KEY_LEN);
+        let json = format!(r#""{key}""#);
+        let result: DedupeKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(result.len(), MAX_DEDUPE_KEY_LEN);
+    }
+
+    #[test]
+    fn test_dedupe_key_serialize_roundtrip() {
+        let original = DedupeKey::new("test-key-123");
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: DedupeKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    // =========================================================================
+    // F09: Path and Network Host Boundedness Tests
+    // =========================================================================
+
+    #[test]
+    fn test_broker_request_validation_path_too_long() {
+        let long_path = "/".to_owned() + &"x".repeat(MAX_PATH_LEN + 1);
+        let request = BrokerToolRequest::new(
+            "req-path",
+            test_episode_id(),
+            ToolClass::Read,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path(long_path);
+
+        assert!(matches!(
+            request.validate(),
+            Err(RequestValidationError::PathTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_broker_request_validation_path_at_limit() {
+        let path = "/".to_owned() + &"x".repeat(MAX_PATH_LEN - 1);
+        assert_eq!(path.len(), MAX_PATH_LEN);
+        let request = BrokerToolRequest::new(
+            "req-path",
+            test_episode_id(),
+            ToolClass::Read,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path(path);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_broker_request_validation_host_too_long() {
+        let long_host = "x".repeat(MAX_HOST_LEN + 1);
+        let request = BrokerToolRequest::new(
+            "req-net",
+            test_episode_id(),
+            ToolClass::Network,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_network(long_host, 443);
+
+        assert!(matches!(
+            request.validate(),
+            Err(RequestValidationError::HostTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_broker_request_validation_host_at_limit() {
+        let host = "x".repeat(MAX_HOST_LEN);
+        let request = BrokerToolRequest::new(
+            "req-net",
+            test_episode_id(),
+            ToolClass::Network,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_network(host, 443);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_broker_request_validation_valid_with_path_and_network() {
+        let request = BrokerToolRequest::new(
+            "req-full",
+            test_episode_id(),
+            ToolClass::Network,
+            make_dedupe_key(),
+            test_args_hash(),
+            RiskTier::Tier0,
+        )
+        .with_path("/workspace/file.txt")
+        .with_network("example.com", 443)
+        .with_inline_args(vec![1, 2, 3]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    // =========================================================================
+    // Error Display Tests
+    // =========================================================================
+
+    #[test]
+    fn test_dedupe_key_error_display() {
+        let err = DedupeKeyError::TooLong { len: 600, max: 512 };
+        let msg = err.to_string();
+        assert!(msg.contains("600"));
+        assert!(msg.contains("512"));
+    }
+
+    #[test]
+    fn test_request_validation_error_display_path() {
+        let err = RequestValidationError::PathTooLong {
+            len: 5000,
+            max: 4096,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("path"));
+        assert!(msg.contains("5000"));
+        assert!(msg.contains("4096"));
+    }
+
+    #[test]
+    fn test_request_validation_error_display_host() {
+        let err = RequestValidationError::HostTooLong { len: 300, max: 255 };
+        let msg = err.to_string();
+        assert!(msg.contains("host"));
+        assert!(msg.contains("300"));
+        assert!(msg.contains("255"));
     }
 }

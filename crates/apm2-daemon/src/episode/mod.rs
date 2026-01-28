@@ -144,9 +144,9 @@ pub use capability::{
     MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, ToolRequest,
 };
 pub use decision::{
-    BrokerToolRequest, BudgetDelta, DedupeKey, MAX_DEDUPE_KEY_LEN, MAX_ERROR_MESSAGE_LEN,
-    MAX_INLINE_ARGS_SIZE, MAX_REQUEST_ID_LEN, MAX_RULE_ID_LEN, MAX_TOOL_OUTPUT_SIZE,
-    RequestValidationError, ToolDecision, ToolResult,
+    BrokerToolRequest, BudgetDelta, DedupeKey, DedupeKeyError, MAX_DEDUPE_KEY_LEN,
+    MAX_ERROR_MESSAGE_LEN, MAX_HOST_LEN, MAX_INLINE_ARGS_SIZE, MAX_REQUEST_ID_LEN, MAX_RULE_ID_LEN,
+    MAX_TOOL_OUTPUT_SIZE, RequestValidationError, ToolDecision, ToolResult,
 };
 pub use dedupe::{
     DEFAULT_TTL_SECS, DedupeCache, DedupeCacheConfig, DedupeCacheStats, MAX_DEDUPE_ENTRIES,

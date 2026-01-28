@@ -286,6 +286,17 @@ pub enum DenyReason {
 
     /// Manifest has expired.
     ManifestExpired,
+
+    /// Request was denied by policy.
+    ///
+    /// This is distinct from capability denial - policy rules provide
+    /// coarse-grained access control independent of capability scopes.
+    PolicyDenied {
+        /// The policy rule ID that caused the denial.
+        rule_id: String,
+        /// Human-readable reason for the denial.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for DenyReason {
@@ -311,6 +322,9 @@ impl std::fmt::Display for DenyReason {
             },
             Self::ManifestExpired => {
                 write!(f, "capability manifest has expired")
+            },
+            Self::PolicyDenied { rule_id, reason } => {
+                write!(f, "policy denied by rule {rule_id}: {reason}")
             },
         }
     }
