@@ -70,6 +70,9 @@ zbus.workspace = true
 # Error types
 thiserror.workspace = true
 
+# Security
+secrecy.workspace = true
+
 [dev-dependencies]
 # Testing utilities
 tempfile.workspace = true

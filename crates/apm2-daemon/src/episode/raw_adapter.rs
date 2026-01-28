@@ -10,6 +10,12 @@
 //! - Does not parse tool calls or structured events
 //! - Forwards termination status directly
 //!
+//! # Resource Bounds
+//!
+//! The adapter enforces a maximum of [`MAX_CONCURRENT_ADAPTERS`] concurrent
+//! spawned processes to prevent resource exhaustion. If this limit is reached,
+//! [`spawn`](RawAdapter::spawn) will return an error.
+//!
 //! This adapter is useful for:
 //! - Running arbitrary shell commands
 //! - Testing and debugging harness infrastructure
@@ -17,7 +23,10 @@
 
 use std::pin::Pin;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::sync::Semaphore;
 
 use super::adapter::{
     AdapterError, AdapterResult, AdapterType, HarnessAdapter, HarnessConfig, HarnessEvent,
@@ -27,10 +36,32 @@ use super::adapter::{
 /// Counter for generating unique handle IDs.
 static HANDLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Maximum number of concurrent adapter instances allowed.
+///
+/// This limit prevents resource exhaustion from spawning too many processes.
+/// The limit is intentionally conservative to account for system resources
+/// like file descriptors, memory, and CPU time.
+///
+/// Each spawned process consumes:
+/// - At least 3 file descriptors (stdin, stdout, stderr / PTY)
+/// - Memory for the process and its buffers
+/// - A tokio task for event handling
+///
+/// With this limit, the maximum file descriptor usage is approximately
+/// 100 * 3 = 300 FDs, well within typical system limits.
+pub const MAX_CONCURRENT_ADAPTERS: usize = 100;
+
 /// Raw adapter that emits unstructured output.
 ///
 /// This adapter spawns processes and emits all PTY output as raw events.
 /// It does not parse tool calls or structured events.
+///
+/// # Resource Bounds
+///
+/// The adapter tracks spawned tasks and enforces [`MAX_CONCURRENT_ADAPTERS`]
+/// as the maximum number of concurrent processes. When this limit is reached,
+/// [`spawn`](RawAdapter::spawn) returns
+/// [`AdapterError::ResourceLimitExceeded`].
 ///
 /// # Example
 ///
@@ -48,17 +79,42 @@ static HANDLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 ///     println!("Event: {:?}", event);
 /// }
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RawAdapter {
-    /// Placeholder for future configuration.
-    _private: (),
+    /// Semaphore for tracking and limiting concurrent spawned tasks.
+    ///
+    /// Each successful spawn acquires a permit, which is released when
+    /// the spawned task completes. This bounds resource usage.
+    task_semaphore: Arc<Semaphore>,
+}
+
+impl Default for RawAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RawAdapter {
     /// Create a new raw adapter.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { _private: () }
+    pub fn new() -> Self {
+        Self {
+            task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_ADAPTERS)),
+        }
+    }
+
+    /// Returns the number of currently active (spawned) processes.
+    ///
+    /// This is useful for monitoring resource usage.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        MAX_CONCURRENT_ADAPTERS - self.task_semaphore.available_permits()
+    }
+
+    /// Returns the number of available slots for new processes.
+    #[must_use]
+    pub fn available_slots(&self) -> usize {
+        self.task_semaphore.available_permits()
     }
 
     /// Generate a new unique handle ID.
@@ -82,7 +138,21 @@ impl HarnessAdapter for RawAdapter {
                 + '_,
         >,
     > {
+        // Clone the semaphore Arc for use in the async block
+        let semaphore = Arc::clone(&self.task_semaphore);
+
         Box::pin(async move {
+            // Validate configuration before spawning
+            config.validate()?;
+
+            // Try to acquire a permit without blocking
+            // This enforces the concurrent adapter limit
+            let permit = semaphore.clone().try_acquire_owned().map_err(|_| {
+                AdapterError::resource_limit_exceeded(format!(
+                    "maximum concurrent adapters ({MAX_CONCURRENT_ADAPTERS}) reached"
+                ))
+            })?;
+
             // For now, create a placeholder implementation.
             // Full PTY integration will come with TCK-00161.
             //
@@ -96,8 +166,12 @@ impl HarnessAdapter for RawAdapter {
             let (tx, rx) = tokio::sync::mpsc::channel(256);
 
             // Spawn a task that runs the process
-            // For now, just immediately emit a terminated event as a placeholder
+            // The permit is moved into the task and dropped when it completes,
+            // releasing the slot for a new process.
             tokio::spawn(async move {
+                // Hold the permit for the duration of the task
+                let _permit = permit;
+
                 // Placeholder: In full implementation, this would:
                 // 1. Create PTY master/slave pair
                 // 2. Fork and exec the command
@@ -111,6 +185,8 @@ impl HarnessAdapter for RawAdapter {
                         TerminationClassification::Unknown,
                     ))
                     .await;
+
+                // Permit is automatically released when dropped here
             });
 
             let handle = HarnessHandle::new(handle_id, episode_id, HarnessHandleInner::Placeholder);
@@ -277,5 +353,60 @@ mod tests {
             },
             _ => panic!("expected Output event"),
         }
+    }
+
+    #[test]
+    fn test_raw_adapter_initial_capacity() {
+        let adapter = RawAdapter::new();
+        assert_eq!(adapter.active_count(), 0);
+        assert_eq!(adapter.available_slots(), MAX_CONCURRENT_ADAPTERS);
+    }
+
+    #[tokio::test]
+    async fn test_raw_adapter_tracks_active_count() {
+        let adapter = RawAdapter::new();
+        let config = HarnessConfig::new("echo", "ep-1");
+
+        // Before spawn, no active tasks
+        assert_eq!(adapter.active_count(), 0);
+
+        // Spawn a process - note: our placeholder immediately terminates,
+        // but there's a brief window where the task is active
+        let (_handle, mut events) = adapter.spawn(config).await.unwrap();
+
+        // Wait for the task to complete
+        while events.recv().await.is_some() {}
+
+        // After completion, the permit should be released
+        // Give a small delay for the task to fully complete
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(adapter.active_count(), 0);
+        assert_eq!(adapter.available_slots(), MAX_CONCURRENT_ADAPTERS);
+    }
+
+    #[tokio::test]
+    async fn test_raw_adapter_validates_config_on_spawn() {
+        let adapter = RawAdapter::new();
+
+        // Empty command should fail validation
+        let config = HarnessConfig::new("", "ep-1");
+        let result = adapter.spawn(config).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, AdapterError::ValidationFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_raw_adapter_validates_args_on_spawn() {
+        let adapter = RawAdapter::new();
+
+        // Arg with null byte should fail validation
+        let config = HarnessConfig::new("echo", "ep-1").with_args(vec!["bad\0arg".to_string()]);
+        let result = adapter.spawn(config).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, AdapterError::ValidationFailed(_)));
     }
 }

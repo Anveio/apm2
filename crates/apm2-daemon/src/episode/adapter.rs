@@ -38,9 +38,43 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitStatus;
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+// ============================================================================
+// Validation Constants
+// ============================================================================
+
+/// Maximum length for the command string (4096 characters).
+///
+/// This limit prevents excessively long command strings that could cause
+/// issues with process spawning or shell parsing.
+pub const MAX_COMMAND_LENGTH: usize = 4096;
+
+/// Maximum number of arguments allowed (1000 args).
+///
+/// This limit prevents resource exhaustion from processing an excessive
+/// number of command-line arguments.
+pub const MAX_ARGS_COUNT: usize = 1000;
+
+/// Maximum length for each argument string (4096 characters).
+///
+/// This limit prevents individual arguments from being excessively long.
+pub const MAX_ARG_LENGTH: usize = 4096;
+
+/// Maximum length for environment variable keys (256 characters).
+pub const MAX_ENV_KEY_LENGTH: usize = 256;
+
+/// Maximum length for environment variable values (32768 characters).
+///
+/// Environment values can be longer than commands/args to support
+/// legitimate use cases like certificates or JSON payloads.
+pub const MAX_ENV_VALUE_LENGTH: usize = 32768;
+
+/// Maximum number of environment variables (500).
+pub const MAX_ENV_COUNT: usize = 500;
 
 /// Type alias for a boxed stream of harness events.
 ///
@@ -48,9 +82,109 @@ use tokio::sync::mpsc;
 /// more practical for our use case than a trait object stream.
 pub type HarnessEventStream = mpsc::Receiver<HarnessEvent>;
 
+/// Errors that can occur during configuration validation.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    /// Command exceeds maximum length.
+    #[error("command too long: {length} chars exceeds maximum {max}")]
+    CommandTooLong {
+        /// Actual length of the command.
+        length: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Command is empty.
+    #[error("command cannot be empty")]
+    CommandEmpty,
+
+    /// Command contains invalid characters.
+    #[error("command contains invalid character: {description}")]
+    CommandInvalidChar {
+        /// Description of the invalid character.
+        description: String,
+    },
+
+    /// Too many arguments.
+    #[error("too many arguments: {count} exceeds maximum {max}")]
+    TooManyArgs {
+        /// Actual number of arguments.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+
+    /// Argument exceeds maximum length.
+    #[error("argument {index} too long: {length} chars exceeds maximum {max}")]
+    ArgTooLong {
+        /// Index of the problematic argument.
+        index: usize,
+        /// Actual length of the argument.
+        length: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Argument contains invalid characters.
+    #[error("argument {index} contains invalid character: {description}")]
+    ArgInvalidChar {
+        /// Index of the problematic argument.
+        index: usize,
+        /// Description of the invalid character.
+        description: String,
+    },
+
+    /// Working directory path cannot be canonicalized.
+    #[error("invalid working directory: {reason}")]
+    InvalidCwd {
+        /// Reason the path is invalid.
+        reason: String,
+    },
+
+    /// Too many environment variables.
+    #[error("too many environment variables: {count} exceeds maximum {max}")]
+    TooManyEnvVars {
+        /// Actual number of env vars.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+
+    /// Environment variable key is invalid.
+    #[error("environment variable key invalid: {reason}")]
+    InvalidEnvKey {
+        /// Reason the key is invalid.
+        reason: String,
+    },
+
+    /// Environment variable value is too long.
+    #[error("environment variable '{key}' value too long: {length} chars exceeds maximum {max}")]
+    EnvValueTooLong {
+        /// Key of the problematic env var.
+        key: String,
+        /// Actual length of the value.
+        length: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// Environment variable value contains invalid characters.
+    #[error("environment variable '{key}' contains invalid character: {description}")]
+    EnvValueInvalidChar {
+        /// Key of the problematic env var.
+        key: String,
+        /// Description of the invalid character.
+        description: String,
+    },
+}
+
 /// Errors that can occur during adapter operations.
 #[derive(Debug, Error)]
 pub enum AdapterError {
+    /// Configuration validation failed.
+    #[error("configuration validation failed: {0}")]
+    ValidationFailed(#[from] ValidationError),
+
     /// Failed to spawn the process.
     #[error("spawn failed: {reason}")]
     SpawnFailed {
@@ -76,6 +210,13 @@ pub enum AdapterError {
     #[error("invalid handle: {reason}")]
     InvalidHandle {
         /// Description of why the handle is invalid.
+        reason: String,
+    },
+
+    /// Resource limit exceeded (too many concurrent adapters).
+    #[error("resource limit exceeded: {reason}")]
+    ResourceLimitExceeded {
+        /// Description of which limit was exceeded.
         reason: String,
     },
 
@@ -116,6 +257,14 @@ impl AdapterError {
             reason: reason.into(),
         }
     }
+
+    /// Create a resource limit exceeded error.
+    #[must_use]
+    pub fn resource_limit_exceeded(reason: impl Into<String>) -> Self {
+        Self::ResourceLimitExceeded {
+            reason: reason.into(),
+        }
+    }
 }
 
 /// Result type for adapter operations.
@@ -150,7 +299,20 @@ impl fmt::Display for AdapterType {
 }
 
 /// Configuration for spawning a harness process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Security
+///
+/// This struct validates all inputs to prevent injection attacks and resource
+/// exhaustion. All string fields are checked for:
+/// - Length bounds
+/// - Absence of null bytes
+/// - Absence of control characters (except common whitespace in env values)
+///
+/// Environment variable values use [`SecretString`] to prevent accidental
+/// logging of sensitive data like API keys or tokens.
+///
+/// Use [`HarnessConfig::validate`] to check configuration before spawning.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessConfig {
     /// Command to execute.
@@ -165,8 +327,11 @@ pub struct HarnessConfig {
     pub cwd: Option<PathBuf>,
 
     /// Environment variables to set.
-    #[serde(default)]
-    pub env: HashMap<String, String>,
+    ///
+    /// Values are stored as [`SecretString`] to protect sensitive data
+    /// like API keys from accidental exposure in logs or debug output.
+    #[serde(default, skip)]
+    pub env: HashMap<String, SecretString>,
 
     /// PTY dimensions (columns, rows).
     #[serde(default = "default_pty_size")]
@@ -174,6 +339,20 @@ pub struct HarnessConfig {
 
     /// Episode ID for tracking.
     pub episode_id: String,
+}
+
+impl fmt::Debug for HarnessConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HarnessConfig")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            // Redact env values to prevent secret leakage
+            .field("env", &format!("<{} redacted entries>", self.env.len()))
+            .field("pty_size", &self.pty_size)
+            .field("episode_id", &self.episode_id)
+            .finish()
+    }
 }
 
 /// Default PTY size (80x24).
@@ -210,9 +389,19 @@ impl HarnessConfig {
     }
 
     /// Set environment variable.
+    ///
+    /// The value is wrapped in [`SecretString`] to prevent accidental logging.
     #[must_use]
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.env.insert(key.into(), value.into());
+        self.env
+            .insert(key.into(), SecretString::from(value.into()));
+        self
+    }
+
+    /// Set environment variable with a pre-wrapped secret value.
+    #[must_use]
+    pub fn with_secret_env(mut self, key: impl Into<String>, value: SecretString) -> Self {
+        self.env.insert(key.into(), value);
         self
     }
 
@@ -221,6 +410,190 @@ impl HarnessConfig {
     pub const fn with_pty_size(mut self, cols: u16, rows: u16) -> Self {
         self.pty_size = (cols, rows);
         self
+    }
+
+    /// Validate the configuration.
+    ///
+    /// This method checks all fields for security constraints:
+    /// - Command: non-empty, max 4096 chars, no null bytes or control chars
+    /// - Args: max 1000 args, each max 4096 chars, no null bytes or control
+    ///   chars
+    /// - cwd: must be canonicalizable (if present)
+    /// - env: max 500 vars, keys max 256 chars, values max 32768 chars
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ValidationError`] describing the first validation failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_daemon::episode::adapter::HarnessConfig;
+    ///
+    /// let config = HarnessConfig::new("echo", "episode-1")
+    ///     .with_args(vec!["hello".to_string()]);
+    ///
+    /// config.validate().expect("validation should pass");
+    /// ```
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.validate_command()?;
+        self.validate_args()?;
+        self.validate_cwd()?;
+        self.validate_env()?;
+        Ok(())
+    }
+
+    /// Validate the command field.
+    fn validate_command(&self) -> Result<(), ValidationError> {
+        if self.command.is_empty() {
+            return Err(ValidationError::CommandEmpty);
+        }
+
+        if self.command.len() > MAX_COMMAND_LENGTH {
+            return Err(ValidationError::CommandTooLong {
+                length: self.command.len(),
+                max: MAX_COMMAND_LENGTH,
+            });
+        }
+
+        if let Some(desc) = Self::check_invalid_chars(&self.command, false) {
+            return Err(ValidationError::CommandInvalidChar { description: desc });
+        }
+
+        Ok(())
+    }
+
+    /// Validate the args field.
+    fn validate_args(&self) -> Result<(), ValidationError> {
+        if self.args.len() > MAX_ARGS_COUNT {
+            return Err(ValidationError::TooManyArgs {
+                count: self.args.len(),
+                max: MAX_ARGS_COUNT,
+            });
+        }
+
+        for (index, arg) in self.args.iter().enumerate() {
+            if arg.len() > MAX_ARG_LENGTH {
+                return Err(ValidationError::ArgTooLong {
+                    index,
+                    length: arg.len(),
+                    max: MAX_ARG_LENGTH,
+                });
+            }
+
+            if let Some(desc) = Self::check_invalid_chars(arg, false) {
+                return Err(ValidationError::ArgInvalidChar {
+                    index,
+                    description: desc,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate the cwd field.
+    fn validate_cwd(&self) -> Result<(), ValidationError> {
+        if let Some(ref cwd) = self.cwd {
+            // Check that the path can be canonicalized (exists and is accessible)
+            std::fs::canonicalize(cwd).map_err(|e| ValidationError::InvalidCwd {
+                reason: format!("cannot canonicalize '{}': {}", cwd.display(), e),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Validate the env field.
+    fn validate_env(&self) -> Result<(), ValidationError> {
+        use secrecy::ExposeSecret;
+
+        if self.env.len() > MAX_ENV_COUNT {
+            return Err(ValidationError::TooManyEnvVars {
+                count: self.env.len(),
+                max: MAX_ENV_COUNT,
+            });
+        }
+
+        for (key, value) in &self.env {
+            // Validate key
+            if key.is_empty() {
+                return Err(ValidationError::InvalidEnvKey {
+                    reason: "key cannot be empty".to_string(),
+                });
+            }
+
+            if key.len() > MAX_ENV_KEY_LENGTH {
+                return Err(ValidationError::InvalidEnvKey {
+                    reason: format!(
+                        "key '{}' too long: {} chars exceeds maximum {}",
+                        key,
+                        key.len(),
+                        MAX_ENV_KEY_LENGTH
+                    ),
+                });
+            }
+
+            // Env var names should only contain alphanumeric chars and underscores
+            if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(ValidationError::InvalidEnvKey {
+                    reason: format!(
+                        "key '{key}' contains invalid characters (must be alphanumeric or underscore)"
+                    ),
+                });
+            }
+
+            // Validate value
+            let value_str = value.expose_secret();
+
+            if value_str.len() > MAX_ENV_VALUE_LENGTH {
+                return Err(ValidationError::EnvValueTooLong {
+                    key: key.clone(),
+                    length: value_str.len(),
+                    max: MAX_ENV_VALUE_LENGTH,
+                });
+            }
+
+            // For env values, allow common whitespace but still reject null bytes and other
+            // control chars
+            if let Some(desc) = Self::check_invalid_chars(value_str, true) {
+                return Err(ValidationError::EnvValueInvalidChar {
+                    key: key.clone(),
+                    description: desc,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check for invalid characters in a string.
+    ///
+    /// Returns `Some(description)` if an invalid character is found.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The string to check
+    /// * `allow_whitespace` - If true, allows tab, newline, carriage return
+    fn check_invalid_chars(s: &str, allow_whitespace: bool) -> Option<String> {
+        for (i, c) in s.chars().enumerate() {
+            // Null bytes are never allowed
+            if c == '\0' {
+                return Some(format!("null byte at position {i}"));
+            }
+
+            // Check for control characters (ASCII 0x00-0x1F, 0x7F)
+            if c.is_ascii_control() {
+                // Allow common whitespace if permitted
+                if allow_whitespace && matches!(c, '\t' | '\n' | '\r') {
+                    continue;
+                }
+                return Some(format!(
+                    "control character 0x{:02X} at position {i}",
+                    c as u32
+                ));
+            }
+        }
+        None
     }
 }
 
@@ -548,6 +921,8 @@ pub trait HarnessAdapter: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     #[test]
@@ -588,8 +963,38 @@ mod tests {
         assert_eq!(config.episode_id, "episode-123");
         assert_eq!(config.args, vec!["hello"]);
         assert_eq!(config.cwd, Some(PathBuf::from("/tmp")));
-        assert_eq!(config.env.get("FOO"), Some(&"bar".to_string()));
+        // Env values are now SecretString, need ExposeSecret to verify
+        assert_eq!(
+            config.env.get("FOO").map(|s| s.expose_secret().to_string()),
+            Some("bar".to_string())
+        );
         assert_eq!(config.pty_size, (120, 40));
+    }
+
+    #[test]
+    fn test_harness_config_with_secret_env() {
+        let secret = SecretString::from("super-secret-api-key".to_string());
+        let config = HarnessConfig::new("test", "ep-1").with_secret_env("API_KEY", secret);
+
+        assert_eq!(
+            config
+                .env
+                .get("API_KEY")
+                .map(|s| s.expose_secret().to_string()),
+            Some("super-secret-api-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_harness_config_debug_redacts_env() {
+        let config = HarnessConfig::new("test", "ep-1")
+            .with_env("SECRET_KEY", "do-not-leak-this")
+            .with_env("API_TOKEN", "also-secret");
+
+        let debug_str = format!("{config:?}");
+        assert!(!debug_str.contains("do-not-leak-this"));
+        assert!(!debug_str.contains("also-secret"));
+        assert!(debug_str.contains("2 redacted entries"));
     }
 
     #[test]
@@ -598,6 +1003,203 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"command\":\"test\""));
         assert!(json.contains("\"episode_id\":\"ep-1\""));
+        // Env is skipped in serialization to prevent secret leakage
+        assert!(!json.contains("env"));
+    }
+
+    // ========================================================================
+    // Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_validate_valid_config() {
+        let config = HarnessConfig::new("echo", "ep-1")
+            .with_args(vec!["hello".to_string()])
+            .with_cwd("/tmp")
+            .with_env("MY_VAR", "value");
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_command() {
+        let config = HarnessConfig::new("", "ep-1");
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::CommandEmpty)));
+    }
+
+    #[test]
+    fn test_validate_command_too_long() {
+        let long_command = "x".repeat(MAX_COMMAND_LENGTH + 1);
+        let config = HarnessConfig::new(long_command, "ep-1");
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::CommandTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_command_with_null_byte() {
+        let config = HarnessConfig::new("echo\0hello", "ep-1");
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::CommandInvalidChar { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_command_with_control_char() {
+        let config = HarnessConfig::new("echo\x07", "ep-1"); // Bell character
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::CommandInvalidChar { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_too_many_args() {
+        let args: Vec<String> = (0..=MAX_ARGS_COUNT).map(|i| format!("arg{i}")).collect();
+        let config = HarnessConfig::new("echo", "ep-1").with_args(args);
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::TooManyArgs { .. })));
+    }
+
+    #[test]
+    fn test_validate_arg_too_long() {
+        let long_arg = "x".repeat(MAX_ARG_LENGTH + 1);
+        let config = HarnessConfig::new("echo", "ep-1").with_args(vec![long_arg]);
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::ArgTooLong { .. })));
+    }
+
+    #[test]
+    fn test_validate_arg_with_null_byte() {
+        let config = HarnessConfig::new("echo", "ep-1").with_args(vec!["hello\0world".to_string()]);
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::ArgInvalidChar { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_invalid_cwd() {
+        let config =
+            HarnessConfig::new("echo", "ep-1").with_cwd("/nonexistent/path/that/does/not/exist");
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::InvalidCwd { .. })));
+    }
+
+    #[test]
+    fn test_validate_valid_cwd() {
+        let config = HarnessConfig::new("echo", "ep-1").with_cwd("/tmp");
+        // /tmp should exist on all Unix systems
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_too_many_env_vars() {
+        let mut config = HarnessConfig::new("echo", "ep-1");
+        for i in 0..=MAX_ENV_COUNT {
+            config = config.with_env(format!("VAR_{i}"), "value");
+        }
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::TooManyEnvVars { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_empty_env_key() {
+        let mut config = HarnessConfig::new("echo", "ep-1");
+        config
+            .env
+            .insert(String::new(), SecretString::from("value".to_string()));
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::InvalidEnvKey { .. })));
+    }
+
+    #[test]
+    fn test_validate_env_key_with_invalid_chars() {
+        let mut config = HarnessConfig::new("echo", "ep-1");
+        config.env.insert(
+            "MY-VAR".to_string(),
+            SecretString::from("value".to_string()),
+        );
+        let result = config.validate();
+        assert!(matches!(result, Err(ValidationError::InvalidEnvKey { .. })));
+    }
+
+    #[test]
+    fn test_validate_env_value_too_long() {
+        let long_value = "x".repeat(MAX_ENV_VALUE_LENGTH + 1);
+        let config = HarnessConfig::new("echo", "ep-1").with_env("MY_VAR", long_value);
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::EnvValueTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_env_value_with_null_byte() {
+        let config = HarnessConfig::new("echo", "ep-1").with_env("MY_VAR", "value\0with\0nulls");
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::EnvValueInvalidChar { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_env_value_allows_whitespace() {
+        // Tabs, newlines, and carriage returns should be allowed in env values
+        let config =
+            HarnessConfig::new("echo", "ep-1").with_env("MY_VAR", "line1\nline2\ttabbed\rcarriage");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_value_rejects_other_control_chars() {
+        // Bell character should be rejected
+        let config = HarnessConfig::new("echo", "ep-1").with_env("MY_VAR", "value\x07bell");
+        let result = config.validate();
+        assert!(matches!(
+            result,
+            Err(ValidationError::EnvValueInvalidChar { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validation_error_display() {
+        let err = ValidationError::CommandEmpty;
+        assert_eq!(err.to_string(), "command cannot be empty");
+
+        let err = ValidationError::CommandTooLong {
+            length: 5000,
+            max: 4096,
+        };
+        assert!(err.to_string().contains("5000"));
+        assert!(err.to_string().contains("4096"));
+    }
+
+    #[test]
+    fn test_adapter_error_from_validation_error() {
+        let validation_err = ValidationError::CommandEmpty;
+        let adapter_err: AdapterError = validation_err.into();
+        assert!(matches!(adapter_err, AdapterError::ValidationFailed(_)));
+        assert!(adapter_err.to_string().contains("command cannot be empty"));
+    }
+
+    #[test]
+    fn test_adapter_error_resource_limit() {
+        let err = AdapterError::resource_limit_exceeded("too many connections");
+        assert!(err.to_string().contains("resource limit exceeded"));
+        assert!(err.to_string().contains("too many connections"));
     }
 
     #[test]
