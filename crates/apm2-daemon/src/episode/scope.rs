@@ -55,23 +55,38 @@ pub const MAX_PATH_LEN: usize = 4096;
 /// Size limits for operations.
 ///
 /// Prevents resource exhaustion by capping operation sizes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Size limits for operations.
+///
+/// Prevents resource exhaustion by capping operation sizes.
+///
+/// # Security
+///
+/// Per CTR-2003 (fail-closed), `Default` uses `default_limits()` which provides
+/// safe, bounded defaults rather than zeroed values that could be interpreted
+/// as unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SizeLimits {
     /// Maximum bytes that can be read in a single operation.
-    /// Zero means use default limit.
     pub max_read_bytes: u64,
 
     /// Maximum bytes that can be written in a single operation.
-    /// Zero means use default limit.
     pub max_write_bytes: u64,
 
     /// Maximum command length for execute operations.
-    /// Zero means use default limit.
     pub max_command_bytes: u64,
 
     /// Maximum response size for network operations.
-    /// Zero means use default limit.
     pub max_response_bytes: u64,
+}
+
+impl Default for SizeLimits {
+    /// Returns safe default limits per CTR-2003 (fail-closed).
+    ///
+    /// This ensures that `SizeLimits::default()` provides bounded defaults
+    /// rather than zeroed values that could bypass resource limits.
+    fn default() -> Self {
+        Self::default_limits()
+    }
 }
 
 impl SizeLimits {
@@ -87,6 +102,12 @@ impl SizeLimits {
     }
 
     /// Creates unlimited size limits (for testing only).
+    ///
+    /// # Warning
+    ///
+    /// This should only be used in tests. Production code should use
+    /// `default_limits()` or explicit bounded values.
+    #[cfg(test)]
     #[must_use]
     pub const fn unlimited() -> Self {
         Self {
@@ -98,21 +119,36 @@ impl SizeLimits {
     }
 
     /// Returns `true` if the given read size is within limits.
+    ///
+    /// # Security
+    ///
+    /// Per CTR-2003 (fail-closed), zero is NOT interpreted as unlimited.
+    /// A limit of zero means zero bytes are allowed.
     #[must_use]
     pub const fn allows_read_size(&self, size: u64) -> bool {
-        self.max_read_bytes == 0 || size <= self.max_read_bytes
+        size <= self.max_read_bytes
     }
 
     /// Returns `true` if the given write size is within limits.
+    ///
+    /// # Security
+    ///
+    /// Per CTR-2003 (fail-closed), zero is NOT interpreted as unlimited.
+    /// A limit of zero means zero bytes are allowed.
     #[must_use]
     pub const fn allows_write_size(&self, size: u64) -> bool {
-        self.max_write_bytes == 0 || size <= self.max_write_bytes
+        size <= self.max_write_bytes
     }
 
     /// Returns `true` if the given command size is within limits.
+    ///
+    /// # Security
+    ///
+    /// Per CTR-2003 (fail-closed), zero is NOT interpreted as unlimited.
+    /// A limit of zero means zero bytes are allowed.
     #[must_use]
     pub const fn allows_command_size(&self, size: u64) -> bool {
-        self.max_command_bytes == 0 || size <= self.max_command_bytes
+        size <= self.max_command_bytes
     }
 }
 
@@ -207,18 +243,32 @@ impl NetworkPolicy {
     }
 
     /// Checks if the given host and port are allowed.
+    ///
+    /// # Security
+    ///
+    /// Host matching respects component boundaries to prevent suffix attacks.
+    /// For example, `*.domain.com` matches `sub.domain.com` but NOT
+    /// `attacker-domain.com`, which merely ends with `domain.com`.
+    ///
+    /// This is implemented by checking that the host either:
+    /// 1. Exactly matches the suffix (e.g., `domain.com` matches
+    ///    `*.domain.com`)
+    /// 2. Ends with `.` followed by the suffix (e.g., `sub.domain.com`)
     #[must_use]
     pub fn allows(&self, host: &str, port: u16) -> bool {
         if self.is_deny_all() {
             return false;
         }
 
-        // Check host pattern
+        // Check host pattern with component-aware matching
         let host_allowed = self.allowed_hosts.iter().any(|pattern| {
             if pattern == "*" {
                 true
             } else if let Some(suffix) = pattern.strip_prefix("*.") {
-                host.ends_with(suffix) || host == suffix
+                // Security: Must check component boundary to prevent suffix attacks.
+                // `*.domain.com` should match `sub.domain.com` but NOT `attacker-domain.com`.
+                // We check: host == suffix OR host ends with ".{suffix}"
+                host == suffix || host.ends_with(&format!(".{suffix}"))
             } else {
                 host == pattern
             }
@@ -688,9 +738,13 @@ fn contains_path_traversal(path: &str) -> bool {
 /// - `*` matches any sequence of characters in a single component
 /// - `**` matches any sequence of path components
 /// - Exact literal matching otherwise
+///
+/// # Security
+///
+/// Uses `Path::starts_with` for component-aware prefix matching to prevent
+/// boundary bypass attacks. For example, `/workspace/**/*.rs` should match
+/// `/workspace/src/main.rs` but NOT `/workspace_secrets/file.rs`.
 fn matches_glob(path: &Path, pattern: &str) -> bool {
-    let path_str = path.to_string_lossy();
-
     // Handle ** for recursive matching
     if pattern.contains("**") {
         // Convert ** to regex-like matching
@@ -699,11 +753,18 @@ fn matches_glob(path: &Path, pattern: &str) -> bool {
             let prefix = parts[0].trim_end_matches('/');
             let suffix = parts[1].trim_start_matches('/');
 
-            if !prefix.is_empty() && !path_str.starts_with(prefix) {
-                return false;
+            // Security: Use Path::starts_with for component-aware matching.
+            // String-based starts_with would allow `/workspace_secrets/` to match
+            // a prefix of `/workspace/`, which is a security vulnerability.
+            if !prefix.is_empty() {
+                let prefix_path = Path::new(prefix);
+                if !path.starts_with(prefix_path) {
+                    return false;
+                }
             }
             if !suffix.is_empty() {
                 // Check if any component matches the suffix pattern
+                let path_str = path.to_string_lossy();
                 return path_str.ends_with(suffix)
                     || path
                         .file_name()
@@ -751,10 +812,21 @@ mod tests {
     }
 
     #[test]
-    fn test_size_limits_zero_means_default() {
+    fn test_size_limits_default_fail_closed() {
+        // Per CTR-2003 (fail-closed), Default uses default_limits() not zeroed values.
+        // This ensures capabilities without explicit limits get safe defaults.
         let limits = SizeLimits::default();
-        // Zero means use default (unlimited in this case)
-        assert!(limits.allows_read_size(u64::MAX));
+
+        // Default should equal default_limits()
+        assert_eq!(limits, SizeLimits::default_limits());
+
+        // Default limits should allow reasonable sizes
+        assert!(limits.allows_read_size(1024));
+        assert!(limits.allows_read_size(100 * 1024 * 1024)); // 100 MB
+
+        // Default limits should reject oversized operations
+        assert!(!limits.allows_read_size(101 * 1024 * 1024)); // > 100 MB
+        assert!(!limits.allows_read_size(u64::MAX));
     }
 
     #[test]
@@ -923,5 +995,172 @@ mod tests {
         assert!(!contains_path_traversal("/path/to/file"));
         assert!(!contains_path_traversal("..."));
         assert!(!contains_path_traversal("..file"));
+    }
+
+    // ==========================================================================
+    // Security Regression Tests
+    //
+    // These tests verify fixes for security vulnerabilities identified in
+    // security review. DO NOT REMOVE or modify without security review approval.
+    // ==========================================================================
+
+    /// Regression test for [HIGH] Network Host Suffix Matching Vulnerability.
+    ///
+    /// The vulnerable implementation used `host.ends_with(suffix)` which
+    /// allowed `attacker-domain.com` to match a policy intended for
+    /// `*.domain.com`.
+    ///
+    /// Fix: Check for `.` prefix before suffix match to respect component
+    /// boundaries.
+    #[test]
+    fn test_network_policy_suffix_attack_regression() {
+        let policy = NetworkPolicy {
+            allowed_hosts: vec!["*.domain.com".to_string()],
+            allowed_ports: vec![443],
+            require_tls: true,
+        };
+
+        // MUST allow legitimate subdomains
+        assert!(
+            policy.allows("api.domain.com", 443),
+            "legitimate subdomain should be allowed"
+        );
+        assert!(
+            policy.allows("sub.api.domain.com", 443),
+            "deeply nested subdomain should be allowed"
+        );
+        assert!(
+            policy.allows("domain.com", 443),
+            "exact domain match should be allowed"
+        );
+
+        // MUST REJECT suffix attacks - this was the vulnerability
+        assert!(
+            !policy.allows("attacker-domain.com", 443),
+            "SECURITY: attacker-domain.com must NOT match *.domain.com"
+        );
+        assert!(
+            !policy.allows("evil-domain.com", 443),
+            "SECURITY: evil-domain.com must NOT match *.domain.com"
+        );
+        assert!(
+            !policy.allows("notdomain.com", 443),
+            "SECURITY: notdomain.com must NOT match *.domain.com"
+        );
+
+        // Edge cases
+        assert!(
+            !policy.allows("xdomain.com", 443),
+            "SECURITY: xdomain.com must NOT match *.domain.com"
+        );
+        assert!(
+            !policy.allows("domain.com.evil.com", 443),
+            "SECURITY: domain.com.evil.com must NOT match *.domain.com"
+        );
+    }
+
+    /// Regression test for [HIGH] Glob Prefix Boundary Bypass.
+    ///
+    /// The vulnerable implementation used string-based `starts_with(prefix)`
+    /// which allowed `/workspace_secrets/file.rs` to match
+    /// `/workspace/**/*.rs`.
+    ///
+    /// Fix: Use `Path::starts_with` which is component-aware.
+    #[test]
+    fn test_glob_prefix_boundary_bypass_regression() {
+        // MUST match paths under the actual prefix
+        assert!(
+            matches_glob(Path::new("/workspace/src/main.rs"), "/workspace/**/*.rs"),
+            "file under /workspace/ should match"
+        );
+        assert!(
+            matches_glob(
+                Path::new("/workspace/deep/nested/lib.rs"),
+                "/workspace/**/*.rs"
+            ),
+            "deeply nested file under /workspace/ should match"
+        );
+
+        // MUST REJECT paths that merely share a string prefix - this was the
+        // vulnerability
+        assert!(
+            !matches_glob(
+                Path::new("/workspace_secrets/file.rs"),
+                "/workspace/**/*.rs"
+            ),
+            "SECURITY: /workspace_secrets/ must NOT match /workspace/**"
+        );
+        assert!(
+            !matches_glob(Path::new("/workspacex/file.rs"), "/workspace/**/*.rs"),
+            "SECURITY: /workspacex/ must NOT match /workspace/**"
+        );
+        assert!(
+            !matches_glob(
+                Path::new("/workspace-private/secrets.rs"),
+                "/workspace/**/*.rs"
+            ),
+            "SECURITY: /workspace-private/ must NOT match /workspace/**"
+        );
+
+        // Edge cases
+        assert!(
+            !matches_glob(Path::new("/workspaces/file.rs"), "/workspace/**/*.rs"),
+            "SECURITY: /workspaces/ must NOT match /workspace/**"
+        );
+    }
+
+    /// Regression test for [MEDIUM] Unlimited Default Size Limits.
+    ///
+    /// The vulnerable implementation used `#[derive(Default)]` which zeroed all
+    /// fields, and the validation logic interpreted 0 as unlimited.
+    ///
+    /// Fix: Implement `Default` using `default_limits()` for fail-closed
+    /// behavior.
+    #[test]
+    fn test_size_limits_zero_is_not_unlimited_regression() {
+        // Create limits with zero values explicitly
+        let zero_limits = SizeLimits {
+            max_read_bytes: 0,
+            max_write_bytes: 0,
+            max_command_bytes: 0,
+            max_response_bytes: 0,
+        };
+
+        // MUST reject ALL sizes when limit is zero (fail-closed)
+        assert!(
+            !zero_limits.allows_read_size(1),
+            "SECURITY: zero limit must not allow any bytes"
+        );
+        assert!(
+            !zero_limits.allows_write_size(1),
+            "SECURITY: zero limit must not allow any bytes"
+        );
+        assert!(
+            !zero_limits.allows_command_size(1),
+            "SECURITY: zero limit must not allow any bytes"
+        );
+
+        // Zero bytes should be allowed when limit is zero
+        assert!(
+            zero_limits.allows_read_size(0),
+            "zero bytes should be allowed with zero limit"
+        );
+    }
+
+    /// Test that `CapabilityScope::default()` uses safe limits.
+    #[test]
+    fn test_capability_scope_default_uses_safe_limits() {
+        let scope = CapabilityScope::default();
+
+        // Default scope should use default_limits(), not zeroed values
+        assert_eq!(
+            scope.size_limits,
+            SizeLimits::default_limits(),
+            "SECURITY: CapabilityScope::default() must use default_limits()"
+        );
+
+        // Verify it actually enforces limits
+        assert!(scope.allows_read_size(100 * 1024 * 1024)); // 100 MB OK
+        assert!(!scope.allows_read_size(101 * 1024 * 1024)); // 101 MB rejected
     }
 }
