@@ -210,19 +210,27 @@ impl ProtocolServer {
     }
 
     /// Ensure a directory exists with appropriate permissions.
+    ///
+    /// # Security
+    ///
+    /// This function enforces directory permissions unconditionally
+    /// (fail-closed). Even if the directory already exists with loose
+    /// permissions (e.g., 0777), we correct them to 0700 to prevent local
+    /// manipulation of the socket.
     fn ensure_directory(path: &Path) -> ProtocolResult<()> {
-        if path.exists() {
-            return Ok(());
+        // Create directory if it doesn't exist
+        if !path.exists() {
+            std::fs::create_dir_all(path).map_err(|e| {
+                ProtocolError::Io(io::Error::new(
+                    e.kind(),
+                    format!("failed to create directory {}: {e}", path.display()),
+                ))
+            })?;
         }
 
-        std::fs::create_dir_all(path).map_err(|e| {
-            ProtocolError::Io(io::Error::new(
-                e.kind(),
-                format!("failed to create directory {}: {e}", path.display()),
-            ))
-        })?;
-
-        // Set directory permissions to 0700 (owner only)
+        // Always enforce directory permissions to 0700 (owner only)
+        // This is critical even for pre-existing directories to prevent
+        // attackers from pre-creating directories with loose permissions.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -672,6 +680,43 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "socket permissions should be 0600, got {mode:04o}"
+        );
+    }
+
+    /// Test that pre-existing directories with loose permissions are corrected.
+    ///
+    /// This test verifies the fail-closed security behavior: if an attacker
+    /// pre-creates the socket directory with loose permissions (0777), the
+    /// server must correct them to 0700 to prevent local manipulation.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_directory_permissions_corrected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let socket_dir = tmp.path().join("apm2_test_dir");
+        let socket_path = socket_dir.join("test.sock");
+
+        // Pre-create directory with loose permissions (simulating attacker)
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        // Verify the directory has loose permissions
+        let initial_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            initial_mode, 0o777,
+            "Pre-condition: directory should be 0777"
+        );
+
+        // Bind server - should correct directory permissions
+        let config = ServerConfig::new(&socket_path);
+        let _server = ProtocolServer::bind(config).unwrap();
+
+        // Verify directory permissions were corrected to 0700
+        let corrected_mode = std::fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            corrected_mode, 0o700,
+            "Directory permissions should be corrected to 0700, got {corrected_mode:04o}"
         );
     }
 }
