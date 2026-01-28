@@ -41,35 +41,6 @@ decision_tree:
           action: "Read baseline documents and record invariants. Adopt the 5 mandatory security reasoning modes."
       next: PHASE_1_COLLECT_PR_IDENTITY
 
-[...]
-
-    - id: PHASE_6_COMPUTE_VERDICT
-      purpose: "Assign final verdict and severity using Assurance-Case reasoning."
-      severity_rubric:
-        CRITICAL: "authn/authz bypass, crypto weakness, RCE, secret exfiltration, fail-open in SCP."
-        HIGH: "DoS in SCP, corruption-stop failure, widened egress without policy."
-        MEDIUM: "Missing strict parsing (deny_unknown_fields), missing timeouts/limits."
-        LOW: "Non-SCP hygiene, refactors without boundary change."
-      rules:
-        BLOCK: "any CRITICAL or HIGH findings."
-        RE-AUDIT: "MANDATORY if SCP == YES and changes were made."
-      steps[1]:
-        - id: CONSTRUCT_ASSURANCE_CASE
-          action: "Construct a Claim-Argument-Evidence structure for each finding and the final verdict."
-      next: PHASE_7_EXECUTE_ACTIONS
-
-    - id: PHASE_7_EXECUTE_ACTIONS
-      purpose: "Post findings (Assurance-Case format) to PR and update status check."
-      steps[2]:
-        - id: POST_COMMENT
-          action: command
-          run: "gh pr comment $PR_URL --body \"$FINDINGS_ASSURANCE_CASE\""
-        - id: UPDATE_STATUS
-          action: command
-          run: |
-            IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL"
-            ELSE: "cargo xtask security-review-exec deny $PR_URL --reason \"$FINDINGS_ASSURANCE_CASE\""
-
     - id: PHASE_1_COLLECT_PR_IDENTITY
       purpose: "Gather PR metadata, diff, and ticket/RFC bindings."
       steps[3]:
@@ -221,7 +192,7 @@ decision_tree:
       next: PHASE_6_COMPUTE_VERDICT
 
     - id: PHASE_6_COMPUTE_VERDICT
-      purpose: "Assign final verdict and severity."
+      purpose: "Assign final verdict and severity using Assurance-Case reasoning."
       severity_rubric:
         CRITICAL: "authn/authz bypass, crypto weakness, RCE, secret exfiltration, fail-open in SCP."
         HIGH: "DoS in SCP, corruption-stop failure, widened egress without policy."
@@ -230,19 +201,22 @@ decision_tree:
       rules:
         BLOCK: "any CRITICAL or HIGH findings."
         RE-AUDIT: "MANDATORY if SCP == YES and changes were made."
+      steps[1]:
+        - id: CONSTRUCT_ASSURANCE_CASE
+          action: "Construct a Claim-Argument-Evidence structure for each finding and the final verdict."
       next: PHASE_7_EXECUTE_ACTIONS
 
     - id: PHASE_7_EXECUTE_ACTIONS
-      purpose: "Post findings to PR and update status check."
+      purpose: "Post findings (Assurance-Case format) to PR and update status check."
       steps[2]:
         - id: POST_COMMENT
           action: command
-          run: "gh pr comment $PR_URL --body \"$FINDINGS_TABLE\""
+          run: "gh pr comment $PR_URL --body \"$FINDINGS_ASSURANCE_CASE\""
         - id: UPDATE_STATUS
           action: command
           run: |
             IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL"
-            ELSE: "cargo xtask security-review-exec deny $PR_URL --reason \"$FINDINGS_TABLE\""
+            ELSE: "cargo xtask security-review-exec deny $PR_URL --reason \"$FINDINGS_ASSURANCE_CASE\""
 
 reference:
   paths:
