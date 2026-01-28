@@ -54,6 +54,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{CString, OsStr};
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -66,7 +67,7 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, close, execvp, fork, setsid};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -331,17 +332,30 @@ impl PtyRunner {
         match fork_result {
             ForkResult::Child => {
                 // Child process - setup and exec
+                //
+                // CRITICAL SECURITY: All error paths in the child process MUST call
+                // `libc::_exit(1)` instead of returning `Err`. Returning from the child
+                // would allow the forked process to continue executing the daemon's
+                // codebase as a "ghost" process, which is a severe security vulnerability.
+                //
+                // We use `_exit()` (not `exit()`) to avoid running atexit handlers and
+                // flushing stdio buffers from the parent's context.
+
                 // Close master fd in child
                 let _ = close(pty.master.as_raw_fd());
 
                 // Create new session (detach from controlling terminal)
-                setsid().map_err(PtyError::Setsid)?;
+                // SAFETY: _exit is safe to call from the child process
+                if setsid().is_err() {
+                    unsafe { libc::_exit(1) };
+                }
 
                 // Set slave as controlling terminal
                 // SAFETY: TIOCSCTTY is a valid ioctl for setting controlling terminal
                 unsafe {
                     if libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY, 0) < 0 {
-                        // Best effort - continue anyway
+                        // Best effort - continue anyway (some systems don't
+                        // require this)
                     }
                 }
 
@@ -349,16 +363,17 @@ impl PtyRunner {
                 // SAFETY: dup2 is a standard POSIX call. We're in the child
                 // process after fork, so we need to use raw file descriptors
                 // to set up stdin/stdout/stderr before exec.
+                // SAFETY: _exit is safe to call from the child process
                 let slave_fd = pty.slave.as_raw_fd();
                 unsafe {
                     if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
-                        return Err(PtyError::Dup2(Errno::last()));
+                        libc::_exit(1);
                     }
                     if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
-                        return Err(PtyError::Dup2(Errno::last()));
+                        libc::_exit(1);
                     }
                     if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
-                        return Err(PtyError::Dup2(Errno::last()));
+                        libc::_exit(1);
                     }
                 }
 
@@ -369,13 +384,14 @@ impl PtyRunner {
 
                 // Execute the program
                 // This replaces the current process image
-                execvp(&program_cstr, &arg_cstrings).map_err(|e| PtyError::Exec {
-                    command: program_path.display().to_string(),
-                    source: e,
-                })?;
+                // SAFETY: _exit is safe to call from the child process
+                if execvp(&program_cstr, &arg_cstrings).is_err() {
+                    unsafe { libc::_exit(127) }; // 127 = command not found convention
+                }
 
-                // execvp never returns on success
-                unreachable!()
+                // execvp never returns on success, but if it somehow does, exit
+                // SAFETY: _exit is safe to call from the child process
+                unsafe { libc::_exit(1) };
             },
             ForkResult::Parent { child } => {
                 // Parent process
@@ -458,16 +474,14 @@ impl PtyRunner {
         let master_fd = self.master_fd.as_ref().ok_or(PtyError::NotRunning)?;
 
         // Create async file from raw fd
-        // SAFETY: We're borrowing the fd temporarily for the write
+        // SAFETY: We're borrowing the fd temporarily for the write.
+        // We use ManuallyDrop to prevent the file from closing our fd when dropped.
+        // This is panic-safe: even if a panic occurs during the await, ManuallyDrop
+        // ensures the destructor never runs, preventing double-close.
         let fd = master_fd.as_raw_fd();
-        let mut file = unsafe { tokio::fs::File::from_raw_fd(fd) };
+        let mut file = ManuallyDrop::new(unsafe { tokio::fs::File::from_raw_fd(fd) });
 
-        let result = file.write_all(data).await.map_err(PtyError::Write);
-
-        // Forget the file to prevent it from closing our fd
-        std::mem::forget(file);
-
-        result
+        file.write_all(data).await.map_err(PtyError::Write)
     }
 
     /// Sends a signal to the child process.
@@ -646,87 +660,147 @@ fn path_to_cstring(path: &Path) -> Result<CString, PtyError> {
 }
 
 /// Spawns the async output capture task.
+///
+/// This task reads from the master PTY fd and sends output chunks through the
+/// channel. It uses `spawn_blocking` with synchronous I/O to avoid FD ownership
+/// conflicts with `send_input`. This approach prevents resource exhaustion at
+/// scale (`MAX_CONCURRENT_EPISODES` = 10,000) by not creating a new tokio
+/// runtime per PTY.
+///
+/// # FD Ownership
+///
+/// The capture task duplicates the master FD using `dup()` to get its own owned
+/// copy. This avoids IO Safety violations from multiple `tokio::fs::File`
+/// instances wrapping the same raw FD. The duplicated FD is closed when the
+/// task completes, while the original FD remains owned by `PtyRunner`.
+///
+/// # Timestamp Handling (HARD-TIME)
+///
+/// This function uses `clock_gettime(CLOCK_MONOTONIC)` directly for output
+/// timestamps. While the `spawn` function accepts a `timestamp_ns` parameter
+/// for HARD-TIME compliance at the episode envelope level, the capture task
+/// operates asynchronously and must timestamp each output chunk at the moment
+/// it's read. Using a stale initial timestamp would produce incorrect ordering
+/// information.
+///
+/// The monotonic clock is acceptable here because:
+/// 1. Output timestamps are for ordering within a single episode, not
+///    cross-episode
+/// 2. Sequence numbers provide the primary ordering guarantee (INV-OUT001)
+/// 3. The monotonic clock provides relative ordering without wall-clock issues
+///
+/// For replay/simulation scenarios where deterministic timestamps are required,
+/// the flight recorder should be fed pre-timestamped data rather than capturing
+/// live.
 fn spawn_capture_task(
     master_fd: i32,
     output_tx: mpsc::Sender<PtyOutput>,
     buffer_size: usize,
 ) -> tokio::task::JoinHandle<()> {
+    // Duplicate the FD so the capture task has its own owned copy.
+    // This avoids IO Safety violations from having multiple File handles to the
+    // same raw FD. The duplicated FD will be closed when the task's OwnedFd is
+    // dropped.
+    //
+    // SAFETY: master_fd is a valid open file descriptor. dup() returns a new fd
+    // that refers to the same open file description but has independent close
+    // semantics.
+    let capture_fd = unsafe { libc::dup(master_fd) };
+    if capture_fd < 0 {
+        // If dup fails, we can't capture output. Log and return a no-op task.
+        error!("failed to dup master fd for capture: {}", Errno::last());
+        return tokio::spawn(async {});
+    }
+
+    // Use spawn_blocking with synchronous I/O. This is simpler than async I/O
+    // and avoids the need for a nested runtime while still running on the
+    // existing thread pool.
     tokio::task::spawn_blocking(move || {
-        // Create a runtime for the async file operations
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("failed to create runtime for PTY capture: {}", e);
-                return;
-            },
-        };
+        // SAFETY: capture_fd is a valid FD from dup(). We take ownership via
+        // OwnedFd, which will close it when dropped.
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(capture_fd) };
 
-        rt.block_on(async move {
-            // SAFETY: We're borrowing the fd from the parent's OwnedFd
-            // The parent keeps the OwnedFd alive for the duration of the task
-            let file = unsafe { tokio::fs::File::from_raw_fd(master_fd) };
-            let mut reader = tokio::io::BufReader::with_capacity(buffer_size, file);
+        // Use std::fs::File for synchronous reads
+        let file = std::fs::File::from(owned_fd);
+        let mut reader = std::io::BufReader::with_capacity(buffer_size, file);
 
-            let mut seq_gen = SequenceGenerator::new();
-            let mut buf = vec![0u8; buffer_size];
+        let mut seq_gen = SequenceGenerator::new();
+        let mut buf = vec![0u8; buffer_size];
 
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => {
-                        // EOF - PTY closed
-                        debug!("PTY EOF reached");
+        // We need to send through the channel, which is async. Use a simple
+        // blocking approach with try_send and a small sleep on backpressure.
+        loop {
+            use std::io::Read;
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    // EOF - PTY closed
+                    debug!("PTY EOF reached");
+                    break;
+                },
+                Ok(n) => {
+                    // Get monotonic timestamp using clock_gettime.
+                    // See function-level documentation for HARD-TIME rationale.
+                    let ts_mono = get_monotonic_ns();
+                    let seq = seq_gen.next();
+
+                    let output =
+                        PtyOutput::combined(Bytes::copy_from_slice(&buf[..n]), seq, ts_mono);
+
+                    // Use blocking_send since we're in spawn_blocking
+                    if output_tx.blocking_send(output).is_err() {
+                        // Receiver dropped
+                        debug!("output channel closed");
                         break;
-                    },
-                    Ok(n) => {
-                        // Get monotonic timestamp
-                        // Note: We use the system monotonic clock here as the
-                        // timestamp source. In production, this would be
-                        // injected for HARD-TIME compliance.
-                        let ts_mono = get_monotonic_ns();
-                        let seq = seq_gen.next();
-
-                        let output =
-                            PtyOutput::combined(Bytes::copy_from_slice(&buf[..n]), seq, ts_mono);
-
-                        if output_tx.send(output).await.is_err() {
-                            // Receiver dropped
-                            debug!("output channel closed");
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            // Non-blocking read with no data
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                            continue;
-                        }
-                        // Check if it's an I/O error due to child exit
-                        if e.kind() == std::io::ErrorKind::Other
-                            || e.raw_os_error() == Some(libc::EIO)
-                        {
-                            debug!("PTY read error (child likely exited): {}", e);
-                            break;
-                        }
-                        error!("PTY read error: {}", e);
+                    }
+                },
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::Interrupted
+                    {
+                        // Transient error - retry after short sleep
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    // Check if it's an I/O error due to child exit
+                    if e.kind() == std::io::ErrorKind::Other || e.raw_os_error() == Some(libc::EIO)
+                    {
+                        debug!("PTY read error (child likely exited): {}", e);
                         break;
-                    },
-                }
+                    }
+                    error!("PTY read error: {}", e);
+                    break;
+                },
             }
+        }
 
-            // Forget the file to prevent double-close
-            // The parent's OwnedFd will close the fd
-            std::mem::forget(reader.into_inner());
-        });
+        // OwnedFd will close capture_fd when dropped here
     })
 }
 
 /// Gets the current monotonic timestamp in nanoseconds.
 ///
-/// Note: This is used internally for output timestamps. In a full HARD-TIME
-/// compliant implementation, timestamps would be injected by the caller.
+/// # HARD-TIME Compliance Note
+///
+/// This function uses `clock_gettime(CLOCK_MONOTONIC)` directly, which is an
+/// exception to the HARD-TIME principle of caller-provided timestamps. This is
+/// acceptable for PTY output capture because:
+///
+/// 1. **Async nature**: The capture task runs asynchronously and timestamps
+///    each output chunk at read time. Using a stale initial timestamp would
+///    produce incorrect ordering information.
+///
+/// 2. **Relative ordering**: Output timestamps are for ordering within a single
+///    episode, not for cross-episode correlation. The monotonic clock provides
+///    correct relative ordering.
+///
+/// 3. **Primary ordering via sequence numbers**: Sequence numbers (INV-OUT001)
+///    provide the definitive ordering guarantee. Timestamps are supplementary.
+///
+/// 4. **No wall-clock dependency**: `CLOCK_MONOTONIC` is not affected by NTP
+///    adjustments or timezone changes, avoiding the main HARD-TIME concerns.
+///
+/// For deterministic replay or simulation scenarios, pre-timestamped data
+/// should be injected directly rather than using live capture.
 #[allow(clippy::cast_sign_loss)]
 fn get_monotonic_ns() -> u64 {
     let mut ts = libc::timespec {

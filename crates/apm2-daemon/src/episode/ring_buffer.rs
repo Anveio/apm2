@@ -147,23 +147,52 @@ impl<T> Default for RingBuffer<T> {
     }
 }
 
-/// Default ring buffer sizes by risk tier (in bytes).
+/// Default ring buffer capacities by risk tier.
 ///
-/// Per ticket TCK-00161:
+/// **IMPORTANT**: `RingBuffer<T>` is item-count based, not byte-based.
+/// These constants specify the maximum number of `PtyOutput` items to retain.
+///
+/// The capacity values are derived from the original byte-based requirements
+/// (TCK-00161) divided by an estimated average output chunk size. Since PTY
+/// output typically arrives in chunks of 1-8KB (`READ_BUFFER_SIZE` = 8KB max),
+/// we use 4KB as the average chunk size estimate:
+///
+/// - Tier 1: ~1 MB / 4KB = 256 items
+/// - Tier 2: ~4 MB / 4KB = 1024 items
+/// - Tier 3+: ~16 MB / 4KB = 4096 items
+///
+/// This provides reasonable flight recorder retention while maintaining
+/// bounded memory usage. Actual memory usage depends on output chunk sizes.
+///
+/// Per ticket TCK-00161 original byte targets:
 /// - Tier 1: 1 MB
 /// - Tier 2: 4 MB
 /// - Tier 3+: 16 MB
 pub mod tier_defaults {
-    /// Tier 1 ring buffer size in bytes.
-    pub const TIER_1_BYTES: usize = 1024 * 1024; // 1 MB
+    /// Estimated average chunk size for capacity calculations (4 KB).
+    ///
+    /// This is a conservative estimate based on typical terminal output
+    /// patterns. `READ_BUFFER_SIZE` is 8KB, so chunks can be up to 8KB, but
+    /// most are smaller.
+    pub const ESTIMATED_AVG_CHUNK_SIZE: usize = 4 * 1024;
 
-    /// Tier 2 ring buffer size in bytes.
-    pub const TIER_2_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+    /// Tier 1 ring buffer capacity (item count, ~1 MB equivalent).
+    ///
+    /// 256 items * 4KB avg = ~1MB of output data retained.
+    pub const TIER_1_CAPACITY: usize = 256;
 
-    /// Tier 3+ ring buffer size in bytes.
-    pub const TIER_3_PLUS_BYTES: usize = 16 * 1024 * 1024; // 16 MB
+    /// Tier 2 ring buffer capacity (item count, ~4 MB equivalent).
+    ///
+    /// 1024 items * 4KB avg = ~4MB of output data retained.
+    pub const TIER_2_CAPACITY: usize = 1024;
 
-    /// Returns the default ring buffer size in bytes for the given risk tier.
+    /// Tier 3+ ring buffer capacity (item count, ~16 MB equivalent).
+    ///
+    /// 4096 items * 4KB avg = ~16MB of output data retained.
+    pub const TIER_3_PLUS_CAPACITY: usize = 4096;
+
+    /// Returns the default ring buffer capacity (item count) for the given risk
+    /// tier.
     ///
     /// # Arguments
     ///
@@ -171,16 +200,41 @@ pub mod tier_defaults {
     ///
     /// # Returns
     ///
-    /// Buffer size in bytes. Tier 0 returns 0 (no flight recorder for
+    /// Buffer capacity as item count. Tier 0 returns 0 (no flight recorder for
     /// read-only operations).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use apm2_daemon::episode::ring_buffer::tier_defaults::buffer_capacity_for_tier;
+    ///
+    /// assert_eq!(buffer_capacity_for_tier(0), 0);
+    /// assert_eq!(buffer_capacity_for_tier(1), 256);
+    /// assert_eq!(buffer_capacity_for_tier(2), 1024);
+    /// assert_eq!(buffer_capacity_for_tier(3), 4096);
+    /// ```
     #[must_use]
-    pub const fn buffer_size_for_tier(tier: u8) -> usize {
+    pub const fn buffer_capacity_for_tier(tier: u8) -> usize {
         match tier {
             0 => 0,
-            1 => TIER_1_BYTES,
-            2 => TIER_2_BYTES,
-            _ => TIER_3_PLUS_BYTES, // Tier 3, 4, and any future tiers
+            1 => TIER_1_CAPACITY,
+            2 => TIER_2_CAPACITY,
+            _ => TIER_3_PLUS_CAPACITY, // Tier 3, 4, and any future tiers
         }
+    }
+
+    /// Deprecated: Use `buffer_capacity_for_tier` instead.
+    ///
+    /// This function previously returned byte sizes, but `RingBuffer<T>` uses
+    /// item counts. The new function `buffer_capacity_for_tier` returns the
+    /// correct item-count values.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use buffer_capacity_for_tier() which returns item counts, not byte sizes"
+    )]
+    #[must_use]
+    pub const fn buffer_size_for_tier(tier: u8) -> usize {
+        buffer_capacity_for_tier(tier)
     }
 }
 
@@ -369,23 +423,59 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_tier_defaults() {
+    fn test_tier_defaults_capacities() {
         use tier_defaults::*;
 
-        assert_eq!(TIER_1_BYTES, 1024 * 1024);
-        assert_eq!(TIER_2_BYTES, 4 * 1024 * 1024);
-        assert_eq!(TIER_3_PLUS_BYTES, 16 * 1024 * 1024);
+        // Verify the capacity constants are reasonable item counts (not huge byte
+        // values)
+        assert_eq!(TIER_1_CAPACITY, 256);
+        assert_eq!(TIER_2_CAPACITY, 1024);
+        assert_eq!(TIER_3_PLUS_CAPACITY, 4096);
+
+        // Verify estimated chunk size is reasonable
+        assert_eq!(ESTIMATED_AVG_CHUNK_SIZE, 4 * 1024);
     }
 
     #[test]
-    fn test_buffer_size_for_tier() {
+    fn test_buffer_capacity_for_tier() {
         use tier_defaults::*;
 
-        assert_eq!(buffer_size_for_tier(0), 0);
-        assert_eq!(buffer_size_for_tier(1), TIER_1_BYTES);
-        assert_eq!(buffer_size_for_tier(2), TIER_2_BYTES);
-        assert_eq!(buffer_size_for_tier(3), TIER_3_PLUS_BYTES);
-        assert_eq!(buffer_size_for_tier(4), TIER_3_PLUS_BYTES);
-        assert_eq!(buffer_size_for_tier(255), TIER_3_PLUS_BYTES); // Future tiers
+        assert_eq!(buffer_capacity_for_tier(0), 0);
+        assert_eq!(buffer_capacity_for_tier(1), TIER_1_CAPACITY);
+        assert_eq!(buffer_capacity_for_tier(2), TIER_2_CAPACITY);
+        assert_eq!(buffer_capacity_for_tier(3), TIER_3_PLUS_CAPACITY);
+        assert_eq!(buffer_capacity_for_tier(4), TIER_3_PLUS_CAPACITY);
+        assert_eq!(buffer_capacity_for_tier(255), TIER_3_PLUS_CAPACITY); // Future tiers
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_buffer_size_for_tier() {
+        use tier_defaults::*;
+
+        // Verify deprecated function still works and returns same values
+        assert_eq!(buffer_size_for_tier(0), buffer_capacity_for_tier(0));
+        assert_eq!(buffer_size_for_tier(1), buffer_capacity_for_tier(1));
+        assert_eq!(buffer_size_for_tier(2), buffer_capacity_for_tier(2));
+        assert_eq!(buffer_size_for_tier(3), buffer_capacity_for_tier(3));
+    }
+
+    /// Verify that tier capacities are reasonable for creating `RingBuffer`s.
+    /// This ensures we don't accidentally pass byte values to the item-count
+    /// `RingBuffer`.
+    #[test]
+    fn test_tier_capacities_are_usable() {
+        use tier_defaults::*;
+
+        // Tier 0 is special - no buffer
+        // Tiers 1-3+ should all create valid ring buffers with reasonable capacities
+        let rb1: RingBuffer<u32> = RingBuffer::new(TIER_1_CAPACITY);
+        let rb2: RingBuffer<u32> = RingBuffer::new(TIER_2_CAPACITY);
+        let rb3: RingBuffer<u32> = RingBuffer::new(TIER_3_PLUS_CAPACITY);
+
+        // Verify capacities are what we expect
+        assert_eq!(rb1.capacity(), 256);
+        assert_eq!(rb2.capacity(), 1024);
+        assert_eq!(rb3.capacity(), 4096);
     }
 }
