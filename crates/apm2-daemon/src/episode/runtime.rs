@@ -202,6 +202,11 @@ pub struct EpisodeRuntime {
     events: RwLock<Vec<EpisodeEvent>>,
     /// Monotonic sequence number for session IDs.
     session_seq: AtomicU64,
+    /// Monotonic sequence number for episode ID entropy.
+    ///
+    /// This counter provides uniqueness even when multiple episodes
+    /// are created with the same envelope hash and timestamp.
+    episode_seq: AtomicU64,
     /// Start time for uptime calculation.
     started_at: Instant,
 }
@@ -215,6 +220,7 @@ impl EpisodeRuntime {
             episodes: RwLock::new(HashMap::new()),
             events: RwLock::new(Vec::new()),
             session_seq: AtomicU64::new(1),
+            episode_seq: AtomicU64::new(1),
             started_at: Instant::now(),
         }
     }
@@ -265,11 +271,16 @@ impl EpisodeRuntime {
         envelope_hash: Hash,
         timestamp_ns: u64,
     ) -> Result<EpisodeId, EpisodeError> {
-        // Generate episode ID from envelope hash and timestamp
+        // Generate episode ID from envelope hash, full nanosecond timestamp, and
+        // sequence number. The sequence number provides uniqueness even when
+        // multiple episodes are created with the same envelope hash and
+        // timestamp (high-concurrency scenario).
+        let seq = self.episode_seq.fetch_add(1, Ordering::Relaxed);
         let id_str = format!(
-            "ep-{}-{}",
+            "ep-{}-{}-{}",
             hex::encode(&envelope_hash[..8]),
-            timestamp_ns / 1_000_000 // milliseconds
+            timestamp_ns, // Full nanosecond precision
+            seq           // Monotonic sequence for entropy
         );
         let episode_id = EpisodeId::new(&id_str)?;
 
@@ -398,14 +409,13 @@ impl EpisodeRuntime {
                 session_id: session_id.clone(),
             };
 
-            // Create session handle
+            // Create session handle and store a clone in the entry.
+            // Both the caller's handle and the runtime's handle share the same
+            // underlying stop signal channel (INV-SH003), so signals sent via
+            // `runtime.signal()` are received by the caller's handle.
             let handle =
                 SessionHandle::new(episode_id.clone(), session_id.clone(), lease_id.clone());
-            entry.handle = Some(SessionHandle::new(
-                episode_id.clone(),
-                session_id.clone(),
-                lease_id.clone(),
-            ));
+            entry.handle = Some(handle.clone());
 
             handle
         };
@@ -939,7 +949,7 @@ mod tests {
         // Initially no stop signal
         assert!(!handle.should_stop());
 
-        // Signal stop
+        // Signal stop via runtime
         runtime
             .signal(
                 &episode_id,
@@ -950,8 +960,47 @@ mod tests {
             .await
             .unwrap();
 
-        // Note: The signal is sent to the internal handle, not the returned one
-        // This is by design - the caller's handle is independent
+        // The caller's handle receives the signal because both handles share
+        // the same underlying channel (INV-SH003).
+        assert!(handle.should_stop());
+        assert!(matches!(
+            handle.current_stop_signal(),
+            StopSignal::Graceful { reason } if reason == "test"
+        ));
+    }
+
+    /// Test that cloned `SessionHandle`s share the same stop signal channel.
+    #[tokio::test]
+    async fn test_session_handle_clone_shares_channel() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        let handle1 = runtime
+            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // Clone the handle
+        let handle2 = handle1.clone();
+
+        // Initially neither should stop
+        assert!(!handle1.should_stop());
+        assert!(!handle2.should_stop());
+
+        // Signal via handle1
+        handle1.signal_stop(StopSignal::Immediate {
+            reason: "test-clone".to_string(),
+        });
+
+        // Both handles should see the signal
+        assert!(handle1.should_stop());
+        assert!(handle2.should_stop());
+        assert!(matches!(
+            handle2.current_stop_signal(),
+            StopSignal::Immediate { reason } if reason == "test-clone"
+        ));
     }
 
     // Invalid transition tests
@@ -1228,5 +1277,73 @@ mod tests {
         let state1 = runtime.observe(&ep).await.unwrap();
         let state2 = runtime2.observe(&ep).await.unwrap();
         assert_eq!(state1, state2);
+    }
+
+    /// Test that episode IDs include nanosecond precision and sequence number
+    /// to prevent collisions in high-concurrency scenarios.
+    #[tokio::test]
+    async fn test_episode_id_includes_nanoseconds_and_sequence() {
+        let runtime = EpisodeRuntime::new(test_config());
+
+        // Create two episodes with the SAME envelope hash and timestamp
+        // The sequence number ensures they get unique IDs
+        let ep1 = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        let ep2 = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        // IDs must be different despite same hash and timestamp
+        assert_ne!(ep1.as_str(), ep2.as_str());
+
+        // Verify the ID format includes full nanosecond timestamp
+        // Format: ep-{hash}-{timestamp_ns}-{seq}
+        let id1 = ep1.as_str();
+        assert!(id1.starts_with("ep-"));
+
+        // The timestamp in the ID should be the full nanosecond value
+        assert!(
+            id1.split('-').count() >= 3,
+            "ID should have at least 3 parts: ep, hash, timestamp-seq"
+        );
+
+        // Verify the timestamp portion contains the full nanosecond value
+        // test_timestamp() = 1_704_067_200_000_000_000
+        assert!(
+            id1.contains("1704067200000000000"),
+            "ID should contain full nanosecond timestamp"
+        );
+    }
+
+    /// Test that concurrent episode creation with same parameters doesn't
+    /// collide.
+    #[tokio::test]
+    async fn test_episode_id_no_collision_concurrent() {
+        let runtime = Arc::new(EpisodeRuntime::new(test_config()));
+
+        // Spawn many concurrent creates with the same envelope hash
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let rt = Arc::clone(&runtime);
+            let hash = test_envelope_hash();
+            let ts = test_timestamp() + i; // Small variation in timestamp
+            handles.push(tokio::spawn(async move { rt.create(hash, ts).await }));
+        }
+
+        // Collect all results
+        let mut episode_ids = std::collections::HashSet::new();
+        for handle in handles {
+            let id = handle.await.unwrap().unwrap();
+            assert!(
+                episode_ids.insert(id.as_str().to_string()),
+                "Duplicate episode ID detected!"
+            );
+        }
+
+        // All 50 episodes should have unique IDs
+        assert_eq!(episode_ids.len(), 50);
     }
 }

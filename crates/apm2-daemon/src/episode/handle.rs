@@ -16,6 +16,24 @@ use super::state::TerminationClass;
 /// Maximum session ID length.
 pub const MAX_SESSION_ID_LEN: usize = 128;
 
+/// Shared inner state for `SessionHandle`.
+///
+/// This is wrapped in `Arc` to allow cloning handles while sharing
+/// the same stop signal channel.
+#[derive(Debug)]
+struct SessionHandleInner {
+    /// Episode identifier.
+    episode_id: EpisodeId,
+    /// Session identifier (unique within the episode).
+    session_id: String,
+    /// Lease ID authorizing this session.
+    lease_id: String,
+    /// When this session started.
+    started_at: Instant,
+    /// Sender for stop signals.
+    stop_sender: watch::Sender<StopSignal>,
+}
+
 /// Handle to a running episode session.
 ///
 /// This handle provides methods to interact with a running episode,
@@ -30,24 +48,24 @@ pub const MAX_SESSION_ID_LEN: usize = 128;
 /// - Stop signal receiver for graceful shutdown
 /// - Timing information for budget enforcement
 ///
+/// # Cloning
+///
+/// `SessionHandle` is `Clone`. All clones share the same underlying
+/// stop signal channel, so signals sent via any clone are received
+/// by all clones. This is essential for the runtime to signal the
+/// caller's handle.
+///
 /// # Invariants
 ///
 /// - [INV-SH001] Session IDs are unique within an episode
 /// - [INV-SH002] Start instant is immutable after creation
-#[derive(Debug)]
+/// - [INV-SH003] All clones share the same stop signal channel
+#[derive(Debug, Clone)]
 pub struct SessionHandle {
-    /// Episode identifier.
-    episode_id: EpisodeId,
-    /// Session identifier (unique within the episode).
-    session_id: String,
-    /// Lease ID authorizing this session.
-    lease_id: String,
-    /// When this session started.
-    started_at: Instant,
-    /// Receiver for stop signals.
+    /// Shared inner state.
+    inner: Arc<SessionHandleInner>,
+    /// Receiver for stop signals (cloned from shared sender).
     stop_receiver: watch::Receiver<StopSignal>,
-    /// Sender for stop signals (held internally for signaling).
-    stop_sender: Arc<watch::Sender<StopSignal>>,
 }
 
 impl SessionHandle {
@@ -64,53 +82,65 @@ impl SessionHandle {
         lease_id: impl Into<String>,
     ) -> Self {
         let (stop_sender, stop_receiver) = watch::channel(StopSignal::None);
-        Self {
+        let inner = SessionHandleInner {
             episode_id,
             session_id: session_id.into(),
             lease_id: lease_id.into(),
             started_at: Instant::now(),
+            stop_sender,
+        };
+        Self {
+            inner: Arc::new(inner),
             stop_receiver,
-            stop_sender: Arc::new(stop_sender),
         }
     }
 
     /// Returns the episode ID.
     #[must_use]
-    pub const fn episode_id(&self) -> &EpisodeId {
-        &self.episode_id
+    pub fn episode_id(&self) -> &EpisodeId {
+        &self.inner.episode_id
     }
 
     /// Returns the session ID.
     #[must_use]
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        &self.inner.session_id
     }
 
     /// Returns the lease ID.
     #[must_use]
     pub fn lease_id(&self) -> &str {
-        &self.lease_id
+        &self.inner.lease_id
     }
 
     /// Returns the duration since this session started.
+    ///
+    /// NOTE: This method uses `Instant::now()` internally, which introduces
+    /// non-determinism. For deterministic testing or replay scenarios,
+    /// use `started_at()` and compute elapsed time from a known timestamp.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
+        self.inner.started_at.elapsed()
     }
 
     /// Returns the start instant.
+    ///
+    /// Use this with an external timestamp for deterministic elapsed time
+    /// calculation instead of `elapsed()`.
     #[must_use]
-    pub const fn started_at(&self) -> Instant {
-        self.started_at
+    pub fn started_at(&self) -> Instant {
+        self.inner.started_at
     }
 
     /// Signals the session to stop with the given reason.
     ///
     /// This sends a stop signal that can be observed via `should_stop()`.
+    /// Because all clones of this handle share the same channel, the signal
+    /// is received by all holders of the handle.
     pub fn signal_stop(&self, signal: StopSignal) {
         // send() only fails if there are no receivers, which can't happen
         // since we hold a receiver ourselves.
-        let _ = self.stop_sender.send(signal);
+        let _ = self.inner.stop_sender.send(signal);
     }
 
     /// Returns the current stop signal, if any.
@@ -137,9 +167,9 @@ impl SessionHandle {
     #[must_use]
     pub fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
-            episode_id: self.episode_id.as_str().to_string(),
-            session_id: self.session_id.clone(),
-            lease_id: self.lease_id.clone(),
+            episode_id: self.inner.episode_id.as_str().to_string(),
+            session_id: self.inner.session_id.clone(),
+            lease_id: self.inner.lease_id.clone(),
             // Saturate to u64::MAX for durations exceeding ~584 million years
             elapsed_ms: u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX),
             stop_signal: self.current_stop_signal(),
@@ -375,5 +405,55 @@ mod tests {
             result.is_err(),
             "SessionSnapshot should reject unknown fields"
         );
+    }
+
+    /// Test that `SessionHandle` implements `Clone` and clones share the
+    /// channel.
+    #[test]
+    fn test_session_handle_is_clone() {
+        let handle1 = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
+        let handle2 = handle1.clone();
+
+        // Both handles should have the same identifiers
+        assert_eq!(handle1.episode_id().as_str(), handle2.episode_id().as_str());
+        assert_eq!(handle1.session_id(), handle2.session_id());
+        assert_eq!(handle1.lease_id(), handle2.lease_id());
+
+        // Initially neither should have a stop signal
+        assert!(!handle1.should_stop());
+        assert!(!handle2.should_stop());
+
+        // Signal through handle1
+        handle1.signal_stop(StopSignal::Graceful {
+            reason: "clone-test".to_string(),
+        });
+
+        // Both handles should see the signal (shared channel - INV-SH003)
+        assert!(handle1.should_stop());
+        assert!(handle2.should_stop());
+        assert!(matches!(
+            handle2.current_stop_signal(),
+            StopSignal::Graceful { reason } if reason == "clone-test"
+        ));
+    }
+
+    /// Test that multiple clones all share the same channel.
+    #[test]
+    fn test_session_handle_multiple_clones_share_channel() {
+        let handle1 = SessionHandle::new(test_episode_id(), "session-1", "lease-1");
+        let handle2 = handle1.clone();
+        let handle3 = handle2.clone();
+        let handle4 = handle1.clone();
+
+        // Signal through handle3
+        handle3.signal_stop(StopSignal::BudgetExhausted {
+            resource: "tokens".to_string(),
+        });
+
+        // All handles should see the signal
+        assert!(handle1.should_stop());
+        assert!(handle2.should_stop());
+        assert!(handle3.should_stop());
+        assert!(handle4.should_stop());
     }
 }
