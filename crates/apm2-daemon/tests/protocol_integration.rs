@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use apm2_daemon::protocol::{
     ClientHandshake, HandshakeMessage, Hello, PROTOCOL_VERSION, ProtocolServer, ServerConfig,
-    ServerHandshake, connect,
+    ServerHandshake, connect, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
@@ -51,6 +51,9 @@ async fn test_server_accepts_connection() {
 }
 
 /// Test full handshake protocol between client and server.
+///
+/// Uses the secure `parse_hello` and `parse_handshake_message` functions
+/// which enforce the 64KB handshake frame limit.
 #[tokio::test]
 async fn test_full_handshake_protocol() {
     let tmp = TempDir::new().unwrap();
@@ -64,21 +67,14 @@ async fn test_full_handshake_protocol() {
         let (mut conn, _permit) = server.accept().await.unwrap();
         let mut handshake = ServerHandshake::new("test-daemon/1.0");
 
-        // Receive Hello from client
+        // Receive Hello from client using secure parsing (enforces 64KB limit)
         let frame = conn.framed().next().await.unwrap().unwrap();
-        let hello_msg: HandshakeMessage = serde_json::from_slice(&frame).unwrap();
-
-        let HandshakeMessage::Hello(hello) = hello_msg else {
-            panic!("Expected Hello message")
-        };
+        let hello = parse_hello(&frame).expect("failed to parse Hello");
 
         // Process and send response
         let response = handshake.process_hello(&hello).unwrap();
-        let response_bytes = serde_json::to_vec(&response).unwrap();
-        conn.framed()
-            .send(Bytes::from(response_bytes))
-            .await
-            .unwrap();
+        let response_bytes = serialize_handshake_message(&response).unwrap();
+        conn.framed().send(response_bytes).await.unwrap();
 
         assert!(handshake.is_completed());
         handshake.negotiated_version()
@@ -88,19 +84,15 @@ async fn test_full_handshake_protocol() {
     let mut client_conn = connect(&socket_path).await.unwrap();
     let mut client_handshake = ClientHandshake::new("test-cli/1.0");
 
-    // Send Hello
+    // Send Hello using secure serialization
     let hello = client_handshake.create_hello();
     let hello_msg = HandshakeMessage::Hello(hello);
-    let hello_bytes = serde_json::to_vec(&hello_msg).unwrap();
-    client_conn
-        .framed()
-        .send(Bytes::from(hello_bytes))
-        .await
-        .unwrap();
+    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+    client_conn.framed().send(hello_bytes).await.unwrap();
 
-    // Receive response
+    // Receive response using secure parsing (enforces 64KB limit)
     let response_frame = client_conn.framed().next().await.unwrap().unwrap();
-    let response: HandshakeMessage = serde_json::from_slice(&response_frame).unwrap();
+    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
     client_handshake.process_response(response).unwrap();
 
     assert!(client_handshake.is_completed());
@@ -115,6 +107,9 @@ async fn test_full_handshake_protocol() {
 }
 
 /// Test that version mismatch is properly rejected.
+///
+/// Uses the secure parsing functions which enforce the 64KB handshake frame
+/// limit.
 #[tokio::test]
 async fn test_handshake_version_mismatch() {
     let tmp = TempDir::new().unwrap();
@@ -128,39 +123,29 @@ async fn test_handshake_version_mismatch() {
         let (mut conn, _permit) = server.accept().await.unwrap();
         let mut handshake = ServerHandshake::new("test-daemon/1.0");
 
+        // Use secure parsing (enforces 64KB limit)
         let frame = conn.framed().next().await.unwrap().unwrap();
-        let hello_msg: HandshakeMessage = serde_json::from_slice(&frame).unwrap();
-
-        let HandshakeMessage::Hello(hello) = hello_msg else {
-            panic!("Expected Hello")
-        };
+        let hello = parse_hello(&frame).expect("failed to parse Hello");
 
         let response = handshake.process_hello(&hello).unwrap();
-        let response_bytes = serde_json::to_vec(&response).unwrap();
-        conn.framed()
-            .send(Bytes::from(response_bytes))
-            .await
-            .unwrap();
+        let response_bytes = serialize_handshake_message(&response).unwrap();
+        conn.framed().send(response_bytes).await.unwrap();
 
         // Should have failed
         assert!(!handshake.is_completed());
     });
 
-    // Client sends incompatible version
+    // Client sends incompatible version using secure serialization
     let mut client_conn = connect(&socket_path).await.unwrap();
 
     let bad_hello = Hello::with_version(99, "bad-client/1.0");
     let hello_msg = HandshakeMessage::Hello(bad_hello);
-    let hello_bytes = serde_json::to_vec(&hello_msg).unwrap();
-    client_conn
-        .framed()
-        .send(Bytes::from(hello_bytes))
-        .await
-        .unwrap();
+    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+    client_conn.framed().send(hello_bytes).await.unwrap();
 
-    // Receive rejection
+    // Receive rejection using secure parsing (enforces 64KB limit)
     let response_frame = client_conn.framed().next().await.unwrap().unwrap();
-    let response: HandshakeMessage = serde_json::from_slice(&response_frame).unwrap();
+    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
 
     assert!(matches!(response, HandshakeMessage::HelloNack(_)));
 
