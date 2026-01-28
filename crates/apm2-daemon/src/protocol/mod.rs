@@ -88,11 +88,13 @@ pub mod handshake;
 pub mod server;
 
 // Re-export commonly used types at module level
-pub use error::{MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult};
+pub use error::{
+    MAX_FRAME_SIZE, MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult,
+};
 pub use framing::FrameCodec;
 pub use handshake::{
     ClientHandshake, HandshakeErrorCode, HandshakeMessage, HandshakeState, Hello, HelloAck,
-    HelloNack, ServerHandshake,
+    HelloNack, ServerHandshake, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,

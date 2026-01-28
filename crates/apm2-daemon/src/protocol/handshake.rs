@@ -29,9 +29,10 @@
 //! - Invalid handshake terminates the connection
 //! - Version mismatch provides diagnostic info without leaking internals
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use super::error::{PROTOCOL_VERSION, ProtocolError, ProtocolResult};
+use super::error::{MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult};
 
 /// Hello message sent by client to initiate handshake.
 ///
@@ -230,6 +231,82 @@ impl From<HelloNack> for HandshakeMessage {
     fn from(nack: HelloNack) -> Self {
         Self::HelloNack(nack)
     }
+}
+
+/// Parse a handshake message from raw frame bytes with size validation.
+///
+/// # Security
+///
+/// This function enforces [`MAX_HANDSHAKE_FRAME_SIZE`] to prevent
+/// denial-of-service attacks during the unauthenticated handshake phase. A
+/// malicious client could otherwise send a large Hello message (up to the 16MB
+/// general frame limit) to consume server memory and CPU before authentication.
+///
+/// # Errors
+///
+/// Returns `Err(ProtocolError::FrameTooLarge)` if the frame exceeds the
+/// handshake size limit, or `Err(ProtocolError::Serialization)` if the
+/// frame cannot be parsed as a valid handshake message.
+pub fn parse_handshake_message(frame: &Bytes) -> ProtocolResult<HandshakeMessage> {
+    // Validate frame size before parsing
+    if frame.len() > MAX_HANDSHAKE_FRAME_SIZE {
+        return Err(ProtocolError::FrameTooLarge {
+            size: frame.len(),
+            max: MAX_HANDSHAKE_FRAME_SIZE,
+        });
+    }
+
+    serde_json::from_slice(frame).map_err(|e| ProtocolError::Serialization {
+        reason: format!("invalid handshake message: {e}"),
+    })
+}
+
+/// Parse a Hello message from raw frame bytes with size validation.
+///
+/// # Security
+///
+/// This function enforces [`MAX_HANDSHAKE_FRAME_SIZE`] to prevent
+/// denial-of-service attacks. See [`parse_handshake_message`] for details.
+///
+/// # Errors
+///
+/// Returns `Err(ProtocolError::FrameTooLarge)` if the frame exceeds the
+/// handshake size limit, or `Err(ProtocolError::Serialization)` if the
+/// frame cannot be parsed as a valid Hello message.
+pub fn parse_hello(frame: &Bytes) -> ProtocolResult<Hello> {
+    // Validate frame size before parsing
+    if frame.len() > MAX_HANDSHAKE_FRAME_SIZE {
+        return Err(ProtocolError::FrameTooLarge {
+            size: frame.len(),
+            max: MAX_HANDSHAKE_FRAME_SIZE,
+        });
+    }
+
+    // Parse as envelope first to validate structure
+    let envelope: HandshakeMessage =
+        serde_json::from_slice(frame).map_err(|e| ProtocolError::Serialization {
+            reason: format!("invalid handshake message: {e}"),
+        })?;
+
+    match envelope {
+        HandshakeMessage::Hello(hello) => Ok(hello),
+        _ => Err(ProtocolError::HandshakeFailed {
+            reason: "expected Hello message".to_string(),
+        }),
+    }
+}
+
+/// Serialize a handshake message to bytes.
+///
+/// # Errors
+///
+/// Returns `Err(ProtocolError::Serialization)` if serialization fails.
+pub fn serialize_handshake_message(msg: &HandshakeMessage) -> ProtocolResult<Bytes> {
+    serde_json::to_vec(msg)
+        .map(Bytes::from)
+        .map_err(|e| ProtocolError::Serialization {
+            reason: format!("failed to serialize handshake message: {e}"),
+        })
 }
 
 /// Handshake state machine for the server side.
@@ -585,5 +662,114 @@ mod tests {
         let json = r#"{"protocol_version": 1, "client_info": "test", "unknown": "field"}"#;
         let result: Result<Hello, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_handshake_message_valid() {
+        let hello = Hello::new("test-client/1.0");
+        let msg: HandshakeMessage = hello.into();
+        let json = serde_json::to_vec(&msg).unwrap();
+        let frame = Bytes::from(json);
+
+        let parsed = parse_handshake_message(&frame).unwrap();
+        assert!(matches!(parsed, HandshakeMessage::Hello(_)));
+    }
+
+    #[test]
+    fn test_parse_hello_valid() {
+        let hello = Hello::new("test-client/1.0");
+        let msg: HandshakeMessage = hello.into();
+        let json = serde_json::to_vec(&msg).unwrap();
+        let frame = Bytes::from(json);
+
+        let parsed = parse_hello(&frame).unwrap();
+        assert_eq!(parsed.client_info, "test-client/1.0");
+    }
+
+    #[test]
+    fn test_parse_hello_wrong_type() {
+        // Sending HelloAck when Hello expected
+        let ack = HelloAck::new("server/1.0");
+        let msg: HandshakeMessage = ack.into();
+        let json = serde_json::to_vec(&msg).unwrap();
+        let frame = Bytes::from(json);
+
+        let result = parse_hello(&frame);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(ProtocolError::HandshakeFailed { .. })));
+    }
+
+    /// Test that oversized Hello messages are rejected during handshake.
+    ///
+    /// This verifies the security fix for the excessive handshake resource
+    /// limit. A malicious client should not be able to send a 1MB Hello
+    /// message.
+    #[test]
+    fn test_parse_hello_rejects_oversized_frame() {
+        // Create a frame that exceeds the handshake limit (64KB)
+        // We'll create a 1MB payload as specified in the security review
+        let oversized_payload = vec![b'x'; 1024 * 1024]; // 1 MB
+        let frame = Bytes::from(oversized_payload);
+
+        let result = parse_hello(&frame);
+        assert!(result.is_err());
+
+        match result {
+            Err(ProtocolError::FrameTooLarge { size, max }) => {
+                assert_eq!(size, 1024 * 1024);
+                assert_eq!(max, MAX_HANDSHAKE_FRAME_SIZE);
+            },
+            other => panic!("Expected FrameTooLarge error, got: {other:?}"),
+        }
+    }
+
+    /// Test that frames at exactly the handshake limit are accepted.
+    #[test]
+    fn test_parse_handshake_message_at_limit() {
+        // Create a valid-ish JSON that's at the limit
+        // We pad with whitespace which is valid JSON
+        let hello = Hello::new("cli/1.0");
+        let msg: HandshakeMessage = hello.into();
+        let mut json = serde_json::to_vec(&msg).unwrap();
+
+        // Pad to exactly the limit with spaces (valid JSON whitespace)
+        while json.len() < MAX_HANDSHAKE_FRAME_SIZE {
+            json.push(b' ');
+        }
+
+        let frame = Bytes::from(json);
+        assert_eq!(frame.len(), MAX_HANDSHAKE_FRAME_SIZE);
+
+        // Should succeed at exactly the limit
+        let result = parse_handshake_message(&frame);
+        assert!(result.is_ok());
+    }
+
+    /// Test that frames exceeding the handshake limit by 1 byte are rejected.
+    #[test]
+    fn test_parse_handshake_message_over_limit() {
+        // Create a frame 1 byte over the limit
+        let oversized_payload = vec![b'x'; MAX_HANDSHAKE_FRAME_SIZE + 1];
+        let frame = Bytes::from(oversized_payload);
+
+        let result = parse_handshake_message(&frame);
+        assert!(matches!(
+            result,
+            Err(ProtocolError::FrameTooLarge { size, max })
+            if size == MAX_HANDSHAKE_FRAME_SIZE + 1 && max == MAX_HANDSHAKE_FRAME_SIZE
+        ));
+    }
+
+    #[test]
+    fn test_serialize_handshake_message() {
+        let hello = Hello::new("test-client/1.0");
+        let msg: HandshakeMessage = hello.into();
+
+        let bytes = serialize_handshake_message(&msg).unwrap();
+        assert!(!bytes.is_empty());
+
+        // Verify it can be parsed back
+        let parsed = parse_handshake_message(&bytes).unwrap();
+        assert!(matches!(parsed, HandshakeMessage::Hello(_)));
     }
 }

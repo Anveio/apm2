@@ -24,6 +24,15 @@ use thiserror::Error;
 /// memory exhaustion attacks.
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
+/// Maximum handshake frame size in bytes (64 KiB).
+///
+/// Handshake messages (Hello/HelloAck/HelloNack) have a stricter limit
+/// than general protocol frames to prevent denial-of-service attacks during the
+/// unauthenticated handshake phase. This limit prevents a malicious
+/// client from consuming excessive memory and CPU (JSON parsing)
+/// before completing authentication.
+pub const MAX_HANDSHAKE_FRAME_SIZE: usize = 64 * 1024;
+
 /// Protocol version supported by this implementation.
 ///
 /// Version negotiation occurs during handshake. Clients with
@@ -214,9 +223,13 @@ mod tests {
         assert!(!err.is_recoverable());
     }
 
+    // Compile-time assertion: handshake limit must be less than general frame limit
+    const _: () = assert!(MAX_HANDSHAKE_FRAME_SIZE < MAX_FRAME_SIZE);
+
     #[test]
     fn test_constants() {
         assert_eq!(MAX_FRAME_SIZE, 16 * 1024 * 1024);
+        assert_eq!(MAX_HANDSHAKE_FRAME_SIZE, 64 * 1024);
         assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

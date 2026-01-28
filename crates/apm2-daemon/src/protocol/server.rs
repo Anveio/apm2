@@ -177,6 +177,25 @@ impl ProtocolServer {
             ))
         })?;
 
+        // Set socket file permissions to 0600 (owner read/write only)
+        // This is critical for security when custom socket paths are used in
+        // shared directories where the parent directory permissions may not
+        // be restrictive (e.g., /tmp).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&config.socket_path, perms).map_err(|e| {
+                ProtocolError::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to set socket permissions on {}: {e}",
+                        config.socket_path.display()
+                    ),
+                ))
+            })?;
+        }
+
         info!(
             socket_path = %config.socket_path.display(),
             max_connections = config.max_connections,
@@ -627,5 +646,32 @@ mod tests {
         assert_eq!(config.max_connections, 50);
         assert_eq!(config.server_info, "test-server/1.0");
         assert_eq!(config.policy_hash, Some("abc123".to_string()));
+    }
+
+    /// Test that socket file permissions are set to 0600 (owner read/write
+    /// only).
+    ///
+    /// This test verifies the security fix for custom socket paths that may be
+    /// created in shared directories (e.g., /tmp) where the parent directory
+    /// permissions are not restrictive.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_socket_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let socket_path = test_socket_path(&tmp);
+
+        let config = ServerConfig::new(&socket_path);
+        let _server = ProtocolServer::bind(config).unwrap();
+
+        // Verify socket file exists and has correct permissions
+        let metadata = std::fs::metadata(&socket_path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+
+        assert_eq!(
+            mode, 0o600,
+            "socket permissions should be 0600, got {mode:04o}"
+        );
     }
 }
