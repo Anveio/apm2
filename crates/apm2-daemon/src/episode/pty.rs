@@ -100,10 +100,10 @@ const MAX_CHANNEL_CAPACITY: usize = 8192;
 
 /// Grace period for SIGTERM before SIGKILL in drop (milliseconds).
 ///
-/// This is intentionally short (10ms) to avoid blocking tokio workers.
+/// This is intentionally short (5ms) to avoid blocking tokio workers.
 /// If the process needs longer to clean up, it should handle shutdown
 /// before the runner is dropped.
-const DROP_GRACE_PERIOD_MS: u64 = 10;
+const DROP_GRACE_PERIOD_MS: u64 = 5;
 
 /// PTY runner errors.
 #[derive(Debug, Error)]
@@ -848,7 +848,7 @@ impl Drop for PtyRunner {
             if matches!(self.try_wait(), Ok(ExitStatus::Running)) {
                 // Send SIGTERM
                 if self.signal(Signal::SIGTERM).is_ok() {
-                    // Brief grace period - kept short (10ms) to avoid blocking tokio workers.
+                    // Brief grace period - kept short (5ms) to avoid blocking tokio workers.
                     // Closing master_fd above already signals the child via EOF.
                     // If a process needs longer cleanup, it should be terminated gracefully
                     // before dropping the runner.

@@ -152,22 +152,22 @@ impl<T> Default for RingBuffer<T> {
 /// **IMPORTANT**: `RingBuffer<T>` is item-count based, not byte-based.
 /// These constants specify the maximum number of `PtyOutput` items to retain.
 ///
-/// The capacity values are derived from the original byte-based requirements
-/// (TCK-00161) divided by an estimated average output chunk size. Since PTY
-/// output typically arrives in chunks of 1-8KB (`READ_BUFFER_SIZE` = 8KB max),
-/// we use 4KB as the average chunk size estimate:
+/// # Aggregate Memory Consideration
 ///
-/// - Tier 1: ~1 MB / 4KB = 256 items
-/// - Tier 2: ~4 MB / 4KB = 1024 items
-/// - Tier 3+: ~16 MB / 4KB = 4096 items
+/// With a maximum of 10,000 concurrent episodes, aggregate memory usage must
+/// be bounded. Using conservative capacity limits:
 ///
-/// This provides reasonable flight recorder retention while maintaining
-/// bounded memory usage. Actual memory usage depends on output chunk sizes.
+/// - Tier 1: 64 items * 4KB avg = ~256KB per episode
+/// - Tier 2: 256 items * 4KB avg = ~1MB per episode
+/// - Tier 3+: 1024 items * 4KB avg = ~4MB per episode
 ///
-/// Per ticket TCK-00161 original byte targets:
-/// - Tier 1: 1 MB
-/// - Tier 2: 4 MB
-/// - Tier 3+: 16 MB
+/// Worst case (all 10,000 episodes at Tier 3+): 10,000 * 4MB = 40GB
+/// This is a reasonable upper bound for server deployments while still
+/// providing adequate flight recorder retention for debugging purposes.
+///
+/// The capacity values are derived from the estimated average output chunk
+/// size. Since PTY output typically arrives in chunks of 1-8KB
+/// (`READ_BUFFER_SIZE` = 8KB max), we use 4KB as the average chunk size.
 pub mod tier_defaults {
     /// Estimated average chunk size for capacity calculations (4 KB).
     ///
@@ -176,20 +176,20 @@ pub mod tier_defaults {
     /// most are smaller.
     pub const ESTIMATED_AVG_CHUNK_SIZE: usize = 4 * 1024;
 
-    /// Tier 1 ring buffer capacity (item count, ~1 MB equivalent).
+    /// Tier 1 ring buffer capacity (item count, ~256KB equivalent).
+    ///
+    /// 64 items * 4KB avg = ~256KB of output data retained.
+    pub const TIER_1_CAPACITY: usize = 64;
+
+    /// Tier 2 ring buffer capacity (item count, ~1MB equivalent).
     ///
     /// 256 items * 4KB avg = ~1MB of output data retained.
-    pub const TIER_1_CAPACITY: usize = 256;
+    pub const TIER_2_CAPACITY: usize = 256;
 
-    /// Tier 2 ring buffer capacity (item count, ~4 MB equivalent).
+    /// Tier 3+ ring buffer capacity (item count, ~4MB equivalent).
     ///
     /// 1024 items * 4KB avg = ~4MB of output data retained.
-    pub const TIER_2_CAPACITY: usize = 1024;
-
-    /// Tier 3+ ring buffer capacity (item count, ~16 MB equivalent).
-    ///
-    /// 4096 items * 4KB avg = ~16MB of output data retained.
-    pub const TIER_3_PLUS_CAPACITY: usize = 4096;
+    pub const TIER_3_PLUS_CAPACITY: usize = 1024;
 
     /// Returns the default ring buffer capacity (item count) for the given risk
     /// tier.
@@ -210,9 +210,9 @@ pub mod tier_defaults {
     /// use apm2_daemon::episode::ring_buffer::tier_defaults::buffer_capacity_for_tier;
     ///
     /// assert_eq!(buffer_capacity_for_tier(0), 1);
-    /// assert_eq!(buffer_capacity_for_tier(1), 256);
-    /// assert_eq!(buffer_capacity_for_tier(2), 1024);
-    /// assert_eq!(buffer_capacity_for_tier(3), 4096);
+    /// assert_eq!(buffer_capacity_for_tier(1), 64);
+    /// assert_eq!(buffer_capacity_for_tier(2), 256);
+    /// assert_eq!(buffer_capacity_for_tier(3), 1024);
     /// ```
     #[must_use]
     pub const fn buffer_capacity_for_tier(tier: u8) -> usize {
@@ -428,10 +428,11 @@ mod tests {
         use tier_defaults::*;
 
         // Verify the capacity constants are reasonable item counts (not huge byte
-        // values)
-        assert_eq!(TIER_1_CAPACITY, 256);
-        assert_eq!(TIER_2_CAPACITY, 1024);
-        assert_eq!(TIER_3_PLUS_CAPACITY, 4096);
+        // values). These are conservative to bound aggregate memory usage:
+        // 10,000 episodes * 4MB max = 40GB worst case.
+        assert_eq!(TIER_1_CAPACITY, 64);
+        assert_eq!(TIER_2_CAPACITY, 256);
+        assert_eq!(TIER_3_PLUS_CAPACITY, 1024);
 
         // Verify estimated chunk size is reasonable
         assert_eq!(ESTIMATED_AVG_CHUNK_SIZE, 4 * 1024);
@@ -495,9 +496,9 @@ mod tests {
         let rb2: RingBuffer<u32> = RingBuffer::new(TIER_2_CAPACITY);
         let rb3: RingBuffer<u32> = RingBuffer::new(TIER_3_PLUS_CAPACITY);
 
-        // Verify capacities are what we expect
-        assert_eq!(rb1.capacity(), 256);
-        assert_eq!(rb2.capacity(), 1024);
-        assert_eq!(rb3.capacity(), 4096);
+        // Verify capacities are what we expect (conservative for aggregate memory)
+        assert_eq!(rb1.capacity(), 64);
+        assert_eq!(rb2.capacity(), 256);
+        assert_eq!(rb3.capacity(), 1024);
     }
 }
