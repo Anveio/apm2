@@ -240,7 +240,13 @@ impl CapabilityDecision {
 }
 
 /// Reason for capability denial.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum DenyReason {
     /// No capability matches the requested tool class.
     NoMatchingCapability {
@@ -315,7 +321,13 @@ impl std::fmt::Display for DenyReason {
 /// Per AD-TOOL-002, capabilities are sealed references that cannot be
 /// forged or escalated. Each capability grants access to a specific tool
 /// class within the defined scope.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capability {
     /// Unique identifier for this capability within the manifest.
     pub capability_id: String,
@@ -475,7 +487,13 @@ impl CapabilityBuilder {
 /// - Is immutable once created
 /// - Is referenced by hash in the episode envelope
 /// - Expires at a specified time (optional)
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityManifest {
     /// Unique identifier for this manifest.
     pub manifest_id: String,

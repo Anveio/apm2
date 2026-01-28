@@ -305,7 +305,13 @@ impl BrokerToolRequest {
 /// - Episode ID
 /// - Tool class
 /// - Relevant arguments (normalized)
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DedupeKey(String);
 
 impl DedupeKey {
@@ -445,7 +451,13 @@ impl ToolDecision {
 ///
 /// This represents the estimated or actual resource consumption for a tool
 /// invocation, used for budget enforcement.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetDelta {
     /// Tokens consumed (for inference operations).
     pub tokens: u64,
@@ -517,7 +529,13 @@ impl BudgetDelta {
 ///
 /// This captures the output, timing, and resource usage of a completed tool
 /// invocation. Results are stored in the dedupe cache for idempotent replay.
+///
+/// # Security
+///
+/// Uses `deny_unknown_fields` to prevent field injection attacks when
+/// deserializing from untrusted input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolResult {
     /// The request ID this result corresponds to.
     pub request_id: String,

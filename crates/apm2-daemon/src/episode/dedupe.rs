@@ -36,6 +36,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 
@@ -55,15 +56,50 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// Maximum TTL for cache entries (24 hours).
 pub const MAX_TTL_SECS: u64 = 86400;
 
+/// Default maximum total bytes for the dedupe cache (100 MB).
+///
+/// This provides a memory safety bound independent of entry count.
+/// With a 10MB max output per entry, even 100k entries could theoretically
+/// consume 1TB of RAM without this limit.
+pub const DEFAULT_MAX_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+
+/// Minimum allowed value for `max_total_bytes` (1 MB).
+///
+/// This prevents misconfiguration that could cause constant eviction.
+pub const MIN_MAX_TOTAL_BYTES: usize = 1024 * 1024;
+
 // =============================================================================
 // DedupeCacheConfig
 // =============================================================================
 
 /// Configuration for the dedupe cache.
-#[derive(Debug, Clone)]
+///
+/// # Memory Safety
+///
+/// The cache enforces two independent bounds to prevent resource exhaustion:
+/// 1. `max_entries` - Maximum number of cached entries (default: 100,000)
+/// 2. `max_total_bytes` - Maximum aggregate memory for cached outputs (default:
+///    100 MB)
+///
+/// Both limits trigger LRU eviction when exceeded. The memory limit is critical
+/// because individual tool outputs can be up to 10 MB each (per
+/// `MAX_TOOL_OUTPUT_SIZE`), meaning 100k entries could theoretically consume 1
+/// TB of RAM without it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DedupeCacheConfig {
     /// Maximum number of entries in the cache.
     pub max_entries: usize,
+
+    /// Maximum total bytes for all cached outputs combined.
+    ///
+    /// When inserting would exceed this limit, entries are evicted in LRU order
+    /// until the new entry fits. This provides memory safety independent of
+    /// entry count.
+    ///
+    /// Default: 100 MB (`DEFAULT_MAX_TOTAL_BYTES`)
+    /// Minimum: 1 MB (`MIN_MAX_TOTAL_BYTES`)
+    pub max_total_bytes: usize,
 
     /// Time-to-live for cache entries in seconds.
     pub ttl_secs: u64,
@@ -76,6 +112,7 @@ impl Default for DedupeCacheConfig {
     fn default() -> Self {
         Self {
             max_entries: MAX_DEDUPE_ENTRIES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             ttl_secs: DEFAULT_TTL_SECS,
             track_episodes: true,
         }
@@ -87,6 +124,19 @@ impl DedupeCacheConfig {
     #[must_use]
     pub const fn with_max_entries(mut self, max: usize) -> Self {
         self.max_entries = max;
+        self
+    }
+
+    /// Creates a config with custom max total bytes.
+    ///
+    /// Values below `MIN_MAX_TOTAL_BYTES` (1 MB) are clamped to the minimum.
+    #[must_use]
+    pub const fn with_max_total_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_total_bytes = if max_bytes < MIN_MAX_TOTAL_BYTES {
+            MIN_MAX_TOTAL_BYTES
+        } else {
+            max_bytes
+        };
         self
     }
 
@@ -132,6 +182,11 @@ struct CacheEntry {
 
     /// Number of times this entry has been accessed.
     access_count: u64,
+
+    /// Size of the cached output in bytes.
+    ///
+    /// Used for memory-based eviction to prevent resource exhaustion.
+    output_size: usize,
 }
 
 impl CacheEntry {
@@ -209,6 +264,13 @@ pub struct DedupeCache {
 
     /// Index of dedupe keys by episode ID for bulk eviction.
     by_episode: RwLock<HashMap<String, HashSet<DedupeKey>>>,
+
+    /// Total bytes currently cached.
+    ///
+    /// This tracks the aggregate size of all cached outputs for memory-based
+    /// eviction. When inserting would exceed `config.max_total_bytes`, entries
+    /// are evicted in LRU order until the new entry fits.
+    total_bytes: RwLock<usize>,
 }
 
 impl DedupeCache {
@@ -220,6 +282,7 @@ impl DedupeCache {
             entries: RwLock::new(HashMap::new()),
             lru_order: RwLock::new(VecDeque::new()),
             by_episode: RwLock::new(HashMap::new()),
+            total_bytes: RwLock::new(0),
         }
     }
 
@@ -237,6 +300,11 @@ impl DedupeCache {
     /// Returns `true` if the cache is empty.
     pub async fn is_empty(&self) -> bool {
         self.entries.read().await.is_empty()
+    }
+
+    /// Returns the current total bytes cached.
+    pub async fn total_bytes(&self) -> usize {
+        *self.total_bytes.read().await
     }
 
     /// Looks up a cached result by dedupe key.
@@ -271,7 +339,8 @@ impl DedupeCache {
 
     /// Inserts a result into the cache.
     ///
-    /// If the cache is at capacity, the oldest entry is evicted first.
+    /// If the cache is at entry count or memory capacity, the oldest entries
+    /// are evicted first (LRU eviction).
     ///
     /// # Arguments
     ///
@@ -286,12 +355,24 @@ impl DedupeCache {
         result: ToolResult,
         current_ns: u64,
     ) {
+        let output_size = result.output.len();
+
         // Evict expired entries first
         self.evict_expired(current_ns).await;
 
-        // Evict LRU if at capacity
+        // Evict LRU if at entry count capacity
         while self.len().await >= self.config.max_entries {
             if !self.evict_lru().await {
+                break;
+            }
+        }
+
+        // Evict LRU if inserting would exceed memory limit
+        while self.total_bytes().await.saturating_add(output_size) > self.config.max_total_bytes {
+            if !self.evict_lru().await {
+                // No more entries to evict but still over limit
+                // This can happen if output_size alone exceeds max_total_bytes
+                // In this case, we still insert (the single-entry case)
                 break;
             }
         }
@@ -301,6 +382,7 @@ impl DedupeCache {
             inserted_at_ns: current_ns,
             episode_id: episode_id.clone(),
             access_count: 0,
+            output_size,
         };
 
         let lru_entry = LruEntry {
@@ -308,10 +390,18 @@ impl DedupeCache {
             inserted_at_ns: current_ns,
         };
 
-        // Insert entry
+        // Insert entry and update total bytes
         {
             let mut entries = self.entries.write().await;
+            // If replacing an existing entry, subtract its size first
+            if let Some(old_entry) = entries.get(&key) {
+                let mut total = self.total_bytes.write().await;
+                *total = total.saturating_sub(old_entry.output_size);
+            }
             entries.insert(key.clone(), entry);
+
+            let mut total = self.total_bytes.write().await;
+            *total = total.saturating_add(output_size);
         }
 
         // Add to LRU order
@@ -329,7 +419,7 @@ impl DedupeCache {
                 .insert(key.clone());
         }
 
-        debug!(key = %key, "inserted into dedupe cache");
+        debug!(key = %key, output_size, "inserted into dedupe cache");
     }
 
     /// Evicts all entries for a specific episode.
@@ -357,17 +447,21 @@ impl DedupeCache {
             return 0;
         }
 
-        // Remove entries
+        // Remove entries and track freed bytes
         let mut entries = self.entries.write().await;
+        let mut total = self.total_bytes.write().await;
         let mut evicted = 0;
+        let mut freed_bytes = 0usize;
         for key in keys {
-            if entries.remove(&key).is_some() {
+            if let Some(entry) = entries.remove(&key) {
+                freed_bytes = freed_bytes.saturating_add(entry.output_size);
                 evicted += 1;
             }
         }
+        *total = total.saturating_sub(freed_bytes);
 
         // Note: We don't remove from LRU order - ghost key detection handles it
-        debug!(episode_id = %episode_id, evicted, "evicted episode cache entries");
+        debug!(episode_id = %episode_id, evicted, freed_bytes, "evicted episode cache entries");
         evicted
     }
 
@@ -380,19 +474,23 @@ impl DedupeCache {
         let ttl_ns = self.config.ttl_secs * 1_000_000_000;
 
         let mut entries = self.entries.write().await;
+        let mut total = self.total_bytes.write().await;
         let before = entries.len();
+        let mut freed_bytes = 0usize;
 
         entries.retain(|key, entry| {
             let expired = entry.is_expired(current_ns, ttl_ns);
             if expired {
+                freed_bytes = freed_bytes.saturating_add(entry.output_size);
                 trace!(key = %key, "evicting expired entry");
             }
             !expired
         });
 
+        *total = total.saturating_sub(freed_bytes);
         let evicted = before - entries.len();
         if evicted > 0 {
-            debug!(evicted, "evicted expired cache entries");
+            debug!(evicted, freed_bytes, "evicted expired cache entries");
         }
         evicted
     }
@@ -423,6 +521,11 @@ impl DedupeCache {
                 if entry.inserted_at_ns == lru_entry.inserted_at_ns {
                     // Valid entry - evict it
                     if let Some(evicted) = entries.remove(&lru_entry.key) {
+                        // Update total bytes
+                        {
+                            let mut total = self.total_bytes.write().await;
+                            *total = total.saturating_sub(evicted.output_size);
+                        }
                         // Clean up episode index
                         if self.config.track_episodes {
                             let mut by_ep = self.by_episode.write().await;
@@ -430,7 +533,7 @@ impl DedupeCache {
                                 keys.remove(&lru_entry.key);
                             }
                         }
-                        trace!(key = %lru_entry.key, "evicted LRU entry");
+                        trace!(key = %lru_entry.key, output_size = evicted.output_size, "evicted LRU entry");
                         return true;
                     }
                 }
@@ -446,10 +549,12 @@ impl DedupeCache {
         let mut entries = self.entries.write().await;
         let mut lru = self.lru_order.write().await;
         let mut by_ep = self.by_episode.write().await;
+        let mut total = self.total_bytes.write().await;
 
         entries.clear();
         lru.clear();
         by_ep.clear();
+        *total = 0;
 
         debug!("cleared dedupe cache");
     }
@@ -459,12 +564,15 @@ impl DedupeCache {
         let entries = self.entries.read().await;
         let lru = self.lru_order.read().await;
         let by_ep = self.by_episode.read().await;
+        let total = self.total_bytes.read().await;
 
         DedupeCacheStats {
             entry_count: entries.len(),
             lru_queue_len: lru.len(),
             episode_count: by_ep.len(),
             max_entries: self.config.max_entries,
+            max_total_bytes: self.config.max_total_bytes,
+            total_bytes: *total,
             ttl_secs: self.config.ttl_secs,
         }
     }
@@ -496,6 +604,12 @@ pub struct DedupeCacheStats {
 
     /// Maximum entries allowed.
     pub max_entries: usize,
+
+    /// Maximum total bytes allowed.
+    pub max_total_bytes: usize,
+
+    /// Current total bytes cached.
+    pub total_bytes: usize,
 
     /// TTL in seconds.
     pub ttl_secs: u64,
@@ -711,12 +825,15 @@ mod tests {
     async fn test_cache_stats() {
         let config = DedupeCacheConfig::default()
             .with_max_entries(1000)
+            .with_max_total_bytes(50 * 1024 * 1024) // 50 MB
             .with_ttl_secs(3600);
         let cache = DedupeCache::new(config);
 
         let stats = cache.stats().await;
         assert_eq!(stats.entry_count, 0);
         assert_eq!(stats.max_entries, 1000);
+        assert_eq!(stats.max_total_bytes, 50 * 1024 * 1024);
+        assert_eq!(stats.total_bytes, 0);
         assert_eq!(stats.ttl_secs, 3600);
     }
 
@@ -802,6 +919,157 @@ mod tests {
     async fn test_config_max_ttl_clamped() {
         let config = DedupeCacheConfig::default().with_ttl_secs(MAX_TTL_SECS + 1000);
         assert_eq!(config.ttl_secs, MAX_TTL_SECS);
+    }
+
+    #[tokio::test]
+    async fn test_config_min_max_total_bytes_clamped() {
+        // Values below MIN_MAX_TOTAL_BYTES should be clamped
+        let config = DedupeCacheConfig::default().with_max_total_bytes(100);
+        assert_eq!(config.max_total_bytes, MIN_MAX_TOTAL_BYTES);
+
+        // Values at or above MIN_MAX_TOTAL_BYTES should be accepted
+        let config = DedupeCacheConfig::default().with_max_total_bytes(MIN_MAX_TOTAL_BYTES);
+        assert_eq!(config.max_total_bytes, MIN_MAX_TOTAL_BYTES);
+
+        let config = DedupeCacheConfig::default().with_max_total_bytes(10 * 1024 * 1024);
+        assert_eq!(config.max_total_bytes, 10 * 1024 * 1024);
+    }
+
+    fn make_large_result(request_id: &str, output: Vec<u8>) -> ToolResult {
+        ToolResult::success(
+            request_id,
+            output,
+            BudgetDelta::single_call(),
+            StdDuration::from_millis(100),
+            1_000_000_000,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_cache_memory_limit_eviction() {
+        // Set a small memory limit (1KB) to test eviction
+        let config = DedupeCacheConfig::default()
+            .with_max_entries(100) // High entry limit
+            .with_max_total_bytes(MIN_MAX_TOTAL_BYTES); // Use minimum (1 MB)
+        let cache = DedupeCache::new(config);
+
+        // Create results with ~100KB output each
+        let large_output = vec![0u8; 100 * 1024];
+
+        // Insert 5 entries (500KB total, well under 1MB limit)
+        for i in 0..5 {
+            let key = test_dedupe_key(&format!("mem-{i}"));
+            let result = make_large_result(&format!("req-mem-{i}"), large_output.clone());
+            cache
+                .insert(test_episode_id(), key, result, timestamp_ns(i))
+                .await;
+        }
+
+        assert_eq!(cache.len().await, 5);
+        assert_eq!(cache.total_bytes().await, 5 * 100 * 1024);
+
+        // Now insert entries until we exceed the 1MB limit
+        // Each entry is 100KB, so after ~10 entries we'll hit 1MB
+        for i in 5..15 {
+            let key = test_dedupe_key(&format!("mem-{i}"));
+            let result = make_large_result(&format!("req-mem-{i}"), large_output.clone());
+            cache
+                .insert(test_episode_id(), key, result, timestamp_ns(i))
+                .await;
+        }
+
+        // Total bytes should be at or under the limit (1 MB = 1,048,576 bytes)
+        let total_bytes = cache.total_bytes().await;
+        assert!(
+            total_bytes <= MIN_MAX_TOTAL_BYTES,
+            "total_bytes ({total_bytes}) should be <= MIN_MAX_TOTAL_BYTES ({MIN_MAX_TOTAL_BYTES})"
+        );
+
+        // Early entries should have been evicted
+        let cached = cache.get(&test_dedupe_key("mem-0"), timestamp_ns(20)).await;
+        assert!(cached.is_none(), "oldest entry should have been evicted");
+    }
+
+    #[tokio::test]
+    async fn test_cache_total_bytes_tracking() {
+        let config = DedupeCacheConfig::default().with_max_total_bytes(10 * 1024 * 1024); // 10 MB
+        let cache = DedupeCache::new(config);
+
+        assert_eq!(cache.total_bytes().await, 0);
+
+        // Insert entry with 1000 byte output
+        let result = ToolResult::success(
+            "req-1",
+            vec![0u8; 1000],
+            BudgetDelta::single_call(),
+            StdDuration::from_millis(100),
+            1_000_000_000,
+        );
+        cache
+            .insert(
+                test_episode_id(),
+                test_dedupe_key("bytes-1"),
+                result,
+                timestamp_ns(0),
+            )
+            .await;
+
+        assert_eq!(cache.total_bytes().await, 1000);
+
+        // Insert another entry with 2000 byte output
+        let result2 = ToolResult::success(
+            "req-2",
+            vec![0u8; 2000],
+            BudgetDelta::single_call(),
+            StdDuration::from_millis(100),
+            1_000_000_000,
+        );
+        cache
+            .insert(
+                test_episode_id(),
+                test_dedupe_key("bytes-2"),
+                result2,
+                timestamp_ns(1),
+            )
+            .await;
+
+        assert_eq!(cache.total_bytes().await, 3000);
+
+        // Clear should reset total bytes
+        cache.clear().await;
+        assert_eq!(cache.total_bytes().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cache_evict_by_episode_updates_total_bytes() {
+        let cache = DedupeCache::with_defaults();
+        let episode1 = EpisodeId::new("ep-bytes-1").unwrap();
+
+        // Insert entries with known sizes
+        for i in 0..3 {
+            let result = ToolResult::success(
+                format!("req-{i}"),
+                vec![0u8; 1000], // 1KB each
+                BudgetDelta::single_call(),
+                StdDuration::from_millis(100),
+                1_000_000_000,
+            );
+            cache
+                .insert(
+                    episode1.clone(),
+                    test_dedupe_key(&format!("ep-bytes-{i}")),
+                    result,
+                    timestamp_ns(i),
+                )
+                .await;
+        }
+
+        assert_eq!(cache.total_bytes().await, 3000);
+
+        // Evict episode should update total bytes
+        let evicted = cache.evict_by_episode(&episode1).await;
+        assert_eq!(evicted, 3);
+        assert_eq!(cache.total_bytes().await, 0);
     }
 
     #[tokio::test]
