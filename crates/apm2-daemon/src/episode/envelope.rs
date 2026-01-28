@@ -116,6 +116,26 @@ impl RiskTier {
             _ => None,
         }
     }
+
+    /// Parses a risk tier from a u32 value.
+    ///
+    /// # Security
+    ///
+    /// This method exists to prevent truncation attacks. When decoding from
+    /// Protobuf (which uses u32 for enum values), we must validate the full
+    /// u32 range. Casting to u8 first would truncate values like 256 to 0,
+    /// allowing an attacker to bypass security gates.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Tier0),
+            1 => Some(Self::Tier1),
+            2 => Some(Self::Tier2),
+            3 => Some(Self::Tier3),
+            4 => Some(Self::Tier4),
+            _ => None,
+        }
+    }
 }
 
 /// Determinism class for episode execution.
@@ -155,6 +175,24 @@ impl DeterminismClass {
     /// Parses a determinism class from a u8 value.
     #[must_use]
     pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::NonDeterministic),
+            1 => Some(Self::SoftDeterministic),
+            2 => Some(Self::FullyDeterministic),
+            _ => None,
+        }
+    }
+
+    /// Parses a determinism class from a u32 value.
+    ///
+    /// # Security
+    ///
+    /// This method exists to prevent truncation attacks. When decoding from
+    /// Protobuf (which uses u32 for enum values), we must validate the full
+    /// u32 range. Casting to u8 first would truncate values like 256 to 0,
+    /// allowing an attacker to bypass replay verification requirements.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
         match value {
             0 => Some(Self::NonDeterministic),
             1 => Some(Self::SoftDeterministic),
@@ -307,19 +345,24 @@ struct BudgetProto {
 }
 
 /// Internal protobuf representation for the snapshot in envelope.
+///
+/// Per AD-VERIFY-001, we use `optional` bytes fields to ensure explicit
+/// serialization of all values including empty hashes. This prevents
+/// Protobuf 3's implicit default skipping which would violate deterministic
+/// encoding requirements.
 #[allow(clippy::struct_field_names)]
 #[derive(Clone, PartialEq, Message)]
 struct SnapshotProto {
-    #[prost(bytes = "vec", tag = "1")]
-    repo_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    lockfile_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    policy_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "4")]
-    toolchain_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "5")]
-    model_profile_hash: Vec<u8>,
+    #[prost(bytes = "vec", optional, tag = "1")]
+    repo_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    lockfile_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    policy_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    toolchain_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    model_profile_hash: Option<Vec<u8>>,
 }
 
 /// Internal protobuf representation for `EpisodeEnvelope`.
@@ -611,15 +654,18 @@ impl EpisodeEnvelope {
             escalation_predicate: Some(s.escalation_predicate.clone()),
         });
 
+        // Per AD-VERIFY-001, all snapshot hash fields are explicitly serialized
+        // even when empty (using Some(vec![])) to ensure deterministic encoding.
         let pinned_snapshot = self.pinned_snapshot.as_ref().map(|s| SnapshotProto {
-            repo_hash: s.repo_hash().map(<[u8]>::to_vec).unwrap_or_default(),
-            lockfile_hash: s.lockfile_hash().map(<[u8]>::to_vec).unwrap_or_default(),
-            policy_hash: s.policy_hash().map(<[u8]>::to_vec).unwrap_or_default(),
-            toolchain_hash: s.toolchain_hash().map(<[u8]>::to_vec).unwrap_or_default(),
-            model_profile_hash: s
-                .model_profile_hash()
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default(),
+            repo_hash: Some(s.repo_hash().map(<[u8]>::to_vec).unwrap_or_default()),
+            lockfile_hash: Some(s.lockfile_hash().map(<[u8]>::to_vec).unwrap_or_default()),
+            policy_hash: Some(s.policy_hash().map(<[u8]>::to_vec).unwrap_or_default()),
+            toolchain_hash: Some(s.toolchain_hash().map(<[u8]>::to_vec).unwrap_or_default()),
+            model_profile_hash: Some(
+                s.model_profile_hash()
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default(),
+            ),
         });
 
         let context_refs = self.context_refs.as_ref().map(|c| {
@@ -720,26 +766,65 @@ impl EpisodeEnvelope {
         }
 
         // Validate risk_tier - FAIL-CLOSED: reject invalid values
-        #[allow(clippy::cast_possible_truncation)]
-        let risk_tier_value = proto.risk_tier.unwrap_or(0) as u8;
+        // SECURITY: Match on u32 directly to prevent truncation attacks (e.g., 256 ->
+        // 0)
+        let risk_tier_u32 = proto.risk_tier.unwrap_or(0);
         let risk_tier =
-            RiskTier::from_u8(risk_tier_value).ok_or(EnvelopeError::InvalidRiskTier {
-                value: risk_tier_value,
+            RiskTier::from_u32(risk_tier_u32).ok_or(EnvelopeError::InvalidRiskTier {
+                value: risk_tier_u32,
             })?;
 
         // Validate determinism_class - FAIL-CLOSED: reject invalid values
-        #[allow(clippy::cast_possible_truncation)]
-        let determinism_class_value = proto.determinism_class.unwrap_or(0) as u8;
-        let determinism_class = DeterminismClass::from_u8(determinism_class_value).ok_or(
+        // SECURITY: Match on u32 directly to prevent truncation attacks (e.g., 256 ->
+        // 0)
+        let determinism_class_u32 = proto.determinism_class.unwrap_or(0);
+        let determinism_class = DeterminismClass::from_u32(determinism_class_u32).ok_or(
             EnvelopeError::InvalidDeterminismClass {
-                value: determinism_class_value,
+                value: determinism_class_u32,
             },
         )?;
 
-        // Validate DCP refs count
+        // Validate DCP refs count and individual ref lengths (DoS protection)
         if let Some(ref ctx) = proto.context_refs {
             if ctx.dcp_refs.len() > MAX_DCP_REFS {
                 return Err(EnvelopeError::TooManyDcpRefs { max: MAX_DCP_REFS });
+            }
+            // SECURITY: Validate each DCP ref string length to prevent DoS
+            for dcp_ref in &ctx.dcp_refs {
+                if dcp_ref.len() > MAX_ID_LENGTH {
+                    return Err(EnvelopeError::StringTooLong {
+                        field: "context_refs.dcp_refs",
+                        max: MAX_ID_LENGTH,
+                    });
+                }
+            }
+        }
+
+        // SECURITY: Validate stop_conditions string field lengths (DoS protection)
+        if let Some(ref sc) = proto.stop_conditions {
+            if let Some(ref gp) = sc.goal_predicate {
+                if gp.len() > MAX_ID_LENGTH {
+                    return Err(EnvelopeError::StringTooLong {
+                        field: "stop_conditions.goal_predicate",
+                        max: MAX_ID_LENGTH,
+                    });
+                }
+            }
+            if let Some(ref fp) = sc.failure_predicate {
+                if fp.len() > MAX_ID_LENGTH {
+                    return Err(EnvelopeError::StringTooLong {
+                        field: "stop_conditions.failure_predicate",
+                        max: MAX_ID_LENGTH,
+                    });
+                }
+            }
+            if let Some(ref ep) = sc.escalation_predicate {
+                if ep.len() > MAX_ID_LENGTH {
+                    return Err(EnvelopeError::StringTooLong {
+                        field: "stop_conditions.escalation_predicate",
+                        max: MAX_ID_LENGTH,
+                    });
+                }
             }
         }
 
@@ -765,14 +850,17 @@ impl EpisodeEnvelope {
         let pinned_snapshot = match proto.pinned_snapshot {
             Some(s) => {
                 // Helper to validate hash length: must be 0 or exactly 32 bytes
+                // Helper to validate optional hash length: must be empty or exactly 32 bytes
                 let validate_hash =
-                    |hash: &[u8], field: &'static str| -> Result<(), EnvelopeError> {
-                        if !hash.is_empty() && hash.len() != 32 {
-                            return Err(EnvelopeError::InvalidHashLength {
-                                field,
-                                expected: 32,
-                                actual: hash.len(),
-                            });
+                    |hash: &Option<Vec<u8>>, field: &'static str| -> Result<(), EnvelopeError> {
+                        if let Some(h) = hash {
+                            if !h.is_empty() && h.len() != 32 {
+                                return Err(EnvelopeError::InvalidHashLength {
+                                    field,
+                                    expected: 32,
+                                    actual: h.len(),
+                                });
+                            }
                         }
                         Ok(())
                     };
@@ -784,30 +872,40 @@ impl EpisodeEnvelope {
                 validate_hash(&s.model_profile_hash, "model_profile_hash")?;
 
                 let mut builder = PinnedSnapshot::builder();
-                if s.repo_hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&s.repo_hash);
-                    builder = builder.repo_hash(arr);
+                if let Some(ref hash) = s.repo_hash {
+                    if hash.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(hash);
+                        builder = builder.repo_hash(arr);
+                    }
                 }
-                if s.lockfile_hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&s.lockfile_hash);
-                    builder = builder.lockfile_hash(arr);
+                if let Some(ref hash) = s.lockfile_hash {
+                    if hash.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(hash);
+                        builder = builder.lockfile_hash(arr);
+                    }
                 }
-                if s.policy_hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&s.policy_hash);
-                    builder = builder.policy_hash(arr);
+                if let Some(ref hash) = s.policy_hash {
+                    if hash.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(hash);
+                        builder = builder.policy_hash(arr);
+                    }
                 }
-                if s.toolchain_hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&s.toolchain_hash);
-                    builder = builder.toolchain_hash(arr);
+                if let Some(ref hash) = s.toolchain_hash {
+                    if hash.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(hash);
+                        builder = builder.toolchain_hash(arr);
+                    }
                 }
-                if s.model_profile_hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&s.model_profile_hash);
-                    builder = builder.model_profile_hash(arr);
+                if let Some(ref hash) = s.model_profile_hash {
+                    if hash.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(hash);
+                        builder = builder.model_profile_hash(arr);
+                    }
                 }
                 Some(builder.build())
             },
@@ -889,15 +987,24 @@ pub enum EnvelopeError {
     /// Invalid risk tier value.
     #[error("invalid risk_tier value: {value}")]
     InvalidRiskTier {
-        /// The invalid value.
-        value: u8,
+        /// The invalid value (stored as u32 to capture truncation attacks).
+        value: u32,
     },
 
     /// Invalid determinism class value.
     #[error("invalid determinism_class value: {value}")]
     InvalidDeterminismClass {
-        /// The invalid value.
-        value: u8,
+        /// The invalid value (stored as u32 to capture truncation attacks).
+        value: u32,
+    },
+
+    /// String field too long (denial-of-service protection).
+    #[error("{field} exceeds maximum length of {max} bytes")]
+    StringTooLong {
+        /// Field name.
+        field: &'static str,
+        /// Maximum allowed length in bytes.
+        max: usize,
     },
 
     /// Protobuf decoding error.
@@ -1122,10 +1229,41 @@ impl EpisodeEnvelopeBuilder {
             return Err(EnvelopeError::InvalidCapabilityManifestHashSize);
         }
 
-        // Validate DCP refs count
+        // Validate DCP refs count and individual ref lengths (DoS protection)
         if let Some(ref ctx) = self.context_refs {
             if ctx.dcp_refs.len() > MAX_DCP_REFS {
                 return Err(EnvelopeError::TooManyDcpRefs { max: MAX_DCP_REFS });
+            }
+            // SECURITY: Validate each DCP ref string length to prevent DoS
+            for dcp_ref in &ctx.dcp_refs {
+                if dcp_ref.len() > MAX_ID_LENGTH {
+                    return Err(EnvelopeError::StringTooLong {
+                        field: "context_refs.dcp_refs",
+                        max: MAX_ID_LENGTH,
+                    });
+                }
+            }
+        }
+
+        // SECURITY: Validate stop_conditions string field lengths (DoS protection)
+        if let Some(ref sc) = self.stop_conditions {
+            if sc.goal_predicate.len() > MAX_ID_LENGTH {
+                return Err(EnvelopeError::StringTooLong {
+                    field: "stop_conditions.goal_predicate",
+                    max: MAX_ID_LENGTH,
+                });
+            }
+            if sc.failure_predicate.len() > MAX_ID_LENGTH {
+                return Err(EnvelopeError::StringTooLong {
+                    field: "stop_conditions.failure_predicate",
+                    max: MAX_ID_LENGTH,
+                });
+            }
+            if sc.escalation_predicate.len() > MAX_ID_LENGTH {
+                return Err(EnvelopeError::StringTooLong {
+                    field: "stop_conditions.escalation_predicate",
+                    max: MAX_ID_LENGTH,
+                });
             }
         }
 
@@ -2161,6 +2299,351 @@ mod tests {
         assert!(
             matches!(result, Err(EnvelopeError::MissingPinnedSnapshot)),
             "decode() must reject missing pinned_snapshot, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects `risk_tier` value 256 (truncation attack).
+    ///
+    /// SECURITY: If we cast `u32` to `u8` before validation, 256 truncates to
+    /// 0, which maps to `Tier0`. This test ensures we reject such values.
+    #[test]
+    fn test_decode_rejects_truncated_risk_tier_256() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+            #[prost(uint32, optional, tag = "9")]
+            risk_tier: Option<u32>,
+        }
+
+        // 256 would truncate to 0 (Tier0) if cast to u8 - SECURITY BYPASS!
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent-007".to_string(),
+            lease_id: "lease-123".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
+            capability_manifest_hash: vec![0xab; 32],
+            risk_tier: Some(256), // Would truncate to 0 if cast to u8
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(result, Err(EnvelopeError::InvalidRiskTier { value: 256 })),
+            "decode() must reject risk_tier=256 (truncation attack), got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects `determinism_class` value 256 (truncation
+    /// attack).
+    #[test]
+    fn test_decode_rejects_truncated_determinism_class_256() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+            #[prost(uint32, optional, tag = "10")]
+            determinism_class: Option<u32>,
+        }
+
+        // 256 would truncate to 0 (NonDeterministic) if cast to u8
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent-007".to_string(),
+            lease_id: "lease-123".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
+            capability_manifest_hash: vec![0xab; 32],
+            determinism_class: Some(256), // Would truncate to 0 if cast to u8
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::InvalidDeterminismClass { value: 256 })
+            ),
+            "decode() must reject determinism_class=256 (truncation attack), got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects oversized `goal_predicate` string.
+    ///
+    /// SECURITY: Denial-of-service protection - prevents memory exhaustion via
+    /// large strings.
+    #[test]
+    fn test_decode_rejects_oversized_goal_predicate() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+            #[prost(string, optional, tag = "2")]
+            goal_predicate: Option<String>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+                goal_predicate: Some("x".repeat(MAX_ID_LENGTH + 1)),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
+            capability_manifest_hash: vec![0xab; 32],
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::StringTooLong {
+                    field: "stop_conditions.goal_predicate",
+                    ..
+                })
+            ),
+            "decode() must reject oversized goal_predicate, got: {result:?}"
+        );
+    }
+
+    /// Tests that `decode()` rejects oversized DCP ref string.
+    ///
+    /// SECURITY: Denial-of-service protection - prevents memory exhaustion via
+    /// large strings.
+    #[test]
+    fn test_decode_rejects_oversized_dcp_ref() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedBudget {
+            #[prost(uint64, optional, tag = "1")]
+            tokens: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedStopConditions {
+            #[prost(uint64, optional, tag = "1")]
+            max_episodes: Option<u64>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedSnapshot {}
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedContextRefs {
+            #[prost(bytes = "vec", tag = "1")]
+            context_pack_hash: Vec<u8>,
+            #[prost(string, repeated, tag = "2")]
+            dcp_refs: Vec<String>,
+        }
+
+        #[derive(Clone, PartialEq, Message)]
+        struct CraftedEnvelope {
+            #[prost(string, tag = "1")]
+            episode_id: String,
+            #[prost(string, tag = "2")]
+            actor_id: String,
+            #[prost(string, tag = "4")]
+            lease_id: String,
+            #[prost(message, optional, tag = "5")]
+            budget: Option<CraftedBudget>,
+            #[prost(message, optional, tag = "6")]
+            stop_conditions: Option<CraftedStopConditions>,
+            #[prost(message, optional, tag = "7")]
+            pinned_snapshot: Option<CraftedSnapshot>,
+            #[prost(bytes = "vec", tag = "8")]
+            capability_manifest_hash: Vec<u8>,
+            #[prost(message, optional, tag = "11")]
+            context_refs: Option<CraftedContextRefs>,
+        }
+
+        let crafted = CraftedEnvelope {
+            episode_id: "ep-001".to_string(),
+            actor_id: "agent".to_string(),
+            lease_id: "lease".to_string(),
+            budget: Some(CraftedBudget { tokens: Some(0) }),
+            stop_conditions: Some(CraftedStopConditions {
+                max_episodes: Some(0),
+            }),
+            pinned_snapshot: Some(CraftedSnapshot {}),
+            capability_manifest_hash: vec![0xab; 32],
+            context_refs: Some(CraftedContextRefs {
+                context_pack_hash: vec![],
+                dcp_refs: vec!["x".repeat(MAX_ID_LENGTH + 1)],
+            }),
+        };
+
+        let crafted_bytes = crafted.encode_to_vec();
+        let result = EpisodeEnvelope::decode(&crafted_bytes);
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::StringTooLong {
+                    field: "context_refs.dcp_refs",
+                    ..
+                })
+            ),
+            "decode() must reject oversized DCP ref, got: {result:?}"
+        );
+    }
+
+    /// Tests that `build()` rejects oversized DCP ref string.
+    #[test]
+    fn test_build_rejects_oversized_dcp_ref() {
+        let result = EpisodeEnvelope::builder()
+            .episode_id("ep")
+            .actor_id("actor")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions::max_episodes(100))
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .context_refs(ContextRefs {
+                context_pack_hash: vec![],
+                dcp_refs: vec!["x".repeat(MAX_ID_LENGTH + 1)],
+            })
+            .build();
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::StringTooLong {
+                    field: "context_refs.dcp_refs",
+                    ..
+                })
+            ),
+            "build() must reject oversized DCP ref, got: {result:?}"
+        );
+    }
+
+    /// Tests that `build()` rejects oversized `goal_predicate`.
+    #[test]
+    fn test_build_rejects_oversized_goal_predicate() {
+        let result = EpisodeEnvelope::builder()
+            .episode_id("ep")
+            .actor_id("actor")
+            .lease_id("lease")
+            .capability_manifest_hash([0xab; 32])
+            .budget(EpisodeBudget::default())
+            .stop_conditions(StopConditions {
+                max_episodes: 100,
+                goal_predicate: "x".repeat(MAX_ID_LENGTH + 1),
+                failure_predicate: String::new(),
+                escalation_predicate: String::new(),
+            })
+            .pinned_snapshot(PinnedSnapshot::empty())
+            .build();
+
+        assert!(
+            matches!(
+                result,
+                Err(EnvelopeError::StringTooLong {
+                    field: "stop_conditions.goal_predicate",
+                    ..
+                })
+            ),
+            "build() must reject oversized goal_predicate, got: {result:?}"
         );
     }
 }

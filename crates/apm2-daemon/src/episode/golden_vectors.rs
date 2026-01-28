@@ -88,19 +88,25 @@ pub const BUDGET_MINIMAL_VECTOR: GoldenVector = GoldenVector {
 // ============================================================================
 
 /// Golden vector for empty snapshot.
+///
+/// Per AD-VERIFY-001, empty hashes are explicitly serialized (using optional
+/// bytes fields) to ensure deterministic encoding.
 pub const SNAPSHOT_EMPTY_VECTOR: GoldenVector = GoldenVector {
     name: "snapshot_empty",
     contract: "AD-EPISODE-001",
-    expected_hash: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
-    expected_bytes: "",
+    expected_hash: "148b0b75ef1104cb4bd1e852f8f908de471997f2ac4286a00a65760a227d592f",
+    expected_bytes: "0a0012001a0022002a00",
 };
 
 /// Golden vector for snapshot with repo hash only.
+///
+/// Per AD-VERIFY-001, empty hashes are explicitly serialized (using optional
+/// bytes fields) to ensure deterministic encoding.
 pub const SNAPSHOT_REPO_ONLY_VECTOR: GoldenVector = GoldenVector {
     name: "snapshot_repo_only",
     contract: "AD-EPISODE-001",
-    expected_hash: "cf8580043564938be43de8f1ca986d786f632e76743d577cd4d454a95f75e7cc",
-    expected_bytes: "0a20abababababababababababababababababababababababababababababababab",
+    expected_hash: "9acca522bf85c06695c5b009b768a1597f6a915ba72eaddfe3a32621167af017",
+    expected_bytes: "0a20abababababababababababababababababababababababababababababababab12001a0022002a00",
 };
 
 /// Golden vector for full snapshot.
@@ -142,33 +148,34 @@ pub const STOP_CONDITIONS_WITH_PREDICATES_VECTOR: GoldenVector = GoldenVector {
 ///
 /// Per AD-EPISODE-001, minimal envelopes still include budget,
 /// `stop_conditions`, and `pinned_snapshot`. Per AD-VERIFY-001, all fields are
-/// explicitly serialized.
+/// explicitly serialized including empty snapshot hashes.
 pub const ENVELOPE_MINIMAL_VECTOR: GoldenVector = GoldenVector {
     name: "envelope_minimal",
     contract: "AD-EPISODE-001",
-    expected_hash: "459d5e4559105c56c95076d598d444b044d1c9dc8848ad84f9b6d0b24fbd0647",
-    expected_bytes: "0a0665702d30303112096167656e742d30303722096c656173652d3132332a0c0800100018002000280030003208080012001a0022003a0042200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2048005000",
+    expected_hash: "a8af2457d3a50cd3bf38fbfbce0bac15f0d6e6ecf28b80b41a55a0f43f5b334b",
+    expected_bytes: "0a0665702d30303112096167656e742d30303722096c656173652d3132332a0c0800100018002000280030003208080012001a0022003a0a0a0012001a0022002a0042200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2048005000",
 };
 
 /// Golden vector for envelope with all optional fields.
 ///
-/// Per AD-VERIFY-001, all fields are explicitly serialized.
+/// Per AD-VERIFY-001, all fields are explicitly serialized including
+/// empty snapshot hashes.
 pub const ENVELOPE_FULL_VECTOR: GoldenVector = GoldenVector {
     name: "envelope_full",
     contract: "AD-EPISODE-001",
-    expected_hash: "a45997b432a661c559ac674733a36c9e1a2f924ab901a91e4f5e3accbe550bf4",
-    expected_bytes: "0a0665702d30303112096167656e742d3030371a08776f726b2d34353622096c656173652d3132332a1108a08d06103218cc0820c0cf24280030003208086412001a0022003a220a2001020304050607080102030405060708010203040506070801020304050607084220abababababababababababababababababababababababababababababababab480250025a300a20efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef1205646370313112056463703232",
+    expected_hash: "5f1b0ec9a9b717cef327ef8afb2dea77e27956fdb4e7f47b323e63f404189896",
+    expected_bytes: "0a0665702d30303112096167656e742d3030371a08776f726b2d34353622096c656173652d3132332a1108a08d06103218cc0820c0cf24280030003208086412001a0022003a2a0a20010203040506070801020304050607080102030405060708010203040506070812001a0022002a004220abababababababababababababababababababababababababababababababab480250025a300a20efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef1205646370313112056463703232",
 };
 
 /// Golden vector for envelope with sorted context refs.
 ///
 /// Per AD-VERIFY-001, all fields are explicitly serialized and DCP refs are
-/// sorted.
+/// sorted. Empty snapshot hashes are explicitly serialized.
 pub const ENVELOPE_SORTED_DCP_REFS_VECTOR: GoldenVector = GoldenVector {
     name: "envelope_sorted_dcp_refs",
     contract: "AD-VERIFY-001",
-    expected_hash: "66dcc8e542d5d6d5e8ff75eadd9705203c9d6df062d5a0b5e6fe4915ee96affe",
-    expected_bytes: "0a0265701206616374696f6e22056c656173652a0c0800100018002000280030003208080012001a0022003a0042200102030405060708010203040506070801020304050607080102030405060708480050005a0c12016112016212016312017a",
+    expected_hash: "383366a5a7ed9f05ede369b655734d1502425ee5f9658af3712d595472cd65fd",
+    expected_bytes: "0a0265701206616374696f6e22056c656173652a0c0800100018002000280030003208080012001a0022003a0a0a0012001a0022002a0042200102030405060708010203040506070801020304050607080102030405060708480050005a0c12016112016212016312017a",
 };
 
 // ============================================================================

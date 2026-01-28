@@ -31,19 +31,24 @@ use serde::{Deserialize, Serialize};
 pub const HASH_SIZE: usize = 32;
 
 /// Internal protobuf representation for encoding/decoding.
+///
+/// Per AD-VERIFY-001, we use `optional` bytes fields to ensure explicit
+/// serialization of all values including empty hashes. This prevents
+/// Protobuf 3's implicit default skipping which would violate deterministic
+/// encoding requirements.
 #[allow(clippy::struct_field_names)]
 #[derive(Clone, PartialEq, Message)]
 struct PinnedSnapshotProto {
-    #[prost(bytes = "vec", tag = "1")]
-    repo_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    lockfile_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    policy_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "4")]
-    toolchain_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "5")]
-    model_profile_hash: Vec<u8>,
+    #[prost(bytes = "vec", optional, tag = "1")]
+    repo_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    lockfile_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    policy_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    toolchain_hash: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "5")]
+    model_profile_hash: Option<Vec<u8>>,
 }
 
 /// Pinned snapshot of reproducibility-relevant inputs.
@@ -232,15 +237,16 @@ impl PinnedSnapshot {
     /// Returns the canonical bytes for this snapshot.
     ///
     /// Per AD-VERIFY-001, this produces deterministic bytes suitable
-    /// for hashing and signing.
+    /// for hashing and signing. All fields are explicitly serialized
+    /// even when empty (using Some(vec![])) to ensure deterministic encoding.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let proto = PinnedSnapshotProto {
-            repo_hash: self.repo_hash.clone(),
-            lockfile_hash: self.lockfile_hash.clone(),
-            policy_hash: self.policy_hash.clone(),
-            toolchain_hash: self.toolchain_hash.clone(),
-            model_profile_hash: self.model_profile_hash.clone(),
+            repo_hash: Some(self.repo_hash.clone()),
+            lockfile_hash: Some(self.lockfile_hash.clone()),
+            policy_hash: Some(self.policy_hash.clone()),
+            toolchain_hash: Some(self.toolchain_hash.clone()),
+            model_profile_hash: Some(self.model_profile_hash.clone()),
         };
         proto.encode_to_vec()
     }
@@ -253,11 +259,11 @@ impl PinnedSnapshot {
     pub fn decode(buf: &[u8]) -> Result<Self, prost::DecodeError> {
         let proto = PinnedSnapshotProto::decode(buf)?;
         Ok(Self {
-            repo_hash: proto.repo_hash,
-            lockfile_hash: proto.lockfile_hash,
-            policy_hash: proto.policy_hash,
-            toolchain_hash: proto.toolchain_hash,
-            model_profile_hash: proto.model_profile_hash,
+            repo_hash: proto.repo_hash.unwrap_or_default(),
+            lockfile_hash: proto.lockfile_hash.unwrap_or_default(),
+            policy_hash: proto.policy_hash.unwrap_or_default(),
+            toolchain_hash: proto.toolchain_hash.unwrap_or_default(),
+            model_profile_hash: proto.model_profile_hash.unwrap_or_default(),
         })
     }
 
