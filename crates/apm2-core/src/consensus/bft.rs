@@ -1,3 +1,4 @@
+// AGENT-AUTHORED
 //! BFT consensus protocol implementation (Chained `HotStuff`).
 //!
 //! This module implements the core types and state machine for Chained
@@ -252,6 +253,22 @@ pub enum BftError {
     /// Already voted in this round.
     #[error("already voted in round {0}")]
     AlreadyVoted(u64),
+
+    /// Safety violation: proposal conflicts with locked QC (`HotStuff` Theorem
+    /// 2).
+    #[error(
+        "safety violation: proposal QC round {proposal_qc_round} <= locked QC round {locked_qc_round} and does not extend locked block"
+    )]
+    SafetyViolation {
+        /// Proposal's parent QC round.
+        proposal_qc_round: u64,
+        /// Locked QC round.
+        locked_qc_round: u64,
+    },
+
+    /// Vote equivocation: validator already voted in this round.
+    #[error("vote equivocation: validator {0} already voted in round {1}")]
+    VoteEquivocation(String, u64),
 
     /// Configuration error.
     #[error("configuration error: {0}")]
@@ -877,9 +894,23 @@ pub struct HotStuffState {
     last_voted_round: u64,
     /// Highest QC seen.
     high_qc: QuorumCertificate,
+    /// Locked QC (`HotStuff` Theorem 2 safety invariant).
+    ///
+    /// Updated when a 2-chain is formed. A validator only votes for a proposal
+    /// if `proposal.parent_qc.round > locked_qc.round` OR the proposal extends
+    /// the `locked_qc` block.
+    locked_qc: Option<QuorumCertificate>,
     /// Votes collected for current round, grouped by block hash.
     /// Key: `block_hash`, Value: map of `validator_id` -> vote.
     votes_by_block: HashMap<BlockHash, HashMap<ValidatorId, Vote>>,
+    /// Tracks which validators have voted in which round (prevents
+    /// equivocation). Key: (round, `validator_id`), Value: the vote they
+    /// cast.
+    votes_per_round: HashMap<(u64, ValidatorId), Vote>,
+    /// `NewView` messages collected per round for quorum-based round
+    /// advancement. Key: round, Value: set of validator IDs who sent
+    /// `NewView` for that round.
+    new_view_messages: HashMap<u64, HashSet<ValidatorId>>,
     /// Pending blocks (`block_hash` -> (round, `parent_hash`)).
     pending_blocks: HashMap<BlockHash, (u64, BlockHash)>,
     /// Certified blocks by round (`round` -> QC).
@@ -900,7 +931,10 @@ impl HotStuffState {
             phase: Phase::Idle,
             last_voted_round: 0,
             high_qc: QuorumCertificate::default(),
+            locked_qc: None,
             votes_by_block: HashMap::new(),
+            votes_per_round: HashMap::new(),
+            new_view_messages: HashMap::new(),
             pending_blocks: HashMap::new(),
             certified_blocks: HashMap::new(),
             committed: Vec::new(),
@@ -929,6 +963,12 @@ impl HotStuffState {
     #[must_use]
     pub const fn high_qc(&self) -> &QuorumCertificate {
         &self.high_qc
+    }
+
+    /// Returns the locked QC (`HotStuff` safety invariant).
+    #[must_use]
+    pub const fn locked_qc(&self) -> Option<&QuorumCertificate> {
+        self.locked_qc.as_ref()
     }
 
     /// Returns true if this node is the current leader.
@@ -1010,6 +1050,32 @@ impl HotStuffState {
             .parent_qc
             .verify_signatures(&self.config.validators, self.config.quorum_threshold)?;
 
+        // HotStuff Theorem 2 Safety Rule: Only vote if:
+        // 1. proposal.parent_qc.round > locked_qc.round, OR
+        // 2. proposal extends the locked_qc block
+        if let Some(ref locked_qc) = self.locked_qc {
+            let proposal_qc_round = proposal.parent_qc.round;
+            let locked_qc_round = locked_qc.round;
+
+            // Check if proposal's parent QC is higher than locked QC
+            let higher_round = proposal_qc_round > locked_qc_round;
+
+            // Check if proposal extends the locked block (proposal's parent is locked
+            // block)
+            let extends_locked: bool = proposal
+                .parent_qc
+                .block_hash
+                .ct_eq(&locked_qc.block_hash)
+                .into();
+
+            if !higher_round && !extends_locked {
+                return Err(BftError::SafetyViolation {
+                    proposal_qc_round,
+                    locked_qc_round,
+                });
+            }
+        }
+
         // Update state
         self.round = proposal.round;
         self.phase = Phase::Voting;
@@ -1065,7 +1131,19 @@ impl HotStuffState {
             .ok_or_else(|| BftError::UnknownValidator(hex::encode(vote.voter_id)))?;
         let public_key = validator.public_key;
 
-        // Check for duplicate vote for this block hash
+        // Check for vote equivocation: one vote per validator per round (regardless of
+        // block hash) This prevents memory exhaustion via unbounded votes per
+        // round for different blocks
+        let round_validator_key = (vote.round, vote.voter_id);
+        if self.votes_per_round.contains_key(&round_validator_key) {
+            return Err(BftError::VoteEquivocation(
+                hex::encode(vote.voter_id),
+                vote.round,
+            ));
+        }
+
+        // Check for duplicate vote for this block hash (redundant with above but kept
+        // for clarity)
         let votes_for_block = self.votes_by_block.entry(vote.block_hash).or_default();
         if votes_for_block.contains_key(&vote.voter_id) {
             return Err(BftError::DuplicateVote(
@@ -1076,6 +1154,10 @@ impl HotStuffState {
 
         // Verify signature
         vote.verify_signature(&public_key)?;
+
+        // Record that this validator voted in this round (equivocation prevention)
+        self.votes_per_round
+            .insert(round_validator_key, vote.clone());
 
         // Collect vote for this block hash
         votes_for_block.insert(vote.voter_id, vote.clone());
@@ -1100,6 +1182,30 @@ impl HotStuffState {
 
             // Store certified block for 3-chain verification with bounded storage
             self.add_certified_block(qc.clone());
+
+            // Update locked_qc when a 2-chain is formed (HotStuff Theorem 2 safety)
+            // A 2-chain exists when we have QCs for consecutive rounds r and r+1.
+            // We lock on the QC at round r (the parent of the newly certified block).
+            if qc.round >= 2 {
+                let parent_round = qc.round - 1;
+                if let Some(parent_qc) = self.certified_blocks.get(&parent_round) {
+                    // Verify this is actually a chain (the new QC's block has parent_qc's block as
+                    // parent)
+                    if let Some((_, parent_hash)) = self.pending_blocks.get(&qc.block_hash) {
+                        let is_chain: bool = parent_hash.ct_eq(&parent_qc.block_hash).into();
+                        if is_chain {
+                            // Update locked_qc if the parent is higher than current locked_qc
+                            let should_update = self
+                                .locked_qc
+                                .as_ref()
+                                .is_none_or(|locked| parent_qc.round > locked.round);
+                            if should_update {
+                                self.locked_qc = Some(parent_qc.clone());
+                            }
+                        }
+                    }
+                }
+            }
 
             // Update state
             self.phase = Phase::Certified;
@@ -1135,8 +1241,9 @@ impl HotStuffState {
 
     /// Processes a `NewView` message.
     ///
-    /// For leaders: collect new-views and start new round.
-    /// For replicas: adopt the new view.
+    /// Collects `NewView` messages and only advances the round when 2f+1
+    /// `NewView` messages are received for that round (prevents
+    /// denial-of-service via single high-round `NewView` message).
     ///
     /// # Errors
     ///
@@ -1164,10 +1271,23 @@ impl HotStuffState {
             self.high_qc = new_view.high_qc.clone();
         }
 
-        // Advance to new round
-        self.round = new_view.round;
-        self.phase = Phase::Idle;
-        self.votes_by_block.clear();
+        // Track this NewView message (prevents DoS via single unauthenticated round
+        // advancement)
+        let new_views_for_round = self.new_view_messages.entry(new_view.round).or_default();
+        new_views_for_round.insert(new_view.sender_id);
+
+        // Only advance round when 2f+1 NewView messages are received for this round
+        if new_views_for_round.len() >= self.config.quorum_threshold {
+            // Advance to new round
+            self.round = new_view.round;
+            self.phase = Phase::Idle;
+            self.votes_by_block.clear();
+            self.votes_per_round.clear();
+
+            // Clean up old NewView messages for rounds we've passed
+            self.new_view_messages
+                .retain(|round, _| *round >= self.round);
+        }
 
         Ok(())
     }
@@ -1243,6 +1363,7 @@ impl HotStuffState {
         self.round += 1;
         self.phase = Phase::Idle;
         self.votes_by_block.clear();
+        self.votes_per_round.clear();
     }
 
     /// Adds a pending block with bounded storage.
