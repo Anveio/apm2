@@ -743,6 +743,25 @@ impl<T: Clone + PartialEq> LwwRegister<T> {
     ///
     /// - **Commutativity**: `a.merge(b) = b.merge(a)`
     /// - **Idempotence**: `a.merge(a) = a`
+    ///
+    /// # Deterministic Tie-Breaking
+    ///
+    /// When HLC timestamps are equal, the `node_id` is used as a tie-breaker.
+    /// The higher `node_id` (lexicographically) always wins, regardless of
+    /// which register is `self` vs `other`. This ensures true
+    /// commutativity.
+    ///
+    /// The [`HlcWithNodeId`] comparison already implements this ordering:
+    /// 1. Compare HLC (`wall_time_ns`, then `logical_counter`)
+    /// 2. If HLCs are equal, compare `node_id`s lexicographically
+    ///
+    /// # Note on Identical Timestamps
+    ///
+    /// If both HLC and `node_id` are identical but values differ, this
+    /// indicates data corruption or a Byzantine fault. In this edge case,
+    /// the merge is not commutative as there is no deterministic way to
+    /// pick a winner without comparing values (which requires `T: Ord`).
+    /// This case should never occur in a correctly functioning system.
     pub fn merge(&self, other: &Self) -> MergeResult<Self> {
         // Check if values are equal - no conflict
         if self.value == other.value {
@@ -759,17 +778,40 @@ impl<T: Clone + PartialEq> LwwRegister<T> {
         let self_ts = self.timestamp();
         let other_ts = other.timestamp();
 
-        // HlcWithNodeId::cmp provides total ordering: HLC first, then node_id
-        // So Ordering::Equal only occurs when both HLC and node_id match exactly
+        // For commutativity, we must pick the same winner regardless of which
+        // register is `self` vs `other`. HlcWithNodeId::cmp provides total ordering
+        // by comparing (HLC, node_id), so we use strict greater-than comparison:
+        //
+        // - If self_ts > other_ts: self wins
+        // - If self_ts < other_ts: other wins
+        // - If self_ts == other_ts: This means both HLC AND node_id are identical,
+        //   which should be impossible with different values (Byzantine fault). We pick
+        //   the register with the lexicographically higher node_id. Since node_ids are
+        //   equal in this case, we document this as undefined behavior and pick self as
+        //   a convention.
         let (winner, resolution, reason) = match self_ts.cmp(&other_ts) {
-            Ordering::Greater | Ordering::Equal => {
-                (self.clone(), MergeWinner::LocalWins, "local timestamp wins")
-            },
+            Ordering::Greater => (self.clone(), MergeWinner::LocalWins, "local timestamp wins"),
             Ordering::Less => (
                 other.clone(),
                 MergeWinner::RemoteWins,
                 "remote timestamp wins",
             ),
+            Ordering::Equal => {
+                // Both HLC and node_id are identical. This should only occur if:
+                // 1. Same register merged with itself (values would be equal, handled above)
+                // 2. Byzantine fault: same node, same time, different values
+                //
+                // For case 2, no commutative resolution is possible without T: Ord.
+                // Convention: pick the register with higher node_id. Since they're
+                // equal, we fall back to picking self (documented as undefined).
+                //
+                // Note: This case is unreachable in correctly functioning systems.
+                (
+                    self.clone(),
+                    MergeWinner::LocalWins,
+                    "identical timestamps: undefined behavior",
+                )
+            },
         };
 
         let conflict = ConflictRecord::lww_unchecked(
@@ -873,9 +915,13 @@ impl GCounter {
     }
 
     /// Returns the total count (sum of all node counts).
+    ///
+    /// Uses saturating arithmetic to prevent overflow.
     #[must_use]
     pub fn value(&self) -> u64 {
-        self.counts.values().sum()
+        self.counts
+            .values()
+            .fold(0u64, |acc, &x| acc.saturating_add(x))
     }
 
     /// Returns the count for a specific node.
@@ -2167,5 +2213,161 @@ mod tests {
         assert_eq!(parsed, set);
         assert!(parsed.contains(&"hello".to_string()));
         assert!(parsed.contains(&"world".to_string()));
+    }
+
+    // =========================================================================
+    // TCK-00197 Security Fixes
+    // =========================================================================
+
+    /// CRITICAL: LWW merge must be commutative when HLCs are equal but
+    /// `node_id`s differ.
+    ///
+    /// This test verifies that `a.merge(b) == b.merge(a)` in terms of the
+    /// winning value when the HLC timestamps are identical but `node_id`s are
+    /// different.
+    #[test]
+    fn tck_00197_lww_commutativity_same_hlc_different_node_ids() {
+        let node_a = [0x01; 32];
+        let node_b = [0x02; 32];
+        let hlc = Hlc::new(1000, 0); // Same HLC for both
+
+        let reg_a = LwwRegister::new("value_a".to_string(), hlc, node_a);
+        let reg_b = LwwRegister::new("value_b".to_string(), hlc, node_b);
+
+        // Test commutativity: merge(a, b) should equal merge(b, a)
+        let result_ab = reg_a.merge(&reg_b);
+        let result_ba = reg_b.merge(&reg_a);
+
+        let winner_ab = result_ab.winner().unwrap();
+        let winner_ba = result_ba.winner().unwrap();
+
+        // CRITICAL: Both orderings must produce the same winner
+        assert_eq!(
+            winner_ab.value(),
+            winner_ba.value(),
+            "LWW merge is not commutative! a.merge(b) != b.merge(a)"
+        );
+
+        // The winner should be value_b since node_b > node_a
+        assert_eq!(winner_ab.value(), "value_b");
+    }
+
+    /// CRITICAL: LWW merge commutativity with various `node_id` orderings.
+    ///
+    /// Tests multiple combinations of `node_id`s to ensure commutativity holds.
+    #[test]
+    fn tck_00197_lww_commutativity_exhaustive() {
+        let hlc = Hlc::new(12_345_678, 42); // Arbitrary HLC
+
+        // Test with various node_id pairs
+        let test_cases: Vec<([u8; 32], [u8; 32])> = vec![
+            ([0x00; 32], [0xff; 32]), // Min vs max
+            ([0x01; 32], [0x02; 32]), // Adjacent
+            ([0xaa; 32], [0x55; 32]), // Arbitrary
+        ];
+
+        for (node_a, node_b) in test_cases {
+            let reg_a = LwwRegister::new(format!("from_node_{:02x}", node_a[0]), hlc, node_a);
+            let reg_b = LwwRegister::new(format!("from_node_{:02x}", node_b[0]), hlc, node_b);
+
+            let winner_ab = reg_a.merge(&reg_b).winner().unwrap();
+            let winner_ba = reg_b.merge(&reg_a).winner().unwrap();
+
+            assert_eq!(
+                winner_ab.value(),
+                winner_ba.value(),
+                "Commutativity failed for node_ids {:02x} and {:02x}",
+                node_a[0],
+                node_b[0]
+            );
+
+            // Winner should always be the one with the higher node_id
+            let expected_winner_node = if node_a > node_b { node_a } else { node_b };
+            assert_eq!(
+                winner_ab.node_id(),
+                expected_winner_node,
+                "Wrong winner for node_ids {:02x} and {:02x}",
+                node_a[0],
+                node_b[0]
+            );
+        }
+    }
+
+    /// HIGH: `GCounter` increment must not panic on `u64::MAX`.
+    ///
+    /// This test verifies that incrementing at the overflow boundary
+    /// saturates instead of panicking.
+    #[test]
+    fn tck_00197_gcounter_no_panic_on_overflow() {
+        let node_id = [0x01; 32];
+        let mut counter = GCounter::new();
+
+        // Set to near-max value
+        counter.increment_unchecked(node_id, u64::MAX - 10);
+        assert_eq!(counter.node_count(&node_id), u64::MAX - 10);
+
+        // Increment past max - should saturate, not panic
+        counter.increment_unchecked(node_id, 100);
+        assert_eq!(counter.node_count(&node_id), u64::MAX);
+
+        // Further increments should stay at max
+        counter.increment_unchecked(node_id, u64::MAX);
+        assert_eq!(counter.node_count(&node_id), u64::MAX);
+    }
+
+    /// HIGH: `GCounter::try_increment` must not panic on `u64::MAX`.
+    #[test]
+    fn tck_00197_gcounter_try_increment_no_panic_on_overflow() {
+        let node_id = [0x01; 32];
+        let mut counter = GCounter::new();
+
+        // Set to near-max value
+        counter.try_increment(node_id, u64::MAX - 10).unwrap();
+        assert_eq!(counter.node_count(&node_id), u64::MAX - 10);
+
+        // Increment past max - should saturate, not panic
+        counter.try_increment(node_id, 100).unwrap();
+        assert_eq!(counter.node_count(&node_id), u64::MAX);
+    }
+
+    /// HIGH: `GCounter::value()` must not panic on overflow when summing.
+    ///
+    /// This test verifies that the total value calculation saturates
+    /// when the sum of all node counts would overflow u64.
+    #[test]
+    fn tck_00197_gcounter_value_no_overflow() {
+        let node_a = [0x01; 32];
+        let node_b = [0x02; 32];
+        let mut counter = GCounter::new();
+
+        // Set both nodes to near-max values
+        counter.increment_unchecked(node_a, u64::MAX - 10);
+        counter.increment_unchecked(node_b, u64::MAX - 10);
+
+        // The sum would overflow, but value() should saturate
+        let total = counter.value();
+        assert_eq!(total, u64::MAX, "value() should saturate at u64::MAX");
+    }
+
+    /// HIGH: `GCounter` with many nodes at max value should saturate.
+    #[test]
+    fn tck_00197_gcounter_many_nodes_saturate() {
+        let mut counter = GCounter::new();
+
+        // Add multiple nodes with large values
+        for i in 0..10u8 {
+            let mut node_id = [0u8; 32];
+            node_id[0] = i;
+            counter.increment_unchecked(node_id, u64::MAX / 5);
+        }
+
+        // The sum of 10 * (u64::MAX / 5) would overflow
+        // (since u64::MAX / 5 * 10 = 2 * u64::MAX), so it should saturate
+        let total = counter.value();
+        assert_eq!(
+            total,
+            u64::MAX,
+            "value() should saturate when sum overflows"
+        );
     }
 }
