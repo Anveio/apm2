@@ -1,11 +1,25 @@
 //! `YubiHSM` provider implementation for T1 validator keys.
 //!
 //! This module provides an HSM provider implementation for `YubiHSM` devices.
-//! The actual `YubiHSM` SDK integration requires the yubihsm feature flag.
+//! The actual `YubiHSM` SDK integration requires the `yubihsm` feature flag.
 //!
-//! # Feature Flag
+//! # Feature Flag and Mock Implementation
 //!
-//! This implementation is only available when the yubihsm feature is enabled:
+//! This provider has two modes of operation:
+//!
+//! - **With `yubihsm` feature enabled**: Connects to real `YubiHSM` hardware
+//!   via the yubihsm-connector daemon. Private keys never leave the HSM
+//!   boundary.
+//!
+//! - **Without `yubihsm` feature (default)**: A mock implementation is provided
+//!   for development and testing. Keys are stored in memory and do NOT provide
+//!   hardware security guarantees. This mode allows testing HSM integration
+//!   logic without requiring actual hardware.
+//!
+//! The trait abstraction (`HsmProvider`) allows easy swapping between mock and
+//! real implementations at compile time via the feature flag.
+//!
+//! To enable real `YubiHSM` support:
 //!
 //! ```toml
 //! [dependencies]
@@ -14,11 +28,15 @@
 //!
 //! # Security Properties
 //!
-//! When using `YubiHSM`:
+//! When using real `YubiHSM` hardware (with the `yubihsm` feature enabled):
 //! - Private keys are generated within the HSM and never leave it
 //! - All signing operations are performed by the HSM hardware
 //! - Key material is protected by tamper-evident hardware
 //! - Audit logging captures all key operations
+//!
+//! **Warning**: The mock implementation (without the `yubihsm` feature) stores
+//! keys in process memory and should NOT be used in production environments
+//! requiring HSM-level security.
 //!
 //! # Connection
 //!
@@ -69,6 +87,12 @@ const DEFAULT_AUTH_KEY_ID: u16 = 1;
 /// Default `YubiHSM` domain.
 const DEFAULT_DOMAIN: u16 = 1;
 
+/// Maximum number of keys that can be stored in the HSM.
+///
+/// This is limited by the 16-bit object ID space (0 is reserved, so max is
+/// `u16::MAX`).
+const MAX_HSM_KEYS: usize = u16::MAX as usize;
+
 /// Mapping from string key IDs to `YubiHSM` object IDs.
 ///
 /// `YubiHSM` uses 16-bit object IDs, so we maintain a mapping from our
@@ -99,11 +123,29 @@ impl KeyIdMapping {
         self.id_to_object.get(key_id).copied()
     }
 
-    fn insert(&mut self, key_id: String) -> u16 {
+    /// Inserts a new key ID and returns the assigned object ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HsmError::CapacityExceeded` if the maximum number of keys
+    /// (`MAX_HSM_KEYS`) has been reached.
+    fn insert(&mut self, key_id: String) -> HsmResult<u16> {
+        // Check if we've reached the maximum capacity
+        if self.id_to_object.len() >= MAX_HSM_KEYS {
+            return Err(HsmError::CapacityExceeded);
+        }
+
         let object_id = self.next_object_id;
-        self.next_object_id = self.next_object_id.saturating_add(1);
+
+        // Use checked_add to detect overflow; if overflow would occur,
+        // we've exhausted the ID space
+        self.next_object_id = self
+            .next_object_id
+            .checked_add(1)
+            .ok_or(HsmError::CapacityExceeded)?;
+
         self.id_to_object.insert(key_id, object_id);
-        object_id
+        Ok(object_id)
     }
 
     fn remove(&mut self, key_id: &str) -> Option<u16> {
@@ -320,7 +362,7 @@ impl HsmProvider for YubiHsmProvider {
             #[cfg(not(feature = "yubihsm"))]
             {
                 // Mock implementation for testing without actual HSM
-                let _object_id = mapping.insert(key_id.to_string());
+                let _object_id = mapping.insert(key_id.to_string())?;
 
                 // Generate a mock key for testing
                 let signer = super::sign::Signer::generate();
@@ -449,7 +491,7 @@ impl HsmProvider for YubiHsmProvider {
             #[cfg(not(feature = "yubihsm"))]
             {
                 let mut mapping = self.key_mapping.write().unwrap();
-                let _object_id = mapping.insert(new_key_id.clone());
+                let _object_id = mapping.insert(new_key_id.clone())?;
 
                 let signer = super::sign::Signer::generate();
                 let public_key = signer.public_key_bytes();
@@ -769,10 +811,10 @@ mod unit_tests {
     fn tck_00192_key_id_mapping() {
         let mut mapping = KeyIdMapping::new();
 
-        let id1 = mapping.insert("key-1".to_string());
+        let id1 = mapping.insert("key-1".to_string()).unwrap();
         assert_eq!(id1, 1);
 
-        let id2 = mapping.insert("key-2".to_string());
+        let id2 = mapping.insert("key-2".to_string()).unwrap();
         assert_eq!(id2, 2);
 
         // Access internal map directly for testing (get method only available with
@@ -787,5 +829,31 @@ mod unit_tests {
         let removed = mapping.remove("key-1");
         assert_eq!(removed, Some(1));
         assert!(!mapping.contains("key-1"));
+    }
+
+    #[test]
+    fn tck_00192_key_id_mapping_capacity_exceeded() {
+        let mut mapping = KeyIdMapping::new();
+
+        // Fill up the mapping to near capacity to test overflow handling
+        // We can't actually insert u16::MAX keys in a test, but we can verify
+        // the error type is correct by manipulating next_object_id
+
+        // Set to MAX - 1 so we can insert one more key
+        mapping.next_object_id = u16::MAX - 1;
+
+        // Insert at MAX - 1 should succeed (next_object_id becomes MAX)
+        let result = mapping.insert("key-penultimate".to_string());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), u16::MAX - 1);
+
+        // Insert at MAX should fail because we can't increment past MAX
+        // (the increment happens before insertion to ensure we have a valid
+        // next ID available)
+        let result = mapping.insert("key-max".to_string());
+        assert!(
+            matches!(result, Err(HsmError::CapacityExceeded)),
+            "expected CapacityExceeded at u16::MAX, got {result:?}"
+        );
     }
 }

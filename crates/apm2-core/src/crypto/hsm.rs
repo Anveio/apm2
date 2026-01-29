@@ -19,8 +19,9 @@
 //! The following providers are available:
 //!
 //! - [`SoftwareHsmProvider`]: In-memory fallback for development and testing
-//! - [`YubiHsmProvider`]: Reference implementation for `YubiHSM` devices
-//!   (requires yubihsm feature flag)
+//! - `YubiHsmProvider`: Implementation for `YubiHSM` devices (requires
+//!   `yubihsm` feature flag). When the feature is disabled, a mock
+//!   implementation is provided for testing and development purposes.
 //!
 //! # Security Properties
 //!
