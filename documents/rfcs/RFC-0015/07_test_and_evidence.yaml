@@ -121,7 +121,8 @@ rfc_test_and_evidence:
       verification_method: |
         Test that AAT GateReceipt with missing required fields is rejected.
         Test that view_commitment_hash binding is enforced.
-        Test that transcript chain and artifact digests are validated.
+        Test that transcript chain and artifact_manifest_hash are validated.
+        Test that terminal/observational evidence digests are required.
 
     - evidence_id: EVID-FAC-0008
       requirement_ids:
@@ -154,6 +155,8 @@ rfc_test_and_evidence:
         Test that N-run stability is enforced for gates with determinism_class > 0.
         Test that nondeterminism emits GATE_NONDETERMINISTIC.
         Test that repeated nondeterminism triggers quarantine.
+        Test that observational evidence differences do not trigger nondeterminism.
+        Test that stability_digest uses terminal_evidence_digest and terminal_verifier_outputs_digest.
 
     - evidence_id: EVID-FAC-0011
       requirement_ids:
@@ -164,6 +167,7 @@ rfc_test_and_evidence:
         Test that UNKNOWN failures cannot PASS via retries.
         Test that HARNESS_FLAKE triggers runner pool quarantine.
         Test that TEST_NONSEMANTIC triggers test spec quarantine.
+        Test that ENVIRONMENT_DRIFT invalidates attestation and blocks admission.
 
     - evidence_id: EVID-FAC-0012
       requirement_ids:
@@ -299,8 +303,8 @@ rfc_test_and_evidence:
       machine_predicate: "check_result == SATISFIED"
 
   test_commands:
-    unit_tests: "cargo test -p apm2-core --features fac"
-    integration_tests: "cargo test -p apm2-daemon --features fac-integration"
-    property_tests: "cargo test -p apm2-core --features proptest"
-    adversarial_tests: "cargo test -p apm2-daemon --features fac-adversarial"
-    all_fac_tests: "cargo test --workspace --features fac-full"
+    unit_tests: "cargo test -p apm2-core"
+    integration_tests: "cargo test -p apm2-daemon"
+    property_tests: "cargo test -p apm2-core --features test-utils"
+    adversarial_tests: "cargo test -p apm2-daemon"
+    all_fac_tests: "cargo test --workspace"

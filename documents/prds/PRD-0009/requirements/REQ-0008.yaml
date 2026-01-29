@@ -6,12 +6,15 @@ prd_requirement:
   source_id: "FAC-REQ-0107"
   title: "AAT flake classification and policy routing"
   statement: |
-    AAT failures MUST be classified into PRODUCT_DETERMINISTIC_FAIL, HARNESS_FLAKE,
-    ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, or UNKNOWN. GateReceipt MUST record flake_class
-    and determinism_class; policy routes each class to a specific quarantine or escalation
-    path.
+    AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and flake_class.
+    flake_class is an enum for mismatch classification: DETERMINISTIC, HARNESS_FLAKE,
+    ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, or UNKNOWN. Deterministic FAIL
+    is expressed via verdict=FAIL with determinism_status=STABLE and flake_class=DETERMINISTIC;
+    flake_class MUST NOT be used to represent deterministic failure. Policy routes each
+    class to a specific quarantine or escalation path.
   acceptance_criteria:
-    - "GateReceipt payload includes determinism_class and flake_class for every AAT run. Verified by: Schema validation test."
+    - "GateReceipt payload includes determinism_class, determinism_status, and flake_class for every AAT run. Verified by: Schema validation test."
+    - "Deterministic FAIL uses verdict=FAIL with determinism_status=STABLE and flake_class=DETERMINISTIC. Verified by: Policy enforcement test."
     - "UNKNOWN failures produce NEEDS_INPUT and never PASS via retries. Verified by: Policy enforcement test."
     - "HARNESS_FLAKE triggers runner pool quarantine; TEST_NONSEMANTIC triggers AAT spec quarantine. Verified by: Integration test with quarantine events."
     - "ENVIRONMENT_DRIFT invalidates attestation and blocks until re-pinned environment. Verified by: Attestation drift test."
@@ -29,6 +32,9 @@ prd_requirement:
       applies_to:
         - "GateReceipt payload"
   defect_codes:
+    - code: "DETERMINISTIC"
+      severity: "S3"
+      description: "Deterministic outcome; no mismatch detected"
     - code: "HARNESS_FLAKE"
       severity: "S2"
       description: "Runner/infra nondeterminism detected"
@@ -38,3 +44,6 @@ prd_requirement:
     - code: "TEST_NONSEMANTIC"
       severity: "S2"
       description: "AAT spec brittle or non-semantic"
+    - code: "CODE_NONSEMANTIC"
+      severity: "S2"
+      description: "Semantically equivalent behavior with non-semantic diff"

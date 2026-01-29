@@ -17,7 +17,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- ci_evidence::import_and_attestation"
+        command: "cargo test --workspace -- ci_evidence::import_and_attestation"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 180

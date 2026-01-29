@@ -6,12 +6,12 @@ prd_requirement:
   source_id: "FAC-REQ-0105"
   title: "Evidence-bound AAT GateReceipt"
   statement: |
-    AAT GateReceipt payloads MUST bind transcript hash chains, artifact digests, terminal
-    verifier outputs, and minimum attestation fields so that AAT PASS is independently
-    verifiable from raw evidence.
+    AAT GateReceipt payloads MUST bind transcript hash chains, artifact manifest hash,
+    terminal verifier outputs, and minimum attestation fields so that AAT PASS is
+    independently verifiable from raw evidence.
   acceptance_criteria:
     - "AAT payload includes transcript_chain_root_hash and transcript_bundle_hash with complete hash-chain ordering. Verified by: Test that missing/altered transcript chunks invalidate verification."
-    - "AAT payload includes artifact_digests for logs, reports, snapshots, and binaries produced by the run. Verified by: Test that missing artifact digest rejects receipt."
+    - "AAT payload includes artifact_manifest_hash referencing CAS manifest for logs, reports, snapshots, and binaries produced by the run. Verified by: Test that missing manifest hash or manifest entry rejects receipt."
     - "AAT payload includes attestation fields (container_image_digest, toolchain_digests, runner_identity_key_id, network_policy_profile_hash). Verified by: Test that missing attestation rejects receipt."
     - "Admission rejects AAT receipts missing evidence bindings and emits AAT_EVIDENCE_MISSING or AAT_ATTESTATION_INVALID. Verified by: Test rejection paths."
   evidence:
@@ -31,7 +31,7 @@ prd_requirement:
   defect_codes:
     - code: "AAT_EVIDENCE_MISSING"
       severity: "S1"
-      description: "AAT receipt missing transcript chain or artifact digests"
+      description: "AAT receipt missing transcript chain or artifact manifest"
     - code: "AAT_TRANSCRIPT_CHAIN_INVALID"
       severity: "S1"
       description: "AAT transcript hash chain invalid or incomplete"

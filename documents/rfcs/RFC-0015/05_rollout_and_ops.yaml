@@ -93,7 +93,7 @@ rfc_rollout_and_ops:
         - phase: FAC-R-01
           mode: WARN
           duration_days: 7
-          description: "Warn-only for non-sensitive domains; auth/crypto/ledger enforced at SOFT_FAIL"
+          description: "Warn-only for LOW risk changes on sterile runner pool (no secrets, egress denied); auth/crypto/ledger enforced at SOFT_FAIL"
         - phase: FAC-R-02
           mode: SOFT_FAIL
           duration_days: 14

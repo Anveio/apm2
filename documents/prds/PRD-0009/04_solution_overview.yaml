@@ -105,7 +105,7 @@ prd_solution_overview:
         type: gate_executor
         description: |
           Executes acceptance test gate under OCAP context firewall against pinned snapshots
-          only. Produces transcript hash chains, artifact digests, and terminal-verifier
+          only. Produces transcript hash chains, artifact manifest hash, and terminal-verifier
           outputs; signs GateRunCompleted for gate=aat under valid lease; publishes
           GateReceipt with AAT-typed payload and attestation binding. Executor keys are
           isolated from coordinator/implementer custody domains.
@@ -257,6 +257,8 @@ prd_solution_overview:
         outputs:
           - evidence_bundle_hash
           - gate_receipt_id
+          - gate_receipt_payload_hash
+          - gate_receipt_payload_type
           - gate_run_started_event
           - gate_run_completed_event_signed
           - run_receipt_hash
@@ -269,10 +271,11 @@ prd_solution_overview:
           - "OCAP context firewall: repo/file reads are allowed only for objects explicitly enumerated in the RCP manifest allowlist."
           - "Context misses are not 'warnings': they terminate the session with rationale CONTEXT_MISS and trigger refinement."
           - GateRunCompleted is a critical signed event (Ed25519 over canonical bytes, domain-separated).
-          - GateReceipt binds to EvidenceBundle hash and is signed by GateReceiptGenerator.
+          - GateRunCompleted binds gate_receipt_payload_hash + gate_receipt_payload_type to EvidenceBundle hash.
+          - GateReceipt signature covers payload_hash and EvidenceBundle hash; payloads are stored in CAS.
           - GateReceipt uses typed payloads; gate_id=aat requires view_commitment_hash, determinism_class, and evidence/attestation bindings in payload.
           - "AAT runs execute against pinned snapshots only: gate_id=aat requires view_commitment_hash and rcp_aat_manifest_hash; live worktree reads are prohibited."
-          - "AAT payload MUST include transcript_chain_root_hash, transcript_bundle_hash, artifact_digests, terminal_verifier_outputs, verifier_policy_hash, selection_policy_id, and risk_tier."
+          - "AAT payload MUST include transcript_chain_root_hash, transcript_bundle_hash, artifact_manifest_hash, terminal_verifier_outputs, terminal_evidence_digest, observational_evidence_digest, terminal_verifier_outputs_digest, verifier_policy_hash, selection_policy_id, and risk_tier."
           - "Terminal verifiers must satisfy the machine-defined acceptance predicate; missing or non-matching outputs force FAIL or NEEDS_INPUT."
           - Advisory narratives are recorded but never substitute for terminal-verifier evidence.
         defects_on_violation:
@@ -306,8 +309,8 @@ prd_solution_overview:
         invariants:
           - Admission reads only internal projections; never reads GitHub status as truth.
           - Required gates must be satisfied by valid GateRunCompleted signatures + matching unexpired leases + matching ChangeSetDigest.
-          - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, flake_class, run_receipt_hashes, run_count, stability_digest).
-          - "AAT admission validates transcript chain completeness, artifact digests, terminal verifier outputs, verifier_policy_hash, selection_policy_id, risk_tier, and attestation fields."
+          - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, determinism_status, flake_class, run_receipt_hashes, run_count, stability_digest).
+          - "AAT admission validates transcript chain completeness, artifact_manifest_hash, terminal verifier outputs, terminal_evidence_digest, observational_evidence_digest, terminal_verifier_outputs_digest, verifier_policy_hash, selection_policy_id, risk_tier, and attestation fields."
           - "AAT admission enforces anti-downgrade: policy_hash matches resolved_policy_hash; risk_tier/determinism_class not lowered; verifier_policy_hash allowed for resolved tier; rcp_profile_id and manifest match resolved profile."
           - "AAT reuse is allowed only via AATResultReused with exact provenance tuple match; otherwise reuse is forbidden."
           - "Atomicity: MergeReceipt is emitted only after result_selector (trunk digest) is observed and recorded."
@@ -375,7 +378,7 @@ prd_solution_overview:
   gate_receipts:
     payloads:
       default:
-        description: "GateReceipt binds gate outcome to EvidenceBundle hash and is signed by GateReceiptGenerator."
+        description: "GateReceipt signature covers payload_hash and EvidenceBundle hash; payloads are stored in CAS."
       aat:
         gate_id: "aat"
         required_fields:
@@ -384,14 +387,18 @@ prd_solution_overview:
           - rcp_profile_id
           - policy_hash
           - determinism_class
+          - determinism_status
           - flake_class
           - run_count
           - run_receipt_hashes
           - stability_digest
           - verdict
+          - terminal_evidence_digest
+          - observational_evidence_digest
+          - terminal_verifier_outputs_digest
           - transcript_chain_root_hash
           - transcript_bundle_hash
-          - artifact_digests
+          - artifact_manifest_hash
           - terminal_verifier_outputs
           - verifier_policy_hash
           - selection_policy_id
@@ -442,7 +449,9 @@ prd_solution_overview:
           - "exit codes"
           - "timestamp buckets"
           - "file diffs"
-      artifact_digests: "All logs, junit, coverage, snapshots, binary outputs; digests must be independently verifiable."
+      artifact_manifest_hash: "CAS hash of ArtifactManifest (logs, junit, coverage, snapshots, binaries); manifest is independently verifiable."
+      terminal_evidence_digest: "Hash of machine-checkable PASS/FAIL artifacts (exit code, structured test report counts, snapshot diff digest, invariant check outputs)."
+      observational_evidence_digest: "Hash of logs/transcripts/timing/debug traces; retained but excluded from determinism equality."
       terminal_verifier_outputs: "Structured outputs required by scenario-type verifier policy; narrative is non-authoritative."
     terminal_verifier_binding:
       schema: "ScenarioType -> allowed_verifier_kinds + required_outputs + machine_predicate"
@@ -464,17 +473,22 @@ prd_solution_overview:
       event: "AATResultReused { from_receipt_hash, key_tuple, justification }"
       enforcement: "Kernel validates tuple + signature chain; mismatch emits AAT_CACHE_KEY_MISMATCH."
     flake_classification:
+      determinism_status:
+        - "STABLE"
+        - "MISMATCH"
       classes:
-        - "PRODUCT_DETERMINISTIC_FAIL"
+        - "DETERMINISTIC"
         - "HARNESS_FLAKE"
         - "ENVIRONMENT_DRIFT"
         - "TEST_NONSEMANTIC"
+        - "CODE_NONSEMANTIC"
         - "UNKNOWN"
       handling:
-        PRODUCT_DETERMINISTIC_FAIL: "FAIL; defect against ChangeSet and block admission."
+        DETERMINISTIC: "No mismatch; deterministic PASS/FAIL handled by verdict."
         HARNESS_FLAKE: "Quarantine runner pool; reroute to clean pool with attestation check."
         ENVIRONMENT_DRIFT: "Invalidate attestation; block until environment is re-pinned."
         TEST_NONSEMANTIC: "Quarantine AAT spec; open defect against test suite."
+        CODE_NONSEMANTIC: "Treat as non-semantic diff; quarantine spec or formatter as policy defines."
         UNKNOWN: "NEEDS_INPUT; never PASS via retries."
     risk_tiering:
       tiers:
@@ -529,14 +543,15 @@ prd_solution_overview:
   determinism_envelope:
     owner: "HOLON-COORDINATOR or Determinism Proxy"
     default_run_count: 3
-    stability_rule: "All N runs must produce identical evidence_bundle_hash, transcript_chain_root_hash, and terminal_verifier_outputs."
-    proof: "GateReceipt payload includes run_receipt_hashes, run_count, and stability_digest."
-    classification: "Coordinator assigns flake_class on mismatch; GateReceipt records determinism_class + flake_class."
+    stability_rule: "All N runs must produce identical terminal_evidence_digest and terminal_verifier_outputs_digest (and verdict)."
+    proof: "GateReceipt payload includes run_receipt_hashes, run_count, terminal_evidence_digest, terminal_verifier_outputs_digest, and stability_digest."
+    classification: "Coordinator assigns determinism_status (STABLE|MISMATCH) and flake_class; GateReceipt records determinism_class + determinism_status + flake_class."
     failure_actions:
       - "Emit DefectRecord(GATE_NONDETERMINISTIC)."
       - "WorkTransitioned -> BLOCKED with rationale=QUARANTINED_CHANGESET (time-bounded)."
       - "WorkAborted abort_reason=POLICY_DENY after repeated nondeterminism."
       - "HARNESS_FLAKE triggers InterventionFreeze(scope=runner_pool) and rerun on clean pool."
+      - "ENVIRONMENT_DRIFT invalidates attestation and blocks until re-pinned environment."
       - "TEST_NONSEMANTIC triggers AAT spec quarantine and defect against test suite."
     phase: "Phase 2"
   stop_conditions:
@@ -769,7 +784,7 @@ prd_solution_overview:
         description: "AAT receipt attestation missing or invalid (runner/toolchain/network profile)"
       - code: "AAT_EVIDENCE_MISSING"
         severity: "S1"
-        description: "AAT receipt missing transcript chain, artifact digests, or required raw evidence"
+        description: "AAT receipt missing transcript chain, artifact manifest, or required raw evidence"
       - code: "AAT_FALSE_NEGATIVE"
         severity: "S1"
         description: "Post-merge defect attributed to missed AAT detection"
@@ -902,11 +917,11 @@ prd_solution_overview:
           messages:
             - "GateLeaseIssued (critical, signed by governance)"
             - "GateRunStarted (non-critical, unsigned ok)"
-            - "GateRunCompleted (critical, signed by gate executor; includes evidence_bundle_hash, gate_receipt_id, lease_id, changeset_digest)"
+            - "GateRunCompleted (critical, signed by gate executor; includes evidence_bundle_hash, gate_receipt_id, gate_receipt_payload_hash, gate_receipt_payload_type, lease_id, changeset_digest)"
           canonicalization: "No maps; sort repeated fields before signing; domain-separated signatures."
           notes:
             - "AAT uses typed GateReceipt payloads (gate_id=aat); no standalone AATReceipt event."
-            - "AAT typed payload binds transcript_chain_root_hash, artifact_digests, terminal_verifier_outputs, selection_policy_id, risk_tier, and attestation fields."
+            - "AAT typed payload binds transcript_chain_root_hash, artifact_manifest_hash, terminal_verifier_outputs, selection_policy_id, risk_tier, and attestation fields."
         - payload_family: "InterventionEvent"
           messages:
             - "InterventionFreeze (repo/work scope, signed by admission authority)"

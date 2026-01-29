@@ -17,7 +17,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- context_miss::session_termination"
+        command: "cargo test --workspace -- context_miss::session_termination"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 180

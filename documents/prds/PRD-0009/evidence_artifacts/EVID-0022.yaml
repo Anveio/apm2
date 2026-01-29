@@ -6,7 +6,7 @@ prd_evidence_artifact:
   title: "AAT Evidence Chain and Attestation Tests"
   description: |
     Tests verifying AAT GateReceipt evidence bindings including transcript hash chain,
-    artifact digests, and minimum attestation fields.
+    artifact manifest hash, and minimum attestation fields.
   source_acceptance_test: FAC-AT-0022
   capture:
     paths:
@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- aat::evidence_chain"
+        command: "cargo test --workspace -- aat::evidence_chain"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 120
@@ -23,7 +23,7 @@ prd_evidence_artifact:
         allowlist_hosts: []
         constraints:
           - "AAT receipts include transcript_chain_root_hash and transcript_bundle_hash"
-          - "Artifact digests and attestation fields are required"
+          - "Artifact manifest hash and attestation fields are required"
   assertions:
     - "AAT evidence-chain fields are required and validated"
     - "Attestation fields include container image, toolchain digests, runner identity, and network policy hash"

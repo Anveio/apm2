@@ -68,18 +68,15 @@ rfc_contracts_and_versioning:
           string gate_receipt_id = 6;
           google.protobuf.Timestamp completed_at = 7;
           bytes executor_signature = 8;
-
-          // Typed payload (discriminated by gate_id)
-          oneof payload {
-            AatGateReceipt aat_receipt = 10;
-            GenericGateReceipt generic_receipt = 11;
-          }
+          bytes gate_receipt_payload_hash = 9;
+          string gate_receipt_payload_type = 10; // e.g., "aat.v1"
         }
       invariants:
         - "lease_id references valid GateLease"
         - "no LeaseRevoked exists for lease_id with revoked_at <= completed_at"
         - "changeset_digest matches lease"
         - "executor_actor_id matches lease"
+        - "gate_receipt_payload_hash references CAS payload with type gate_receipt_payload_type"
         - "executor_signature covers canonical bytes with GATE_RUN_COMPLETED: prefix"
         - "completed_at <= lease.expires_at"
       domain_separator: "GATE_RUN_COMPLETED:"
@@ -87,7 +84,7 @@ rfc_contracts_and_versioning:
     - contract_id: FAC-CONTRACT-003
       name: "AatGateReceipt Contract"
       description: |
-        Typed payload for AAT gate receipts with evidence binding.
+        Typed payload for AAT gate receipts with evidence binding (stored in CAS, referenced by payload hash).
       schema: |
         message AatGateReceipt {
           // View commitment binding
@@ -98,36 +95,31 @@ rfc_contracts_and_versioning:
 
           // Determinism tracking
           uint32 determinism_class = 5;
-          string flake_class = 6;
-          uint32 run_count = 7;
-          repeated bytes run_receipt_hashes = 8;
-          bytes stability_digest = 9;
+          string determinism_status = 6; // STABLE, MISMATCH
+          string flake_class = 7;        // DETERMINISTIC, HARNESS_FLAKE, ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN
+          uint32 run_count = 8;
+          repeated bytes run_receipt_hashes = 9;
+          bytes terminal_evidence_digest = 10;
+          bytes observational_evidence_digest = 11;
+          bytes terminal_verifier_outputs_digest = 12;
+          bytes stability_digest = 13;
 
           // Verdict
-          string verdict = 10;  // PASS, FAIL, NEEDS_INPUT
+          string verdict = 14;  // PASS, FAIL, NEEDS_INPUT
 
           // Evidence binding
-          bytes transcript_chain_root_hash = 11;
-          bytes transcript_bundle_hash = 12;
-          repeated ArtifactDigest artifact_digests = 13;
-          repeated TerminalVerifierOutput terminal_verifier_outputs = 14;
-          bytes verifier_policy_hash = 15;
+          bytes transcript_chain_root_hash = 15;
+          bytes transcript_bundle_hash = 16;
+          bytes artifact_manifest_hash = 17;
+          repeated TerminalVerifierOutput terminal_verifier_outputs = 18;
+          bytes verifier_policy_hash = 19;
 
           // Risk tier
-          string selection_policy_id = 16;
-          string risk_tier = 17;  // HIGH, MED, LOW
+          string selection_policy_id = 20;
+          string risk_tier = 21;  // HIGH, MED, LOW
 
           // Attestation
-          AatAttestation attestation = 18;
-        }
-
-        message ArtifactDigest {
-          string artifact_type = 1;  // log, junit, coverage, snapshot, binary
-          bytes digest = 2;
-          string data_classification = 3;
-          bool redaction_applied = 4;
-          bytes redaction_profile_hash = 5;
-          uint64 retention_ttl_seconds = 6;
+          AatAttestation attestation = 22;
         }
 
         message TerminalVerifierOutput {
@@ -147,9 +139,32 @@ rfc_contracts_and_versioning:
         - "rcp_manifest_hash matches FAC-02 output for profile"
         - "run_receipt_hashes.len() == run_count"
         - "transcript_chain_root_hash derivable from transcript_bundle_hash"
-        - "All artifact_digests include data_classification"
+        - "artifact_manifest_hash references CAS ArtifactManifest"
+        - "observational_evidence_digest excluded from determinism equality"
         - "At least one terminal_verifier_output present for PASS"
         - "predicate_satisfied == true for all verifier outputs when verdict == PASS"
+        - "determinism_status == STABLE implies flake_class == DETERMINISTIC"
+        - "stability_digest == hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest)"
+
+    - contract_id: FAC-CONTRACT-010
+      name: "ArtifactManifest Contract"
+      description: |
+        Defines a manifest for large evidence artifact lists stored in CAS.
+      schema: |
+        message ArtifactManifest {
+          repeated ArtifactDigest artifacts = 1;
+        }
+
+        message ArtifactDigest {
+          string artifact_type = 1;  // log, junit, coverage, snapshot, binary
+          bytes digest = 2;
+          string data_classification = 3;
+          bool redaction_applied = 4;
+          bytes redaction_profile_hash = 5;
+          uint64 retention_ttl_seconds = 6;
+        }
+      invariants:
+        - "All artifacts include data_classification"
 
     - contract_id: FAC-CONTRACT-007
       name: "VerifierPolicy Contract"

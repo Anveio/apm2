@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- aat::selection_policy"
+        command: "cargo test --workspace -- aat::selection_policy"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 180

@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- resilience::fault_injection"
+        command: "cargo test --workspace -- resilience::fault_injection"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 300

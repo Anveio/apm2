@@ -161,7 +161,9 @@ prd_constraints_invariants:
       statement: |
         GateReceipt MUST support typed payloads; when gate_id=aat, payload MUST include
         view_commitment_hash, determinism_class, run_receipt_hashes, run_count, stability_digest,
-        and verdict, all bound to the EvidenceBundle hash.
+        verdict, terminal_evidence_digest, observational_evidence_digest, and
+        terminal_verifier_outputs_digest. Payload is referenced by payload_hash (stored in CAS);
+        receipt signature covers payload_hash and evidence_bundle_hash.
       rationale: |
         Typed payloads keep admission logic single-path while allowing AAT-specific
         acceptance contracts to be enforced without parallel receipt types.
@@ -172,7 +174,9 @@ prd_constraints_invariants:
     - id: CNS-0019
       statement: |
         When determinism_class > 0, gate outcomes MUST be validated under a coordinator-
-        managed determinism envelope requiring N identical runs before PASS.
+        managed determinism envelope requiring N runs with identical stability_digest
+        (verdict + terminal_evidence_digest + terminal_verifier_outputs_digest) before PASS.
+        Observational evidence differences must not trigger nondeterminism.
       rationale: |
         Prevents gate flakiness from compromising admission integrity; removes executor
         self-attestation of stability.
@@ -183,7 +187,8 @@ prd_constraints_invariants:
     - id: CNS-0020
       statement: |
         AAT GateReceipt payload MUST bind transcript_chain_root_hash, transcript_bundle_hash,
-        artifact_digests, terminal_verifier_outputs, and minimum attestation fields.
+        artifact_manifest_hash, terminal_verifier_outputs, terminal_evidence_digest,
+        observational_evidence_digest, and minimum attestation fields.
       rationale: |
         Prevents spoofed AAT PASS by requiring raw, independently verifiable evidence and
         environment binding.
@@ -210,8 +215,11 @@ prd_constraints_invariants:
         - EVID-0024
     - id: CNS-0023
       statement: |
-        AAT failures MUST be classified into PRODUCT_DETERMINISTIC_FAIL, HARNESS_FLAKE,
-        ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, or UNKNOWN with policy-specific handling.
+        AAT outcomes MUST record determinism_status (STABLE|MISMATCH) and flake_class.
+        flake_class is an enum for mismatch classification: DETERMINISTIC, HARNESS_FLAKE,
+        ENVIRONMENT_DRIFT, TEST_NONSEMANTIC, CODE_NONSEMANTIC, or UNKNOWN. Deterministic
+        FAIL is represented by verdict=FAIL with determinism_status=STABLE and
+        flake_class=DETERMINISTIC.
       rationale: |
         Classification prevents wasteful retries and avoids throughput collapse.
       enforcement: UNKNOWN => NEEDS_INPUT; HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.

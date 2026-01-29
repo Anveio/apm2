@@ -28,7 +28,7 @@ prd_governance_model:
         - GateLease subset rule enforcement
         - MergeReceipt atomic binding verification
         - Typed GateReceipt payloads for gate_id=aat
-        - AAT evidence-chain binding (transcript + artifact digests + attestation)
+        - AAT evidence-chain binding (transcript + artifact manifest hash + attestation)
         - Terminal verifier binding schema enforcement
         - Risk-tiered AAT selection policy enforcement
         - AAT anti-downgrade enforcement for risk_tier/verifier policy/RCP profile

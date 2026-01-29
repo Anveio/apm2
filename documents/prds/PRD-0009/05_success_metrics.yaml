@@ -138,12 +138,12 @@ prd_success_metrics:
     - id: MET-0012
       name: Determinism envelope stability rate
       description: |
-        Percentage of determinism-required gate runs that produce identical evidence
+        Percentage of determinism-required gate runs that produce identical terminal evidence
         across N runs (default 3) and are accepted.
       baseline: "Baseline established after Phase 2 determinism enforcement."
       target: ">95% stability for AAT; >99% for deterministic gates"
       measurement_method: |
-        Compare evidence_bundle_hash and typed payload fields across N runs. Track
+        Compare terminal_evidence_digest and terminal_verifier_outputs_digest across N runs. Track
         GATE_NONDETERMINISTIC defects and acceptance rates.
       evidence_ids:
         - EVID-0019
@@ -161,13 +161,14 @@ prd_success_metrics:
     - id: MET-0014
       name: AAT evidence-chain completeness rate
       description: |
-        Percentage of AAT receipts that include transcript hash chain, artifact digests,
+        Percentage of AAT receipts that include transcript hash chain, artifact manifest hash,
         terminal verifier outputs, and minimum attestation fields.
       baseline: "0% (no evidence-chain enforcement pre-FAC)"
       target: "100% for AAT-required gate outcomes"
       measurement_method: |
         Validate GateReceipt payloads for required fields (transcript_chain_root_hash,
-        transcript_bundle_hash, artifact_digests, terminal_verifier_outputs, attestation).
+        transcript_bundle_hash, artifact_manifest_hash, terminal_verifier_outputs,
+        terminal_evidence_digest, observational_evidence_digest, attestation).
       evidence_ids:
         - EVID-0022
     - id: MET-0015
@@ -185,8 +186,8 @@ prd_success_metrics:
     - id: MET-0016
       name: Flake attribution distribution
       description: |
-        Distribution of AAT failures by flake_class (HARNESS_FLAKE, ENVIRONMENT_DRIFT,
-        TEST_NONSEMANTIC, PRODUCT_DETERMINISTIC_FAIL, UNKNOWN).
+        Distribution of AAT mismatches by flake_class (HARNESS_FLAKE, ENVIRONMENT_DRIFT,
+        TEST_NONSEMANTIC, CODE_NONSEMANTIC, UNKNOWN).
       baseline: "Baseline established after flake classification rollout."
       target: "UNKNOWN <5%; HARNESS_FLAKE + ENVIRONMENT_DRIFT trending down"
       measurement_method: |

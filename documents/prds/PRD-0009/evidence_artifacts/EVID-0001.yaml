@@ -16,7 +16,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- context_firewall::enforcement"
+        command: "cargo test --workspace -- context_firewall::enforcement"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 120

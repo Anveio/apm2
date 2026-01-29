@@ -6,7 +6,7 @@ prd_goals_scope:
       statement: Cryptographically signed gate outcomes - All GateRunCompleted events are signed with Ed25519 using domain-separated signatures binding executor, lease, and changeset.
       measurable_outcomes:
         - GateRunCompleted events include Ed25519 signature over canonical bytes with domain separator GATE_RUN_COMPLETED.
-        - Signature binds (gate_id, lease_id, changeset_digest, executor_actor_id, evidence_bundle_hash).
+        - Signature binds (gate_id, lease_id, changeset_digest, executor_actor_id, evidence_bundle_hash, gate_receipt_payload_hash, gate_receipt_payload_type).
         - Unsigned or invalid signatures rejected with INVALID_SIGNATURE defect at admission.
         - 100% of gate outcomes are cryptographically verifiable from ledger.
     - id: FAC-G-0002
@@ -68,14 +68,15 @@ prd_goals_scope:
     - id: FAC-G-0010
       statement: Gate outcome determinism envelope - Deterministic gates must prove stability under coordinator-managed N-run validation.
       measurable_outcomes:
-        - Determinism envelope enforces N identical runs for gates with determinism_class > 0.
+        - Determinism envelope enforces N runs with identical stability_digest (verdict + terminal_evidence_digest + terminal_verifier_outputs_digest) for determinism_class > 0.
+        - Observational evidence differences do not trigger nondeterminism.
         - Nondeterminism emits GATE_NONDETERMINISTIC defect and fails closed.
         - Repeated nondeterminism quarantines and aborts changesets per policy.
     - id: FAC-G-0011
       statement: Evidence-first AAT receipts - AAT GateReceipts bind raw evidence digests, transcript chains, and attestation fields.
       measurable_outcomes:
         - AAT GateReceipt payload includes transcript_chain_root_hash and transcript_bundle_hash.
-        - AAT GateReceipt payload includes artifact_digests for logs, reports, snapshots, and binaries.
+        - AAT GateReceipt payload includes artifact_manifest_hash for logs, reports, snapshots, and binaries.
         - AAT GateReceipt payload includes attestation fields (container_image_digest, toolchain_digests, runner_identity_key_id, network_policy_profile_hash).
         - Admission rejects AAT receipts missing any required evidence bindings.
     - id: FAC-G-0012
@@ -87,7 +88,7 @@ prd_goals_scope:
     - id: FAC-G-0013
       statement: Flake classification and policy routing - Failures are classified and routed by policy to prevent throughput collapse.
       measurable_outcomes:
-        - GateReceipt payload records determinism_class and flake_class for AAT runs.
+        - GateReceipt payload records determinism_class, determinism_status, and flake_class for AAT runs.
         - UNKNOWN failures never PASS via retries; NEEDS_INPUT required.
         - HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec.
     - id: FAC-G-0014
@@ -163,7 +164,7 @@ prd_goals_scope:
         - GitHub adapter projection-only; status setters outside adapter removed from skills and denied by policy.
         - Projection divergence watchdog + freeze/unfreeze path.
         - Typed GateReceipt payloads for AAT bound to view commitments.
-        - AAT evidence bindings (transcript chains, artifact digests, attestation fields) validated at admission.
+        - AAT evidence bindings (transcript chains, artifact manifest hash, attestation fields) validated at admission.
         - Terminal verifier binding schema enforced for AAT PASS.
         - Risk-tiered AAT selection policy with diff-aware gating.
         - Anti-downgrade enforcement for risk tier, verifier policy, and RCP profiles.
@@ -209,7 +210,7 @@ prd_goals_scope:
     - Bounded retries and echo-trap detection prevent runaway loops.
     - AAT gate receipts are typed and bound to view commitments.
     - Determinism envelope prevents nondeterministic gate outcomes from passing.
-    - AAT receipts bind transcript chains, artifact digests, and attestation fields.
+    - AAT receipts bind transcript chains, artifact manifest hash, and attestation fields.
     - Terminal verifier binding prevents narrative-only PASS.
     - Risk-tiered AAT selection preserves merge cadence while protecting high-risk changes.
     - AAT specs are invariant-first and machine-verifiable.

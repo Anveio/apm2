@@ -400,6 +400,8 @@ rfc_design_decisions:
         outputs:
           - evidence_bundle_hash
           - gate_receipt_id
+          - gate_receipt_payload_hash
+          - gate_receipt_payload_type
           - gate_run_completed_event_signed
 
       - stage_id: FAC-05-ADMISSION_DECISION
@@ -650,28 +652,37 @@ rfc_design_decisions:
       decision: |
         AAT outcomes use typed GateReceipt payloads (gate_id=aat) with required fields for
         view commitment binding, determinism tracking, evidence binding, and attestation.
-        No standalone AATReceipt event; all AAT-specific data in GateReceipt payload.
+        No standalone AATReceipt event; AAT-specific payloads are stored in CAS and referenced
+        by payload_hash from GateRunCompleted to preserve canonicalization stability.
+        Terminal evidence digest is computed from machine-checkable PASS/FAIL outputs (exit code,
+        structured test report counts, snapshot diff digest, invariant check outputs).
+        Observational evidence digest covers logs/transcripts/timing/debug traces and is excluded
+        from determinism equality.
       required_fields:
         - view_commitment_hash
         - rcp_manifest_hash
         - rcp_profile_id
         - policy_hash
         - determinism_class
+        - determinism_status
         - flake_class
         - run_count
         - run_receipt_hashes
+        - terminal_evidence_digest
+        - observational_evidence_digest
+        - terminal_verifier_outputs_digest
         - stability_digest
         - verdict
         - transcript_chain_root_hash
         - transcript_bundle_hash
-        - artifact_digests
+        - artifact_manifest_hash
         - terminal_verifier_outputs
         - verifier_policy_hash
         - selection_policy_id
         - risk_tier
         - attestation
       phase_notes:
-        phase_1: "Record determinism metadata (run_count, run_receipt_hashes, stability_digest) without enforcing N-run rejection."
+        phase_1: "Record determinism metadata (run_count, run_receipt_hashes, terminal_evidence_digest, terminal_verifier_outputs_digest, stability_digest) without enforcing N-run rejection."
         phase_2: "Enable determinism envelope enforcement; nondeterminism fails closed per FAC-REQ-0005."
       alternatives:
         - id: ALT-0006-A
@@ -681,6 +692,7 @@ rfc_design_decisions:
         - "Single GateReceipt with typed payload keeps admission logic unified"
         - "Required fields prevent spoofed PASS"
         - "Evidence binding enables independent verification"
+        - "Terminal/observational evidence split avoids false nondeterminism"
       requirement_ids:
         - FAC-REQ-0004
         - FAC-REQ-0006
@@ -850,14 +862,17 @@ rfc_design_decisions:
       title: "AAT Flake Classification and Policy Routing"
       status: VALIDATED
       validation_evidence: |
-        PRD-0009 FAC-REQ-0008 defines determinism_class and flake_class routing.
+        PRD-0009 FAC-REQ-0008 defines determinism_class, determinism_status, and flake_class routing.
         Q-RFC-FAC-0006 defines flake classes for mismatch scenarios.
       decision: |
-        AAT GateReceipts MUST record determinism_class and flake_class. Policy routes:
-        UNKNOWN -> NEEDS_INPUT, HARNESS_FLAKE -> runner pool quarantine, TEST_NONSEMANTIC ->
-        spec quarantine. No retries may convert UNKNOWN to PASS.
+        AAT GateReceipts MUST record determinism_class, determinism_status (STABLE|MISMATCH),
+        and flake_class. flake_class is used only for mismatch routing:
+        HARNESS_FLAKE -> runner pool quarantine, ENVIRONMENT_DRIFT -> attestation invalidation,
+        TEST_NONSEMANTIC/CODE_NONSEMANTIC -> spec quarantine, UNKNOWN -> NEEDS_INPUT.
+        Deterministic FAIL is represented by verdict=FAIL with determinism_status=STABLE
+        and flake_class=DETERMINISTIC. No retries may convert UNKNOWN to PASS.
       phase_notes:
-        phase_1: "Record flake_class in receipt payloads."
+        phase_1: "Record determinism_status and flake_class in receipt payloads."
         phase_2: "Enforce quarantine routing and audit metrics."
       requirement_ids:
         - FAC-REQ-0008

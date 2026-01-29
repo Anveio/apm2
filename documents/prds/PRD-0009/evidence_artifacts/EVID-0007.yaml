@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- lease::scope_and_expiry"
+        command: "cargo test --workspace -- lease::scope_and_expiry"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 180

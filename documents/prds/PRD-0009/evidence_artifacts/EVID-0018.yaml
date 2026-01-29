@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- gate_receipt::typed_payload"
+        command: "cargo test --workspace -- gate_receipt::typed_payload"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 120
@@ -26,7 +26,9 @@ prd_evidence_artifact:
   assertions:
     - "AAT payload requires view_commitment_hash, rcp_manifest_hash, rcp_profile_id, policy_hash, and determinism_class"
     - "AAT payload requires run_receipt_hashes, run_count, stability_digest, verdict"
-    - "Signature covers typed payload and EvidenceBundle hash"
+    - "AAT payload requires terminal_evidence_digest, observational_evidence_digest, and terminal_verifier_outputs_digest"
+    - "AAT payload references artifact_manifest_hash stored in CAS"
+    - "Signature covers payload_hash and EvidenceBundle hash"
   data:
     classification: "INTERNAL"
     redaction:

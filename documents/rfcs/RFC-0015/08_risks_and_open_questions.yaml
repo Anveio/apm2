@@ -48,7 +48,7 @@ rfc_risks_and_open_questions:
     - id: RSK-RFC-FAC-0004
       statement: "AAT evidence binding increases implementation complexity"
       impact: |
-        Transcript chain hashing, artifact digests, and attestation binding add significant
+        Transcript chain hashing, artifact manifest hashing, and attestation binding add significant
         implementation complexity and potential for validation bugs.
       likelihood: MEDIUM
       mitigations:
@@ -241,10 +241,12 @@ rfc_risks_and_open_questions:
         - Phase 2: Enforcement enabled; expand to other gates if GATE_NONDETERMINISTIC >1%
 
         Flake Classification:
-        - DETERMINISTIC: All N runs agree
-        - TEST_FLAKE: Infra-attributable disagreement
+        - DETERMINISTIC: determinism_status=STABLE; use verdict for PASS/FAIL (not a mismatch)
+        - HARNESS_FLAKE: Runner/infra nondeterminism
+        - ENVIRONMENT_DRIFT: Toolchain/runner environment drift
         - TEST_NONSEMANTIC: Semantically equivalent but different format
-        - CODE_NONDETERMINISTIC: Actual behavioral nondeterminism (QUARANTINE)
+        - CODE_NONSEMANTIC: Non-semantic diff due to tooling/formatting
+        - UNKNOWN: Unclassified mismatch; needs input
       resolved_by: COUNCIL-RFC-0015-FINALIZE-20260129
       resolved_date: "2026-01-29"
       confidence: HIGH

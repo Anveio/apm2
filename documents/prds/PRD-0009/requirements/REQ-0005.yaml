@@ -7,13 +7,17 @@ prd_requirement:
   title: "Gate outcome determinism envelope"
   statement: |
     When determinism_class > 0, gate outcomes MUST be proven stable under a coordinator-
-    managed determinism envelope. PASS verdicts require N identical runs with matching
-    evidence_bundle_hash and typed payload fields. Nondeterminism MUST emit defects and
+    managed determinism envelope. PASS verdicts require N runs with matching
+    terminal_evidence_digest, terminal_verifier_outputs_digest, and verdict.
+    Observational evidence MAY vary across runs and MUST NOT be used for determinism equality.
+    Nondeterminism MUST emit defects and
     fail-closed via quarantine or abort.
   acceptance_criteria:
     - "Determinism envelope is enforced by HOLON-COORDINATOR or a Determinism Proxy, not by gate executors. Verified by: Test that coordinator triggers N-run stability check before PASS acceptance."
     - "Default N-run count is policy-defined (>=3) and recorded in GateReceipt payload. Verified by: Test that run_count reflects policy and matches run_receipt_hashes length."
-    - "PASS requires identical evidence_bundle_hash and AAT payload fields across all runs. Verified by: Test that mismatched run evidence triggers rejection."
+    - "PASS requires identical terminal_evidence_digest, terminal_verifier_outputs_digest, and verdict across all runs. Verified by: Test that mismatched terminal evidence triggers rejection."
+    - "Observational evidence digest differences do not trigger nondeterminism. Verified by: Test that only observational changes do not reject."
+    - "stability_digest is computed over (verdict, terminal_evidence_digest, terminal_verifier_outputs_digest). Verified by: Test that stability_digest changes on any terminal evidence change."
     - "Nondeterminism emits DefectRecord(GATE_NONDETERMINISTIC). Verified by: Test defect emission on mismatch."
     - "Repeated nondeterminism transitions work to BLOCKED with rationale=QUARANTINED_CHANGESET and ultimately aborts with WorkAborted abort_reason=POLICY_DENY. Verified by: Test quarantine then abort after threshold."
   evidence:

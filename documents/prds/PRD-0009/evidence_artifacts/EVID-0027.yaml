@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- aat::spec_invariants"
+        command: "cargo test --workspace -- aat::spec_invariants"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 120

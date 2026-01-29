@@ -15,7 +15,7 @@ prd_evidence_artifact:
     commands:
       - id: "CMD-0001"
         shell: "bash"
-        command: "cargo test --package apm2-fac -- aat::flake_classification"
+        command: "cargo test --workspace -- aat::flake_classification"
         expected_exit_code: 0
         cwd: "."
         timeout_seconds: 180
@@ -26,7 +26,7 @@ prd_evidence_artifact:
           - "TEST_NONSEMANTIC quarantines AAT spec"
           - "UNKNOWN requires NEEDS_INPUT"
   assertions:
-    - "GateReceipt payload records determinism_class and flake_class"
+    - "GateReceipt payload records determinism_class, determinism_status, and flake_class"
     - "Policy routes classifications to quarantine or escalation"
   data:
     classification: "INTERNAL"

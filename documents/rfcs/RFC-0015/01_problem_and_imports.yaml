@@ -120,6 +120,8 @@ rfc_problem_and_imports:
       acceptance_criteria:
         - "AAT GateReceipt payload includes view_commitment_hash and determinism_class"
         - "AAT GateReceipt payload includes run_receipt_hashes and run_count binding all runs"
+        - "AAT GateReceipt payload includes terminal_evidence_digest, observational_evidence_digest, and terminal_verifier_outputs_digest"
+        - "AAT GateReceipt payload references artifact_manifest_hash stored in CAS"
         - "Admission rejects AAT GateReceipts missing required typed payload fields"
 
     - prd_requirement_id: REQ-0005
@@ -129,7 +131,9 @@ rfc_problem_and_imports:
         Deterministic gates must prove stability under coordinator-managed N-run validation;
         nondeterminism emits GATE_NONDETERMINISTIC and triggers quarantine/abort per policy.
       acceptance_criteria:
-        - "Determinism envelope enforces N identical runs for gates with determinism_class > 0"
+        - "Determinism envelope enforces N runs with identical stability_digest for gates with determinism_class > 0"
+        - "PASS requires identical terminal_evidence_digest and terminal_verifier_outputs_digest across runs"
+        - "Observational evidence differences do not trigger nondeterminism"
         - "Nondeterminism emits GATE_NONDETERMINISTIC defect and fails closed"
         - "Repeated nondeterminism quarantines and aborts changesets per policy"
         - "Phase 1 records determinism metadata; enforcement enabled in Phase 2 via FAC_DETERMINISM_ENVELOPE_ENABLED"
@@ -142,7 +146,7 @@ rfc_problem_and_imports:
         for independent verification.
       acceptance_criteria:
         - "AAT GateReceipt payload includes transcript_chain_root_hash and transcript_bundle_hash"
-        - "AAT GateReceipt payload includes artifact_digests for logs, reports, snapshots, binaries"
+        - "AAT GateReceipt payload includes artifact_manifest_hash for logs, reports, snapshots, binaries"
         - "AAT GateReceipt payload includes attestation fields (container_image_digest, toolchain_digests, runner_identity_key_id, network_policy_profile_hash)"
         - "Admission rejects AAT receipts missing any required evidence bindings"
 
@@ -164,7 +168,7 @@ rfc_problem_and_imports:
         Failures are classified and routed by policy to prevent throughput collapse; UNKNOWN
         failures never PASS via retries.
       acceptance_criteria:
-        - "GateReceipt payload records determinism_class and flake_class for AAT runs"
+        - "GateReceipt payload records determinism_class, determinism_status, and flake_class for AAT runs"
         - "UNKNOWN failures never PASS via retries; NEEDS_INPUT required"
         - "HARNESS_FLAKE quarantines runner pool; TEST_NONSEMANTIC quarantines test spec"
 
@@ -257,7 +261,7 @@ rfc_problem_and_imports:
         binding executor, lease, and changeset.
       acceptance_criteria:
         - "GateRunCompleted events include Ed25519 signature over canonical bytes with domain separator GATE_RUN_COMPLETED"
-        - "Signature binds (gate_id, lease_id, changeset_digest, executor_actor_id, evidence_bundle_hash)"
+        - "Signature binds (gate_id, lease_id, changeset_digest, executor_actor_id, evidence_bundle_hash, gate_receipt_payload_hash, gate_receipt_payload_type)"
         - "Unsigned or invalid signatures rejected with INVALID_SIGNATURE defect at admission"
         - "100% of gate outcomes are cryptographically verifiable from ledger"
       law_refs:

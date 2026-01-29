@@ -91,7 +91,7 @@ prd_risks_questions:
     - id: RSK-FAC-0008
       statement: AAT evidence-chain capture increases latency and storage costs.
       impact: |
-        Transcript hash chains and artifact digests add compute overhead; if unchecked,
+        Transcript hash chains and artifact manifest hashing add compute overhead; if unchecked,
         AAT could slow merge cadence or inflate evidence retention costs.
       likelihood: MEDIUM
       mitigations:
@@ -287,9 +287,9 @@ prd_risks_questions:
           recommendation: Not recommended; security posture insufficient for FAC goals
       coordinated_mitigation:
         rollout_phases:
-          - phase: "FAC-R-01 (14 days)"
+          - phase: "FAC-R-01 (7 days)"
             mode: WARN
-            description: "Context firewall and COI in warn-only mode; all violations logged but not blocking."
+            description: "Warn-only for LOW risk changes on sterile runner pool (no secrets, egress denied); all violations logged but not blocking."
           - phase: "FAC-R-02 (14 days)"
             mode: SOFT_FAIL
             description: "Context miss terminates session but allows retry; COI waiver auto-granted with audit."

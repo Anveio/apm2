@@ -190,7 +190,7 @@ prd_decisions_review:
         Selected Design: Evidence-bound AAT GateReceipts with transcript hash chains and attestation.
       rationale: |
         AAT runners are untrusted surfaces unless receipts bind to independently verifiable
-        evidence. Transcript chains, artifact digests, and minimum attestation prevent
+        evidence. Transcript chains, artifact manifest hash, and minimum attestation prevent
         “signed nonsense” from passing admission.
       alternatives_considered:
         - id: ALT-NARRATIVE-ONLY
