@@ -941,15 +941,40 @@ impl SqliteLedgerBackend {
     }
 }
 
+// -----------------------------------------------------------------------------
+// LedgerBackend Trait Implementation
+// -----------------------------------------------------------------------------
+//
+// INTENTIONAL DESIGN: Namespace parameter is ignored in this implementation.
+//
+// This SqliteLedgerBackend is a direct extraction of the existing Ledger struct
+// (TCK-00180 scope: "No behavioral changes to existing code"). The namespace
+// parameter was added to the LedgerBackend trait API to enable future namespace
+// isolation per RFC-0014's architectural design.
+//
+// The actual namespace isolation (table partitioning or separate databases per
+// namespace) is intentionally deferred to a future ticket. This approach:
+//
+//   1. Preserves backward compatibility with all existing code
+//   2. Enables incremental adoption of the trait abstraction
+//   3. Allows namespace isolation to be implemented with proper schema
+//      migration
+//
+// TODO(RFC-0014): Implement namespace isolation in a follow-up ticket. Options:
+//   - Per-namespace table prefixes (e.g., `{namespace}_events`)
+//   - Separate SQLite databases per namespace
+//   - Namespace column with filtered queries
+//
+// See RFC-0014 section 02_design_decisions.yaml for namespace scoping design.
+// -----------------------------------------------------------------------------
+
 impl LedgerBackend for SqliteLedgerBackend {
     fn append<'a>(
         &'a self,
         _namespace: &'a str,
         event: &'a EventRecord,
     ) -> super::backend::BoxFuture<'a, Result<u64, LedgerError>> {
-        // Note: namespace parameter is currently unused as this SQLite backend
-        // stores all events in a single table. Future implementations may use
-        // namespace for partitioning or multi-tenant storage.
+        // Namespace parameter intentionally ignored - see block comment above.
         Box::pin(async move { Self::append(self, event) })
     }
 
@@ -959,7 +984,7 @@ impl LedgerBackend for SqliteLedgerBackend {
         cursor: u64,
         limit: u64,
     ) -> super::backend::BoxFuture<'a, Result<Vec<EventRecord>, LedgerError>> {
-        // Note: namespace parameter is currently unused. See append() note.
+        // Namespace parameter intentionally ignored - see block comment above.
         Box::pin(async move { Self::read_from(self, cursor, limit) })
     }
 
@@ -967,7 +992,7 @@ impl LedgerBackend for SqliteLedgerBackend {
         &'a self,
         _namespace: &'a str,
     ) -> super::backend::BoxFuture<'a, Result<u64, LedgerError>> {
-        // Note: namespace parameter is currently unused. See append() note.
+        // Namespace parameter intentionally ignored - see block comment above.
         Box::pin(async move { self.head_sync() })
     }
 
@@ -978,7 +1003,7 @@ impl LedgerBackend for SqliteLedgerBackend {
         verify_hash_fn: super::backend::HashFn<'a>,
         verify_sig_fn: super::backend::VerifyFn<'a>,
     ) -> super::backend::BoxFuture<'a, Result<(), LedgerError>> {
-        // Note: namespace parameter is currently unused. See append() note.
+        // Namespace parameter intentionally ignored - see block comment above.
         Box::pin(async move {
             Self::verify_chain_from(self, from_seq_id, verify_hash_fn, verify_sig_fn)
         })
