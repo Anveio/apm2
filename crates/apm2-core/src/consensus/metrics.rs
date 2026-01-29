@@ -70,6 +70,74 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
+// Resource Limits
+// ============================================================================
+
+/// Maximum length for node ID to prevent resource exhaustion.
+pub const MAX_NODE_ID_LENGTH: usize = 128;
+
+/// Maximum number of Byzantine evidence entries to store.
+/// Prevents unbounded memory growth from malicious or buggy nodes.
+pub const MAX_BYZANTINE_EVIDENCE: usize = 1000;
+
+/// Maximum size of Prometheus render output buffer in bytes.
+/// Prevents unbounded memory allocation during metrics export.
+pub const MAX_RENDER_OUTPUT_SIZE: usize = 1024 * 1024; // 1MB
+
+// ============================================================================
+// Metrics Error
+// ============================================================================
+
+/// Error type for metrics operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricsError {
+    /// Node ID contains invalid characters (must be alphanumeric, hyphen, or
+    /// underscore).
+    InvalidNodeId(String),
+    /// Node ID exceeds maximum length.
+    NodeIdTooLong(usize),
+}
+
+impl std::fmt::Display for MetricsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidNodeId(id) => {
+                write!(
+                    f,
+                    "Invalid node_id: '{id}' (must contain only alphanumeric, hyphen, or underscore)",
+                )
+            },
+            Self::NodeIdTooLong(len) => {
+                write!(
+                    f,
+                    "Node ID too long: {len} bytes (max {MAX_NODE_ID_LENGTH})",
+                )
+            },
+        }
+    }
+}
+
+impl std::error::Error for MetricsError {}
+
+/// Validates a node ID for use in Prometheus labels.
+///
+/// Node IDs must only contain alphanumeric characters, hyphens, or underscores
+/// to prevent label injection attacks.
+fn validate_node_id(node_id: &str) -> Result<(), MetricsError> {
+    if node_id.len() > MAX_NODE_ID_LENGTH {
+        return Err(MetricsError::NodeIdTooLong(node_id.len()));
+    }
+    if node_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Ok(())
+    } else {
+        Err(MetricsError::InvalidNodeId(node_id.to_string()))
+    }
+}
+
+// ============================================================================
 // Label Types
 // ============================================================================
 
@@ -258,10 +326,21 @@ impl Histogram {
         // Increment bucket count
         self.counts[bucket_idx].fetch_add(1, Ordering::Relaxed);
 
-        // Update sum (store as u64 bits)
-        let current = f64::from_bits(self.sum.load(Ordering::Relaxed));
-        let new_sum = current + value;
-        self.sum.store(new_sum.to_bits(), Ordering::Relaxed);
+        // Update sum atomically using CAS loop to avoid data race
+        let mut current = self.sum.load(Ordering::Relaxed);
+        loop {
+            let current_f64 = f64::from_bits(current);
+            let new_sum = (current_f64 + value).to_bits();
+            match self.sum.compare_exchange_weak(
+                current,
+                new_sum,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(x) => current = x,
+            }
+        }
 
         // Increment total count
         self.count.fetch_add(1, Ordering::Relaxed);
@@ -367,10 +446,34 @@ pub struct ConsensusMetrics {
 
 impl ConsensusMetrics {
     /// Creates a new metrics collector for the given node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_id` contains invalid characters. Use [`try_new`] for
+    /// fallible construction.
+    ///
+    /// [`try_new`]: Self::try_new
     #[must_use]
     pub fn new(node_id: impl Into<String>) -> Self {
-        Self {
-            node_id: node_id.into(),
+        Self::try_new(node_id).expect("invalid node_id")
+    }
+
+    /// Creates a new metrics collector for the given node, returning an error
+    /// if the `node_id` is invalid.
+    ///
+    /// Node IDs must only contain alphanumeric characters, hyphens, or
+    /// underscores to prevent Prometheus label injection attacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MetricsError::InvalidNodeId` if the `node_id` contains invalid
+    /// characters. Returns `MetricsError::NodeIdTooLong` if the `node_id`
+    /// exceeds the maximum length.
+    pub fn try_new(node_id: impl Into<String>) -> Result<Self, MetricsError> {
+        let node_id = node_id.into();
+        validate_node_id(&node_id)?;
+        Ok(Self {
+            node_id,
             proposals_committed: AtomicU64::new(0),
             proposals_rejected: AtomicU64::new(0),
             proposals_timeout: AtomicU64::new(0),
@@ -394,7 +497,7 @@ impl ConsensusMetrics {
             byzantine_invalid_signature: AtomicU64::new(0),
             byzantine_quorum_forgery: AtomicU64::new(0),
             byzantine_replay: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Returns the node ID.
@@ -752,6 +855,17 @@ impl ConsensusMetrics {
             self.byzantine_replay.load(Ordering::Relaxed)
         );
 
+        // Truncate output if it exceeds the maximum size to prevent unbounded memory
+        // usage
+        if output.len() > MAX_RENDER_OUTPUT_SIZE {
+            output.truncate(MAX_RENDER_OUTPUT_SIZE);
+            // Ensure we end at a newline boundary for valid Prometheus format
+            if let Some(last_newline) = output.rfind('\n') {
+                output.truncate(last_newline + 1);
+            }
+            output.push_str("# TRUNCATED: Output exceeded maximum size\n");
+        }
+
         output
     }
 }
@@ -1029,5 +1143,105 @@ mod tests {
             output.contains("apm2_byzantine_evidence_total"),
             "Missing byzantine counter"
         );
+    }
+
+    // ========================================================================
+    // Node ID Validation Tests (Security)
+    // ========================================================================
+
+    #[test]
+    fn test_valid_node_id_alphanumeric() {
+        assert!(ConsensusMetrics::try_new("node001").is_ok());
+        assert!(ConsensusMetrics::try_new("Node001").is_ok());
+        assert!(ConsensusMetrics::try_new("NODE001").is_ok());
+    }
+
+    #[test]
+    fn test_valid_node_id_with_hyphen() {
+        assert!(ConsensusMetrics::try_new("node-001").is_ok());
+        assert!(ConsensusMetrics::try_new("my-node-001").is_ok());
+    }
+
+    #[test]
+    fn test_valid_node_id_with_underscore() {
+        assert!(ConsensusMetrics::try_new("node_001").is_ok());
+        assert!(ConsensusMetrics::try_new("my_node_001").is_ok());
+    }
+
+    #[test]
+    fn test_valid_node_id_mixed() {
+        assert!(ConsensusMetrics::try_new("node-001_test").is_ok());
+        assert!(ConsensusMetrics::try_new("My_Node-001").is_ok());
+    }
+
+    /// SECURITY TEST: Verify `node_id` with quotes is rejected (prevents label
+    /// injection).
+    #[test]
+    fn test_invalid_node_id_with_quotes() {
+        let result = ConsensusMetrics::try_new("node\"injection");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MetricsError::InvalidNodeId(_))));
+    }
+
+    /// SECURITY TEST: Verify `node_id` with newlines is rejected.
+    #[test]
+    fn test_invalid_node_id_with_newline() {
+        let result = ConsensusMetrics::try_new("node\ninjection");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MetricsError::InvalidNodeId(_))));
+    }
+
+    /// SECURITY TEST: Verify `node_id` with backslash is rejected.
+    #[test]
+    fn test_invalid_node_id_with_backslash() {
+        let result = ConsensusMetrics::try_new("node\\injection");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MetricsError::InvalidNodeId(_))));
+    }
+
+    /// SECURITY TEST: Verify `node_id` with spaces is rejected.
+    #[test]
+    fn test_invalid_node_id_with_space() {
+        let result = ConsensusMetrics::try_new("node 001");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MetricsError::InvalidNodeId(_))));
+    }
+
+    /// SECURITY TEST: Verify `node_id` with special characters is rejected.
+    #[test]
+    fn test_invalid_node_id_with_special_chars() {
+        assert!(ConsensusMetrics::try_new("node{001}").is_err());
+        assert!(ConsensusMetrics::try_new("node=001").is_err());
+        assert!(ConsensusMetrics::try_new("node,001").is_err());
+        assert!(ConsensusMetrics::try_new("node;001").is_err());
+    }
+
+    /// SECURITY TEST: Verify `node_id` length limit is enforced.
+    #[test]
+    fn test_node_id_too_long() {
+        let long_id = "a".repeat(MAX_NODE_ID_LENGTH + 1);
+        let result = ConsensusMetrics::try_new(long_id);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MetricsError::NodeIdTooLong(_))));
+    }
+
+    /// Test that `node_id` at max length is accepted.
+    #[test]
+    fn test_node_id_at_max_length() {
+        let max_id = "a".repeat(MAX_NODE_ID_LENGTH);
+        assert!(ConsensusMetrics::try_new(max_id).is_ok());
+    }
+
+    #[test]
+    fn test_metrics_error_display() {
+        let err = MetricsError::InvalidNodeId("bad\"id".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid node_id"));
+        assert!(msg.contains("bad\"id"));
+
+        let err = MetricsError::NodeIdTooLong(200);
+        let msg = err.to_string();
+        assert!(msg.contains("too long"));
+        assert!(msg.contains("200"));
     }
 }

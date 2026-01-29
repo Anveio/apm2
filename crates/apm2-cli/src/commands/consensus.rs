@@ -39,6 +39,18 @@ pub mod exit_codes {
     pub const UNHEALTHY: u8 = 2;
 }
 
+/// Resource limits for consensus data.
+pub mod limits {
+    /// Maximum number of Byzantine evidence entries to return in a single
+    /// query. Prevents unbounded memory usage from large evidence
+    /// collections.
+    pub const MAX_BYZANTINE_EVIDENCE_ENTRIES: usize = 1000;
+
+    /// Maximum length of Byzantine evidence details string in bytes.
+    /// Prevents unbounded memory usage from large evidence payloads.
+    pub const MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH: usize = 4096;
+}
+
 /// Consensus command group.
 #[derive(Debug, Args)]
 pub struct ConsensusCommand {
@@ -115,9 +127,17 @@ pub struct ByzantineListArgs {
     #[arg(long)]
     pub fault_type: Option<String>,
 
-    /// Maximum number of entries to return.
+    /// Maximum number of entries to return (max 1000).
     #[arg(long, default_value = "100")]
     pub limit: u32,
+}
+
+impl ByzantineListArgs {
+    /// Returns the effective limit, capped at the maximum allowed entries.
+    #[must_use]
+    pub fn effective_limit(&self) -> usize {
+        (self.limit as usize).min(limits::MAX_BYZANTINE_EVIDENCE_ENTRIES)
+    }
 }
 
 // ============================================================================
@@ -289,26 +309,23 @@ pub fn run_consensus(cmd: &ConsensusCommand, _socket_path: &std::path::Path) -> 
 fn run_status(args: &StatusArgs, json_output: bool) -> u8 {
     // TODO: Query daemon for actual status via UDS
     // For now, return mock data to demonstrate the interface
+    // NOTE: Using "unknown" health and quorum_met=false to indicate mock data
 
     let response = StatusResponse {
-        node_id: "node-001".to_string(),
-        epoch: 1,
-        round: 42,
-        leader_id: "abcd1234...".to_string(),
+        node_id: "mock-node-001".to_string(),
+        epoch: 0,
+        round: 0,
+        leader_id: "unknown".to_string(),
         is_leader: false,
-        validator_count: 4,
-        active_validators: 4,
-        quorum_threshold: 3,
-        quorum_met: true,
-        health: "healthy".to_string(),
-        high_qc_round: if args.verbose { Some(41) } else { None },
-        locked_qc_round: if args.verbose { Some(39) } else { None },
-        committed_blocks: if args.verbose { Some(40) } else { None },
-        last_committed_hash: if args.verbose {
-            Some("0xabcdef...".to_string())
-        } else {
-            None
-        },
+        validator_count: 0,
+        active_validators: 0,
+        quorum_threshold: 0,
+        quorum_met: false,
+        health: "unknown".to_string(),
+        high_qc_round: if args.verbose { Some(0) } else { None },
+        locked_qc_round: None,
+        committed_blocks: if args.verbose { Some(0) } else { None },
+        last_committed_hash: None,
     };
 
     if json_output {
@@ -319,6 +336,8 @@ fn run_status(args: &StatusArgs, json_output: bool) -> u8 {
     } else {
         println!("Consensus Cluster Status");
         println!("========================");
+        println!();
+        println!("WARNING: Daemon not connected. Displaying mock data.");
         println!();
         println!("Node ID:           {}", response.node_id);
         println!("Epoch:             {}", response.epoch);
@@ -361,53 +380,16 @@ fn run_status(args: &StatusArgs, json_output: bool) -> u8 {
         }
     }
 
-    // Return unhealthy exit code if cluster is not healthy
-    if response.health == "healthy" {
-        exit_codes::SUCCESS
-    } else {
-        exit_codes::UNHEALTHY
-    }
+    // Return unhealthy exit code since status is unknown (mock data)
+    exit_codes::UNHEALTHY
 }
 
 /// Execute the validators command.
 fn run_validators(args: &ValidatorsArgs, json_output: bool) -> u8 {
     // TODO: Query daemon for actual validator list
-    // Mock data for demonstration
+    // Return empty list to indicate no daemon connection (mock data)
 
-    let all_validators = vec![
-        ValidatorInfo {
-            id: "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_string(),
-            index: 0,
-            public_key: "1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            active: true,
-            last_seen: Some("2026-01-29T12:00:00Z".to_string()),
-        },
-        ValidatorInfo {
-            id: "bcde2345bcde2345bcde2345bcde2345bcde2345bcde2345bcde2345bcde2345".to_string(),
-            index: 1,
-            public_key: "2222222222222222222222222222222222222222222222222222222222222222"
-                .to_string(),
-            active: true,
-            last_seen: Some("2026-01-29T12:00:01Z".to_string()),
-        },
-        ValidatorInfo {
-            id: "cdef3456cdef3456cdef3456cdef3456cdef3456cdef3456cdef3456cdef3456".to_string(),
-            index: 2,
-            public_key: "3333333333333333333333333333333333333333333333333333333333333333"
-                .to_string(),
-            active: true,
-            last_seen: Some("2026-01-29T12:00:02Z".to_string()),
-        },
-        ValidatorInfo {
-            id: "defg4567defg4567defg4567defg4567defg4567defg4567defg4567defg4567".to_string(),
-            index: 3,
-            public_key: "4444444444444444444444444444444444444444444444444444444444444444"
-                .to_string(),
-            active: false,
-            last_seen: Some("2026-01-29T11:55:00Z".to_string()),
-        },
-    ];
+    let all_validators: Vec<ValidatorInfo> = vec![];
 
     let validators: Vec<ValidatorInfo> = if args.active_only {
         all_validators.into_iter().filter(|v| v.active).collect()
@@ -430,6 +412,8 @@ fn run_validators(args: &ValidatorsArgs, json_output: bool) -> u8 {
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
         );
     } else {
+        println!("WARNING: Daemon not connected. Displaying mock data.");
+        println!();
         println!(
             "{:<6} {:<16} {:<8} {:<25}",
             "INDEX", "ID (TRUNCATED)", "ACTIVE", "LAST SEEN"
@@ -462,27 +446,22 @@ fn run_validators(args: &ValidatorsArgs, json_output: bool) -> u8 {
 /// Execute the byzantine-evidence list command.
 fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool) -> u8 {
     // TODO: Query daemon for actual evidence
-    // Mock data for demonstration
+    // Return empty list to indicate no daemon connection (mock data)
 
-    let all_evidence = vec![ByzantineEvidence {
-        id: "evid-001".to_string(),
-        fault_type: "equivocation".to_string(),
-        validator_id: "defg4567...".to_string(),
-        details: "Validator signed conflicting proposals in round 38".to_string(),
-        timestamp: "2026-01-29T11:55:30Z".to_string(),
-        epoch: 1,
-        round: 38,
-    }];
+    let all_evidence: Vec<ByzantineEvidence> = vec![];
+
+    // Use effective_limit to cap at MAX_BYZANTINE_EVIDENCE_ENTRIES
+    let limit = args.effective_limit();
 
     // Filter by fault type if specified
     let evidence: Vec<ByzantineEvidence> = if let Some(ref ft) = args.fault_type {
         all_evidence
             .into_iter()
             .filter(|e| e.fault_type == *ft)
-            .take(args.limit as usize)
+            .take(limit)
             .collect()
     } else {
-        all_evidence.into_iter().take(args.limit as usize).collect()
+        all_evidence.into_iter().take(limit).collect()
     };
 
     let total = evidence.len();
@@ -495,8 +474,12 @@ fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool) -> u8 {
             serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
         );
     } else if response.evidence.is_empty() {
+        println!("WARNING: Daemon not connected. Displaying mock data.");
+        println!();
         println!("No Byzantine fault evidence detected.");
     } else {
+        println!("WARNING: Daemon not connected. Displaying mock data.");
+        println!();
         println!("Byzantine Fault Evidence");
         println!("========================");
         println!();
@@ -523,19 +506,19 @@ fn run_byzantine_list(args: &ByzantineListArgs, json_output: bool) -> u8 {
 /// Execute the metrics command.
 fn run_metrics(_args: &MetricsArgs, json_output: bool) -> u8 {
     // TODO: Query daemon for actual metrics
-    // Mock data for demonstration
+    // Return zeroed metrics to indicate no daemon connection (mock data)
 
     let response = MetricsResponse {
-        node_id: "node-001".to_string(),
-        proposals_committed: 1250,
-        proposals_rejected: 15,
-        proposals_timeout: 3,
-        leader_elections: 42,
-        sync_events: 5000,
-        conflicts: 12,
-        byzantine_evidence: 1,
-        latency_p50_ms: 85.0,
-        latency_p99_ms: 245.0,
+        node_id: "mock-node-001".to_string(),
+        proposals_committed: 0,
+        proposals_rejected: 0,
+        proposals_timeout: 0,
+        leader_elections: 0,
+        sync_events: 0,
+        conflicts: 0,
+        byzantine_evidence: 0,
+        latency_p50_ms: 0.0,
+        latency_p99_ms: 0.0,
     };
 
     if json_output {
@@ -546,6 +529,8 @@ fn run_metrics(_args: &MetricsArgs, json_output: bool) -> u8 {
     } else {
         println!("Consensus Metrics Summary");
         println!("=========================");
+        println!();
+        println!("WARNING: Daemon not connected. Displaying mock data.");
         println!();
         println!("Node ID: {}", response.node_id);
         println!();
@@ -592,6 +577,21 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
     exit_code
 }
 
+/// Truncates Byzantine evidence details to the maximum allowed length.
+///
+/// This function should be used when receiving evidence from the daemon
+/// to prevent unbounded memory usage from large payloads.
+#[allow(dead_code)]
+fn truncate_evidence_details(details: &str) -> String {
+    if details.len() <= limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH {
+        details.to_string()
+    } else {
+        let mut truncated = details[..limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH].to_string();
+        truncated.push_str("... [TRUNCATED]");
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,8 +607,8 @@ mod tests {
             validator_count: 4,
             active_validators: 4,
             quorum_threshold: 3,
-            quorum_met: true,
-            health: "healthy".to_string(),
+            quorum_met: false,
+            health: "unknown".to_string(),
             high_qc_round: None,
             locked_qc_round: None,
             committed_blocks: None,
@@ -619,6 +619,7 @@ mod tests {
         let deserialized: StatusResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.node_id, "test-node");
         assert_eq!(deserialized.epoch, 1);
+        assert_eq!(deserialized.health, "unknown");
     }
 
     #[test]
@@ -704,5 +705,60 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&error).unwrap();
         assert!(json.contains("not_found"));
+    }
+
+    // ========================================================================
+    // Resource Limit Tests
+    // ========================================================================
+
+    #[test]
+    fn test_byzantine_list_args_effective_limit() {
+        let args = ByzantineListArgs {
+            fault_type: None,
+            limit: 100,
+        };
+        assert_eq!(args.effective_limit(), 100);
+    }
+
+    #[test]
+    fn test_byzantine_list_args_effective_limit_capped() {
+        let args = ByzantineListArgs {
+            fault_type: None,
+            limit: 5000, // Exceeds MAX_BYZANTINE_EVIDENCE_ENTRIES
+        };
+        assert_eq!(
+            args.effective_limit(),
+            limits::MAX_BYZANTINE_EVIDENCE_ENTRIES
+        );
+    }
+
+    #[test]
+    fn test_truncate_evidence_details_short() {
+        let details = "Short details";
+        let truncated = truncate_evidence_details(details);
+        assert_eq!(truncated, details);
+    }
+
+    #[test]
+    fn test_truncate_evidence_details_long() {
+        let details = "a".repeat(limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH + 100);
+        let truncated = truncate_evidence_details(&details);
+        assert!(truncated.len() < details.len());
+        assert!(truncated.ends_with("... [TRUNCATED]"));
+    }
+
+    #[test]
+    fn test_limits_constants() {
+        // Verify the limits are reasonable values using const assertions
+        const _: () = {
+            assert!(limits::MAX_BYZANTINE_EVIDENCE_ENTRIES >= 100);
+            assert!(limits::MAX_BYZANTINE_EVIDENCE_ENTRIES <= 10000);
+            assert!(limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH >= 1024);
+            assert!(limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH <= 1024 * 1024);
+        };
+
+        // Verify the values at runtime too
+        assert_eq!(limits::MAX_BYZANTINE_EVIDENCE_ENTRIES, 1000);
+        assert_eq!(limits::MAX_BYZANTINE_EVIDENCE_DETAILS_LENGTH, 4096);
     }
 }
