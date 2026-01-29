@@ -244,9 +244,10 @@ impl Hlc {
     /// Updates this HLC based on a received message's HLC, with future skew
     /// validation.
     ///
-    /// This is the secure version of [`Self::receive`] that rejects timestamps
-    /// that are too far in the future, preventing "bricking" attacks where a
-    /// malicious peer could skew the node's clock forward indefinitely.
+    /// This is the secure version of [`Self::receive_unchecked`] that rejects
+    /// timestamps that are too far in the future, preventing "bricking"
+    /// attacks where a malicious peer could skew the node's clock forward
+    /// indefinitely.
     ///
     /// # Errors
     ///
@@ -565,8 +566,8 @@ impl ConflictRecord {
 
     /// Creates a new conflict record for LWW resolution with input validation.
     ///
-    /// This is the secure version of [`Self::lww`] that validates the reason
-    /// string length.
+    /// This is the secure version of [`Self::lww_unchecked`] that validates the
+    /// reason string length.
     ///
     /// # Errors
     ///
@@ -613,8 +614,8 @@ impl ConflictRecord {
 
     /// Sets the key for this conflict record with validation.
     ///
-    /// This is the secure version of [`Self::with_key`] that validates the key
-    /// length against [`MAX_KEY_LEN`].
+    /// This is the secure version of [`Self::with_key_unchecked`] that
+    /// validates the key length against [`MAX_KEY_LEN`].
     ///
     /// # Errors
     ///
@@ -799,9 +800,9 @@ impl GCounter {
 
     /// Increments this node's count with capacity checking.
     ///
-    /// This is the secure version of [`Self::increment`] that rejects new node
-    /// entries when the counter already has [`MAX_GCOUNTER_NODES`] nodes.
-    /// Existing nodes can always be incremented.
+    /// This is the secure version of [`Self::increment_unchecked`] that rejects
+    /// new node entries when the counter already has [`MAX_GCOUNTER_NODES`]
+    /// nodes. Existing nodes can always be incremented.
     ///
     /// # Errors
     ///
@@ -875,8 +876,9 @@ impl GCounter {
 
     /// Merges this counter with another, with capacity checking.
     ///
-    /// This is the secure version of [`Self::merge`] that rejects merges
-    /// when the resulting counter would exceed [`MAX_GCOUNTER_NODES`] nodes.
+    /// This is the secure version of [`Self::merge_unchecked`] that rejects
+    /// merges when the resulting counter would exceed
+    /// [`MAX_GCOUNTER_NODES`] nodes.
     ///
     /// # Errors
     ///
