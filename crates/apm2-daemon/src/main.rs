@@ -297,10 +297,12 @@ async fn main() -> Result<()> {
     let daemon_config = DaemonConfig::new(&args)?;
     let supervisor = init_supervisor(&daemon_config.config);
 
-    // Create shared state
+    // Create shared state with schema registry
+    // The registry persists for the daemon's lifetime (TCK-00181)
     let state: SharedState = Arc::new(DaemonStateHandle::new(
         daemon_config.config.clone(),
         supervisor,
+        registry, // Pass the registry created during bootstrap
     ));
 
     // Write PID file

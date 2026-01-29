@@ -90,11 +90,13 @@ Non-persistent implementation for testing and single-node deployments.
 - [INV-0022] Thread-safe via `RwLock`
 - [INV-0014] One stable_id per digest (no aliases) - prevents ghost entries
 - [INV-0015] Lock ordering: insertion_order -> by_digest -> by_stable_id (prevents deadlocks)
+- [INV-0016] Protected schemas (kernel:) are never evicted
 
 **Contracts:**
-- [CTR-0020] Evicts oldest entries when capacity exceeded (O(1) FIFO)
-- [CTR-0021] `clear()` removes all schemas
+- [CTR-0020] Evicts oldest non-protected entries when capacity exceeded (O(1) FIFO)
+- [CTR-0021] `clear()` removes all schemas including protected ones
 - [CTR-0022] Re-registering same digest with different stable_id is a no-op (first stable_id wins)
+- [CTR-0023] Returns `RegistryFull` error when all schemas are protected and registry is at capacity
 
 ### `SchemaRegistryError`
 
@@ -207,6 +209,10 @@ if result.is_fully_compatible() {
 6. **Bounded stable_id Growth**: Since each digest can only have one stable_id, an attacker cannot exhaust memory by registering unlimited aliases for the same content.
 
 7. **Deadlock Prevention**: Consistent lock ordering ([INV-0015]) prevents AB-BA deadlocks between concurrent operations. Lock order: `insertion_order` -> `by_digest` -> `by_stable_id`.
+
+8. **Kernel Schema Protection**: Kernel schemas (stable_id starting with `kernel:`) are protected from eviction ([INV-0016]). An attacker cannot flood the registry to evict core protocol schemas.
+
+9. **Staging Pattern for DoS Prevention**: The `register()` method validates and hashes content BEFORE acquiring write locks. This prevents lock contention during expensive operations.
 
 ## Related Modules
 

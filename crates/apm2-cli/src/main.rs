@@ -217,15 +217,19 @@ fn main() -> Result<()> {
     // This is a critical security check that must pass before any CAC operations.
     verify_bootstrap_hash().context("bootstrap schema integrity check failed")?;
 
-    // Register core kernel schemas on startup (TCK-00181).
-    // This establishes the schema registry with all kernel event types
-    // before any event processing can occur.
+    // Validate kernel schema registration capability on startup (TCK-00181).
+    // The CLI is short-lived, so we verify that kernel schemas CAN be registered
+    // correctly. The actual long-lived registry is maintained by the daemon.
+    // This ensures the CLI can validate schema-related operations before
+    // forwarding to the daemon.
     let registry = InMemorySchemaRegistry::new();
     tokio::runtime::Builder::new_current_thread()
         .build()
         .context("Failed to build tokio runtime for kernel schema registration")?
         .block_on(register_kernel_schemas(&registry))
         .context("kernel schema registration failed")?;
+    // Registry is intentionally dropped here - CLI operations use daemon's registry
+    drop(registry);
 
     let cli = Cli::parse();
 

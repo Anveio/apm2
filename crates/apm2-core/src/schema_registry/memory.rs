@@ -31,9 +31,10 @@
 //!
 //! Never acquire locks in a different order.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use super::KERNEL_SCHEMA_PREFIX;
 use super::traits::{
     BoxFuture, DEFAULT_MAX_SCHEMAS, HandshakeResult, MAX_HANDSHAKE_DIGESTS, MAX_SCHEMA_SIZE,
     SchemaDigest, SchemaEntry, SchemaRegistry, SchemaRegistryError,
@@ -56,6 +57,7 @@ use crate::crypto::EventHasher;
 ///   entries
 /// - [INV-0015] Lock ordering: `insertion_order` -> `by_digest` ->
 ///   `by_stable_id`
+/// - [INV-0016] Protected schemas (kernel:) are never evicted
 ///
 /// # Example
 ///
@@ -92,6 +94,10 @@ pub struct InMemorySchemaRegistry {
     /// Index from stable ID to digest for fast lookup.
     /// Note: One `stable_id` per digest ([INV-0014]).
     by_stable_id: Arc<RwLock<HashMap<String, SchemaDigest>>>,
+    /// Protected digests that cannot be evicted ([INV-0016]).
+    /// Kernel schemas (`stable_id` starting with "kernel:") are automatically
+    /// protected.
+    protected_digests: Arc<RwLock<HashSet<SchemaDigest>>>,
     /// Maximum number of schemas allowed.
     max_schemas: usize,
 }
@@ -122,6 +128,7 @@ impl InMemorySchemaRegistry {
             insertion_order: Arc::new(RwLock::new(VecDeque::new())),
             by_digest: Arc::new(RwLock::new(HashMap::new())),
             by_stable_id: Arc::new(RwLock::new(HashMap::new())),
+            protected_digests: Arc::new(RwLock::new(HashSet::new())),
             max_schemas,
         }
     }
@@ -146,7 +153,7 @@ impl InMemorySchemaRegistry {
         self.by_digest.read().expect("lock poisoned").is_empty()
     }
 
-    /// Clears all registered schemas.
+    /// Clears all registered schemas, including protected ones.
     ///
     /// # Panics
     ///
@@ -161,10 +168,12 @@ impl InMemorySchemaRegistry {
         let mut insertion_order = self.insertion_order.write().expect("lock poisoned");
         let mut by_digest = self.by_digest.write().expect("lock poisoned");
         let mut by_stable_id = self.by_stable_id.write().expect("lock poisoned");
+        let mut protected = self.protected_digests.write().expect("lock poisoned");
 
         insertion_order.clear();
         by_digest.clear();
         by_stable_id.clear();
+        protected.clear();
     }
 
     /// Performs cheap validation of a schema entry (without hash verification).
@@ -227,6 +236,7 @@ impl Clone for InMemorySchemaRegistry {
             insertion_order: Arc::clone(&self.insertion_order),
             by_digest: Arc::clone(&self.by_digest),
             by_stable_id: Arc::clone(&self.by_stable_id),
+            protected_digests: Arc::clone(&self.protected_digests),
             max_schemas: self.max_schemas,
         }
     }
@@ -295,6 +305,7 @@ impl SchemaRegistry for InMemorySchemaRegistry {
             let mut insertion_order = self.insertion_order.write().expect("lock poisoned");
             let mut by_digest = self.by_digest.write().expect("lock poisoned");
             let mut by_stable_id = self.by_stable_id.write().expect("lock poisoned");
+            let mut protected = self.protected_digests.write().expect("lock poisoned");
 
             // Double-checked locking: Re-verify under write lock since another
             // thread may have registered between our read check and write lock
@@ -312,9 +323,27 @@ impl SchemaRegistry for InMemorySchemaRegistry {
 
             // Evict oldest entries if at capacity ([CTR-1303])
             // O(1) eviction via insertion_order VecDeque ([INV-0013])
+            // SECURITY [INV-0016]: Skip protected digests (kernel schemas)
+            let mut eviction_attempts = 0;
+            let max_eviction_attempts = insertion_order.len();
             while by_digest.len() >= self.max_schemas {
                 if let Some(oldest_digest) = insertion_order.pop_front() {
-                    // Remove the oldest entry and its stable_id mapping
+                    eviction_attempts += 1;
+
+                    // Skip protected digests - put them back at the end
+                    if protected.contains(&oldest_digest) {
+                        insertion_order.push_back(oldest_digest);
+                        // Safety: If we've tried all entries and none can be evicted,
+                        // the registry is full of protected schemas.
+                        if eviction_attempts > max_eviction_attempts {
+                            return Err(SchemaRegistryError::RegistryFull {
+                                current: by_digest.len(),
+                                max: self.max_schemas,
+                            });
+                        }
+                        continue;
+                    }
+                    // Remove the oldest non-protected entry and its stable_id mapping
                     if let Some(evicted) = by_digest.remove(&oldest_digest) {
                         by_stable_id.remove(&evicted.stable_id);
                     }
@@ -331,6 +360,11 @@ impl SchemaRegistry for InMemorySchemaRegistry {
             by_digest.insert(entry.digest, entry.clone());
             by_stable_id.insert(entry.stable_id.clone(), entry.digest);
             insertion_order.push_back(entry.digest);
+
+            // SECURITY [INV-0016]: Protect kernel schemas from eviction
+            if entry.stable_id.starts_with(KERNEL_SCHEMA_PREFIX) {
+                protected.insert(entry.digest);
+            }
 
             Ok(())
         })
@@ -1220,6 +1254,129 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "Later stable_ids should not work (first wins)"
+        );
+    }
+
+    // =========================================================================
+    // Kernel schema protection tests ([INV-0016])
+    // =========================================================================
+
+    #[tokio::test]
+    async fn tck_00181_kernel_schemas_protected_from_eviction() {
+        // SECURITY [INV-0016]: Kernel schemas cannot be evicted.
+        // This prevents an attacker from flooding the registry to evict
+        // kernel schemas and then registering malicious replacements.
+        let registry = InMemorySchemaRegistry::with_capacity(3);
+
+        // Register a kernel schema
+        let kernel_entry = make_entry("kernel:test.v1", br#"{"kernel": true}"#);
+        registry.register(&kernel_entry).await.unwrap();
+
+        // Register non-kernel schemas to fill the registry
+        let entry1 = make_entry("test:schema1.v1", br#"{"id": 1}"#);
+        let entry2 = make_entry("test:schema2.v1", br#"{"id": 2}"#);
+        registry.register(&entry1).await.unwrap();
+        registry.register(&entry2).await.unwrap();
+        assert_eq!(registry.count(), 3);
+
+        // Register another schema - should evict entry1, NOT the kernel schema
+        let entry3 = make_entry("test:schema3.v1", br#"{"id": 3}"#);
+        registry.register(&entry3).await.unwrap();
+        assert_eq!(registry.count(), 3);
+
+        // Kernel schema should still exist
+        assert!(
+            registry
+                .lookup_by_stable_id("kernel:test.v1")
+                .await
+                .unwrap()
+                .is_some(),
+            "Kernel schema should be protected from eviction"
+        );
+
+        // entry1 should have been evicted (it was oldest non-protected)
+        assert!(
+            registry
+                .lookup_by_digest(&entry1.digest)
+                .await
+                .unwrap()
+                .is_none(),
+            "Oldest non-kernel schema should be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tck_00181_registry_full_when_all_protected() {
+        // SECURITY: When all schemas are protected (kernel), new registrations
+        // should fail with RegistryFull rather than evicting protected schemas.
+        let registry = InMemorySchemaRegistry::with_capacity(2);
+
+        // Fill registry with kernel schemas
+        let kernel1 = make_entry("kernel:schema1.v1", br#"{"id": 1}"#);
+        let kernel2 = make_entry("kernel:schema2.v1", br#"{"id": 2}"#);
+        registry.register(&kernel1).await.unwrap();
+        registry.register(&kernel2).await.unwrap();
+        assert_eq!(registry.count(), 2);
+
+        // Try to register a non-kernel schema - should fail
+        let entry3 = make_entry("test:schema3.v1", br#"{"id": 3}"#);
+        let result = registry.register(&entry3).await;
+        assert!(
+            matches!(result, Err(SchemaRegistryError::RegistryFull { .. })),
+            "Should return RegistryFull when all schemas are protected"
+        );
+
+        // Both kernel schemas should still exist
+        assert!(
+            registry
+                .lookup_by_stable_id("kernel:schema1.v1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registry
+                .lookup_by_stable_id("kernel:schema2.v1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn tck_00181_kernel_schema_can_still_be_registered() {
+        // Kernel schemas can be registered even when registry is "full"
+        // with non-kernel schemas, because non-kernel schemas can be evicted.
+        let registry = InMemorySchemaRegistry::with_capacity(2);
+
+        // Fill registry with non-kernel schemas
+        let entry1 = make_entry("test:schema1.v1", br#"{"id": 1}"#);
+        let entry2 = make_entry("test:schema2.v1", br#"{"id": 2}"#);
+        registry.register(&entry1).await.unwrap();
+        registry.register(&entry2).await.unwrap();
+        assert_eq!(registry.count(), 2);
+
+        // Register a kernel schema - should evict entry1
+        let kernel = make_entry("kernel:schema.v1", br#"{"kernel": true}"#);
+        registry.register(&kernel).await.unwrap();
+        assert_eq!(registry.count(), 2);
+
+        // Kernel schema should be registered
+        assert!(
+            registry
+                .lookup_by_stable_id("kernel:schema.v1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // entry1 should be evicted
+        assert!(
+            registry
+                .lookup_by_digest(&entry1.digest)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }
