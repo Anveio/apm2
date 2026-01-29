@@ -49,7 +49,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 // ============================================================================
@@ -252,6 +254,24 @@ impl ValidatorSignature {
             signature,
         }
     }
+
+    /// Verifies this signature against a message and public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature is invalid.
+    pub fn verify(&self, message: &[u8], public_key: &[u8; 32]) -> Result<(), BftError> {
+        let verifying_key = VerifyingKey::from_bytes(public_key)
+            .map_err(|e| BftError::SignatureVerification(format!("invalid public key: {e}")))?;
+
+        let signature = Signature::from_bytes(&self.signature);
+
+        verifying_key
+            .verify(message, &signature)
+            .map_err(|_| BftError::InvalidSignature {
+                validator_id: hex::encode(self.validator_id),
+            })
+    }
 }
 
 /// A consensus proposal from the leader.
@@ -315,6 +335,25 @@ impl Proposal {
         }
         Ok(())
     }
+
+    /// Verifies the proposer's Ed25519 signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature is invalid.
+    pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<(), BftError> {
+        let message = self.signing_message();
+        let verifying_key = VerifyingKey::from_bytes(public_key)
+            .map_err(|e| BftError::SignatureVerification(format!("invalid public key: {e}")))?;
+
+        let signature = Signature::from_bytes(&self.signature);
+
+        verifying_key
+            .verify(&message, &signature)
+            .map_err(|_| BftError::InvalidSignature {
+                validator_id: hex::encode(self.proposer_id),
+            })
+    }
 }
 
 /// A vote for a proposal.
@@ -348,6 +387,25 @@ impl Vote {
         msg.extend_from_slice(&self.round.to_le_bytes());
         msg.extend_from_slice(&self.block_hash);
         msg
+    }
+
+    /// Verifies the voter's Ed25519 signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature is invalid.
+    pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<(), BftError> {
+        let message = self.signing_message();
+        let verifying_key = VerifyingKey::from_bytes(public_key)
+            .map_err(|e| BftError::SignatureVerification(format!("invalid public key: {e}")))?;
+
+        let signature = Signature::from_bytes(&self.signature);
+
+        verifying_key
+            .verify(&message, &signature)
+            .map_err(|_| BftError::InvalidSignature {
+                validator_id: hex::encode(self.voter_id),
+            })
     }
 }
 
@@ -419,6 +477,60 @@ impl QuorumCertificate {
         }
         Ok(())
     }
+
+    /// Verifies all signatures in the QC against the validator set.
+    ///
+    /// This method performs cryptographic verification of each signature,
+    /// not just a count check. Each signature must:
+    /// 1. Correspond to a known validator
+    /// 2. Be a valid Ed25519 signature over the vote message
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any signature is invalid or from an unknown
+    /// validator.
+    pub fn verify_signatures(
+        &self,
+        validators: &[ValidatorInfo],
+        quorum_threshold: usize,
+    ) -> Result<(), BftError> {
+        // Genesis QC needs no signature verification
+        if self.is_genesis() {
+            return Ok(());
+        }
+
+        // First check quorum count
+        self.validate_quorum(quorum_threshold)?;
+
+        // Build vote message that was signed
+        let mut vote_msg = Vec::with_capacity(4 + 8 + 8 + 32);
+        vote_msg.extend_from_slice(b"VOTE");
+        vote_msg.extend_from_slice(&self.epoch.to_le_bytes());
+        vote_msg.extend_from_slice(&self.round.to_le_bytes());
+        vote_msg.extend_from_slice(&self.block_hash);
+
+        // Verify each signature
+        for sig in &self.signatures {
+            // Find validator by ID (using constant-time comparison)
+            let validator = validators
+                .iter()
+                .find(|v| v.id.ct_eq(&sig.validator_id).into())
+                .ok_or_else(|| BftError::UnknownValidator(hex::encode(sig.validator_id)))?;
+
+            // Verify the signature
+            sig.verify(&vote_msg, &validator.public_key)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compares block hash using constant-time comparison.
+    ///
+    /// This prevents timing side-channel attacks when comparing hashes.
+    #[must_use]
+    pub fn block_hash_eq(&self, other: &BlockHash) -> bool {
+        self.block_hash.ct_eq(other).into()
+    }
 }
 
 impl Default for QuorumCertificate {
@@ -459,6 +571,25 @@ impl NewView {
         msg.extend_from_slice(&self.round.to_le_bytes());
         msg.extend_from_slice(&self.high_qc.block_hash);
         msg
+    }
+
+    /// Verifies the sender's Ed25519 signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature is invalid.
+    pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<(), BftError> {
+        let message = self.signing_message();
+        let verifying_key = VerifyingKey::from_bytes(public_key)
+            .map_err(|e| BftError::SignatureVerification(format!("invalid public key: {e}")))?;
+
+        let signature = Signature::from_bytes(&self.signature);
+
+        verifying_key
+            .verify(&message, &signature)
+            .map_err(|_| BftError::InvalidSignature {
+                validator_id: hex::encode(self.sender_id),
+            })
     }
 }
 
@@ -674,10 +805,14 @@ pub struct HotStuffState {
     last_voted_round: u64,
     /// Highest QC seen.
     high_qc: QuorumCertificate,
-    /// Votes collected for current round (`validator_id` -> vote).
-    votes: HashMap<ValidatorId, Vote>,
+    /// Votes collected for current round, grouped by block hash.
+    /// Key: `block_hash`, Value: map of `validator_id` -> vote.
+    votes_by_block: HashMap<BlockHash, HashMap<ValidatorId, Vote>>,
     /// Pending blocks (`block_hash` -> (round, `parent_hash`)).
     pending_blocks: HashMap<BlockHash, (u64, BlockHash)>,
+    /// Certified blocks by round (`round` -> QC).
+    /// Used for 3-chain commit rule verification.
+    certified_blocks: HashMap<u64, QuorumCertificate>,
     /// Committed block hashes in order.
     committed: Vec<BlockHash>,
 }
@@ -693,8 +828,9 @@ impl HotStuffState {
             phase: Phase::Idle,
             last_voted_round: 0,
             high_qc: QuorumCertificate::default(),
-            votes: HashMap::new(),
+            votes_by_block: HashMap::new(),
             pending_blocks: HashMap::new(),
+            certified_blocks: HashMap::new(),
             committed: Vec::new(),
         }
     }
@@ -762,9 +898,10 @@ impl HotStuffState {
             });
         }
 
-        // Validate proposer is leader
+        // Validate proposer is leader and get public key
         let expected_leader = self.config.leader_for_round(proposal.round);
-        if proposal.proposer_id != expected_leader.id {
+        // Use constant-time comparison for validator ID
+        if !bool::from(proposal.proposer_id.ct_eq(&expected_leader.id)) {
             return Err(BftError::NotLeader {
                 round: proposal.round,
                 expected: hex::encode(expected_leader.id),
@@ -780,7 +917,13 @@ impl HotStuffState {
             return Err(BftError::AlreadyVoted(proposal.round));
         }
 
-        // TODO: Verify signature (requires ed25519-dalek integration)
+        // Verify proposer's signature
+        proposal.verify_signature(&expected_leader.public_key)?;
+
+        // Verify parent QC signatures
+        proposal
+            .parent_qc
+            .verify_signatures(&self.config.validators, self.config.quorum_threshold)?;
 
         // Update state
         self.round = proposal.round;
@@ -812,7 +955,8 @@ impl HotStuffState {
 
     /// Processes an incoming vote.
     ///
-    /// Collects votes and returns a QC when quorum is reached.
+    /// Collects votes grouped by block hash and returns a QC when 2f+1 votes
+    /// for the *same* block hash are collected.
     ///
     /// # Errors
     ///
@@ -828,31 +972,38 @@ impl HotStuffState {
             });
         }
 
-        // Validate voter is in validator set
-        if self.config.get_validator(&vote.voter_id).is_none() {
-            return Err(BftError::UnknownValidator(hex::encode(vote.voter_id)));
-        }
+        // Validate voter is in validator set and get public key for verification
+        let validator = self
+            .config
+            .get_validator(&vote.voter_id)
+            .ok_or_else(|| BftError::UnknownValidator(hex::encode(vote.voter_id)))?;
+        let public_key = validator.public_key;
 
-        // Check for duplicate vote
-        if self.votes.contains_key(&vote.voter_id) {
+        // Check for duplicate vote for this block hash
+        let votes_for_block = self.votes_by_block.entry(vote.block_hash).or_default();
+        if votes_for_block.contains_key(&vote.voter_id) {
             return Err(BftError::DuplicateVote(
                 hex::encode(vote.voter_id),
                 vote.round,
             ));
         }
 
-        // TODO: Verify signature
+        // Verify signature
+        vote.verify_signature(&public_key)?;
 
-        // Collect vote
-        self.votes.insert(vote.voter_id, vote.clone());
+        // Collect vote for this block hash
+        votes_for_block.insert(vote.voter_id, vote.clone());
+        let vote_count = votes_for_block.len();
 
-        // Check for quorum
-        if self.votes.len() >= self.config.quorum_threshold {
-            let signatures: Vec<ValidatorSignature> = self
-                .votes
+        // Check for quorum on this specific block hash
+        if vote_count >= self.config.quorum_threshold {
+            // Collect and sort signatures by validator_id for deterministic ordering
+            // (CTR-2612)
+            let mut signatures: Vec<ValidatorSignature> = votes_for_block
                 .values()
                 .map(|v| ValidatorSignature::new(v.voter_id, v.signature))
                 .collect();
+            signatures.sort_by(|a, b| a.validator_id.cmp(&b.validator_id));
 
             let qc = QuorumCertificate {
                 epoch: vote.epoch,
@@ -860,6 +1011,9 @@ impl HotStuffState {
                 block_hash: vote.block_hash,
                 signatures,
             };
+
+            // Store certified block for 3-chain verification
+            self.certified_blocks.insert(qc.round, qc.clone());
 
             // Update state
             self.phase = Phase::Certified;
@@ -906,6 +1060,18 @@ impl HotStuffState {
             return Ok(()); // Ignore stale new-view
         }
 
+        // Validate sender is in validator set and verify signature
+        let validator = self
+            .config
+            .get_validator(&new_view.sender_id)
+            .ok_or_else(|| BftError::UnknownValidator(hex::encode(new_view.sender_id)))?;
+        new_view.verify_signature(&validator.public_key)?;
+
+        // Verify the embedded high_qc signatures
+        new_view
+            .high_qc
+            .verify_signatures(&self.config.validators, self.config.quorum_threshold)?;
+
         // Update high_qc if theirs is higher
         if new_view.high_qc.round > self.high_qc.round {
             self.high_qc = new_view.high_qc.clone();
@@ -914,7 +1080,7 @@ impl HotStuffState {
         // Advance to new round
         self.round = new_view.round;
         self.phase = Phase::Idle;
-        self.votes.clear();
+        self.votes_by_block.clear();
 
         Ok(())
     }
@@ -922,17 +1088,66 @@ impl HotStuffState {
     /// Attempts to commit blocks using the 3-chain rule.
     ///
     /// A block B is committed when there exists a 3-chain:
-    /// B <- B' <- B'' where B', B'' have consecutive rounds.
-    #[allow(clippy::missing_const_for_fn)]
+    /// `B <- B' <- B''` where B, B', B'' have consecutive rounds (r, r+1, r+2).
+    ///
+    /// This implements the `HotStuff` commit rule: a block at round r is
+    /// committed when we have QCs for rounds r, r+1, and r+2, where each
+    /// QC's block extends the previous (verified via `pending_blocks`
+    /// parent tracking).
     fn try_commit(&mut self) {
-        // Simplified 3-chain check
-        // In full implementation, we'd walk the chain from high_qc
-        // and commit the block 2 rounds back if it forms a 3-chain.
+        let current_round = self.high_qc.round;
 
-        // For now, just mark phase as committed if we're past round 3
-        if self.high_qc.round >= 3 {
-            self.phase = Phase::Committed;
-            // TODO: Identify and record the committed block
+        // Need at least 3 rounds to form a 3-chain
+        if current_round < 3 {
+            return;
+        }
+
+        // Check for 3 consecutive certified rounds ending at current_round
+        // grandparent (r) <- parent (r+1) <- current (r+2)
+        let grandparent_round = current_round - 2;
+        let parent_round = current_round - 1;
+
+        // Get QCs for all three rounds
+        let Some(grandparent_qc) = self.certified_blocks.get(&grandparent_round) else {
+            return;
+        };
+        let Some(parent_qc) = self.certified_blocks.get(&parent_round) else {
+            return;
+        };
+        let Some(current_qc) = self.certified_blocks.get(&current_round) else {
+            return;
+        };
+
+        // Verify the chain links using constant-time comparison:
+        // current's parent should be parent_qc's block
+        // parent's parent should be grandparent_qc's block
+        let current_parent = self.pending_blocks.get(&current_qc.block_hash);
+        let parent_parent = self.pending_blocks.get(&parent_qc.block_hash);
+
+        let chain_valid = match (current_parent, parent_parent) {
+            (Some((_, current_parent_hash)), Some((_, parent_parent_hash))) => {
+                // Use constant-time comparison for hash checks
+                let current_links_to_parent: bool =
+                    current_parent_hash.ct_eq(&parent_qc.block_hash).into();
+                let parent_links_to_grandparent: bool =
+                    parent_parent_hash.ct_eq(&grandparent_qc.block_hash).into();
+                current_links_to_parent && parent_links_to_grandparent
+            },
+            _ => false,
+        };
+
+        if chain_valid {
+            // Commit the grandparent block (head of the 3-chain)
+            // Use constant-time comparison to check if already committed
+            let already_committed = self
+                .committed
+                .iter()
+                .any(|h| h.ct_eq(&grandparent_qc.block_hash).into());
+
+            if !already_committed {
+                self.committed.push(grandparent_qc.block_hash);
+                self.phase = Phase::Committed;
+            }
         }
     }
 
@@ -940,7 +1155,7 @@ impl HotStuffState {
     pub fn advance_round(&mut self) {
         self.round += 1;
         self.phase = Phase::Idle;
-        self.votes.clear();
+        self.votes_by_block.clear();
     }
 }
 
