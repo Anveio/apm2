@@ -182,6 +182,7 @@ pub enum CrdtMergeError {
 /// HLCs are compared by `(wall_time_ns, logical_counter)` tuple.
 /// For deterministic tie-breaking when HLCs are equal, use [`HlcWithNodeId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hlc {
     /// Wall clock time in nanoseconds since Unix epoch.
     pub wall_time_ns: u64,
@@ -214,19 +215,23 @@ impl Hlc {
         }
     }
 
-    /// Updates this HLC based on a received message's HLC.
+    /// Updates this HLC based on a received message's HLC without skew
+    /// validation.
     ///
     /// This implements the HLC receive algorithm:
     /// - `new_wall_time = max(local_wall, msg_wall, physical_now)`
     /// - If wall times equal, increment the max counter
     /// - If wall time advances, reset counter
     ///
-    /// **Note:** This method does not validate future skew. For secure
+    /// # Safety
+    ///
+    /// This method does not validate future skew. A malicious peer could send
+    /// timestamps far in the future to "brick" the node's clock. For secure
     /// operation, use [`Self::update_with_remote`] which rejects timestamps
     /// too far in the future.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Nanoseconds won't overflow u64 until year 2554
-    pub fn receive(&self, msg_hlc: &Self) -> Self {
+    pub fn receive_unchecked(&self, msg_hlc: &Self) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         let physical_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -379,6 +384,7 @@ pub type NodeId = [u8; 32];
 /// This type provides a total ordering even when HLCs are exactly equal,
 /// using the node ID as a deterministic tie-breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HlcWithNodeId {
     /// The HLC timestamp.
     pub hlc: Hlc,
@@ -414,6 +420,7 @@ impl Ord for HlcWithNodeId {
 /// These operators define how conflicting values are resolved during
 /// anti-entropy synchronization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MergeOperator {
     /// Last-writer-wins by HLC timestamp.
     ///
@@ -492,6 +499,7 @@ impl<T> MergeResult<T> {
 
 /// Record of a merge conflict for `DefectRecorded` events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictRecord {
     /// The merge operator used.
     pub operator: MergeOperator,
@@ -525,12 +533,15 @@ pub struct ConflictRecord {
 }
 
 impl ConflictRecord {
-    /// Creates a new conflict record for LWW resolution.
+    /// Creates a new conflict record for LWW resolution without validation.
     ///
-    /// **Note:** This method does not validate input lengths. For secure
-    /// operation, use [`Self::try_lww`] which validates all inputs.
+    /// # Safety
+    ///
+    /// This method does not validate input lengths. Unbounded reason strings
+    /// could cause memory exhaustion. For secure operation, use
+    /// [`Self::try_lww`] which validates all inputs.
     #[must_use]
-    pub const fn lww(
+    pub const fn lww_unchecked(
         local_hlc: Hlc,
         local_node_id: NodeId,
         remote_hlc: Hlc,
@@ -576,7 +587,7 @@ impl ConflictRecord {
             });
         }
 
-        Ok(Self::lww(
+        Ok(Self::lww_unchecked(
             local_hlc,
             local_node_id,
             remote_hlc,
@@ -586,14 +597,16 @@ impl ConflictRecord {
         ))
     }
 
-    /// Sets the key for this conflict record.
+    /// Sets the key for this conflict record without validation.
     ///
-    /// **Note:** This method does not validate key length. For secure
-    /// operation, use [`Self::try_with_key`] which validates the key
-    /// length.
+    /// # Safety
+    ///
+    /// This method does not validate key length. Unbounded key strings could
+    /// cause memory exhaustion. For secure operation, use
+    /// [`Self::try_with_key`] which validates the key length.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Builder pattern with Into trait
-    pub fn with_key(mut self, key: impl Into<String>) -> Self {
+    pub fn with_key_unchecked(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self
     }
@@ -629,6 +642,7 @@ impl ConflictRecord {
 /// This enum tracks which value was selected during merge resolution,
 /// distinct from the `ConflictResolution` metric in the metrics module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum MergeWinner {
     /// Local value won.
     LocalWins,
@@ -649,6 +663,7 @@ pub enum MergeWinner {
 /// The register stores a value with an associated HLC and node ID.
 /// When merging, the value with the higher `(HLC, node_id)` wins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LwwRegister<T> {
     /// The stored value.
     pub value: T,
@@ -725,7 +740,7 @@ impl<T: Clone + PartialEq> LwwRegister<T> {
             },
         };
 
-        let conflict = ConflictRecord::lww(
+        let conflict = ConflictRecord::lww_unchecked(
             self.hlc,
             self.node_id,
             other.hlc,
@@ -747,6 +762,7 @@ impl<T: Clone + PartialEq> LwwRegister<T> {
 /// Each node maintains its own count, and the total is the sum of all counts.
 /// This ensures commutativity and convergence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GCounter {
     /// Per-node counts. Key is node ID, value is that node's count.
     /// Using a `BTreeMap` for deterministic iteration order.
@@ -768,12 +784,15 @@ impl GCounter {
         }
     }
 
-    /// Increments this node's count.
+    /// Increments this node's count without capacity checking.
     ///
-    /// **Note:** This method does not enforce the node limit. For secure
+    /// # Safety
+    ///
+    /// This method does not enforce the node limit. An attacker could inject
+    /// arbitrary node entries to cause memory exhaustion (OOM). For secure
     /// operation, use [`Self::try_increment`] which rejects additions
     /// beyond the limit.
-    pub fn increment(&mut self, node_id: NodeId, delta: u64) {
+    pub fn increment_unchecked(&mut self, node_id: NodeId, delta: u64) {
         let count = self.counts.entry(node_id).or_insert(0);
         *count = count.saturating_add(delta);
     }
@@ -833,16 +852,19 @@ impl GCounter {
         self.counts.get(node_id).copied().unwrap_or(0)
     }
 
-    /// Merges this counter with another.
+    /// Merges this counter with another without capacity checking.
     ///
     /// For each node, takes the maximum of the two counts.
     /// This is commutative, associative, and idempotent.
     ///
-    /// **Note:** This method does not enforce the node limit. For secure
+    /// # Safety
+    ///
+    /// This method does not enforce the node limit. An attacker could inject
+    /// counters with many nodes to cause memory exhaustion (OOM). For secure
     /// operation, use [`Self::try_merge`] which rejects merges that would
     /// exceed the limit.
     #[must_use]
-    pub fn merge(&self, other: &Self) -> Self {
+    pub fn merge_unchecked(&self, other: &Self) -> Self {
         let mut result = self.clone();
         for (node_id, &count) in &other.counts {
             let entry = result.counts.entry(*node_id).or_insert(0);
@@ -894,7 +916,7 @@ impl GCounter {
             });
         }
 
-        Ok(self.merge(other))
+        Ok(self.merge_unchecked(other))
     }
 
     /// Returns the number of nodes that have contributed to this counter.
@@ -951,12 +973,17 @@ impl MergeEngine {
         Ok(result)
     }
 
-    /// Merges two G-Counters.
+    /// Merges two G-Counters without capacity checking.
     ///
     /// G-Counter merge never produces conflicts (it's always a sum).
+    ///
+    /// # Safety
+    ///
+    /// This method does not enforce the node limit. For secure operation,
+    /// use [`GCounter::try_merge`] directly.
     #[must_use]
-    pub fn merge_gcounter(&self, local: &GCounter, remote: &GCounter) -> GCounter {
-        local.merge(remote)
+    pub fn merge_gcounter_unchecked(&self, local: &GCounter, remote: &GCounter) -> GCounter {
+        local.merge_unchecked(remote)
     }
 
     /// Returns the accumulated conflicts.
@@ -1238,12 +1265,12 @@ mod tests {
         let node_b = [0x02; 32];
 
         let mut counter_a = GCounter::new();
-        counter_a.increment(node_a, 5);
+        counter_a.increment_unchecked(node_a, 5);
 
         let mut counter_b = GCounter::new();
-        counter_b.increment(node_b, 3);
+        counter_b.increment_unchecked(node_b, 3);
 
-        let merged = counter_a.merge(&counter_b);
+        let merged = counter_a.merge_unchecked(&counter_b);
 
         assert_eq!(merged.value(), 8); // 5 + 3
         assert_eq!(merged.node_count(&node_a), 5);
@@ -1257,13 +1284,13 @@ mod tests {
         let node_b = [0x02; 32];
 
         let mut counter_a = GCounter::new();
-        counter_a.increment(node_a, 5);
+        counter_a.increment_unchecked(node_a, 5);
 
         let mut counter_b = GCounter::new();
-        counter_b.increment(node_b, 3);
+        counter_b.increment_unchecked(node_b, 3);
 
-        let merged_ab = counter_a.merge(&counter_b);
-        let merged_ba = counter_b.merge(&counter_a);
+        let merged_ab = counter_a.merge_unchecked(&counter_b);
+        let merged_ba = counter_b.merge_unchecked(&counter_a);
 
         assert_eq!(merged_ab.value(), merged_ba.value());
     }
@@ -1274,12 +1301,12 @@ mod tests {
         let node_a = [0x01; 32];
 
         let mut counter_1 = GCounter::new();
-        counter_1.increment(node_a, 5);
+        counter_1.increment_unchecked(node_a, 5);
 
         let mut counter_2 = GCounter::new();
-        counter_2.increment(node_a, 8);
+        counter_2.increment_unchecked(node_a, 8);
 
-        let merged = counter_1.merge(&counter_2);
+        let merged = counter_1.merge_unchecked(&counter_2);
 
         assert_eq!(merged.value(), 8); // max(5, 8)
     }
@@ -1290,7 +1317,7 @@ mod tests {
         let local = Hlc::new(1000, 5);
         let remote = Hlc::new(1000, 10);
 
-        let updated = local.receive(&remote);
+        let updated = local.receive_unchecked(&remote);
 
         // Should have the same or higher wall time
         assert!(updated.wall_time_ns >= 1000);
@@ -1356,7 +1383,7 @@ mod tests {
     /// Test `ConflictRecord` serialization.
     #[test]
     fn tck_00197_conflict_record_serializable() {
-        let conflict = ConflictRecord::lww(
+        let conflict = ConflictRecord::lww_unchecked(
             Hlc::new(1000, 0),
             [0x01; 32],
             Hlc::new(1001, 0),
@@ -1364,7 +1391,7 @@ mod tests {
             MergeWinner::RemoteWins,
             "remote HLC is higher".to_string(),
         )
-        .with_key("test_key")
+        .with_key_unchecked("test_key")
         .with_value_hashes([0xaa; 32], [0xbb; 32]);
 
         let json = serde_json::to_string(&conflict).unwrap();
@@ -1412,7 +1439,7 @@ mod tests {
         assert!(no_conflict.winner().is_some()); // consumes
 
         // Resolved - check borrow methods first
-        let conflict = ConflictRecord::lww(
+        let conflict = ConflictRecord::lww_unchecked(
             Hlc::new(1000, 0),
             node_a,
             Hlc::new(1001, 0),
@@ -1584,8 +1611,8 @@ mod tests {
         let local = Hlc::new(1000, 5);
         let remote = Hlc::new(1000, 10);
 
-        // Use receive (which has no skew check) to compare behavior
-        let _received = local.receive(&remote);
+        // Use receive_unchecked (which has no skew check) to compare behavior
+        let _received = local.receive_unchecked(&remote);
 
         // update_with_remote with a valid timestamp should produce the same result
         // Note: we can't directly compare due to timing, but we can verify it succeeds
@@ -1635,7 +1662,7 @@ mod tests {
         let node_a = [0x01; 32];
         let node_b = [0x02; 32];
 
-        let record = ConflictRecord::lww(
+        let record = ConflictRecord::lww_unchecked(
             Hlc::new(1000, 0),
             node_a,
             Hlc::new(1001, 0),
