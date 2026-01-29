@@ -213,6 +213,47 @@ prd_success_metrics:
         Track time between AAT defect creation and linked fix merge, stratified by risk tier.
       evidence_ids:
         - EVID-0027
+    - id: MET-0019
+      name: Anti-downgrade enforcement rate
+      description: |
+        Rate of detected downgrade attempts versus total AAT receipts.
+      baseline: "Baseline established after anti-downgrade enforcement."
+      target: "0% of downgrades accepted; 100% downgrade attempts rejected"
+      measurement_method: |
+        Track AAT_POLICY_DOWNGRADE_ATTEMPT and AAT_PROFILE_SUBSTITUTION defects; verify
+        no admissions proceed when these defects are present.
+      evidence_ids:
+        - EVID-0028
+    - id: MET-0020
+      name: AAT reuse integrity rate
+      description: |
+        Percentage of AAT reuses with exact provenance tuple match; mismatches are defects.
+      baseline: "Baseline established after reuse policy rollout."
+      target: "100% provenance match; 0 AAT_CACHE_KEY_MISMATCH accepted"
+      measurement_method: |
+        Track AATResultReused events and validate key tuple equality; count AAT_CACHE_KEY_MISMATCH defects.
+      evidence_ids:
+        - EVID-0029
+    - id: MET-0021
+      name: Evidence hygiene compliance rate
+      description: |
+        Percentage of AAT evidence artifacts with classification, redaction metadata, and retention TTL.
+      baseline: "Baseline established after evidence hygiene enforcement."
+      target: "100% compliance; 0 AAT_EVIDENCE_POLICY_VIOLATION accepted"
+      measurement_method: |
+        Validate evidence artifact metadata for AAT receipts; track AAT_EVIDENCE_POLICY_VIOLATION defects.
+      evidence_ids:
+        - EVID-0030
+    - id: MET-0022
+      name: HIGH-risk quorum coverage rate
+      description: |
+        Percentage of HIGH-risk admissions that include two independent AAT receipts.
+      baseline: "Baseline established after quorum enforcement."
+      target: "100% for risk_tier=HIGH"
+      measurement_method: |
+        Validate presence of two receipts with disjoint runner pool identities; track missing quorum defects.
+      evidence_ids:
+        - EVID-0031
   guardrails:
     - id: GRD-0001
       name: Admission decision internal-only
@@ -296,6 +337,28 @@ prd_success_metrics:
         AAT_POLICY_MISMATCH defect emitted; admission blocked until selection policy corrected.
       evidence_ids:
         - EVID-0024
+    - id: GRD-0011
+      name: Anti-downgrade enforcement
+      threshold: "Resolved AAT policy tuple MUST NOT be downgraded without waiver."
+      response_plan: |
+        AAT_POLICY_DOWNGRADE_ATTEMPT or AAT_PROFILE_SUBSTITUTION defect emitted; admission blocked
+        until waiver is approved and projection-visible.
+      evidence_ids:
+        - EVID-0028
+    - id: GRD-0012
+      name: AAT reuse provenance integrity
+      threshold: "AAT reuse MUST match exact provenance tuple."
+      response_plan: |
+        AAT_CACHE_KEY_MISMATCH defect emitted; reuse rejected and cache entry invalidated.
+      evidence_ids:
+        - EVID-0029
+    - id: GRD-0013
+      name: Evidence hygiene enforcement
+      threshold: "AAT evidence artifacts MUST meet classification/redaction/retention policy."
+      response_plan: |
+        AAT_EVIDENCE_POLICY_VIOLATION defect emitted; admission blocked until evidence remediated.
+      evidence_ids:
+        - EVID-0030
   definition_of_done:
     phase_1:
       name: "Phase 1 (FAC Core Hardening)"

@@ -31,6 +31,11 @@ prd_governance_model:
         - AAT evidence-chain binding (transcript + artifact digests + attestation)
         - Terminal verifier binding schema enforcement
         - Risk-tiered AAT selection policy enforcement
+        - AAT anti-downgrade enforcement for risk_tier/verifier policy/RCP profile
+        - AAT reuse provenance enforcement (AATResultReused)
+        - AAT evidence hygiene enforcement (classification/redaction/retention)
+        - AAT quorum/audit enforcement for HIGH/MED tiers
+        - AAT harness sandbox and egress control verification
         - Determinism envelope validation (Phase 2)
     - gate_id: GATE-PRD-PRODUCT
       authority_role: AUTH_PRODUCT
@@ -53,6 +58,8 @@ prd_governance_model:
         - Context firewall deny verification (CTX-ALLOWLIST-001)
         - Lease expiry and scope enforcement
         - AAT evidence-chain and attestation validation
+        - AAT anti-downgrade and reuse safety validation
+        - Evidence hygiene and retention policy validation
         - Fail-closed handling for nondeterministic gate outcomes
   adjudication_policy:
     enabled: true

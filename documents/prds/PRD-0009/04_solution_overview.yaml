@@ -155,6 +155,11 @@ prd_solution_overview:
           - changeset_digest
           - pr_bundle_hash
           - view_commitment_hash
+          - resolved_policy_hash
+          - resolved_risk_tier
+          - resolved_determinism_class
+          - resolved_verifier_policy_hash
+          - resolved_rcp_profile_id
           - run_receipt_hash
         actors:
           - HOLON-COORDINATOR
@@ -162,6 +167,7 @@ prd_solution_overview:
           - All selectors are resolved to concrete git object IDs (commit/tree), no symbolic HEAD.
           - Workspace deltas are content-addressed artifacts; never inferred from disk.
           - "CAS-at-commit: bind changeset_digest to work_id in ledger before spawning any gate episodes."
+          - "Policy resolution is pinned at ingest: resolved_policy_hash, resolved_risk_tier, resolved_verifier_policy_hash, and resolved_rcp_profile_id are immutable unless waived."
         defects_on_violation:
           - INVALID_SELECTOR
           - UNPINNED_INPUTS
@@ -203,6 +209,7 @@ prd_solution_overview:
           - rcp_quality_manifest_hash
           - rcp_security_manifest_hash
           - rcp_aat_manifest_hash
+          - rcp_profile_id
           - run_receipt_hash
         actors:
           - HOLON-CONTEXT-COMPILER
@@ -231,7 +238,7 @@ prd_solution_overview:
           - HOLON-COORDINATOR
         invariants:
           - "GateLease scope is strict: (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash)."
-          - "For gate_id=aat, GateLease scope additionally binds view_commitment_hash, rcp_aat_manifest_hash, and selection_policy_id."
+          - "For gate_id=aat, GateLease scope additionally binds view_commitment_hash, rcp_aat_manifest_hash, rcp_profile_id, and selection_policy_id."
           - Lease issuance committed before session.spawn (CAS-at-commit ordering).
           - Lease derivation obeys subset rule (child leases can only narrow).
         defects_on_violation:
@@ -290,6 +297,7 @@ prd_solution_overview:
         outputs:
           - admission_decision
           - merge_receipt_hash (on success)
+          - aat_result_reused_event (optional)
           - run_receipt_hash
         actors:
           - HOLON-KERNEL-GATE
@@ -300,6 +308,8 @@ prd_solution_overview:
           - Required gates must be satisfied by valid GateRunCompleted signatures + matching unexpired leases + matching ChangeSetDigest.
           - AAT admission validates typed GateReceipt payload (view_commitment_hash, rcp_manifest_hash, determinism_class, flake_class, run_receipt_hashes, run_count, stability_digest).
           - "AAT admission validates transcript chain completeness, artifact digests, terminal verifier outputs, verifier_policy_hash, selection_policy_id, risk_tier, and attestation fields."
+          - "AAT admission enforces anti-downgrade: policy_hash matches resolved_policy_hash; risk_tier/determinism_class not lowered; verifier_policy_hash allowed for resolved tier; rcp_profile_id and manifest match resolved profile."
+          - "AAT reuse is allowed only via AATResultReused with exact provenance tuple match; otherwise reuse is forbidden."
           - "Atomicity: MergeReceipt is emitted only after result_selector (trunk digest) is observed and recorded."
           - "MergeReceipt binds (base_selector, changeset_digest, gate_receipts, policy_hash) -> (result_selector)."
         defects_on_violation:
@@ -311,6 +321,10 @@ prd_solution_overview:
           - AAT_TERMINAL_VERIFIER_MISMATCH
           - AAT_ATTESTATION_INVALID
           - AAT_POLICY_MISMATCH
+          - AAT_POLICY_DOWNGRADE_ATTEMPT
+          - AAT_PROFILE_SUBSTITUTION
+          - AAT_CACHE_KEY_MISMATCH
+          - AAT_EVIDENCE_POLICY_VIOLATION
           - MERGE_NONATOMIC
           - MERGE_RECEIPT_INVALID
       - stage_id: FAC-06-PROJECTION_SYNC
@@ -367,6 +381,8 @@ prd_solution_overview:
         required_fields:
           - view_commitment_hash
           - rcp_manifest_hash
+          - rcp_profile_id
+          - policy_hash
           - determinism_class
           - flake_class
           - run_count
@@ -384,6 +400,7 @@ prd_solution_overview:
         binding_rules:
           - "view_commitment_hash MUST match FAC-00-INGEST_CHANGESET output."
           - "rcp_manifest_hash MUST match FAC-02-RCP_COMPILE rcp_aat_manifest_hash."
+          - "rcp_profile_id MUST match FAC-02-RCP_COMPILE rcp_profile_id."
           - "run_receipt_hashes MUST reference the GateRunCompleted sessions for this gate."
           - "verifier_policy_hash and selection_policy_id MUST match the policy_profile hash used for the run."
           - "transcript_chain_root_hash MUST be derivable from transcript_bundle_hash and complete chunk ordering."
@@ -392,13 +409,28 @@ prd_solution_overview:
     binding:
       view_commitment_hash: "FAC-00-INGEST_CHANGESET view_commitment_hash"
       rcp_manifest_hash: "FAC-02-RCP_COMPILE rcp_aat_manifest_hash"
+      rcp_profile_id: "FAC-02-RCP_COMPILE rcp_profile_id"
       gate_receipt_id: "GateReceipt for gate_id=aat"
       policy_hash: "AAT policy profile hash (selection + verifier binding + attestation requirements)."
       selection_policy_id: "Risk-tier selection policy identifier bound into GateReceipt payload."
+      resolved_policy_hash: "FAC-00-INGEST_CHANGESET resolved_policy_hash"
+      resolved_risk_tier: "FAC-00-INGEST_CHANGESET resolved_risk_tier"
+      resolved_verifier_policy_hash: "FAC-00-INGEST_CHANGESET resolved_verifier_policy_hash"
+      resolved_rcp_profile_id: "FAC-00-INGEST_CHANGESET resolved_rcp_profile_id"
+      resolved_determinism_class: "FAC-00-INGEST_CHANGESET resolved_determinism_class"
     verdicts:
       - PASS
       - FAIL
       - NEEDS_INPUT
+    anti_downgrade_invariant:
+      statement: "Resolved risk tier, determinism class, verifier policy, and RCP profile are pinned at FAC start and cannot be lowered without an explicit waiver."
+      enforcement:
+        - "policy_hash MUST equal resolved_policy_hash."
+        - "rcp_aat_manifest_hash MUST equal issued manifest hash for resolved_rcp_profile_id."
+        - "risk_tier MUST NOT be lower than resolved_risk_tier."
+        - "determinism_class MUST NOT be lower than resolved_determinism_class."
+        - "verifier_policy_hash MUST be allowed for resolved_risk_tier."
+        - "Downgrades require AdjudicationRequested(WAIVER) with separate authority; waiver is projection-visible."
     evidence_binding:
       transcript_chain:
         root_hash_field: "transcript_chain_root_hash"
@@ -420,6 +452,17 @@ prd_solution_overview:
         - "structured_test_report"
         - "invariant_check"
       enforcement: "PASS requires predicate satisfied; missing verifier outputs => FAIL or NEEDS_INPUT."
+    reuse_policy:
+      allowed: "Only when provenance tuple matches exactly; otherwise forbidden."
+      provenance_tuple:
+        - "changeset_digest"
+        - "pinned_snapshot_digest (derived from view_commitment_hash)"
+        - "verifier_policy_hash"
+        - "toolchain_digest"
+        - "env_attestation_digest"
+        - "rcp_aat_manifest_hash"
+      event: "AATResultReused { from_receipt_hash, key_tuple, justification }"
+      enforcement: "Kernel validates tuple + signature chain; mismatch emits AAT_CACHE_KEY_MISMATCH."
     flake_classification:
       classes:
         - "PRODUCT_DETERMINISTIC_FAIL"
@@ -443,6 +486,17 @@ prd_solution_overview:
         - "MED: AAT required for sensitive domains (auth/crypto/ledger/tool mediation); otherwise sampled."
         - "LOW: Sampled AAT (1 in N) + nightly full AAT on main."
       enforcement: "GateReceipt payload includes risk_tier + selection_policy_id; admission validates against policy_hash."
+    evidence_hygiene:
+      required_fields:
+        - "data_classification"
+        - "redaction_applied"
+        - "redaction_profile_hash"
+        - "retention_ttl"
+      enforcement: "Admission rejects receipts referencing evidence artifacts that violate policy or omit classification/redaction metadata."
+    quorum_audit:
+      high_risk: "Require two independent AAT receipts from disjoint runner pools (distinct signing roots) for risk_tier=HIGH."
+      medium_risk: "Random audit re-run for risk_tier=MED (target 5-10%); admission finalizes after audit PASS."
+      low_risk: "No quorum required; reuse permitted only under strict provenance tuple."
     attestation:
       minimum_viable:
         - "container_image_digest"
@@ -457,6 +511,11 @@ prd_solution_overview:
       invariant_first: true
       invariants_required: "AAT specs define invariants; steps exist only to observe invariants."
       steps_are_observational: true
+    harness_security:
+      sandbox: "Run AAT harnesses in strict namespaces/containers; no host mounts beyond pinned snapshot."
+      network: "Egress deny by default; any allowed network must be policy-declared and recorded in receipt."
+      env_allowlist: "Only allowlisted env vars are visible; redact all others from transcripts."
+      policy_lint: "Spec linter forbids tautological PASS hooks and requires at least one terminal verifier."
     determinism_policy:
       required_gate_ids:
         - "aat"
@@ -520,6 +579,7 @@ prd_solution_overview:
           merge_receipt: "MERGE_RECEIPT:"
           ci_import_attestation: "CI_IMPORT_ATTESTATION:"
           projection_receipt: "PROJECTION_RECEIPT:"
+          aat_result_reused: "AAT_RESULT_REUSED:"
         ingestion:
           critical_events_must_verify: true
           reject_reason_codes:
@@ -544,6 +604,7 @@ prd_solution_overview:
       aat_scope_extensions:
         - view_commitment_hash
         - rcp_manifest_hash
+        - rcp_profile_id
         - selection_policy_id
         - policy_hash
       aat_binding: "GateRunCompleted for gate_id=aat MUST match view_commitment_hash and rcp_manifest_hash from lease."
@@ -715,6 +776,18 @@ prd_solution_overview:
       - code: "AAT_POLICY_MISMATCH"
         severity: "S1"
         description: "AAT receipt policy_hash or selection_policy_id mismatch"
+      - code: "AAT_POLICY_DOWNGRADE_ATTEMPT"
+        severity: "S0"
+        description: "Attempt to lower risk tier, determinism class, or verifier policy without waiver"
+      - code: "AAT_PROFILE_SUBSTITUTION"
+        severity: "S1"
+        description: "AAT receipt references unapproved RCP profile or manifest"
+      - code: "AAT_CACHE_KEY_MISMATCH"
+        severity: "S1"
+        description: "AAT reuse attempted with non-matching provenance tuple"
+      - code: "AAT_EVIDENCE_POLICY_VIOLATION"
+        severity: "S1"
+        description: "Evidence artifact violates classification/redaction/retention policy"
       - code: "AAT_SPEC_INVALID"
         severity: "S2"
         description: "AAT spec missing invariant or uses step-based acceptance"
@@ -791,6 +864,7 @@ prd_solution_overview:
       - "Projection watchdog events"
       - "AAT receipt evidence validation"
       - "Terminal verifier policy evaluation"
+      - "AAT reuse provenance validation"
       - "Determinism envelope mismatches"
       - "Gate audit/holdout metrics"
     linkage: "DefectRecord links to (work_id, session_id, gate_id, changeset_digest) and evidence hashes."
@@ -842,3 +916,6 @@ prd_solution_overview:
             - "ProjectionApplied (receipt-backed sync attempt)"
             - "ProjectionDiverged (critical; triggers freeze)"
             - "ProjectionTamperObserved (defect signal)"
+        - payload_family: "AATEvent"
+          messages:
+            - "AATResultReused (critical, signed by admission authority; includes from_receipt_hash, provenance_tuple, policy_hash, justification)"

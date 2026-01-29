@@ -237,6 +237,52 @@ prd_constraints_invariants:
       enforcement: Spec validation rejects AAT suites lacking invariant declarations with AAT_SPEC_INVALID defect.
       evidence_ids:
         - EVID-0027
+    - id: CNS-0026
+      statement: |
+        Admission MUST enforce AAT anti-downgrade: risk_tier, determinism_class, verifier_policy_hash,
+        and rcp_profile_id are pinned at FAC start and cannot be lowered without explicit waiver.
+      rationale: |
+        Prevents “easier exam” attacks where a valid-looking PASS is obtained under weaker policies.
+      enforcement: AAT_POLICY_DOWNGRADE_ATTEMPT or AAT_PROFILE_SUBSTITUTION defect; admission rejects.
+      evidence_ids:
+        - EVID-0028
+    - id: CNS-0027
+      statement: |
+        Any AAT reuse MUST be keyed by an exact provenance tuple and emitted as AATResultReused;
+        mismatches are forbidden.
+      rationale: |
+        Prevents receipt replay, cache poisoning, and policy/toolchain context drift.
+      enforcement: AAT_CACHE_KEY_MISMATCH defect; reuse rejected.
+      evidence_ids:
+        - EVID-0029
+    - id: CNS-0028
+      statement: |
+        Evidence artifacts referenced by AAT receipts MUST include data_classification,
+        redaction_applied + redaction_profile_hash, and retention_ttl; policy violations
+        are admission-blocking.
+      rationale: |
+        Prevents permanent storage of secrets and enforces evidence hygiene without disabling auditability.
+      enforcement: AAT_EVIDENCE_POLICY_VIOLATION defect; admission rejects.
+      evidence_ids:
+        - EVID-0030
+    - id: CNS-0029
+      statement: |
+        Risk-tiered quorum/audit enforcement: HIGH requires two independent receipts from
+        disjoint runner pools; MED requires audit re-run at target rate; LOW requires no quorum.
+      rationale: |
+        Prevents single-runner compromise from spoofing AAT PASS for high-risk changes.
+      enforcement: AAT_POLICY_DOWNGRADE_ATTEMPT or AAT_POLICY_MISMATCH defect on missing quorum/audit.
+      evidence_ids:
+        - EVID-0031
+    - id: CNS-0030
+      statement: |
+        AAT harness execution MUST be sandboxed with egress deny by default, allowlisted env vars,
+        and no host mounts beyond pinned snapshot.
+      rationale: |
+        Treats AAT harness as untrusted code and prevents evidence forgery or exfiltration.
+      enforcement: AAT_EVIDENCE_POLICY_VIOLATION or CONTEXT_FIREWALL_DENY defect; session terminated.
+      evidence_ids:
+        - EVID-0032
   invariants:
     - id: INV-0001
       statement: |
@@ -356,6 +402,15 @@ prd_constraints_invariants:
       evidence_ids:
         - EVID-0022
         - EVID-0023
+    - id: INV-0013
+      statement: |
+        AAT policy resolution is immutable for a given (work_id, changeset_digest) unless waived;
+        downgrades are rejected and audited.
+      rationale: |
+        Prevents silent weakening of evaluation surfaces.
+      enforcement: Admission rejects downgrades; waiver required and projection-visible.
+      evidence_ids:
+        - EVID-0028
   security_properties:
     - id: SEC-PROP-0001
       name: Cryptographic admission authority

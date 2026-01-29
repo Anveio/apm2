@@ -110,6 +110,49 @@ prd_risks_questions:
         - Use holdout suites to detect false negatives.
         - Require invariants-first specs to avoid step-based brittleness.
       evidence_ids: []
+    - id: RSK-FAC-0010
+      statement: AAT reuse without strict provenance increases replay and cache poisoning risk.
+      impact: |
+        Reusing stale or mismatched receipts could allow regressions to pass or conceal
+        failures, undermining admission integrity.
+      likelihood: MEDIUM
+      mitigations:
+        - Enforce exact provenance tuple and AATResultReused event.
+        - Emit AAT_CACHE_KEY_MISMATCH on any mismatch.
+        - Log and invalidate caches on mismatch.
+      evidence_ids: []
+    - id: RSK-FAC-0011
+      statement: Evidence retention and transcripts increase long-term secret exposure risk.
+      impact: |
+        Secrets captured in logs or transcripts become permanent if retention is unmanaged,
+        creating compliance and security liabilities.
+      likelihood: MEDIUM
+      mitigations:
+        - Enforce classification, redaction profile, and retention TTL on all evidence.
+        - Reject admission when evidence hygiene requirements are not met.
+        - Apply deduplication and compression to reduce unnecessary exposure.
+      evidence_ids: []
+    - id: RSK-FAC-0012
+      statement: Quorum/audit enforcement for HIGH risk may reduce throughput.
+      impact: |
+        Requiring independent receipts and audit re-runs increases latency and compute,
+        potentially slowing high-risk merges.
+      likelihood: MEDIUM
+      mitigations:
+        - Limit quorum to HIGH tier and audit sampling to MED tier.
+        - Use disjoint runner pools with pinned environments to reduce flake-induced reruns.
+        - Measure quorum coverage vs latency to tune policy.
+      evidence_ids: []
+    - id: RSK-FAC-0013
+      statement: AAT harness execution surface enables exfiltration or evidence forgery.
+      impact: |
+        Malicious harness changes could leak data or forge evidence unless sandboxed.
+      likelihood: MEDIUM
+      mitigations:
+        - Enforce strict sandboxing with deny-by-default egress and env allowlist.
+        - Bind transcripts and artifacts into receipt with hash-chain completeness.
+        - Require verifier policy linting to prevent tautological tests.
+      evidence_ids: []
   open_questions:
     - id: Q-FAC-0001
       question: |
@@ -177,6 +220,19 @@ prd_risks_questions:
       resolution_plan: |
         Start with policy-defined critical domains (auth/crypto/ledger/tool mediation) and
         expand with impact expansion heuristics; revise based on escape-rate metrics.
+    - id: Q-FAC-0009
+      question: |
+        Where should policy resolution be recorded (PolicyResolved event vs embedded in FAC-00 run receipt),
+        and what is the canonical hash for anti-downgrade enforcement?
+      decision_needed_by: Phase 1 (FAC Core Hardening)
+      resolution_plan: |
+        Define PolicyResolved payload with resolved_policy_hash and policy tuple; bind to ledger at FAC-00.
+    - id: Q-FAC-0010
+      question: |
+        Should AAT reuse be allowed for LOW risk only, or for MED with explicit waiver?
+      decision_needed_by: Phase 1 (FAC Core Hardening)
+      resolution_plan: |
+        Start with LOW-only reuse; expand based on cache integrity metrics and escape rate.
   tradeoff_analyses:
     - id: TRADEOFF-FAC-0001
       name: Strictness vs. Adoption

@@ -7,11 +7,11 @@ prd_requirement:
   title: "AAT lease binding and executor isolation"
   statement: |
     AAT GateLease scope MUST bind view_commitment_hash, rcp_aat_manifest_hash, and
-    selection_policy_id; AAT executor keys MUST be isolated from coordinator and
-    implementer custody domains. Gate runs MUST execute against pinned snapshots,
-    not live worktrees.
+    rcp_profile_id, selection_policy_id, and policy_hash; AAT executor keys MUST be
+    isolated from coordinator and implementer custody domains. Gate runs MUST execute
+    against pinned snapshots, not live worktrees.
   acceptance_criteria:
-    - "GateLease for gate_id=aat includes view_commitment_hash, rcp_aat_manifest_hash, and selection_policy_id. Verified by: Lease schema validation test."
+    - "GateLease for gate_id=aat includes view_commitment_hash, rcp_aat_manifest_hash, rcp_profile_id, selection_policy_id, and policy_hash. Verified by: Lease schema validation test."
     - "GateRunCompleted for gate_id=aat matches lease-bound view_commitment_hash and rcp_aat_manifest_hash. Verified by: Admission rejection on mismatch."
     - "Executor key custody domain differs from coordinator/implementer roles. Verified by: KeyPolicy enforcement test."
     - "AAT runs execute against pinned snapshots only; live worktree reads are denied. Verified by: Context firewall test using a live worktree probe."

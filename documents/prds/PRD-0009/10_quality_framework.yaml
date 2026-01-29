@@ -77,8 +77,10 @@ prd_quality_framework:
       coverage:
         requirement_ids:
           - REQ-0001
+          - REQ-0014
         evidence_ids:
           - EVID-0003
+          - EVID-0030
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -99,6 +101,10 @@ prd_quality_framework:
           - REQ-0007
           - REQ-0008
           - REQ-0010
+          - REQ-0012
+          - REQ-0013
+          - REQ-0015
+          - REQ-0016
         evidence_ids:
           - EVID-0004
           - EVID-0005
@@ -107,6 +113,10 @@ prd_quality_framework:
           - EVID-0023
           - EVID-0025
           - EVID-0026
+          - EVID-0028
+          - EVID-0029
+          - EVID-0031
+          - EVID-0032
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -155,10 +165,14 @@ prd_quality_framework:
           - REQ-0002
           - REQ-0005
           - REQ-0008
+          - REQ-0012
+          - REQ-0013
         evidence_ids:
           - EVID-0008
           - EVID-0021
           - EVID-0025
+          - EVID-0028
+          - EVID-0029
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -198,6 +212,11 @@ prd_quality_framework:
           - REQ-0009
           - REQ-0010
           - REQ-0011
+          - REQ-0012
+          - REQ-0013
+          - REQ-0014
+          - REQ-0015
+          - REQ-0016
         evidence_ids:
           - EVID-0010
           - EVID-0011
@@ -209,6 +228,11 @@ prd_quality_framework:
           - EVID-0025
           - EVID-0026
           - EVID-0027
+          - EVID-0028
+          - EVID-0029
+          - EVID-0030
+          - EVID-0031
+          - EVID-0032
       delegation:
         guardrails: []
         required_evidence_categories: []
@@ -223,9 +247,11 @@ prd_quality_framework:
         requirement_ids:
           - REQ-0002
           - REQ-0009
+          - REQ-0013
         evidence_ids:
           - EVID-0012
           - EVID-0024
+          - EVID-0029
       delegation:
         guardrails: []
         required_evidence_categories: []

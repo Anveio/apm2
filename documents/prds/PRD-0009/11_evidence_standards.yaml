@@ -182,6 +182,26 @@ prd_evidence_standards:
       description: "Test results demonstrating invariant-first AAT specification validation."
       required_for:
         - FAC-REQ-0110
+    - category: AAT_ANTI_DOWNGRADE_RESULTS
+      description: "Test results demonstrating anti-downgrade enforcement for risk tier, verifier policy, and RCP profile."
+      required_for:
+        - FAC-REQ-0111
+    - category: AAT_REUSE_PROVENANCE_RESULTS
+      description: "Test results demonstrating AAT reuse provenance tuple enforcement and replay safety."
+      required_for:
+        - FAC-REQ-0112
+    - category: AAT_EVIDENCE_HYGIENE_RESULTS
+      description: "Test results demonstrating evidence classification, redaction, and retention policy enforcement."
+      required_for:
+        - FAC-REQ-0113
+    - category: AAT_QUORUM_AUDIT_RESULTS
+      description: "Test results demonstrating risk-tier quorum and audit re-run enforcement."
+      required_for:
+        - FAC-REQ-0114
+    - category: AAT_HARNESS_SANDBOX_RESULTS
+      description: "Test results demonstrating AAT harness sandboxing and egress control."
+      required_for:
+        - FAC-REQ-0115
     - category: GATE_DETERMINISM_ENVELOPE_RESULTS
       description: "Test results demonstrating coordinator-managed N-run stability checks."
       required_for:

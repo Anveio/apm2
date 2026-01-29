@@ -170,3 +170,33 @@ evidence_artifacts_readme:
       file: "EVID-0027.yaml"
       verifies:
         - "FAC-REQ-0110"
+    - id: "EVID-0028"
+      title: "AAT Anti-Downgrade Enforcement Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0028.yaml"
+      verifies:
+        - "FAC-REQ-0111"
+    - id: "EVID-0029"
+      title: "AAT Reuse Provenance Safety Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0029.yaml"
+      verifies:
+        - "FAC-REQ-0112"
+    - id: "EVID-0030"
+      title: "AAT Evidence Hygiene and Retention Tests"
+      category: "TEST_RESULTS"
+      file: "EVID-0030.yaml"
+      verifies:
+        - "FAC-REQ-0113"
+    - id: "EVID-0031"
+      title: "AAT Quorum/Audit Enforcement Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0031.yaml"
+      verifies:
+        - "FAC-REQ-0114"
+    - id: "EVID-0032"
+      title: "AAT Harness Sandbox and Egress Control Tests"
+      category: "INTEGRATION_TEST_RESULTS"
+      file: "EVID-0032.yaml"
+      verifies:
+        - "FAC-REQ-0115"

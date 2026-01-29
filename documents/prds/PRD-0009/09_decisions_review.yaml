@@ -248,6 +248,69 @@ prd_decisions_review:
           reason: |
             Step-first tests encode current behavior and block legitimate refactors.
       evidence_ids: []
+    - id: DEC-FAC-0012
+      statement: |
+        Selected Design: Anti-downgrade enforcement for AAT policy resolution.
+      rationale: |
+        Prevents silent weakening of risk tier, verifier policy, or RCP profile that would
+        turn hardened receipts into an easier exam.
+      alternatives_considered:
+        - id: ALT-SOFT-WARN
+          description: Log downgrades but allow PASS.
+          status: REJECTED
+          reason: |
+            Soft warnings create a spoofable PASS surface and violate admission integrity.
+      evidence_ids: []
+    - id: DEC-FAC-0013
+      statement: |
+        Selected Design: Provenance-bound AAT reuse with AATResultReused event.
+      rationale: |
+        Enables safe reuse without replay or cache poisoning by requiring exact tuple match
+        and signature verification.
+      alternatives_considered:
+        - id: ALT-UNKEYED-REUSE
+          description: Reuse based on changeset_digest only.
+          status: REJECTED
+          reason: |
+            Ignores toolchain, policy, and environment context; unsafe.
+      evidence_ids: []
+    - id: DEC-FAC-0014
+      statement: |
+        Selected Design: Evidence hygiene enforcement for AAT artifacts.
+      rationale: |
+        Prevents secrets from becoming permanent liabilities and keeps audit chain intact.
+      alternatives_considered:
+        - id: ALT-DISABLE-EVIDENCE
+          description: Turn off evidence capture to avoid leaks.
+          status: REJECTED
+          reason: |
+            Destroys auditability and weakens admission verification.
+      evidence_ids: []
+    - id: DEC-FAC-0015
+      statement: |
+        Selected Design: Quorum receipts for HIGH risk; audit sampling for MED.
+      rationale: |
+        Provides independent verification against runner compromise without collapsing
+        throughput for all tiers.
+      alternatives_considered:
+        - id: ALT-SINGLE-RUN
+          description: Single receipt for all risk tiers.
+          status: REJECTED
+          reason: |
+            Single compromised runner can spoof PASS for high-risk changes.
+      evidence_ids: []
+    - id: DEC-FAC-0016
+      statement: |
+        Selected Design: AAT harness sandboxing with deny-by-default egress.
+      rationale: |
+        Treats harness execution as untrusted code and blocks exfiltration or evidence forgery.
+      alternatives_considered:
+        - id: ALT-LOG-ONLY
+          description: Log harness actions without enforcement.
+          status: REJECTED
+          reason: |
+            Logging without enforcement cannot prevent compromise.
+      evidence_ids: []
   gate_reviews:
     - gate_id: GATE-PRD-SECURITY
       status: PENDING
