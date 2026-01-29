@@ -36,6 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -52,6 +53,12 @@ use super::tunnel::{
 
 /// Maximum pending messages per tunnel (CTR-1303: Bounded Stores).
 pub const MAX_PENDING_MESSAGES: usize = 100;
+
+/// Maximum tunnels per worker (CTR-1303: Bounded Stores).
+///
+/// This limit prevents a single worker from exhausting the global tunnel pool,
+/// ensuring fair resource allocation across workers.
+pub const MAX_TUNNELS_PER_WORKER: usize = 4;
 
 /// Message routing timeout.
 pub const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -95,6 +102,19 @@ pub enum RelayError {
     #[error("maximum tunnels reached: {max}")]
     MaxTunnelsReached {
         /// Maximum allowed tunnels.
+        max: usize,
+    },
+
+    /// Maximum tunnels per worker reached.
+    #[error(
+        "maximum tunnels per worker reached: worker {worker_id} has {current} of {max} allowed"
+    )]
+    MaxTunnelsPerWorkerReached {
+        /// The worker ID.
+        worker_id: String,
+        /// Current number of tunnels for this worker.
+        current: usize,
+        /// Maximum allowed tunnels per worker.
         max: usize,
     },
 
@@ -333,6 +353,16 @@ impl TunnelRegistry {
             });
         }
 
+        // Check per-worker tunnel limit (CTR-1303: Bounded Stores)
+        let current_worker_tunnels = by_worker.get(&info.worker_id).map_or(0, Vec::len);
+        if current_worker_tunnels >= MAX_TUNNELS_PER_WORKER {
+            return Err(RelayError::MaxTunnelsPerWorkerReached {
+                worker_id: info.worker_id.clone(),
+                current: current_worker_tunnels,
+                max: MAX_TUNNELS_PER_WORKER,
+            });
+        }
+
         let tunnel_id = info.tunnel_id.clone();
         let worker_id = info.worker_id.clone();
 
@@ -482,6 +512,15 @@ impl RelayHolon {
 
     /// Handles an incoming tunnel registration request.
     ///
+    /// # Security
+    ///
+    /// This method extracts the peer's Common Name (CN) directly from the TLS
+    /// connection's verified certificate chain, ensuring the identity is
+    /// mechanically bound to the connection and cannot be spoofed.
+    ///
+    /// Identity comparison uses constant-time equality to prevent timing
+    /// attacks.
+    ///
     /// # Errors
     ///
     /// Returns an error if registration fails.
@@ -489,24 +528,27 @@ impl RelayHolon {
         &self,
         request: TunnelRegisterRequest,
         connection: Connection,
-        cert_cn: Option<&str>,
     ) -> Result<TunnelAcceptResponse, RelayError> {
         // Validate request
         request.validate()?;
 
         // Validate identity if configured (INV-0023)
+        // Extract CN directly from connection to ensure identity-connection binding
         if self.config.validate_identity {
-            if let Some(cn) = cert_cn {
-                if cn != request.worker_id {
-                    return Err(RelayError::IdentityMismatch {
-                        cert_cn: cn.to_string(),
-                        worker_id: request.worker_id.clone(),
-                    });
-                }
-            } else {
-                return Err(RelayError::InvalidMessage(
-                    "certificate CN required for identity validation".into(),
-                ));
+            let cert_cn = connection.peer_common_name().ok_or_else(|| {
+                RelayError::InvalidMessage("certificate CN required for identity validation".into())
+            })?;
+
+            // Use constant-time comparison to prevent timing attacks
+            let cn_bytes = cert_cn.as_bytes();
+            let worker_id_bytes = request.worker_id.as_bytes();
+            let is_equal: bool = cn_bytes.ct_eq(worker_id_bytes).into();
+
+            if !is_equal {
+                return Err(RelayError::IdentityMismatch {
+                    cert_cn,
+                    worker_id: request.worker_id.clone(),
+                });
             }
         }
 
@@ -757,6 +799,9 @@ mod tck_00184_relay_tests {
         assert!(MAX_TUNNELS <= 1024);
         assert!(MAX_PENDING_MESSAGES > 0);
         assert!(MAX_PENDING_MESSAGES <= 1000);
+        // Per-worker tunnel limit must be positive and less than global limit
+        assert!(MAX_TUNNELS_PER_WORKER > 0);
+        assert!(MAX_TUNNELS_PER_WORKER <= MAX_TUNNELS);
     };
 
     #[tokio::test]
@@ -846,5 +891,37 @@ mod tck_00184_relay_tests {
             reason: String::new(),
         };
         let _: RelayError = RelayError::Shutdown;
+        // Verify per-worker limit error variant exists
+        let _: RelayError = RelayError::MaxTunnelsPerWorkerReached {
+            worker_id: String::new(),
+            current: 0,
+            max: MAX_TUNNELS_PER_WORKER,
+        };
+    }
+
+    #[test]
+    fn test_tck_00184_per_worker_tunnel_limit_constant() {
+        // CTR-1303: Per-worker tunnel limit should be reasonable
+        assert_eq!(
+            MAX_TUNNELS_PER_WORKER, 4,
+            "Per-worker tunnel limit should be 4"
+        );
+        // Note: MAX_TUNNELS_PER_WORKER <= MAX_TUNNELS is verified at
+        // compile-time in the const block above
+    }
+
+    #[test]
+    fn test_tck_00184_constant_time_comparison_trait_bound() {
+        // Verify subtle::ConstantTimeEq is usable for identity comparison
+        // This is a compile-time check that the trait is available
+        use subtle::ConstantTimeEq;
+
+        let a = b"test_identity";
+        let b = b"test_identity";
+        let c = b"other_identity";
+
+        // Verify the API works as expected
+        assert!(bool::from(a.ct_eq(b)));
+        assert!(!bool::from(a.ct_eq(c)));
     }
 }
