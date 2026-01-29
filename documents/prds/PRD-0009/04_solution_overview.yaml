@@ -1,0 +1,694 @@
+prd_solution_overview:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  proposed_solution:
+    overview: |
+      FAC is the internal, cryptographically enforced admission protocol; reviewers and
+      verifiers sign lease-bound outcomes; merges are proven by MergeReceipts; GitHub is
+      a projection. APM2 CLI runs the PR inner loop as a hardened protocol: admission is
+      impossible to spoof, and every decision is replayable from ledger+CAS under strict
+      OCAP. The key insight is that external forges (GitHub) cannot be sources of truth;
+      all admission decisions must be cryptographically signed, internally verified, and
+      projected outward.
+    key_components:
+      - name: Coordinator
+        holon_id: HOLON-COORDINATOR
+        type: orchestration_service
+        description: |
+          CAS-at-commit orchestration, bounded retries, echo-trap detection. Responsible
+          for binding changesets to work items before spawning gate episodes and managing
+          the overall FAC workflow.
+        tool_allowlist:
+          - ledger.append
+          - ledger.read
+          - session.spawn
+          - cas.put
+          - cas.get
+          - policy.query
+      - name: Kernel Governance
+        holon_id: HOLON-KERNEL-GOVERNANCE
+        type: authority_service
+        description: |
+          Critical event signing, authority minting, key policy. Issues lease-scoped
+          authority for gate executors and manages key rotation with chain-of-custody.
+        responsibilities:
+          - sign GateLeaseIssued events
+          - manage key rotation via KeyRotated events
+          - enforce COI grouping policy
+      - name: Kernel Gate
+        holon_id: HOLON-KERNEL-GATE
+        type: admission_service
+        description: |
+          Gate receipt verification, admission decision, merge receipt emission. The
+          sole authority for emitting MergeReceipts and freezing admissions.
+        responsibilities:
+          - verify GateRunCompleted signatures
+          - emit MergeReceipt on successful admission
+          - deny admission on policy violations
+          - request adjudication when needed
+          - freeze admissions on divergence
+      - name: Context Compiler
+        holon_id: HOLON-CONTEXT-COMPILER
+        type: compilation_service
+        description: |
+          CCP/RCP compilation, impact expansion, ZTI scoring. Generates deterministic,
+          bounded context views for each gate role with deep-pinned dependencies.
+        responsibilities:
+          - compile Review Context Packs (RCP)
+          - deterministic impact expansion
+          - emit View Commitments binding to ledger anchor
+      - name: GitHub Adapter
+        holon_id: HOLON-GITHUB-ADAPTER
+        type: projection_service
+        description: |
+          Projection-only sync and divergence watchdog. The only identity permitted to
+          write GitHub checks, status, labels, and comments. Imports CI evidence.
+        tool_allowlist:
+          - github.write
+          - github.read_limited
+          - artifact.fetch
+          - cas.put
+          - cas.get
+          - ledger.read
+        responsibilities:
+          - project internal state to GitHub
+          - import CI logs/artifacts as evidence
+          - detect and react to projection divergence
+      - name: Security Reviewer
+        holon_id: HOLON-REVIEWER-SECURITY
+        type: gate_executor
+        description: |
+          Executes security gate under OCAP context firewall. Signs GateRunCompleted
+          for gate=security under valid lease. Produces evidence bundles and findings.
+        tool_allowlist:
+          - cas.get
+          - repo.read_allowlisted
+          - cargo.test
+          - dep.audit
+          - policy.scan
+          - artifact.fetch
+      - name: Quality Reviewer
+        holon_id: HOLON-REVIEWER-QUALITY
+        type: gate_executor
+        description: |
+          Executes quality gate under OCAP context firewall. Signs GateRunCompleted
+          for gate=quality under valid lease. Produces evidence bundles and findings.
+        tool_allowlist:
+          - cas.get
+          - repo.read_allowlisted
+          - cargo.test
+          - cargo.clippy
+          - rustfmt.check
+          - artifact.fetch
+      - name: AAT Verifier
+        holon_id: HOLON-AAT
+        type: gate_executor
+        description: |
+          Executes acceptance test gate under OCAP context firewall. Signs GateRunCompleted
+          for gate=aat under valid lease. Publishes GateReceipt with AAT-typed payload
+          as terminal verification (determinism enforced externally in Phase 2).
+        tool_allowlist:
+          - cas.get
+          - repo.read_allowlisted
+          - shell.exec_allowlisted
+          - cargo.test
+          - artifact.fetch
+      - name: Auditor
+        holon_id: HOLON-AUDITOR
+        type: measurement_service
+        description: |
+          Measurement integrity, drift/holdout auditing (Phase 2). Runs adversarial
+          holdout suites and samples gate outcomes to detect evaluator drift.
+        responsibilities:
+          - execute FAC-90-HOLDOUT_AUDIT
+          - measure false negative rates
+          - emit drift alerts and policy quarantine
+      - name: Work Executor
+        holon_id: HOLON-WORK-EXECUTOR
+        type: implementation_service
+        description: |
+          Produces changesets and publishes implementation evidence. Cannot sign
+          GateRunCompleted for required gates, emit MergeReceipt, or write projections.
+        may:
+          - produce changesets
+          - publish implementation evidence
+        may_not:
+          - sign GateRunCompleted for required gates
+          - emit MergeReceipt
+          - write external projections
+  protocol:
+    name: "Forge Admission Cycle (FAC)"
+    stages:
+      - stage_id: FAC-00-INGEST_CHANGESET
+        name: Ingest ChangeSet + View Commitment
+        purpose: |
+          Bind a candidate change to pinned inputs; produce a ChangeSetDigest and
+          PRBundle artifact.
+        inputs:
+          - work_id
+          - plan_snapshot_hash
+          - base_selector
+          - workspace_delta_or_commit_range
+        outputs:
+          - changeset_digest
+          - pr_bundle_hash
+          - view_commitment_hash
+          - run_receipt_hash
+        actors:
+          - HOLON-COORDINATOR
+        invariants:
+          - All selectors are resolved to concrete git object IDs (commit/tree), no symbolic HEAD.
+          - Workspace deltas are content-addressed artifacts; never inferred from disk.
+          - "CAS-at-commit: bind changeset_digest to work_id in ledger before spawning any gate episodes."
+        defects_on_violation:
+          - INVALID_SELECTOR
+          - UNPINNED_INPUTS
+      - stage_id: FAC-01-CI_EVIDENCE_IMPORT
+        name: Import CI evidence (projection->evidence), not CI truth
+        purpose: |
+          Capture CI outputs as evidence artifacts; optionally gate readiness-for-review.
+        inputs:
+          - pr_number
+          - commit_sha
+          - ci_provider_observations
+          - workflow_artifacts
+        outputs:
+          - ci_evidence_bundle_hash
+          - ci_import_attestation_hash
+          - work_transition_ready_for_review (optional)
+        actors:
+          - HOLON-GITHUB-ADAPTER
+        invariants:
+          - CI observations are never treated as authoritative admission signals.
+          - If readiness transition is emitted, it must be backed by imported raw artifacts/log digests stored in CAS.
+          - "READY_FOR_REVIEW transition requires: (a) webhook signature verified, (b) raw log/artifact digests imported into CAS, (c) adapter attestation signed and committed."
+          - "A plain 'success' conclusion without evidence import is ignored (fail-closed)."
+        defects_on_violation:
+          - CI_EVIDENCE_MISSING
+          - CI_SHA_MISMATCH
+          - CI_ATTESTATION_INVALID
+      - stage_id: FAC-02-RCP_COMPILE
+        name: Compile Review Context Packs (RCP)
+        purpose: |
+          Generate deterministic, bounded context views for each gate role; maximize
+          ZTI for consumption holons.
+        inputs:
+          - changeset_digest
+          - ccp_atlas_hash
+          - pack_profiles
+          - impact_policy_profile
+        outputs:
+          - rcp_quality_manifest_hash
+          - rcp_security_manifest_hash
+          - rcp_aat_manifest_hash
+          - run_receipt_hash
+        actors:
+          - HOLON-CONTEXT-COMPILER
+        invariants:
+          - Each RCP includes a View Commitment binding to ledger anchor + pinned repo/toolchain/policy digests.
+          - RCP manifests deep-pin stable IDs to content hashes (CAC).
+          - Impact Expansion is deterministic for same inputs; non-deterministic tools are prohibited in the compiler path.
+        defects_on_violation:
+          - RCP_NONDETERMINISTIC
+          - RCP_MISSING_VIEW_COMMITMENT
+      - stage_id: FAC-03-MINT_AUTHORITY
+        name: Mint gate-scoped authority (GateLease)
+        purpose: |
+          Issue lease-scoped authority for a specific gate executor over a specific
+          ChangeSetDigest.
+        inputs:
+          - work_id
+          - changeset_digest
+          - gate_set
+          - executor_selection_policy
+        outputs:
+          - gate_lease_issued_events
+          - run_receipt_hash
+        actors:
+          - HOLON-KERNEL-GOVERNANCE
+          - HOLON-COORDINATOR
+        invariants:
+          - "GateLease scope is strict: (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash)."
+          - Lease issuance committed before session.spawn (CAS-at-commit ordering).
+          - Lease derivation obeys subset rule (child leases can only narrow).
+        defects_on_violation:
+          - LEASE_SCOPE_BROADENED
+          - LEASE_NO_POLICY_HASH
+      - stage_id: FAC-04-RUN_GATES
+        name: Run gates under OCAP context firewall
+        purpose: |
+          Execute quality/security/AAT gates; produce evidence bundles, gate receipts,
+          and signed GateRunCompleted events.
+        inputs:
+          - gate_lease
+          - rcp_manifest_hash
+          - tool_policy_profile
+          - target_profile
+        outputs:
+          - evidence_bundle_hash
+          - gate_receipt_id
+          - gate_run_started_event
+          - gate_run_completed_event_signed
+          - run_receipt_hash
+          - defect_records (optional)
+        actors:
+          - HOLON-REVIEWER-QUALITY
+          - HOLON-REVIEWER-SECURITY
+          - HOLON-AAT
+        invariants:
+          - "OCAP context firewall: repo/file reads are allowed only for objects explicitly enumerated in the RCP manifest allowlist."
+          - "Context misses are not 'warnings': they terminate the session with rationale CONTEXT_MISS and trigger refinement."
+          - GateRunCompleted is a critical signed event (Ed25519 over canonical bytes, domain-separated).
+          - GateReceipt binds to EvidenceBundle hash and is signed by GateReceiptGenerator.
+          - GateReceipt uses typed payloads; gate_id=aat requires view_commitment_hash and determinism_class in payload.
+          - Advisory narratives are recorded but never substitute for terminal-verifier evidence.
+        defects_on_violation:
+          - CONTEXT_FIREWALL_DENY
+          - CONTEXT_MISS
+          - INVALID_SIGNATURE
+          - UNAUTHORIZED_EXECUTOR
+      - stage_id: FAC-05-ADMISSION_DECISION
+        name: Admission decision + atomic merge
+        purpose: |
+          Decide promote/deny; on promote, perform atomic merge and emit MergeReceipt
+          after observing trunk update.
+        inputs:
+          - gate_run_completed_events
+          - gate_receipts
+          - policy_profile
+          - base_selector
+          - changeset_digest
+        outputs:
+          - admission_decision
+          - merge_receipt_hash (on success)
+          - run_receipt_hash
+        actors:
+          - HOLON-KERNEL-GATE
+          - HOLON-GITHUB-ADAPTER (actuation)
+          - HOLON-COORDINATOR
+        invariants:
+          - Admission reads only internal projections; never reads GitHub status as truth.
+          - Required gates must be satisfied by valid GateRunCompleted signatures + matching unexpired leases + matching ChangeSetDigest.
+          - AAT admission validates typed GateReceipt payload (view_commitment_hash, determinism_class, run_receipt_hashes, run_count, stability_digest).
+          - "Atomicity: MergeReceipt is emitted only after result_selector (trunk digest) is observed and recorded."
+          - "MergeReceipt binds (base_selector, changeset_digest, gate_receipts, policy_hash) -> (result_selector)."
+        defects_on_violation:
+          - GATE_MISSING
+          - GATE_STALE_SHA
+          - MERGE_NONATOMIC
+          - MERGE_RECEIPT_INVALID
+      - stage_id: FAC-06-PROJECTION_SYNC
+        name: Projection sync + anti-entropy watchdog
+        purpose: |
+          Project authoritative state to GitHub; detect and react to divergence.
+        inputs:
+          - ledger_head
+          - projection_targets
+          - latest_merge_receipt
+        outputs:
+          - projection_receipt_hash
+          - projection_health
+          - defect_records (optional)
+        actors:
+          - HOLON-GITHUB-ADAPTER
+        invariants:
+          - Sync direction is always ledger -> GitHub.
+          - Projection is idempotent; repeated sync yields same GitHub state.
+          - Adapter is the only identity permitted to write GitHub checks/status/labels/comments.
+          - "Continuous divergence detection: compare external trunk HEAD to latest MergeReceipt result_selector; if diverged, emit PROJECTION_DIVERGENCE and freeze admissions for that repo."
+        defects_on_violation:
+          - PROJECTION_TAMPER
+          - PROJECTION_DIVERGENCE
+          - PROJECTION_WRITE_UNAUTHORIZED
+      - stage_id: FAC-90-HOLDOUT_AUDIT
+        name: Adversarial holdout / drift audit (Phase 2)
+        purpose: |
+          Measure false negatives and evaluator drift using known-bad ChangeSets
+          and sampled audits.
+        inputs:
+          - holdout_suite_id
+          - gate_policy_version
+          - sampling_policy
+        outputs:
+          - evaluator_metrics
+          - drift_alerts
+          - policy_quarantine (optional)
+        actors:
+          - HOLON-AUDITOR
+        invariants:
+          - Holdout ChangeSets are isolated from production trunk (no merge capability).
+          - If false-negative rate exceeds threshold, gate policy is quarantined and admission requires explicit adjudication until resolved.
+        defects_on_violation:
+          - EVALUATOR_DRIFT
+          - HOLDOUT_FALSE_NEGATIVE
+        phase: "Phase 2"
+  gate_receipts:
+    payloads:
+      default:
+        description: "GateReceipt binds gate outcome to EvidenceBundle hash and is signed by GateReceiptGenerator."
+      aat:
+        gate_id: "aat"
+        required_fields:
+          - determinism_class
+          - run_count
+          - run_receipt_hashes
+          - stability_digest
+          - verdict
+          - view_commitment_hash
+        binding_rules:
+          - "view_commitment_hash MUST match FAC-00-INGEST_CHANGESET output."
+          - "run_receipt_hashes MUST reference the GateRunCompleted sessions for this gate."
+  aat_contract:
+    binding:
+      view_commitment_hash: "FAC-00-INGEST_CHANGESET view_commitment_hash"
+      rcp_manifest_hash: "FAC-02-RCP_COMPILE rcp_aat_manifest_hash"
+      gate_receipt_id: "GateReceipt for gate_id=aat"
+    verdicts:
+      - PASS
+      - FAIL
+      - NEEDS_INPUT
+    determinism_policy:
+      required_gate_ids:
+        - "aat"
+      extension_note: "Policy may require determinism_class > 0 for other gates over time."
+    phase_1:
+      scope: "Schema + signed typed GateReceipt payload for AAT."
+      enforcement: "Admission verifies presence of AAT payload fields when gate_id=aat."
+    phase_2:
+      scope: "Determinism envelope enforced by Coordinator/Determinism Proxy."
+      enforcement: "PASS requires stability proof across N runs."
+  determinism_envelope:
+    owner: "HOLON-COORDINATOR or Determinism Proxy"
+    default_run_count: 3
+    stability_rule: "All N runs must produce identical evidence_bundle_hash and AAT payload fields."
+    proof: "GateReceipt payload includes run_receipt_hashes, run_count, and stability_digest."
+    failure_actions:
+      - "Emit DefectRecord(GATE_NONDETERMINISTIC)."
+      - "WorkTransitioned -> BLOCKED with rationale=QUARANTINED_CHANGESET (time-bounded)."
+      - "WorkAborted abort_reason=POLICY_DENY after repeated nondeterminism."
+    phase: "Phase 2"
+  stop_conditions:
+    boundedness:
+      per_gate_max_attempts: 3
+      global_max_episodes: 50
+      budgets:
+        review_security:
+          tokens: 250000
+          tool_calls: 800
+          duration_ms: 3600000
+        review_quality:
+          tokens: 250000
+          tool_calls: 800
+          duration_ms: 3600000
+        aat:
+          tokens: 200000
+          tool_calls: 1000
+          duration_ms: 3600000
+    echo_trap_detection:
+      signal: FindingSignature repeats without delta
+      threshold: 3
+      window: single GateRun
+      actions:
+        - Terminate session rationale=REASONING_DEGENERATION
+        - Emit DefectRecord(ECHO_TRAP)
+        - Escalate via OracleRequest or AdjudicationRequested(request_type=GATE_REVIEW)
+    retry_policy:
+      backoff: exponential
+      max_backoff_seconds: 3600
+      provider_errors: "classified into retryable/non-retryable; see provider_routing"
+  authority:
+    identity:
+      keys:
+        algorithm: ed25519
+        binding: KeyRotated establishes actor_id -> verifying_key with chain-of-custody
+        domain_separators:
+          gate_run_completed: "GATE_RUN_COMPLETED:"
+          gate_lease: "GATE_LEASE_ISSUED:"
+          merge_receipt: "MERGE_RECEIPT:"
+          ci_import_attestation: "CI_IMPORT_ATTESTATION:"
+          projection_receipt: "PROJECTION_RECEIPT:"
+        ingestion:
+          critical_events_must_verify: true
+          reject_reason_codes:
+            - INVALID_SIGNATURE
+            - UNAUTHORIZED_EXECUTOR
+            - UNKNOWN_KEY
+    gate_lease:
+      fields:
+        - lease_id
+        - work_id
+        - gate_id
+        - changeset_digest
+        - executor_actor_id
+        - issued_at
+        - expires_at
+        - policy_hash
+        - issuer_actor_id
+        - issuer_signature
+      single_use: true
+      expiry_enforced: true
+      lease_outcome_binding: "GateRunCompleted must reference lease_id and include changeset_digest; mismatch rejects."
+    conflict_of_interest:
+      enabled: true
+      rule: Executor of a required gate must not be the author of the ChangeSet (or a key in the same COI group).
+      coi_grouping: Keys may be grouped by custody domain; COI is enforced at group-level.
+      waiver:
+        enabled: true
+        path: "AdjudicationRequested request_type=WAIVER with explicit rationale and bounded scope; signed by authority set"
+        scope_fields:
+          - work_id
+          - changeset_digest
+          - gate_id
+          - expires_at
+          - rationale
+  ocap_and_context:
+    mode: "ZTI-first consumption"
+    context_firewall:
+      mechanism: "OCAP mediated tools with manifest-scoped read handles"
+      rules:
+        - rule_id: "CTX-ALLOWLIST-001"
+          statement: "repo.read and file.read operations must reference a manifest entry (stable_id or path+hash) present in the ContextPackManifest allowlist."
+          enforcement: "ToolDecided=DENY if not allowlisted"
+          severity: "S1"
+        - rule_id: "CTX-SUFFICIENCY-001"
+          statement: "Every RunReceipt records context sufficiency metrics (bytes supplied, entries used, misses, denied reads, ZTI score)."
+          enforcement: "RunReceipt required for GateRunCompleted acceptance"
+          severity: "S2"
+        - rule_id: "CTX-ZOOM-001"
+          statement: "Consumers may request additional context only via ContextRefinementRequest; no in-session discovery."
+          enforcement: "SessionTerminated rationale=CONTEXT_MISS; coordinator reissues lease after refined pack"
+          severity: "S1"
+      defect_emission:
+        on_denied_read: "CONTEXT_FIREWALL_DENY"
+        on_context_miss: "CONTEXT_MISS"
+        on_excessive_zoom_requests: "ECHO_TRAP"
+    tool_policy:
+      default: "deny"
+      per_role_allowlists:
+        HOLON-AAT:
+          - artifact.fetch
+          - cas.get
+          - cargo.test
+          - repo.read_allowlisted
+          - shell.exec_allowlisted
+        HOLON-COORDINATOR:
+          - cas.get
+          - cas.put
+          - ledger.append
+          - ledger.read
+          - policy.query
+          - session.spawn
+        HOLON-GITHUB-ADAPTER:
+          - artifact.fetch
+          - cas.get
+          - cas.put
+          - github.read_limited
+          - github.write
+          - ledger.read
+        HOLON-REVIEWER-QUALITY:
+          - artifact.fetch
+          - cas.get
+          - cargo.clippy
+          - cargo.test
+          - repo.read_allowlisted
+          - rustfmt.check
+        HOLON-REVIEWER-SECURITY:
+          - artifact.fetch
+          - cas.get
+          - dep.audit
+          - policy.scan
+          - repo.read_allowlisted
+          - cargo.test
+      ambient_credential_ban:
+        - "No agent processes inherit GitHub tokens/ssh keys; only adapter has projection credentials."
+        - "Any attempt to access forbidden credentials emits PolicyViolation and quarantines session."
+  ci_ingestion:
+    trusted_boundary: "GitHub webhook signature verifies origin but is not sufficient for readiness/admission."
+    evidence_binding:
+      required_for_ready_for_review: "when_ci_gating_enabled"
+      raw_import:
+        - "workflow logs (compressed)"
+        - "test reports/artifacts"
+        - "workflow metadata (run id, job ids)"
+      attestation:
+        level: "L1"
+        fields:
+          - "runner_image_digest?"
+          - "toolchain?"
+          - "command_transcript_hash?"
+          - "workflow_run_id"
+          - "downloaded_artifact_hashes"
+        signed_by: "HOLON-GITHUB-ADAPTER"
+    feature_flags:
+      CI_EVENTS_ENABLED: "false by default (fail-closed); when true, evidence-backed import is required"
+      CI_GATED_QUEUE_ENABLED: "false by default (fail-closed); when true, READY_FOR_REVIEW transitions require attested evidence import"
+    open_question: "How to obtain stable runner image digests from hosted CI; may require self-hosted runners for L1+."
+    security_notes:
+      - "CI conclusions are treated as observations; admission requires internal gates with terminal verifiers."
+      - "Where hosted CI cannot provide strong environment attestations, re-run critical verifiers in controlled environments for T3 changes."
+  projection:
+    projection_only: true
+    write_identity: "HOLON-GITHUB-ADAPTER"
+    idempotence: "Projection keyed by (work_id, changeset_digest, ledger_head) fingerprint; reapply is safe."
+    tamper_detection:
+      status_write_policy: "Only adapter token may write checks/status; other writers treated as tamper."
+      tamper_reaction:
+        - "Optionally set external checks to FAILURE on tamper detection to prevent reliance on stale green UI."
+        - "Overwrite projection to match ledger truth on next sync."
+        - "Emit DefectRecord(PROJECTION_TAMPER) with evidence (diff of fingerprints)."
+    divergence_watchdog:
+      check: "Compare external trunk HEAD commit/tree to latest internal MergeReceipt result_selector."
+      poll_interval_seconds: 30
+      on_divergence:
+        - "Emit DefectRecord(PROJECTION_DIVERGENCE) with observed head + expected head"
+        - "Emit InterventionFreeze(scope=repo) and halt new FAC admissions for repo"
+        - "Open AdjudicationRequested(request_type=EMERGENCY_RECOVERY) referencing divergence evidence"
+      unfreeze: "Requires explicit adjudication or emergency override ceremony per PRD-0007."
+    branch_protection_contract:
+      goal: "Ensure external merge paths cannot bypass FAC admission."
+      requirements:
+        - "Main branch protection requires checks that are only set by HOLON-GITHUB-ADAPTER."
+        - "Restrict merge permissions so only adapter identity (or merge bot) can merge to main."
+        - "Disable administrator bypass for routine operations; if kept, treat use as emergency override with audit."
+      open_question: "Exact GitHub org policies and enforcement mechanics; document and codify in adapter handshake."
+  goodhart_resistance:
+    enabled: false
+    activation_phase: "Phase 2"
+    policy: "Holdouts/audits are measurement channels isolated from admission objectives; they can quarantine policies but do not auto-merge or auto-block in Phase 1."
+    holdouts:
+      concept: "Known-bad ChangeSets and adversarial suites routed through gate pipeline to estimate false-negative rates."
+      execution: "HOLON-AUDITOR runs FAC-90-HOLDOUT_AUDIT on schedule; cannot merge."
+      metrics:
+        - false_negative_rate
+        - finding_precision
+        - gate_evidence_coverage
+    evaluator_audit:
+      concept: "Sample GateRunCompleted + EvidenceBundle pairs and verify rationale codes align with raw evidence (LAW-15)."
+      sampling:
+        rate: "1% of GateRuns or min 1/day"
+        bias: "oversample security-sensitive changes"
+      actions_on_drift:
+        - "Quarantine affected gate policy version"
+        - "Require adjudication for affected gate until resolved"
+  defects:
+    schema: "cac.defect_record.v1"
+    taxonomy:
+      - code: "CI_ATTESTATION_INVALID"
+        severity: "S1"
+        description: "CI import attestation signature invalid or missing fields"
+      - code: "CI_EVIDENCE_MISSING"
+        severity: "S1"
+        description: "CI readiness transition attempted without imported raw evidence digests"
+      - code: "CI_SHA_MISMATCH"
+        severity: "S1"
+        description: "CI evidence commit SHA does not match expected changeset"
+      - code: "CONTEXT_FIREWALL_DENY"
+        severity: "S2"
+        description: "Attempted read outside pack allowlist"
+      - code: "CONTEXT_MISS"
+        severity: "S2"
+        description: "Pack lacks required context; session terminated; triggers refinement loop"
+      - code: "ECHO_TRAP"
+        severity: "S2"
+        description: "Reasoning degeneration detected (repeated finding signatures)"
+      - code: "EVALUATOR_DRIFT"
+        severity: "S1"
+        description: "Auditor detected drift between rationale codes and evidence"
+      - code: "GATE_NONDETERMINISTIC"
+        severity: "S1"
+        description: "Gate outcomes diverged under determinism envelope"
+      - code: "HOLDOUT_FALSE_NEGATIVE"
+        severity: "S1"
+        description: "Gate missed known-bad holdout vulnerability/bug"
+      - code: "INVALID_SIGNATURE"
+        severity: "S0"
+        description: "Critical event signature invalid"
+      - code: "PROJECTION_DIVERGENCE"
+        severity: "S0"
+        description: "External trunk diverges from latest MergeReceipt"
+      - code: "PROJECTION_TAMPER"
+        severity: "S1"
+        description: "External projection mutated by non-adapter identity"
+      - code: "PROJECTION_WRITE_UNAUTHORIZED"
+        severity: "S1"
+        description: "Non-adapter identity attempted projection write"
+      - code: "PROVIDER_RATE_LIMIT"
+        severity: "S3"
+        description: "LLM provider rate limiting impacted run"
+      - code: "PROVIDER_TIMEOUT"
+        severity: "S3"
+        description: "LLM provider timeout impacted run"
+      - code: "UNAUTHORIZED_EXECUTOR"
+        severity: "S0"
+        description: "Gate outcome signed by actor not authorized/leased"
+    generation_sources:
+      - "ToolDecided DENY"
+      - "SessionTerminated rationale codes"
+      - "Provider error classification from ToolExecuted"
+      - "Projection watchdog events"
+      - "Determinism envelope mismatches"
+      - "Gate audit/holdout metrics"
+    linkage: "DefectRecord links to (work_id, session_id, gate_id, changeset_digest) and evidence hashes."
+    phase2_only_codes:
+      - "EVALUATOR_DRIFT"
+      - "GATE_NONDETERMINISTIC"
+      - "HOLDOUT_FALSE_NEGATIVE"
+  provider_routing:
+    classification_aware: true
+    stage_scoped: true
+    error_taxonomy:
+      - "INVALID_RESPONSE"
+      - "POLICY_DENY"
+      - "RATE_LIMIT"
+      - "TIMEOUT"
+      - "TRANSIENT_5XX"
+    circuit_breaker:
+      thresholds:
+        RATE_LIMIT: 3
+        TIMEOUT: 2
+        TRANSIENT_5XX: 2
+      ttl_ms: 900000
+      reset_on_success: true
+    recording: "All provider routing decisions and errors are recorded in ToolDecided/ToolExecuted receipts and normalized into DefectRecords."
+    fallback_policy: "Deterministic routing profile per stage with ordered fallbacks; emits routing rationale."
+    open_issue: "Cross-provider prompt equivalence & data classification constraints."
+  appendix:
+    new_event_shapes:
+      proto_changes_required:
+        - payload_family: "GateEvent"
+          messages:
+            - "GateLeaseIssued (critical, signed by governance)"
+            - "GateRunStarted (non-critical, unsigned ok)"
+            - "GateRunCompleted (critical, signed by gate executor; includes evidence_bundle_hash, gate_receipt_id, lease_id, changeset_digest)"
+          canonicalization: "No maps; sort repeated fields before signing; domain-separated signatures."
+          notes:
+            - "AAT uses typed GateReceipt payloads (gate_id=aat); no standalone AATReceipt event."
+        - payload_family: "InterventionEvent"
+          messages:
+            - "InterventionFreeze (repo/work scope, signed by admission authority)"
+            - "InterventionUnfreeze (signed; may require adjudication/override ceremony)"
+        - payload_family: "ProjectionEvent"
+          messages:
+            - "ProjectionApplied (receipt-backed sync attempt)"
+            - "ProjectionDiverged (critical; triggers freeze)"
+            - "ProjectionTamperObserved (defect signal)"

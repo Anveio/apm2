@@ -1,0 +1,404 @@
+prd_constraints_invariants:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  constraints:
+    - id: CNS-0001
+      statement: All selectors MUST be resolved to concrete git object IDs (commit/tree); no symbolic HEAD.
+      rationale: |
+        Symbolic references can resolve to different commits at different times, breaking
+        reproducibility and enabling TOCTOU attacks on admission decisions.
+      enforcement: FAC-00-INGEST_CHANGESET rejects INVALID_SELECTOR if symbolic references are not resolved.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0002
+      statement: Workspace deltas MUST be content-addressed artifacts; never inferred from disk.
+      rationale: |
+        Disk state is mutable and non-deterministic. Content-addressing ensures changesets
+        are immutable and verifiable.
+      enforcement: FAC-00-INGEST_CHANGESET rejects UNPINNED_INPUTS if workspace delta is not CAS-stored.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0003
+      statement: CAS-at-commit ordering MUST be enforced; changeset_digest bound to work_id before gate spawning.
+      rationale: |
+        Prevents race conditions where gates evaluate uncommitted or different changesets
+        than the one being admitted.
+      enforcement: Coordinator verifies ledger binding before session.spawn.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0004
+      statement: CI observations are never treated as authoritative admission signals.
+      rationale: |
+        External CI systems can be spoofed or manipulated. FAC treats CI outputs as
+        evidence artifacts, not admission decisions.
+      enforcement: FAC-01-CI_EVIDENCE_IMPORT requires evidence import; plain 'success' conclusion is ignored.
+      evidence_ids:
+        - EVID-0006
+    - id: CNS-0005
+      statement: |
+        READY_FOR_REVIEW transition requires: (a) webhook signature verified, (b) raw
+        log/artifact digests imported into CAS, (c) adapter attestation signed and committed.
+      rationale: |
+        Prevents attackers from triggering review without legitimate CI evidence backing.
+      enforcement: FAC-01-CI_EVIDENCE_IMPORT rejects CI_EVIDENCE_MISSING if requirements not met.
+      evidence_ids:
+        - EVID-0006
+    - id: CNS-0006
+      statement: |
+        repo.read and file.read operations MUST reference a manifest entry (stable_id or
+        path+hash) present in the ContextPackManifest allowlist.
+      rationale: |
+        Context firewall ensures consumption holons cannot perform open-ended discovery,
+        maintaining deterministic and bounded execution.
+      enforcement: ToolDecided=DENY if not allowlisted (rule_id CTX-ALLOWLIST-001).
+      evidence_ids:
+        - EVID-0003
+    - id: CNS-0007
+      statement: |
+        Consumers may request additional context only via ContextRefinementRequest, which
+        terminates current session and triggers pack recompilation; no in-session discovery.
+      rationale: |
+        Prevents unbounded context expansion during execution. Forces systematic improvement
+        of pack compilation rather than runtime workarounds.
+      enforcement: SessionTerminated rationale=CONTEXT_MISS; coordinator reissues lease after refined pack.
+      evidence_ids:
+        - EVID-0004
+    - id: CNS-0008
+      statement: |
+        Every RunReceipt MUST record context sufficiency metrics (bytes supplied, entries
+        used, misses, denied reads, ZTI score).
+      rationale: |
+        Enables measurement of pack quality and systematic improvement. RunReceipt is
+        required for GateRunCompleted acceptance.
+      enforcement: RunReceipt validation rejects missing sufficiency metrics.
+      evidence_ids:
+        - EVID-0004
+    - id: CNS-0009
+      statement: |
+        GateLease scope is strict: (work_id, gate_id, changeset_digest, executor_actor_id,
+        expiry, policy_hash). Lease derivation obeys subset rule.
+      rationale: |
+        Prevents privilege escalation via lease manipulation. Child leases can only narrow
+        scope, never broaden.
+      enforcement: LEASE_SCOPE_BROADENED defect on subset rule violation; lease rejected.
+      evidence_ids:
+        - EVID-0007
+    - id: CNS-0010
+      statement: Lease issuance MUST be committed before session.spawn (CAS-at-commit ordering).
+      rationale: |
+        Ensures gate execution has cryptographically verifiable authority before it begins.
+        Prevents unauthorized gate execution.
+      enforcement: Coordinator verifies ledger contains GateLeaseIssued before spawning.
+      evidence_ids:
+        - EVID-0007
+    - id: CNS-0011
+      statement: |
+        GateRunCompleted is a critical signed event (Ed25519 over canonical bytes,
+        domain-separated with GATE_RUN_COMPLETED: prefix).
+      rationale: |
+        Cryptographic signatures prevent spoofing and ensure non-repudiation of gate
+        outcomes.
+      enforcement: Signature verification on ingestion; INVALID_SIGNATURE rejects.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0012
+      statement: Admission reads only internal projections; never reads GitHub status as truth.
+      rationale: |
+        GitHub is a projection target, not a source of truth. Reading GitHub status would
+        allow external manipulation of admission decisions.
+      enforcement: Code review and policy enforcement; no GitHub status reads in admission path.
+      evidence_ids:
+        - EVID-0001
+    - id: CNS-0013
+      statement: |
+        MergeReceipt is emitted only after result_selector (trunk digest) is observed and
+        recorded, ensuring atomic merge semantics.
+      rationale: |
+        Prevents MergeReceipt emission for failed merges. Ensures cryptographic binding
+        of merge outcome.
+      enforcement: MERGE_NONATOMIC defect if result_selector not observed.
+      evidence_ids:
+        - EVID-0002
+    - id: CNS-0014
+      statement: Sync direction is always ledger -> GitHub; projection is idempotent.
+      rationale: |
+        Single source of truth (ledger) prevents split-brain scenarios. Idempotence
+        ensures safe retries.
+      enforcement: Adapter enforces write direction; repeated sync yields same state.
+      evidence_ids:
+        - EVID-0005
+    - id: CNS-0015
+      statement: |
+        Adapter is the only identity permitted to write GitHub checks/status/labels/comments.
+        Other writers are treated as tamper.
+      rationale: |
+        Single writer prevents confusion about authoritative status. Tamper detection
+        enables security response.
+      enforcement: PROJECTION_TAMPER defect on non-adapter writes; overwrite on next sync.
+      evidence_ids:
+        - EVID-0005
+    - id: CNS-0016
+      statement: |
+        Continuous divergence detection: compare external trunk HEAD to latest MergeReceipt
+        result_selector; if diverged, emit PROJECTION_DIVERGENCE and freeze admissions.
+      rationale: |
+        Detects external tampering or uncontrolled merges. Freezing prevents admission
+        of changes to corrupted state.
+      enforcement: Watchdog polls every 30 seconds; InterventionFreeze on divergence.
+      evidence_ids:
+        - EVID-0005
+    - id: CNS-0017
+      statement: |
+        Holdout ChangeSets are isolated from production trunk (no merge capability);
+        if false-negative rate exceeds threshold, gate policy is quarantined.
+      rationale: |
+        Holdouts measure evaluator quality without affecting production. Quarantine
+        prevents use of degraded policies.
+      enforcement: FAC-90 holdout execution; policy quarantine on threshold breach.
+      evidence_ids:
+        - EVID-0010
+    - id: CNS-0018
+      statement: |
+        GateReceipt MUST support typed payloads; when gate_id=aat, payload MUST include
+        view_commitment_hash, determinism_class, run_receipt_hashes, run_count, stability_digest,
+        and verdict, all bound to the EvidenceBundle hash.
+      rationale: |
+        Typed payloads keep admission logic single-path while allowing AAT-specific
+        acceptance contracts to be enforced without parallel receipt types.
+      enforcement: GateReceipt validation rejects missing fields for gate_id=aat.
+      evidence_ids:
+        - EVID-0018
+        - EVID-0020
+    - id: CNS-0019
+      statement: |
+        When determinism_class > 0, gate outcomes MUST be validated under a coordinator-
+        managed determinism envelope requiring N identical runs before PASS.
+      rationale: |
+        Prevents gate flakiness from compromising admission integrity; removes executor
+        self-attestation of stability.
+      enforcement: GATE_NONDETERMINISTIC defect emitted; WorkTransitioned rationale=QUARANTINED_CHANGESET and WorkAborted abort_reason=POLICY_DENY after threshold.
+      evidence_ids:
+        - EVID-0019
+        - EVID-0021
+  invariants:
+    - id: INV-0001
+      statement: |
+        An autonomous agent cannot flip a gate outcome or merge by manipulating GitHub
+        or xtask; it must produce signed internal events and receipts.
+      rationale: |
+        Core FAC guarantee. All admission authority flows through cryptographically
+        signed internal events.
+      enforcement: Signature verification, lease validation, OCAP containment.
+      evidence_ids:
+        - EVID-0001
+    - id: INV-0002
+      statement: |
+        A GateRun cannot proceed with missing context; it terminates and triggers pack
+        refinement.
+      rationale: |
+        Context misses indicate compiler failures, not execution necessities. System
+        improves through refinement, not workarounds.
+      enforcement: SessionTerminated rationale=CONTEXT_MISS; refinement loop.
+      evidence_ids:
+        - EVID-0004
+    - id: INV-0003
+      statement: |
+        All critical events (GateLeaseIssued, GateRunCompleted, MergeReceipt) are signed
+        with Ed25519 using domain-separated signatures.
+      rationale: |
+        Cryptographic non-repudiation and integrity. Domain separation prevents
+        cross-context signature reuse.
+      enforcement: Signature verification on ingestion with domain prefix validation.
+      evidence_ids:
+        - EVID-0001
+    - id: INV-0004
+      statement: |
+        GitHub is a projection target; it is never a source of truth. Sync direction
+        is always ledger -> GitHub.
+      rationale: |
+        Single source of truth prevents split-brain and external manipulation. GitHub
+        reflects internal state, not vice versa.
+      enforcement: Code architecture; no GitHub reads in admission path.
+      evidence_ids:
+        - EVID-0005
+    - id: INV-0005
+      statement: |
+        Executor of a required gate must not be the author of the ChangeSet (or a key
+        in the same COI group).
+      rationale: |
+        Conflict of interest prevention. Self-review is not permitted for admission-
+        gating reviews.
+      enforcement: COI check at lease issuance; waiver requires explicit adjudication.
+      evidence_ids:
+        - EVID-0009
+    - id: INV-0006
+      statement: |
+        All leases are single-use with enforced expiry. GateRunCompleted must reference
+        lease_id and include changeset_digest; mismatch rejects.
+      rationale: |
+        Prevents replay attacks and ensures temporal validity of gate authority.
+      enforcement: Lease validation on GateRunCompleted ingestion.
+      evidence_ids:
+        - EVID-0007
+    - id: INV-0007
+      statement: |
+        Advisory narratives from LLM reviewers are recorded but never substitute for
+        terminal-verifier evidence in admission decisions.
+      rationale: |
+        LLM outputs can be manipulated or hallucinated. Terminal verifiers (tests,
+        linters, security scanners) provide ground truth.
+      enforcement: Admission policy requires terminal-verifier evidence for pass.
+      evidence_ids:
+        - EVID-0012
+    - id: INV-0008
+      statement: |
+        MergeReceipt binds (base_selector, changeset_digest, gate_receipts, policy_hash)
+        -> (result_selector) atomically.
+      rationale: |
+        Complete binding ensures merge provenance is verifiable and reproducible.
+      enforcement: MergeReceipt schema validation; all fields required.
+      evidence_ids:
+        - EVID-0002
+    - id: INV-0009
+      statement: |
+        No agent processes inherit GitHub tokens/ssh keys; only adapter has projection
+        credentials.
+      rationale: |
+        Least privilege credential management. Prevents credential theft via compromised
+        agents.
+      enforcement: PolicyViolation and session quarantine on credential access attempt.
+      evidence_ids:
+        - EVID-0011
+    - id: INV-0010
+      statement: |
+        Bounded retries and echo-trap detection prevent infinite loops; sessions terminate
+        with escalation on reasoning degeneration.
+      rationale: |
+        Resource exhaustion prevention and quality assurance. Degenerate reasoning must
+        be detected and escalated.
+      enforcement: Echo-trap threshold=3; SessionTerminated rationale=REASONING_DEGENERATION.
+      evidence_ids:
+        - EVID-0008
+    - id: INV-0011
+      statement: |
+        Determinism-required gates cannot pass without N-run stability proof; nondeterminism
+        triggers quarantine and abort per policy.
+      rationale: |
+        Fail-closed admission is required to prevent spoofed or flaky gate outcomes.
+      enforcement: GateReceipt stability_digest validation and quarantine/abort policy.
+      evidence_ids:
+        - EVID-0019
+        - EVID-0021
+  security_properties:
+    - id: SEC-PROP-0001
+      name: Cryptographic admission authority
+      statement: |
+        No admission decision can occur without cryptographically signed GateRunCompleted
+        events from authorized executors with valid leases.
+      evidence_ids:
+        - EVID-0001
+    - id: SEC-PROP-0002
+      name: Projection-only external forges
+      statement: |
+        External forges (GitHub) receive projections of internal truth but never influence
+        admission decisions.
+      evidence_ids:
+        - EVID-0005
+    - id: SEC-PROP-0003
+      name: OCAP containment for consumption
+      statement: |
+        Consumption-mode holons operate under mechanical context firewall with manifest-
+        scoped read handles; no ambient authority.
+      evidence_ids:
+        - EVID-0003
+    - id: SEC-PROP-0004
+      name: Fail-closed on uncertainty
+      statement: |
+        Uncertain truth implies deny admission or escalate to adjudication/oracle.
+        No silent failures or implicit approvals.
+      evidence_ids:
+        - EVID-0001
+    - id: SEC-PROP-0005
+      name: Lease-bound temporal authority
+      statement: |
+        Gate execution authority is time-bounded via leases; expired leases cannot
+        produce valid gate outcomes.
+      evidence_ids:
+        - EVID-0007
+    - id: SEC-PROP-0006
+      name: COI separation enforcement
+      statement: |
+        Authors cannot review their own changes for required gates; COI is enforced
+        at key custody group level.
+      evidence_ids:
+        - EVID-0009
+  security_controls:
+    - id: SEC-CTRL-0001
+      name: Ed25519 signature verification on critical events
+      type: preventative
+      details: |
+        GateLeaseIssued, GateRunCompleted, and MergeReceipt events require Ed25519
+        signature verification on ingestion. Domain-separated with distinct prefixes
+        to prevent cross-context reuse.
+    - id: SEC-CTRL-0002
+      name: OCAP context firewall with manifest allowlist
+      type: preventative
+      details: |
+        Context firewall mediates all repo.read and file.read operations through
+        ContextPackManifest allowlist. Denials emit ToolDecided=DENY with rule_id.
+    - id: SEC-CTRL-0003
+      name: Projection divergence watchdog
+      type: detective
+      details: |
+        Continuous monitoring of external trunk HEAD vs internal MergeReceipt
+        result_selector. Poll interval 30 seconds. Divergence triggers freeze.
+    - id: SEC-CTRL-0004
+      name: Lease expiry enforcement
+      type: preventative
+      details: |
+        All leases have mandatory expires_at field. GateRunCompleted verification
+        rejects if timestamp exceeds lease expiry.
+    - id: SEC-CTRL-0005
+      name: COI validation at lease issuance
+      type: preventative
+      details: |
+        Coordinator verifies executor_actor_id is not in same COI group as changeset
+        author before issuing GateLease.
+    - id: SEC-CTRL-0006
+      name: Echo-trap detection and termination
+      type: detective+corrective
+      details: |
+        Monitor FindingSignature repetition within GateRun window. Threshold=3
+        triggers SessionTerminated rationale=REASONING_DEGENERATION with escalation.
+    - id: SEC-CTRL-0007
+      name: CI evidence import attestation
+      type: preventative
+      details: |
+        READY_FOR_REVIEW transitions require signed adapter attestation with
+        workflow_run_id and downloaded_artifact_hashes. Fail-closed on missing evidence.
+    - id: SEC-CTRL-0008
+      name: Ambient credential prohibition
+      type: preventative
+      details: |
+        Agent processes denied access to GitHub tokens/ssh keys. Only HOLON-GITHUB-ADAPTER
+        has projection credentials. PolicyViolation on access attempt.
+    - id: SEC-CTRL-0009
+      name: Context miss defect emission and refinement
+      type: detective+corrective
+      details: |
+        CONTEXT_MISS defects trigger SessionTerminated and ContextRefinementRequest.
+        Feeds back to pack compiler improvement loop.
+    - id: SEC-CTRL-0010
+      name: Provider error classification and circuit breaker
+      type: preventative+corrective
+      details: |
+        Provider errors classified into RATE_LIMIT, TIMEOUT, TRANSIENT_5XX,
+        INVALID_RESPONSE, POLICY_DENY. Circuit breaker thresholds: RATE_LIMIT=3,
+        TIMEOUT=2, TRANSIENT_5XX=2. TTL 900000ms.
+    - id: SEC-CTRL-0011
+      name: Holdout suite isolation and policy quarantine
+      type: detective+corrective
+      details: |
+        Holdout ChangeSets isolated from production trunk (no merge capability).
+        False-negative rate exceeding threshold triggers policy quarantine requiring
+        explicit adjudication for affected gate.

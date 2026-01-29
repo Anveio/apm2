@@ -1,0 +1,146 @@
+prd_goals_scope:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  goals:
+    - id: FAC-G-0001
+      statement: Cryptographically signed gate outcomes - All GateRunCompleted events are signed with Ed25519 using domain-separated signatures binding executor, lease, and changeset.
+      measurable_outcomes:
+        - GateRunCompleted events include Ed25519 signature over canonical bytes with domain separator GATE_RUN_COMPLETED.
+        - Signature binds (gate_id, lease_id, changeset_digest, executor_actor_id, evidence_bundle_hash).
+        - Unsigned or invalid signatures rejected with INVALID_SIGNATURE defect at admission.
+        - 100% of gate outcomes are cryptographically verifiable from ledger.
+    - id: FAC-G-0002
+      statement: Lease-bound gate authority - Gate executors operate under lease-scoped authority that cannot be broadened and expires.
+      measurable_outcomes:
+        - GateLease scope is strict with fields (work_id, gate_id, changeset_digest, executor_actor_id, expiry, policy_hash).
+        - Lease issuance committed before session spawn (CAS-at-commit ordering).
+        - Child leases can only narrow scope (subset rule enforced).
+        - Expired or scope-mismatched leases rejected with LEASE_SCOPE_BROADENED or UNAUTHORIZED_EXECUTOR.
+    - id: FAC-G-0003
+      statement: OCAP context firewall for consumption holons - Gate executors can only read objects explicitly enumerated in their RCP manifest allowlist.
+      measurable_outcomes:
+        - Repo/file reads outside RCP manifest allowlist emit ToolDecided=DENY with rule_id CTX-ALLOWLIST-001.
+        - Context misses terminate session with rationale CONTEXT_MISS and trigger refinement.
+        - RunReceipt records context sufficiency metrics (bytes supplied, entries used, misses, denied reads, ZTI score).
+        - Zero unauthorized reads succeed in gate execution sessions.
+    - id: FAC-G-0004
+      statement: Projection-only GitHub integration - GitHub status checks are projections of internal ledger truth and never inputs to admission decisions.
+      measurable_outcomes:
+        - Admission reads only internal projections; never reads GitHub status as truth.
+        - Only HOLON-GITHUB-ADAPTER may write GitHub checks/status/labels/comments (enforced by policy).
+        - Projection is idempotent and keyed by (work_id, changeset_digest, ledger_head) fingerprint.
+        - External status manipulation does not affect admission decisions.
+    - id: FAC-G-0005
+      statement: Divergence detection and emergency stop - External trunk divergence from MergeReceipt truth triggers freeze until adjudication.
+      measurable_outcomes:
+        - Divergence watchdog compares external trunk HEAD to latest MergeReceipt result_selector every 30 seconds.
+        - On divergence, PROJECTION_DIVERGENCE defect emitted and InterventionFreeze(repo) halts admissions.
+        - Unfreeze requires AdjudicationResolved(request_type=EMERGENCY_RECOVERY) or emergency_override ceremony.
+        - Zero admissions proceed during divergence freeze.
+    - id: FAC-G-0006
+      statement: Evidence-backed CI import - CI transitions to READY_FOR_REVIEW require imported raw evidence digests and adapter attestation when CI gating is enabled.
+      measurable_outcomes:
+        - No transition based only on CI 'success' conclusion (fail-closed).
+        - READY_FOR_REVIEW requires webhook signature verified, raw log/artifact digests in CAS, signed adapter attestation.
+        - EvidencePublished entries exist for CI logs/artifacts and are referenced from transition rationale.
+        - CI_EVIDENCE_MISSING defect emitted if evidence import bypassed.
+    - id: FAC-G-0007
+      statement: Atomic merge with receipt - Merges produce MergeReceipt binding inputs to result after observing trunk update.
+      measurable_outcomes:
+        - MergeReceipt binds (base_selector, changeset_digest, gate_receipts, policy_hash) -> result_selector.
+        - MergeReceipt emitted only after result_selector (trunk digest) is observed and recorded.
+        - Receipt is signed with domain separator MERGE_RECEIPT.
+        - 100% of successful admissions have corresponding verifiable MergeReceipt.
+    - id: FAC-G-0008
+      statement: Bounded retries and echo-trap detection - Coordinator enforces bounded attempts and detects reasoning degeneration.
+      measurable_outcomes:
+        - Per-gate max attempts of 3 enforced.
+        - Global max episodes of 50 enforced.
+        - Echo-trap detected when FindingSignature repeats 3 times without delta within single GateRun.
+        - On echo-trap, session terminated with rationale REASONING_DEGENERATION and DefectRecord(ECHO_TRAP) emitted.
+        - Oracle escalation triggered for unresolved loops.
+    - id: FAC-G-0009
+      statement: Typed AAT gate receipts - AAT outcomes are recorded as typed GateReceipt payloads bound to view commitments.
+      measurable_outcomes:
+        - AAT GateReceipt payload includes view_commitment_hash and determinism_class.
+        - AAT GateReceipt payload includes run_receipt_hashes and run_count binding all runs.
+        - Admission rejects AAT GateReceipts missing required typed payload fields.
+    - id: FAC-G-0010
+      statement: Gate outcome determinism envelope - Deterministic gates must prove stability under coordinator-managed N-run validation.
+      measurable_outcomes:
+        - Determinism envelope enforces N identical runs for gates with determinism_class > 0.
+        - Nondeterminism emits GATE_NONDETERMINISTIC defect and fails closed.
+        - Repeated nondeterminism quarantines and aborts changesets per policy.
+  scope:
+    in_scope:
+      - forge
+      - admission
+      - gates
+      - ledger
+      - cas
+      - ocap
+      - context_packs
+      - projection
+      - ci_attestation
+      - containment
+      - measurement_integrity
+      - goodhart
+      - efficiency
+    out_of_scope:
+      - id: NG-0001
+        statement: Building a universal CI integration framework.
+      - id: NG-0002
+        statement: Replacing existing kernel Protobuf schemas for gate events.
+      - id: NG-0003
+        statement: Automated divergence resolution without human adjudication.
+      - id: NG-0004
+        statement: Full Goodhart resistance in Phase 1.
+      - id: NG-0005
+        statement: Cross-provider prompt equivalence guarantees.
+  milestones:
+    - id: PHASE-1
+      name: "Phase 1: FAC Core Hardening"
+      description: Core admission hardening with signed gates, OCAP firewall, and projection-only GitHub.
+      deliverables:
+        - New gate events (GateLeaseIssued, GateRunStarted, GateRunCompleted) with mandatory signature verification on ingestion.
+        - OCAP context firewall enforced mechanically for CONSUME holons.
+        - GitHub adapter projection-only; status setters outside adapter removed from skills and denied by policy.
+        - Projection divergence watchdog + freeze/unfreeze path.
+        - Typed GateReceipt payloads for AAT bound to view commitments.
+      definition_of_done:
+        - An autonomous agent cannot flip a gate outcome or merge by manipulating GitHub or xtask; it must produce signed internal events and receipts.
+        - A GateRun cannot proceed with missing context; it terminates and triggers pack refinement.
+    - id: PHASE-2
+      name: "Phase 2: Measurement Integrity + Goodhart Resistance"
+      description: Holdout suites and evaluator audits to detect drift and false negatives.
+      deliverables:
+        - Holdout suite runner (known-bad changes) to measure false negatives.
+        - Auditor sampling of gate outcomes vs evidence; drift alerts and policy quarantine.
+        - Echo-trap metrics feeding instruction and pack compiler updates.
+        - Determinism envelope enforcement for gates with determinism_class > 0 (AAT first).
+      definition_of_done:
+        - Holdout suite runs on schedule and produces false_negative_rate, finding_precision, gate_evidence_coverage metrics.
+        - Auditor samples 1% of GateRuns (or min 1/day) and detects rationale/evidence drift.
+        - Affected gate policies are quarantined when drift thresholds exceeded.
+        - Determinism envelope rejects nondeterministic gate outcomes and triggers quarantine/abort policy.
+    - id: PHASE-3
+      name: "Phase 3: Autonomous Improvement Substrate"
+      description: Defect-driven auto-tuning and improved provider routing.
+      deliverables:
+        - Defect-driven auto-tuning of pack specs and instructions under CAC governance.
+        - Provider routing improvements with safe fallback and classification-aware routing.
+      definition_of_done:
+        - Pack compiler updates based on accumulated defect patterns without human intervention.
+        - Provider routing handles RATE_LIMIT, TIMEOUT, TRANSIENT_5XX with circuit breaker and fallback.
+        - Routing decisions recorded with rationale in ToolDecided/ToolExecuted receipts.
+  success_criteria_summary:
+    - All gate outcomes are cryptographically signed with Ed25519 and verifiable from ledger.
+    - Gate executors operate under lease-scoped authority with expiry and scope enforcement.
+    - OCAP context firewall prevents all unauthorized reads during gate execution.
+    - GitHub is projection-only; external manipulation does not affect admission.
+    - Divergence detection freezes admissions automatically until adjudication.
+    - CI evidence import is required for readiness transitions when CI gating enabled.
+    - Every successful admission has a verifiable MergeReceipt.
+    - Bounded retries and echo-trap detection prevent runaway loops.
+    - AAT gate receipts are typed and bound to view commitments.
+    - Determinism envelope prevents nondeterministic gate outcomes from passing.
