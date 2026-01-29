@@ -537,17 +537,17 @@ impl AntiEntropyEngine {
     ///
     /// Returns an error if rate limited or too many sessions.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// This method will not panic under normal conditions. The internal
-    /// `expect` call is guarded by the prior `insert` operation which
-    /// guarantees the key exists.
+    /// Returns an error if rate limited or too many pending sessions.
     pub fn start_session(
         &mut self,
         peer_id: &str,
         namespace: &str,
         local_tree: MerkleTree,
     ) -> Result<&mut SyncSession, AntiEntropyError> {
+        use std::collections::hash_map::Entry;
+
         self.rate_limiter.check(peer_id)?;
 
         if self.sessions.len() >= self.max_sessions && !self.sessions.contains_key(peer_id) {
@@ -556,15 +556,16 @@ impl AntiEntropyEngine {
             });
         }
 
-        self.sessions.insert(
-            peer_id.to_string(),
-            SyncSession::new(peer_id.to_string(), namespace.to_string(), local_tree),
-        );
+        let session = match self.sessions.entry(peer_id.to_string()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(SyncSession::new(
+                peer_id.to_string(),
+                namespace.to_string(),
+                local_tree,
+            )),
+        };
 
-        Ok(self
-            .sessions
-            .get_mut(peer_id)
-            .expect("session was just inserted"))
+        Ok(session)
     }
 
     /// Gets an active session for a peer.

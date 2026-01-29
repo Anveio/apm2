@@ -228,8 +228,12 @@ impl MerkleTree {
         let mut levels: Vec<Vec<Hash>> = vec![leaf_hashes];
 
         while levels.last().is_some_and(|l: &Vec<Hash>| l.len() > 1) {
-            // SAFETY: We just verified that levels.last() is Some and has len > 1
-            let prev_level = levels.last().expect("levels cannot be empty here");
+            // The condition above guarantees levels.last() is Some
+            let Some(prev_level) = levels.last() else {
+                // This branch is unreachable due to the while condition,
+                // but we handle it gracefully instead of using expect()
+                break;
+            };
             let mut next_level: Vec<Hash> = Vec::with_capacity(prev_level.len().div_ceil(2));
 
             for chunk in prev_level.chunks(2) {
