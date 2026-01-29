@@ -19,6 +19,8 @@
 //! - Tunnel registration requires valid mTLS identity (INV-0021)
 //! - Tunnel heartbeats prevent zombie connections (INV-0022)
 //! - Relay validates worker identity matches certificate CN (INV-0023)
+//! - Anti-entropy sync uses pull-based model (INV-0024)
+//! - Sync requests are rate-limited per peer (INV-0025)
 //!
 //! # Example
 //!
@@ -63,17 +65,72 @@
 //! // ... handle incoming connections
 //! ```
 
+pub mod anti_entropy;
+pub mod bft;
+pub mod bft_machine;
 pub mod discovery;
+pub mod genesis;
+pub mod handlers;
+pub mod merkle;
+pub mod metrics;
 pub mod network;
+pub mod qc_aggregator;
 pub mod relay;
 pub mod tunnel;
 
+// BFT consensus (Chained HotStuff)
+// Anti-entropy and Merkle tree (TCK-00191)
+pub use anti_entropy::{
+    AntiEntropyEngine, AntiEntropyError, CompareRequest, CompareResponse, DEFAULT_SYNC_INTERVAL,
+    DigestRequest, DigestResponse, EventRequest, EventResponse, MAX_COMPARISON_DEPTH,
+    MAX_DIVERGENT_RANGES, MAX_PENDING_REQUESTS_PER_PEER, MAX_REQUESTS_PER_INTERVAL,
+    MAX_SYNC_BATCH_SIZE, RATE_LIMIT_INTERVAL, RangeDigestResult, RangeQuery, SyncEvent,
+    SyncRateLimiter, SyncSession, event_record_to_sync_event, verify_events_with_proof,
+    verify_sync_events,
+};
+pub use bft::{
+    BftError, DEFAULT_ROUND_TIMEOUT, HotStuffConfig, HotStuffConfigBuilder, HotStuffState,
+    MAX_PAYLOAD_SIZE, MAX_QC_SIGNATURES, MAX_VALIDATORS, MIN_ROUND_TIMEOUT, NewView, Phase,
+    Proposal, QuorumCertificate, TIMEOUT_MULTIPLIER, ValidatorId, ValidatorInfo,
+    ValidatorSignature, Vote,
+};
+// BFT machine driver
+pub use bft_machine::{
+    BftAction, BftEvent, BftMachine, MAX_BUFFERED_MESSAGES, MAX_PENDING_ACTIONS, MSG_BFT_NEW_VIEW,
+    MSG_BFT_PROPOSAL, MSG_BFT_QC, MSG_BFT_VOTE,
+};
 pub use discovery::{
     DiscoveryConfig, DiscoveryError, PeerDiscovery, PeerInfo, PeerList, PeerStatus,
+};
+pub use genesis::{
+    Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
+    JoinRateLimiter, MAX_JOIN_ATTEMPTS_PER_MINUTE, MAX_NAMESPACE_LEN, MAX_QUORUM_SIGNATURES,
+    MAX_RATE_LIMIT_SOURCES, QuorumSignature, RATE_LIMIT_WINDOW,
+};
+// BFT message handlers
+pub use handlers::{
+    BftMessageEnvelope, HandlerConfig, HandlerError, MAX_EPOCH_AGE, MAX_PENDING_INBOUND,
+    MAX_REPLAY_CACHE_SIZE, MessageHandler, PeerEndpoint, PeerManager, REPLAY_CACHE_ROUND_WINDOW,
+    ReplayCache,
+};
+pub use merkle::{
+    DivergentRange, EMPTY_HASH, MAX_PROOF_NODES, MAX_TREE_DEPTH, MAX_TREE_LEAVES, MerkleError,
+    MerkleNode, MerkleProof, MerkleTree, RangeDigest, hash_internal, hash_leaf,
+};
+// Prometheus metrics for consensus health (TCK-00193)
+pub use metrics::{
+    ByzantineFaultType, ClusterHealth, ClusterStatus, ConflictResolution, ConsensusMetrics,
+    DEFAULT_LATENCY_BUCKETS, Histogram, LeaderElectionReason, ProposalOutcome, SyncDirection,
 };
 pub use network::{
     CONTROL_FRAME_SIZE, Connection, ConnectionPool, ControlFrame, Network, NetworkConfig,
     NetworkError, PooledConnection, TlsConfig, TlsConfigBuilder, apply_dispatch_jitter,
+};
+// QC aggregation and verification (TCK-00190)
+pub use qc_aggregator::{
+    MAX_TRACKED_ROUNDS, MAX_VOTES_PER_ROUND, QcAggregator, QcVerificationContext,
+    QcVerificationResult, build_vote_message, compute_quorum_threshold, is_quorum, verify_qc,
+    verify_qc_with_message,
 };
 // Note: process_tunnel_frame is deprecated, use the internal identity-bound
 // version instead
