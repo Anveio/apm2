@@ -251,6 +251,8 @@ impl Hlc {
     /// # Example
     ///
     /// ```
+    /// use std::time::{SystemTime, UNIX_EPOCH};
+    ///
     /// use apm2_core::consensus::crdt::{CrdtMergeError, Hlc, MAX_FUTURE_SKEW_NS};
     ///
     /// let local = Hlc::now();
@@ -260,7 +262,13 @@ impl Hlc {
     /// let updated = local.update_with_remote(&remote).unwrap();
     ///
     /// // Far-future timestamp is rejected
-    /// let malicious = Hlc::new(local.wall_time_ns + MAX_FUTURE_SKEW_NS + 1, 0);
+    /// // We need to use current time + skew since the method checks against
+    /// // physical time at the moment of the call, not the local HLC's time
+    /// let now_ns = SystemTime::now()
+    ///     .duration_since(UNIX_EPOCH)
+    ///     .map(|d| d.as_nanos() as u64)
+    ///     .unwrap_or(0);
+    /// let malicious = Hlc::new(now_ns + MAX_FUTURE_SKEW_NS + 1_000_000_000, 0);
     /// assert!(local.update_with_remote(&malicious).is_err());
     /// ```
     #[allow(clippy::cast_possible_truncation)] // Nanoseconds won't overflow u64 until year 2554
