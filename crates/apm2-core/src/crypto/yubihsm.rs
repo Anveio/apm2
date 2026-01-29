@@ -279,17 +279,36 @@ impl YubiHsmProvider {
         self.config.yubihsm_domain.unwrap_or(DEFAULT_DOMAIN)
     }
 
+    /// Truncates a key ID for safe inclusion in error messages.
+    ///
+    /// This prevents memory-based `DoS` attacks where an attacker provides a
+    /// very large `key_id` that would be copied into error messages.
+    fn truncate_key_id_for_error(key_id: &str) -> String {
+        const ERROR_TRUNCATE_LEN: usize = 64;
+        if key_id.len() <= ERROR_TRUNCATE_LEN {
+            key_id.to_string()
+        } else {
+            // Find a safe truncation point that doesn't split a UTF-8 character
+            let truncate_at = key_id
+                .char_indices()
+                .take_while(|(i, _)| *i < ERROR_TRUNCATE_LEN)
+                .last()
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            format!("{}... (truncated)", &key_id[..truncate_at])
+        }
+    }
+
     /// Validates a key ID.
     fn validate_key_id(key_id: &str) -> HsmResult<()> {
         if key_id.is_empty() || key_id.len() > MAX_KEY_ID_LEN {
             return Err(HsmError::InvalidKeyId {
-                key_id: key_id.to_string(),
+                key_id: Self::truncate_key_id_for_error(key_id),
             });
         }
 
         if key_id.starts_with('-') {
             return Err(HsmError::InvalidKeyId {
-                key_id: key_id.to_string(),
+                key_id: Self::truncate_key_id_for_error(key_id),
             });
         }
 
@@ -298,7 +317,7 @@ impl YubiHsmProvider {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err(HsmError::InvalidKeyId {
-                key_id: key_id.to_string(),
+                key_id: Self::truncate_key_id_for_error(key_id),
             });
         }
 
