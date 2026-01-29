@@ -41,6 +41,17 @@ use crate::ledger::EventRecord;
 /// Maximum number of events to request in a single sync batch.
 ///
 /// Bounded to prevent memory exhaustion from large sync requests.
+///
+/// # Data Plane vs Control Plane
+///
+/// Note that `MAX_SYNC_BATCH_SIZE` (1000 events) exceeds `CONTROL_FRAME_SIZE`
+/// (1024 bytes). This is intentional: anti-entropy event transfer uses the
+/// **data plane** with larger frame sizes, not the control plane. The control
+/// plane is used only for protocol negotiation and small metadata exchanges.
+///
+/// Event batches are serialized and transmitted over the data plane, which
+/// supports frames sized to accommodate the serialized batch (typically using
+/// length-prefixed framing or chunked transfer).
 pub const MAX_SYNC_BATCH_SIZE: usize = 1000;
 
 /// Maximum number of divergent ranges to process per sync round.
@@ -94,6 +105,14 @@ pub const MAX_COMPARISON_DEPTH: usize = 32;
 
 /// Default sync interval for periodic anti-entropy.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Session timeout duration for stale session cleanup.
+///
+/// Sessions that have not had activity within this duration will be
+/// automatically cleaned up to prevent session slot exhaustion attacks.
+/// This bounds the time an attacker can hold session slots without
+/// performing legitimate sync operations.
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ============================================================================
 // Errors
@@ -156,6 +175,32 @@ pub enum AntiEntropyError {
     HashChainBroken {
         /// The sequence ID where the chain broke.
         seq_id: u64,
+    },
+
+    /// Sequence ID monotonicity violation.
+    ///
+    /// Sequence IDs must be strictly increasing. This error is returned
+    /// when a non-increasing `seq_id` is detected, which could indicate
+    /// a replay attack or data corruption.
+    #[error("seq_id not strictly increasing: {current} <= {previous}")]
+    SeqIdNotIncreasing {
+        /// The current `seq_id` that violated monotonicity.
+        current: u64,
+        /// The previous `seq_id`.
+        previous: u64,
+    },
+
+    /// Sequence ID continuity violation.
+    ///
+    /// The first event's `seq_id` does not match the expected starting
+    /// `seq_id`. This indicates a gap in the event sequence which could
+    /// indicate missing events or a sync protocol error.
+    #[error("seq_id continuity broken: expected {expected}, got {actual}")]
+    SeqIdContinuityBroken {
+        /// The expected starting `seq_id`.
+        expected: u64,
+        /// The actual `seq_id` of the first event.
+        actual: u64,
     },
 
     /// Sync batch too large.
@@ -437,6 +482,12 @@ pub struct SyncSession {
     pub processed_ranges: Vec<(u64, u64)>,
     /// Session start time.
     pub started_at: Instant,
+    /// Last activity time for session timeout tracking.
+    ///
+    /// Updated whenever meaningful sync activity occurs (digest exchange,
+    /// range comparison, event transfer). Used by `cleanup_stale_sessions()`
+    /// to evict abandoned sessions.
+    pub last_activity: Instant,
     /// Number of events synced.
     pub events_synced: u64,
 }
@@ -445,15 +496,31 @@ impl SyncSession {
     /// Creates a new sync session.
     #[must_use]
     pub fn new(peer_id: String, namespace: String, local_tree: MerkleTree) -> Self {
+        let now = Instant::now();
         Self {
             peer_id,
             namespace,
             local_tree,
             divergent_ranges: Vec::new(),
             processed_ranges: Vec::new(),
-            started_at: Instant::now(),
+            started_at: now,
+            last_activity: now,
             events_synced: 0,
         }
+    }
+
+    /// Updates the last activity timestamp to the current time.
+    ///
+    /// Call this method whenever meaningful sync activity occurs to
+    /// prevent the session from being cleaned up as stale.
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Checks if this session is stale (no activity within timeout).
+    #[must_use]
+    pub fn is_stale(&self, timeout: Duration) -> bool {
+        self.last_activity.elapsed() >= timeout
     }
 
     /// Returns the session duration.
@@ -531,6 +598,34 @@ impl AntiEntropyEngine {
         Ok(MerkleTree::new(event_hashes.iter().copied())?)
     }
 
+    /// Cleans up stale sessions that have exceeded the timeout duration.
+    ///
+    /// This method removes sessions that have not had any activity within
+    /// `SESSION_TIMEOUT`. Call this before checking session limits to prevent
+    /// session slot exhaustion attacks where an attacker occupies all slots
+    /// indefinitely.
+    ///
+    /// Returns the number of sessions cleaned up.
+    pub fn cleanup_stale_sessions(&mut self) -> usize {
+        let before = self.sessions.len();
+        self.sessions
+            .retain(|_, session| !session.is_stale(SESSION_TIMEOUT));
+        before - self.sessions.len()
+    }
+
+    /// Cleans up stale sessions using a custom timeout duration.
+    ///
+    /// This is useful for testing or for use cases that need different
+    /// timeout values.
+    ///
+    /// Returns the number of sessions cleaned up.
+    pub fn cleanup_stale_sessions_with_timeout(&mut self, timeout: Duration) -> usize {
+        let before = self.sessions.len();
+        self.sessions
+            .retain(|_, session| !session.is_stale(timeout));
+        before - self.sessions.len()
+    }
+
     /// Starts a new sync session with a peer.
     ///
     /// # Errors
@@ -550,6 +645,10 @@ impl AntiEntropyEngine {
 
         self.rate_limiter.check(peer_id)?;
 
+        // Clean up stale sessions before checking the limit to prevent
+        // session slot exhaustion attacks (INV-0024 related).
+        self.cleanup_stale_sessions();
+
         if self.sessions.len() >= self.max_sessions && !self.sessions.contains_key(peer_id) {
             return Err(AntiEntropyError::TooManyPendingRequests {
                 peer_id: peer_id.to_string(),
@@ -557,7 +656,12 @@ impl AntiEntropyEngine {
         }
 
         let session = match self.sessions.entry(peer_id.to_string()) {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => {
+                let session = entry.into_mut();
+                // Refresh activity timestamp for existing session
+                session.touch();
+                session
+            },
             Entry::Vacant(entry) => entry.insert(SyncSession::new(
                 peer_id.to_string(),
                 namespace.to_string(),
@@ -777,9 +881,9 @@ impl Default for AntiEntropyEngine {
 /// Verifies a batch of sync events for integrity.
 ///
 /// Checks that:
-/// 1. Event hashes are correct
-/// 2. Hash chain is valid (each event links to previous)
-/// 3. Events are in sequence order
+/// 1. Sequence IDs are strictly increasing (monotonicity)
+/// 2. Event hashes are correct
+/// 3. Hash chain is valid (each event links to previous)
 ///
 /// # Arguments
 ///
@@ -789,17 +893,82 @@ impl Default for AntiEntropyEngine {
 /// # Errors
 ///
 /// Returns an error if any event fails verification.
+///
+/// # Security Note
+///
+/// Since `EventHasher` does not include `seq_id` in the hash computation,
+/// this function explicitly verifies `seq_id` monotonicity to prevent attacks
+/// where a malicious peer provides events with spoofed `seq_ids`.
 pub fn verify_sync_events(
     events: &[SyncEvent],
     expected_prev_hash: &Hash,
+) -> Result<(), AntiEntropyError> {
+    verify_sync_events_with_start_seq(events, expected_prev_hash, None)
+}
+
+/// Verifies a batch of sync events with optional starting `seq_id` check.
+///
+/// This is the full verification function that checks:
+/// 1. Optional: First event's `seq_id` matches `expected_start_seq_id`
+/// 2. Sequence IDs are strictly increasing (monotonicity)
+/// 3. Event hashes are correct
+/// 4. Hash chain is valid (each event links to previous)
+///
+/// # Arguments
+///
+/// * `events` - Events to verify.
+/// * `expected_prev_hash` - Expected previous hash for the first event.
+/// * `expected_start_seq_id` - If `Some(id)`, verify the first event has this
+///   `seq_id`. Use this to verify continuity with the local ledger.
+///
+/// # Errors
+///
+/// Returns an error if any event fails verification:
+/// - `SeqIdContinuityBroken` if first event's `seq_id` doesn't match expected
+/// - `SeqIdNotIncreasing` if `seq_ids` are not strictly increasing
+/// - `HashChainBroken` if `prev_hash` linkage is broken
+/// - `EventVerificationFailed` if computed hash doesn't match `event_hash`
+///
+/// # Security Note
+///
+/// Since `EventHasher` does not include `seq_id` in the hash computation,
+/// this function explicitly verifies `seq_id` monotonicity to prevent attacks
+/// where a malicious peer provides events with spoofed `seq_ids`.
+pub fn verify_sync_events_with_start_seq(
+    events: &[SyncEvent],
+    expected_prev_hash: &Hash,
+    expected_start_seq_id: Option<u64>,
 ) -> Result<(), AntiEntropyError> {
     if events.is_empty() {
         return Ok(());
     }
 
+    // Verify starting seq_id if specified
+    if let Some(expected_start) = expected_start_seq_id {
+        let actual_start = events[0].seq_id;
+        if actual_start != expected_start {
+            return Err(AntiEntropyError::SeqIdContinuityBroken {
+                expected: expected_start,
+                actual: actual_start,
+            });
+        }
+    }
+
     let mut prev_hash = *expected_prev_hash;
+    let mut prev_seq_id: Option<u64> = None;
 
     for event in events {
+        // Verify seq_id monotonicity (strictly increasing)
+        if let Some(prev) = prev_seq_id {
+            if event.seq_id <= prev {
+                return Err(AntiEntropyError::SeqIdNotIncreasing {
+                    current: event.seq_id,
+                    previous: prev,
+                });
+            }
+        }
+        prev_seq_id = Some(event.seq_id);
+
         // Verify previous hash linkage
         if event.prev_hash != prev_hash {
             return Err(AntiEntropyError::HashChainBroken {
@@ -1052,6 +1221,8 @@ mod tck_00191_unit_tests {
         assert_eq!(session.namespace, "kernel");
         assert_eq!(session.events_synced, 0);
         assert!(session.divergent_ranges.is_empty());
+        // Verify last_activity is initialized
+        assert!(session.last_activity.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -1071,6 +1242,40 @@ mod tck_00191_unit_tests {
         // Mark as processed
         session.mark_processed(2, 5);
         assert!(session.is_complete());
+    }
+
+    #[test]
+    fn test_sync_session_touch_updates_activity() {
+        let tree = make_test_tree(10);
+        let mut session = SyncSession::new("peer-1".to_string(), "kernel".to_string(), tree);
+
+        let initial_activity = session.last_activity;
+
+        // Small sleep to ensure time passes
+        std::thread::sleep(Duration::from_millis(10));
+
+        session.touch();
+
+        // last_activity should have been updated
+        assert!(session.last_activity > initial_activity);
+    }
+
+    #[test]
+    fn test_sync_session_is_stale() {
+        let tree = make_test_tree(10);
+        let session = SyncSession::new("peer-1".to_string(), "kernel".to_string(), tree);
+
+        // Session should not be stale immediately with a reasonable timeout
+        assert!(!session.is_stale(Duration::from_secs(60)));
+
+        // Session should be stale with zero timeout
+        assert!(session.is_stale(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_session_timeout_constant() {
+        // Verify SESSION_TIMEOUT is set to expected value
+        assert_eq!(SESSION_TIMEOUT, Duration::from_secs(60));
     }
 
     // ==================== Anti-Entropy Engine Tests ====================
@@ -1109,6 +1314,87 @@ mod tck_00191_unit_tests {
         let session = engine.end_session("peer-1");
         assert!(session.is_some());
         assert_eq!(engine.session_count(), 0);
+    }
+
+    #[test]
+    fn test_engine_cleanup_stale_sessions() {
+        let mut engine = AntiEntropyEngine::with_config(SyncRateLimiter::new(), 10);
+
+        let tree1 = make_test_tree(10);
+        let tree2 = make_test_tree(10);
+
+        engine.start_session("peer-1", "kernel", tree1).unwrap();
+        engine.start_session("peer-2", "kernel", tree2).unwrap();
+
+        assert_eq!(engine.session_count(), 2);
+
+        // With zero timeout, all sessions should be stale
+        let cleaned = engine.cleanup_stale_sessions_with_timeout(Duration::ZERO);
+        assert_eq!(cleaned, 2);
+        assert_eq!(engine.session_count(), 0);
+    }
+
+    #[test]
+    fn test_engine_cleanup_preserves_active_sessions() {
+        let mut engine = AntiEntropyEngine::with_config(SyncRateLimiter::new(), 10);
+
+        let tree1 = make_test_tree(10);
+        let tree2 = make_test_tree(10);
+
+        engine.start_session("peer-1", "kernel", tree1).unwrap();
+        engine.start_session("peer-2", "kernel", tree2).unwrap();
+
+        assert_eq!(engine.session_count(), 2);
+
+        // With a long timeout, no sessions should be cleaned
+        let cleaned = engine.cleanup_stale_sessions_with_timeout(Duration::from_secs(3600));
+        assert_eq!(cleaned, 0);
+        assert_eq!(engine.session_count(), 2);
+    }
+
+    #[test]
+    fn test_engine_start_session_cleans_stale_on_full() {
+        // Create engine with max 2 sessions
+        let mut engine = AntiEntropyEngine::with_config(SyncRateLimiter::new(), 2);
+
+        let tree1 = make_test_tree(10);
+        let tree2 = make_test_tree(10);
+        let tree3 = make_test_tree(10);
+
+        // Fill up to max sessions
+        engine.start_session("peer-1", "kernel", tree1).unwrap();
+        engine.start_session("peer-2", "kernel", tree2).unwrap();
+
+        // Normally peer-3 would be rejected, but sessions are fresh
+        // so they won't be cleaned and peer-3 will still be rejected
+        // (This tests that cleanup runs but doesn't help when sessions are active)
+        let result = engine.start_session("peer-3", "kernel", tree3);
+        assert!(
+            matches!(result, Err(AntiEntropyError::TooManyPendingRequests { .. })),
+            "peer-3 should be rejected when sessions are at max and active"
+        );
+    }
+
+    #[test]
+    fn test_engine_start_session_touches_existing() {
+        let mut engine = AntiEntropyEngine::new();
+        let tree = make_test_tree(10);
+
+        engine.start_session("peer-1", "kernel", tree).unwrap();
+
+        // Get the session and record its last_activity
+        let initial_activity = engine.get_session("peer-1").unwrap().last_activity;
+
+        // Small sleep to ensure time passes
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Start session again (reuses existing)
+        let tree2 = make_test_tree(10);
+        engine.start_session("peer-1", "kernel", tree2).unwrap();
+
+        // last_activity should have been updated
+        let new_activity = engine.get_session("peer-1").unwrap().last_activity;
+        assert!(new_activity > initial_activity);
     }
 
     #[test]
@@ -1320,6 +1606,116 @@ mod tck_00191_unit_tests {
     fn test_verify_sync_events_empty() {
         let result = verify_sync_events(&[], &[0u8; HASH_SIZE]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_sync_events_seq_id_not_increasing() {
+        let mut events = make_test_events(10);
+        // Make seq_ids not strictly increasing by setting event 5's seq_id = event 4's
+        // seq_id
+        events[5].seq_id = events[4].seq_id;
+
+        let genesis_hash = [0u8; HASH_SIZE];
+        let result = verify_sync_events(&events, &genesis_hash);
+
+        assert!(
+            matches!(
+                result,
+                Err(AntiEntropyError::SeqIdNotIncreasing {
+                    current: 5,
+                    previous: 5
+                })
+            ),
+            "expected SeqIdNotIncreasing, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_sync_events_seq_id_decreasing() {
+        let mut events = make_test_events(10);
+        // Make seq_ids decrease by setting event 5's seq_id to less than event 4's
+        // seq_id
+        events[5].seq_id = 1; // Way less than event 4's seq_id (5)
+
+        let genesis_hash = [0u8; HASH_SIZE];
+        let result = verify_sync_events(&events, &genesis_hash);
+
+        assert!(
+            matches!(
+                result,
+                Err(AntiEntropyError::SeqIdNotIncreasing {
+                    current: 1,
+                    previous: 5
+                })
+            ),
+            "expected SeqIdNotIncreasing, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_sync_events_with_start_seq_correct() {
+        let events = make_test_events(10);
+        let genesis_hash = [0u8; HASH_SIZE];
+
+        // First event has seq_id 1
+        let result = verify_sync_events_with_start_seq(&events, &genesis_hash, Some(1));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_sync_events_with_start_seq_mismatch() {
+        let events = make_test_events(10);
+        let genesis_hash = [0u8; HASH_SIZE];
+
+        // First event has seq_id 1, but we expect 100
+        let result = verify_sync_events_with_start_seq(&events, &genesis_hash, Some(100));
+
+        assert!(
+            matches!(
+                result,
+                Err(AntiEntropyError::SeqIdContinuityBroken {
+                    expected: 100,
+                    actual: 1
+                })
+            ),
+            "expected SeqIdContinuityBroken, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_sync_events_with_start_seq_none() {
+        let events = make_test_events(10);
+        let genesis_hash = [0u8; HASH_SIZE];
+
+        // When expected_start_seq_id is None, no continuity check
+        let result = verify_sync_events_with_start_seq(&events, &genesis_hash, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_sync_events_with_start_seq_empty_events() {
+        // Empty events should succeed regardless of expected_start_seq_id
+        let result = verify_sync_events_with_start_seq(&[], &[0u8; HASH_SIZE], Some(100));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_sync_events_spoofed_seq_id_detected() {
+        // This test verifies that a malicious peer cannot provide spoofed seq_ids.
+        // Since EventHasher doesn't include seq_id in the hash, an attacker could
+        // potentially send valid events with fake seq_ids. Our monotonicity check
+        // prevents this.
+        let mut spoofed_events = make_test_events(5);
+        let genesis_hash = [0u8; HASH_SIZE];
+
+        // Create events with spoofed (duplicated) seq_ids but valid hashes
+        spoofed_events[2].seq_id = 1; // Spoof: claim this is seq_id 1 (already seen)
+
+        let result = verify_sync_events(&spoofed_events, &genesis_hash);
+        assert!(
+            matches!(result, Err(AntiEntropyError::SeqIdNotIncreasing { .. })),
+            "spoofed seq_id should be detected"
+        );
     }
 
     // ==================== Find Divergences Tests ====================
