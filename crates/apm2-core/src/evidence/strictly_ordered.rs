@@ -1042,8 +1042,9 @@ impl GatePredicateReceipt {
         hasher.update(&self.generated_at.to_le_bytes());
 
         // Include strictly_ordered_count and unordered_count in the hash
-        hasher.update(&self.strictly_ordered_count.to_le_bytes());
-        hasher.update(&self.unordered_count.to_le_bytes());
+        // Cast to u64 for deterministic hashing across 32-bit and 64-bit platforms
+        hasher.update(&(self.strictly_ordered_count as u64).to_le_bytes());
+        hasher.update(&(self.unordered_count as u64).to_le_bytes());
 
         hasher.finalize().into()
     }
