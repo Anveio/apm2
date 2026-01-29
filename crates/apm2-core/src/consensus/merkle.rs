@@ -428,7 +428,7 @@ impl MerkleTree {
 
     /// Compares this tree with another tree to find divergent ranges.
     ///
-    /// Uses a top-down approach: compare roots, then recursively compare
+    /// Uses a top-down BFS approach: compare roots, then iteratively compare
     /// children of mismatched nodes. Returns the minimal set of leaf ranges
     /// where the trees differ.
     ///
@@ -439,6 +439,23 @@ impl MerkleTree {
     /// # Returns
     ///
     /// Vector of divergent ranges. Empty if trees are identical.
+    ///
+    /// # Memory Characteristics
+    ///
+    /// In the worst case (completely divergent trees), this function may
+    /// return up to `leaf_count` individual ranges before merging. After
+    /// merging adjacent ranges, the result is typically much smaller.
+    ///
+    /// For a tree with `MAX_TREE_LEAVES` (1M leaves), worst-case memory
+    /// usage for the result vector is approximately:
+    /// - Before merge: ~16 MB (1M ranges * 16 bytes each)
+    /// - After merge: typically 1-2 ranges for fully divergent trees
+    ///
+    /// The BFS queue may temporarily hold up to `O(leaf_count)` nodes in
+    /// the worst case of all leaves diverging.
+    ///
+    /// Callers should use `AntiEntropyEngine::find_divergences()` which
+    /// enforces `MAX_DIVERGENT_RANGES` to bound the returned result.
     #[must_use]
     pub fn find_divergent_ranges(&self, other: &Self) -> Vec<DivergentRange> {
         let mut divergent = Vec::new();

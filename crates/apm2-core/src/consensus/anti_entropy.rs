@@ -60,6 +60,15 @@ pub const MAX_REQUESTS_PER_INTERVAL: u32 = 100;
 pub const RATE_LIMIT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Maximum age of a cached tree digest (for `DoS` prevention).
+///
+/// This constant defines the maximum time a cached Merkle tree digest should
+/// be considered valid. Implementations using digest caching should expire
+/// entries older than this duration to prevent serving stale data and to
+/// bound memory usage.
+///
+/// Note: This constant is provided for future caching implementations and
+/// external consumers. The current in-memory sync protocol does not cache
+/// digests between sync sessions.
 pub const MAX_DIGEST_CACHE_AGE: Duration = Duration::from_secs(300);
 
 /// Maximum number of peers to track in rate limiter.
@@ -69,7 +78,18 @@ pub const MAX_RATE_LIMIT_PEERS: usize = 1000;
 
 /// Maximum tree depth for comparison (`DoS` prevention).
 ///
-/// Limits recursive comparison depth to prevent stack exhaustion.
+/// This constant bounds the maximum depth of tree comparison operations
+/// to prevent resource exhaustion attacks. The Merkle tree implementation
+/// uses iterative BFS traversal (not recursion), so stack exhaustion is
+/// not a concern. However, this constant is enforced during remote sync
+/// operations to prevent malicious peers from requesting comparisons at
+/// excessive depths.
+///
+/// The value of 32 supports trees with up to 2^32 leaves, which is well
+/// above `MAX_TREE_LEAVES` (2^20). This provides headroom for future
+/// expansion while maintaining safety bounds.
+///
+/// See also: `merkle::MAX_TREE_DEPTH` for the actual tree depth limit.
 pub const MAX_COMPARISON_DEPTH: usize = 32;
 
 /// Default sync interval for periodic anti-entropy.
@@ -97,6 +117,20 @@ pub enum AntiEntropyError {
     #[error("too many pending requests for peer {peer_id}")]
     TooManyPendingRequests {
         /// The peer with too many pending requests.
+        peer_id: String,
+    },
+
+    /// Too many tracked peers in rate limiter.
+    ///
+    /// This error is returned when the rate limiter has reached its maximum
+    /// capacity for tracked peers (`MAX_RATE_LIMIT_PEERS`) and cannot accept
+    /// new peer requests. This prevents memory exhaustion from Sybil attacks.
+    #[error(
+        "rate limiter at capacity ({} peers), cannot track new peer {peer_id}",
+        MAX_RATE_LIMIT_PEERS
+    )]
+    RateLimiterAtCapacity {
+        /// The peer that was rejected.
         peer_id: String,
     },
 
@@ -139,6 +173,17 @@ pub enum AntiEntropyError {
     TooManyDivergentRanges {
         /// The number of divergent ranges found.
         count: usize,
+    },
+
+    /// Comparison depth exceeds limit.
+    ///
+    /// This error is returned when a compare request specifies a range
+    /// that would require traversing deeper than `MAX_COMPARISON_DEPTH`.
+    /// This prevents `DoS` attacks via deeply nested comparison requests.
+    #[error("comparison depth {depth} exceeds limit {}", MAX_COMPARISON_DEPTH)]
+    ComparisonDepthExceeded {
+        /// The requested comparison depth.
+        depth: usize,
     },
 }
 
@@ -301,21 +346,21 @@ impl SyncRateLimiter {
 
     /// Checks if a request from a peer is allowed.
     ///
-    /// Returns `Ok(())` if allowed, `Err` if rate limited.
+    /// Returns `Ok(())` if allowed, `Err` if rate limited or at capacity.
     ///
     /// # Errors
     ///
     /// Returns `AntiEntropyError::RateLimitExceeded` if the peer has exceeded
     /// the rate limit for this interval.
+    ///
+    /// Returns `AntiEntropyError::RateLimiterAtCapacity` if the rate limiter
+    /// is tracking the maximum number of peers and cannot accept new peers.
+    /// This prevents memory exhaustion from Sybil attacks where an attacker
+    /// floods the node with requests from unique peer IDs.
     pub fn check(&mut self, peer_id: &str) -> Result<(), AntiEntropyError> {
         let now = Instant::now();
 
-        // Clean up old entries if we're at capacity
-        if self.requests.len() >= MAX_RATE_LIMIT_PEERS {
-            self.requests
-                .retain(|_, (_, last)| now.duration_since(*last) < self.interval);
-        }
-
+        // Check if peer is already tracked (existing peers always allowed through)
         if let Some((count, last_reset)) = self.requests.get_mut(peer_id) {
             if now.duration_since(*last_reset) >= self.interval {
                 // Reset for new interval
@@ -331,6 +376,20 @@ impl SyncRateLimiter {
                 Ok(())
             }
         } else {
+            // New peer - check capacity before adding
+            // First, try to clean up expired entries if at capacity
+            if self.requests.len() >= MAX_RATE_LIMIT_PEERS {
+                self.requests
+                    .retain(|_, (_, last)| now.duration_since(*last) < self.interval);
+            }
+
+            // After cleanup, if still at capacity, reject the new peer (fail-closed)
+            if self.requests.len() >= MAX_RATE_LIMIT_PEERS {
+                return Err(AntiEntropyError::RateLimiterAtCapacity {
+                    peer_id: peer_id.to_string(),
+                });
+            }
+
             self.requests.insert(peer_id.to_string(), (1, now));
             Ok(())
         }
@@ -550,7 +609,8 @@ impl AntiEntropyEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if rate limited or invalid request.
+    /// Returns an error if rate limited, invalid request, or comparison
+    /// depth exceeds `MAX_COMPARISON_DEPTH`.
     pub fn handle_compare_request(
         &mut self,
         request: &CompareRequest,
@@ -572,6 +632,22 @@ impl AntiEntropyEngine {
             let start = query.range.0 as usize;
             #[allow(clippy::cast_possible_truncation)]
             let end = query.range.1 as usize;
+
+            // Validate comparison depth to prevent DoS via deeply nested requests.
+            // Depth is computed as log2(range_size), bounded by MAX_COMPARISON_DEPTH.
+            let range_size = end.saturating_sub(start);
+            if range_size > 0 {
+                // Calculate the depth required to represent this range
+                // depth = ceil(log2(range_size)) when range_size > 1
+                let depth = if range_size <= 1 {
+                    0
+                } else {
+                    usize::BITS as usize - range_size.leading_zeros() as usize
+                };
+                if depth > MAX_COMPARISON_DEPTH {
+                    return Err(AntiEntropyError::ComparisonDepthExceeded { depth });
+                }
+            }
 
             // Get local digest for this range
             let local_digest = local_tree
@@ -897,6 +973,73 @@ mod tck_00191_unit_tests {
         assert!(limiter.check("peer-1").is_ok());
     }
 
+    #[test]
+    fn test_rate_limiter_peer_cap_rejects_new_peers_at_capacity() {
+        // Use a small cap for testing (override MAX_RATE_LIMIT_PEERS behavior)
+        // We test with the default limiter but fill it up to MAX_RATE_LIMIT_PEERS
+        let mut limiter = SyncRateLimiter::with_config(100, Duration::from_secs(60));
+
+        // Fill up to MAX_RATE_LIMIT_PEERS
+        for i in 0..MAX_RATE_LIMIT_PEERS {
+            let peer_id = format!("peer-{i}");
+            assert!(
+                limiter.check(&peer_id).is_ok(),
+                "peer {i} should be allowed"
+            );
+        }
+
+        // Next new peer should be rejected (at capacity)
+        let result = limiter.check("new-peer-overflow");
+        assert!(
+            matches!(result, Err(AntiEntropyError::RateLimiterAtCapacity { .. })),
+            "new peer should be rejected when at capacity, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_existing_peer_allowed_at_capacity() {
+        let mut limiter = SyncRateLimiter::with_config(100, Duration::from_secs(60));
+
+        // Fill up to MAX_RATE_LIMIT_PEERS
+        for i in 0..MAX_RATE_LIMIT_PEERS {
+            let peer_id = format!("peer-{i}");
+            assert!(limiter.check(&peer_id).is_ok());
+        }
+
+        // Existing peer should still be allowed (already tracked)
+        let result = limiter.check("peer-0");
+        assert!(
+            result.is_ok(),
+            "existing peer should be allowed even at capacity, got: {result:?}"
+        );
+
+        // New peer should still be rejected
+        let result = limiter.check("totally-new-peer");
+        assert!(matches!(
+            result,
+            Err(AntiEntropyError::RateLimiterAtCapacity { .. })
+        ));
+    }
+
+    #[test]
+    fn test_rate_limiter_peer_cap_error_message() {
+        let mut limiter = SyncRateLimiter::with_config(100, Duration::from_secs(60));
+
+        // Fill to capacity
+        for i in 0..MAX_RATE_LIMIT_PEERS {
+            limiter.check(&format!("peer-{i}")).unwrap();
+        }
+
+        // Check error message format
+        let result = limiter.check("rejected-peer");
+        match result {
+            Err(AntiEntropyError::RateLimiterAtCapacity { peer_id }) => {
+                assert_eq!(peer_id, "rejected-peer");
+            },
+            other => panic!("expected RateLimiterAtCapacity, got: {other:?}"),
+        }
+    }
+
     // ==================== Sync Session Tests ====================
 
     #[test]
@@ -1071,6 +1214,64 @@ mod tck_00191_unit_tests {
             result,
             Err(AntiEntropyError::BatchTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn test_engine_handle_compare_request_depth_limit() {
+        let mut engine = AntiEntropyEngine::new();
+        let tree = make_test_tree(8);
+
+        // Create a range that would exceed MAX_COMPARISON_DEPTH
+        // A range of 2^33 would require depth 33 which exceeds MAX_COMPARISON_DEPTH
+        // (32)
+        let huge_range: u64 = 1u64 << 33; // 8 billion
+        let request = CompareRequest {
+            namespace: "kernel".to_string(),
+            ranges: vec![RangeQuery {
+                range: (0, huge_range),
+                expected_hash: tree.root(),
+            }],
+            peer_id: "peer-1".to_string(),
+        };
+
+        let result = engine.handle_compare_request(&request, &tree);
+        assert!(
+            matches!(
+                result,
+                Err(AntiEntropyError::ComparisonDepthExceeded { .. })
+            ),
+            "expected ComparisonDepthExceeded, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_engine_handle_compare_request_depth_at_limit_allowed() {
+        let mut engine = AntiEntropyEngine::new();
+        let tree = make_test_tree(8);
+
+        // A range of 2^31 would require depth 32 (since depth = bit_length)
+        // which equals MAX_COMPARISON_DEPTH (32). This should be allowed.
+        // Note: depth is computed as usize::BITS - leading_zeros for range_size > 1
+        let max_allowed_range: u64 = 1u64 << 31; // 2 billion - requires depth 32
+        let request = CompareRequest {
+            namespace: "kernel".to_string(),
+            ranges: vec![RangeQuery {
+                range: (0, max_allowed_range),
+                expected_hash: tree.root(),
+            }],
+            peer_id: "peer-1".to_string(),
+        };
+
+        // This will fail due to InvalidRange (out of bounds for our small tree)
+        // but NOT due to depth exceeded - that's what we're testing
+        let result = engine.handle_compare_request(&request, &tree);
+        assert!(
+            !matches!(
+                result,
+                Err(AntiEntropyError::ComparisonDepthExceeded { .. })
+            ),
+            "depth at limit should be allowed, got: {result:?}"
+        );
     }
 
     // ==================== Event Verification Tests ====================
