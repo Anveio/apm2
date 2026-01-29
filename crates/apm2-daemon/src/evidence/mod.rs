@@ -2,8 +2,8 @@
 //!
 //! This module handles tool receipts, evidence binding, receipt signing and
 //! verification, keychain integration, flight recording, ring buffer
-//! management, and evidence retention policies for audit and debugging
-//! purposes.
+//! management, evidence compaction, and evidence retention policies for
+//! audit and debugging purposes.
 //!
 //! # Architecture
 //!
@@ -18,7 +18,10 @@
 //!     |-- config.rs          - RecorderConfig per risk tier (TCK-00170)
 //!     |-- trigger.rs         - Persistence trigger conditions (TCK-00170)
 //!     |-- recorder.rs        - FlightRecorder implementation (TCK-00170)
-//!     `-- (future: ttl.rs, compaction.rs)
+//!     |-- tombstone.rs       - Tombstone tracking for compacted artifacts (TCK-00172)
+//!     |-- compaction.rs      - Evidence compaction strategy and jobs (TCK-00172)
+//!     |-- summary.rs         - Compaction receipt generation (TCK-00172)
+//!     `-- (future: ttl.rs, artifact.rs, pin.rs)
 //! ```
 //!
 //! # Security Model
@@ -55,9 +58,20 @@ pub mod config;
 pub mod recorder;
 pub mod trigger;
 
+// TCK-00172: Evidence compaction
+pub mod compaction;
+pub mod summary;
+pub mod tombstone;
+
 // Re-export core receipt types
 // Re-export binding types
 pub use binding::{EvidenceBinding, ToolEvidenceCollector};
+// Re-export compaction types (TCK-00172)
+pub use compaction::{
+    ArtifactId, CompactionCounts, CompactionError, CompactionJob, CompactionJobBuilder,
+    CompactionResult, CompactionStrategy, CompactionSummary, DEFAULT_COMPACTION_THRESHOLD_NS,
+    MAX_ARTIFACT_ID_LEN, MAX_COMPACTION_ARTIFACTS, MIN_COMPACTION_THRESHOLD_NS,
+};
 // Re-export flight recorder types (TCK-00170)
 pub use config::{
     ESTIMATED_PTY_CHUNK_SIZE, ESTIMATED_TELEMETRY_FRAME_SIZE, ESTIMATED_TOOL_EVENT_SIZE,
@@ -82,6 +96,13 @@ pub use receipt_builder::{ReceiptBuilder, ReceiptSigning};
 pub use recorder::{EvidenceBundle, FlightRecorder, PersistResult, ToolEvent};
 // Re-export signer types (TCK-00167)
 pub use signer::{INITIAL_KEY_VERSION, KeyId, MAX_KEY_ID_LEN, ReceiptSigner, SignerError};
+pub use summary::{
+    CompactionReceipt, CompactionReceiptBuilder, CompactionReceiptError, CompactionStats,
+    MAX_COMPACTED_HASHES,
+};
+pub use tombstone::{
+    ArtifactKind, MAX_ARTIFACT_KIND_LEN, MAX_TOMBSTONES, Tombstone, TombstoneError, TombstoneList,
+};
 pub use trigger::{
     MAX_ACTOR_LEN, MAX_GATE_ID_LEN, MAX_REASON_LEN, MAX_RESOURCE_LEN,
     MAX_RULE_ID_LEN as MAX_TRIGGER_RULE_ID_LEN, MAX_VIOLATION_LEN, PersistTrigger, TriggerCategory,
@@ -93,5 +114,5 @@ pub use verifier::{
 };
 
 // Placeholder exports for future evidence types.
-// TODO(TCK-00171): Implement TTL and pinning types.
-// TODO(TCK-00172): Implement compaction types.
+// TODO(TCK-00171): Implement TTL and pinning types (artifact.rs, ttl.rs,
+// pin.rs).
