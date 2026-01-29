@@ -998,6 +998,10 @@ impl GatePredicateReceipt {
     }
 
     /// Computes a deterministic hash of the receipt for replay verification.
+    ///
+    /// This method sorts predicates and evidence hashes before hashing to
+    /// ensure deterministic output regardless of insertion order
+    /// (CTR-2612).
     #[must_use]
     pub fn compute_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
@@ -1007,8 +1011,17 @@ impl GatePredicateReceipt {
         hasher.update(self.work_id.as_bytes());
         hasher.update(&[u8::from(self.passed)]);
 
-        // Hash predicates in order
-        for predicate in &self.evidence_predicates {
+        // Sort predicates by name (primary) and evidence_id (secondary) for
+        // deterministic hashing (CTR-2612)
+        let mut sorted_predicates: Vec<_> = self.evidence_predicates.iter().collect();
+        sorted_predicates.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.evidence_id.cmp(&b.evidence_id))
+        });
+
+        // Hash predicates in sorted order
+        for predicate in sorted_predicates {
             hasher.update(predicate.name.as_bytes());
             hasher.update(predicate.value.as_bytes());
             hasher.update(&[u8::from(predicate.satisfied)]);
@@ -1017,14 +1030,35 @@ impl GatePredicateReceipt {
             }
         }
 
-        // Hash evidence hashes
-        for hash in &self.evidence_hashes {
+        // Sort evidence hashes lexicographically for deterministic hashing (CTR-2612)
+        let mut sorted_hashes = self.evidence_hashes.clone();
+        sorted_hashes.sort_unstable();
+
+        // Hash evidence hashes in sorted order
+        for hash in &sorted_hashes {
             hasher.update(hash);
         }
 
         hasher.update(&self.generated_at.to_le_bytes());
 
+        // Include strictly_ordered_count and unordered_count in the hash
+        hasher.update(&self.strictly_ordered_count.to_le_bytes());
+        hasher.update(&self.unordered_count.to_le_bytes());
+
         hasher.finalize().into()
+    }
+
+    /// Validates that this receipt has been signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StrictlyOrderedError::ReceiptNotSigned`] if the receipt
+    /// does not have a signature.
+    pub const fn validate_signature(&self) -> Result<(), StrictlyOrderedError> {
+        if self.signature.is_none() {
+            return Err(StrictlyOrderedError::ReceiptNotSigned);
+        }
+        Ok(())
     }
 }
 
@@ -1492,6 +1526,183 @@ mod tests {
         .unwrap();
 
         assert_eq!(receipt1.compute_hash(), receipt2.compute_hash());
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_hash_deterministic_regardless_of_predicate_order() {
+        // Create predicates in order A, B, C
+        let predicates_abc = vec![
+            EvidencePredicate::new_unchecked(
+                "alpha".to_string(),
+                "val_a".to_string(),
+                true,
+                Some("evid-001".to_string()),
+                1_000_000_000,
+            ),
+            EvidencePredicate::new_unchecked(
+                "beta".to_string(),
+                "val_b".to_string(),
+                true,
+                Some("evid-002".to_string()),
+                1_000_000_000,
+            ),
+            EvidencePredicate::new_unchecked(
+                "gamma".to_string(),
+                "val_c".to_string(),
+                false,
+                None,
+                1_000_000_000,
+            ),
+        ];
+
+        // Create predicates in order C, A, B (different order)
+        let predicates_cab = vec![
+            EvidencePredicate::new_unchecked(
+                "gamma".to_string(),
+                "val_c".to_string(),
+                false,
+                None,
+                1_000_000_000,
+            ),
+            EvidencePredicate::new_unchecked(
+                "alpha".to_string(),
+                "val_a".to_string(),
+                true,
+                Some("evid-001".to_string()),
+                1_000_000_000,
+            ),
+            EvidencePredicate::new_unchecked(
+                "beta".to_string(),
+                "val_b".to_string(),
+                true,
+                Some("evid-002".to_string()),
+                1_000_000_000,
+            ),
+        ];
+
+        // Create evidence hashes in order 1, 2, 3
+        let hashes_123 = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+
+        // Create evidence hashes in order 3, 1, 2 (different order)
+        let hashes_312 = vec![[3u8; 32], [1u8; 32], [2u8; 32]];
+
+        // Receipt with predicates ABC and hashes 123
+        let receipt1 = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            predicates_abc,
+            hashes_123,
+            2_000_000_000,
+            3,
+            1,
+        )
+        .unwrap();
+
+        // Receipt with predicates CAB and hashes 312 (different insertion order)
+        let receipt2 = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            predicates_cab,
+            hashes_312,
+            2_000_000_000,
+            3,
+            1,
+        )
+        .unwrap();
+
+        // Hashes should be identical regardless of insertion order (CTR-2612)
+        assert_eq!(
+            receipt1.compute_hash(),
+            receipt2.compute_hash(),
+            "Hash must be deterministic regardless of predicate/hash insertion order"
+        );
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_hash_includes_counts() {
+        // Two receipts identical except for strictly_ordered_count and unordered_count
+        let predicates = vec![EvidencePredicate::total_order_finalized(
+            "evid-001",
+            true,
+            1_000_000_000,
+        )];
+
+        let receipt1 = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            predicates.clone(),
+            vec![[1u8; 32]],
+            2_000_000_000,
+            5, // strictly_ordered_count
+            2, // unordered_count
+        )
+        .unwrap();
+
+        let receipt2 = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            predicates,
+            vec![[1u8; 32]],
+            2_000_000_000,
+            3, // different strictly_ordered_count
+            4, // different unordered_count
+        )
+        .unwrap();
+
+        // Hashes should be different because counts differ
+        assert_ne!(
+            receipt1.compute_hash(),
+            receipt2.compute_hash(),
+            "Hash must include strictly_ordered_count and unordered_count"
+        );
+    }
+
+    #[test]
+    fn tck_00198_gate_predicate_receipt_validate_signature() {
+        // Unsigned receipt should fail validation
+        let receipt = GatePredicateReceipt::try_new(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let result = receipt.validate_signature();
+        assert!(matches!(
+            result,
+            Err(StrictlyOrderedError::ReceiptNotSigned)
+        ));
+
+        // Signed receipt should pass validation
+        let signed_receipt = GatePredicateReceipt::try_new_signed(
+            "rcpt-001".to_string(),
+            "gate-001".to_string(),
+            "work-123".to_string(),
+            true,
+            vec![],
+            vec![],
+            2_000_000_000,
+            0,
+            0,
+            [0xab; SIGNATURE_SIZE],
+        )
+        .unwrap();
+
+        assert!(signed_receipt.validate_signature().is_ok());
     }
 
     #[test]
