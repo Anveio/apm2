@@ -748,6 +748,34 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// Runs a git command with proper environment isolation.
+    ///
+    /// When running tests in a git worktree, git commands can accidentally use
+    /// the parent worktree's configuration. This helper ensures that each
+    /// test's temporary repo is fully isolated by setting `GIT_DIR` and
+    /// `GIT_WORK_TREE`.
+    ///
+    /// For `git init`, we don't set `GIT_DIR` since it doesn't exist yet.
+    fn run_git_command(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(root);
+
+        // For init, don't set GIT_DIR (it doesn't exist yet), but clear
+        // any inherited git env vars to avoid using parent worktree
+        if args.first() == Some(&"init") {
+            cmd.env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY");
+        } else {
+            // For other commands, explicitly point to the test repo
+            cmd.env("GIT_DIR", root.join(".git"))
+                .env("GIT_WORK_TREE", root);
+        }
+
+        cmd.output()
+    }
+
     /// Creates a test git repository with some history.
     ///
     /// # Errors
@@ -755,21 +783,12 @@ pub(crate) mod tests {
     /// Returns an error if git commands or file operations fail.
     pub fn create_test_repo(root: &Path) -> std::io::Result<()> {
         // Initialize git repo
-        Command::new("git")
-            .args(["init"])
-            .current_dir(root)
-            .output()?;
+        run_git_command(root, &["init"])?;
 
         // Configure git for the test
-        Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(root)
-            .output()?;
+        run_git_command(root, &["config", "user.email", "test@example.com"])?;
 
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(root)
-            .output()?;
+        run_git_command(root, &["config", "user.name", "Test"])?;
 
         // Create some files
         std::fs::create_dir_all(root.join("src"))?;
@@ -777,15 +796,9 @@ pub(crate) mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub fn test() {}")?;
 
         // Initial commit
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output()?;
+        run_git_command(root, &["add", "."])?;
 
-        Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
-            .current_dir(root)
-            .output()?;
+        run_git_command(root, &["commit", "-m", "Initial commit"])?;
 
         Ok(())
     }
@@ -806,16 +819,8 @@ pub(crate) mod tests {
                 format!("fn main() {{ /* {i} */ }}"),
             )
             .unwrap();
-            Command::new("git")
-                .args(["add", "src/main.rs"])
-                .current_dir(root)
-                .output()
-                .unwrap();
-            Command::new("git")
-                .args(["commit", "-m", &format!("Update {i}")])
-                .current_dir(root)
-                .output()
-                .unwrap();
+            run_git_command(root, &["add", "src/main.rs"]).unwrap();
+            run_git_command(root, &["commit", "-m", &format!("Update {i}")]).unwrap();
         }
 
         let collector = HotspotCollector::new(Duration::from_secs(30 * 86400), 3);
@@ -899,16 +904,8 @@ pub(crate) mod tests {
         std::fs::write(root.join("src/module_a/handler.rs"), "fn handle() {}").unwrap();
         std::fs::write(root.join("src/module_b/handler.rs"), "fn handle() {}").unwrap();
 
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "Add handlers"])
-            .current_dir(root)
-            .output()
-            .unwrap();
+        run_git_command(root, &["add", "."]).unwrap();
+        run_git_command(root, &["commit", "-m", "Add handlers"]).unwrap();
 
         let collector = DuplicationCollector::new(60);
         let signals = collector.collect(root).unwrap();
@@ -940,16 +937,8 @@ pub(crate) mod tests {
         });
         std::fs::write(root.join("src/large.rs"), &large_content).unwrap();
 
-        Command::new("git")
-            .args(["add", "src/large.rs"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "Add large file"])
-            .current_dir(root)
-            .output()
-            .unwrap();
+        run_git_command(root, &["add", "src/large.rs"]).unwrap();
+        run_git_command(root, &["commit", "-m", "Add large file"]).unwrap();
 
         let collector = ComplexityCollector::new(500);
         let signals = collector.collect(root).unwrap();
