@@ -46,10 +46,10 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -71,8 +71,10 @@ pub const MAX_QC_SIGNATURES: usize = 16;
 
 /// Maximum payload size in bytes.
 ///
-/// Control-plane events are small; 64KB is generous.
-pub const MAX_PAYLOAD_SIZE: usize = 65536;
+/// This must match the network layer's `MAX_PAYLOAD_SIZE` (1016 bytes) to
+/// ensure consensus messages fit within fixed-size control frames (INV-0017).
+/// See `network.rs::MAX_PAYLOAD_SIZE` for the authoritative definition.
+pub const MAX_PAYLOAD_SIZE: usize = super::network::MAX_PAYLOAD_SIZE;
 
 /// Default round timeout duration.
 pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,6 +87,22 @@ pub const MAX_ROUND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout multiplier for exponential backoff on view change.
 pub const TIMEOUT_MULTIPLIER: f64 = 1.5;
+
+/// Maximum allowed round jump in proposals.
+///
+/// Proposals that skip more than this many rounds are rejected to prevent
+/// round-skipping attacks that could disrupt consensus progress.
+pub const MAX_ROUND_JUMP: u64 = 10;
+
+/// Maximum number of pending blocks to track.
+///
+/// Bounds state growth to prevent denial-of-service via memory exhaustion.
+pub const MAX_PENDING_BLOCKS: usize = 128;
+
+/// Maximum number of certified blocks to track.
+///
+/// Bounds state growth to prevent denial-of-service via memory exhaustion.
+pub const MAX_CERTIFIED_BLOCKS: usize = 128;
 
 // ============================================================================
 // Types
@@ -172,6 +190,23 @@ pub enum BftError {
     /// Duplicate vote.
     #[error("duplicate vote from validator {0} in round {1}")]
     DuplicateVote(String, u64),
+
+    /// Duplicate signature in QC (quorum forgery attempt).
+    #[error("duplicate signature from validator {0} in QC")]
+    DuplicateSignature(String),
+
+    /// Round jump too large.
+    #[error("round jump too large: {proposed} - {current} = {jump} > {max}")]
+    RoundJumpTooLarge {
+        /// Proposed round.
+        proposed: u64,
+        /// Current round.
+        current: u64,
+        /// Actual jump.
+        jump: u64,
+        /// Maximum allowed jump.
+        max: u64,
+    },
 
     /// Stale message (old epoch or round).
     #[error(
@@ -389,6 +424,16 @@ impl Vote {
         msg
     }
 
+    /// Signs the vote using the provided signing key.
+    ///
+    /// This method computes the Ed25519 signature over the canonical vote
+    /// message and stores it in the `signature` field.
+    pub fn sign(&mut self, signing_key: &SigningKey) {
+        let message = self.signing_message();
+        let signature = signing_key.sign(&message);
+        self.signature = signature.to_bytes();
+    }
+
     /// Verifies the voter's Ed25519 signature.
     ///
     /// # Errors
@@ -484,11 +529,18 @@ impl QuorumCertificate {
     /// not just a count check. Each signature must:
     /// 1. Correspond to a known validator
     /// 2. Be a valid Ed25519 signature over the vote message
+    /// 3. Be from a unique validator (no duplicate signatures)
+    ///
+    /// # Security
+    ///
+    /// The duplicate validator check prevents quorum forgery attacks where
+    /// an attacker repeats the same valid signature 2f+1 times to create
+    /// a fake QC.
     ///
     /// # Errors
     ///
-    /// Returns an error if any signature is invalid or from an unknown
-    /// validator.
+    /// Returns an error if any signature is invalid, from an unknown
+    /// validator, or if the same validator appears twice.
     pub fn verify_signatures(
         &self,
         validators: &[ValidatorInfo],
@@ -502,6 +554,11 @@ impl QuorumCertificate {
         // First check quorum count
         self.validate_quorum(quorum_threshold)?;
 
+        // Track seen validators to detect duplicate signatures (quorum forgery
+        // prevention)
+        let mut seen_validators: HashSet<ValidatorId> =
+            HashSet::with_capacity(self.signatures.len());
+
         // Build vote message that was signed
         let mut vote_msg = Vec::with_capacity(4 + 8 + 8 + 32);
         vote_msg.extend_from_slice(b"VOTE");
@@ -511,6 +568,11 @@ impl QuorumCertificate {
 
         // Verify each signature
         for sig in &self.signatures {
+            // Check for duplicate validator (quorum forgery prevention)
+            if !seen_validators.insert(sig.validator_id) {
+                return Err(BftError::DuplicateSignature(hex::encode(sig.validator_id)));
+            }
+
             // Find validator by ID (using constant-time comparison)
             let validator = validators
                 .iter()
@@ -571,6 +633,16 @@ impl NewView {
         msg.extend_from_slice(&self.round.to_le_bytes());
         msg.extend_from_slice(&self.high_qc.block_hash);
         msg
+    }
+
+    /// Signs the new-view message using the provided signing key.
+    ///
+    /// This method computes the Ed25519 signature over the canonical new-view
+    /// message and stores it in the `signature` field.
+    pub fn sign(&mut self, signing_key: &SigningKey) {
+        let message = self.signing_message();
+        let signature = signing_key.sign(&message);
+        self.signature = signature.to_bytes();
     }
 
     /// Verifies the sender's Ed25519 signature.
@@ -898,6 +970,19 @@ impl HotStuffState {
             });
         }
 
+        // Validate round jump is not too large (prevents round-skipping attacks)
+        if proposal.epoch == self.epoch && proposal.round > self.round {
+            let jump = proposal.round - self.round;
+            if jump > MAX_ROUND_JUMP {
+                return Err(BftError::RoundJumpTooLarge {
+                    proposed: proposal.round,
+                    current: self.round,
+                    jump,
+                    max: MAX_ROUND_JUMP,
+                });
+            }
+        }
+
         // Validate proposer is leader and get public key
         let expected_leader = self.config.leader_for_round(proposal.round);
         // Use constant-time comparison for validator ID
@@ -929,10 +1014,11 @@ impl HotStuffState {
         self.round = proposal.round;
         self.phase = Phase::Voting;
 
-        // Track pending block
-        self.pending_blocks.insert(
+        // Track pending block with bounded storage
+        self.add_pending_block(
             proposal.block_hash,
-            (proposal.round, proposal.parent_qc.block_hash),
+            proposal.round,
+            proposal.parent_qc.block_hash,
         );
 
         // Update high_qc if proposal's parent_qc is higher
@@ -940,14 +1026,14 @@ impl HotStuffState {
             self.high_qc = proposal.parent_qc.clone();
         }
 
-        // Create vote
+        // Create vote (signature must be added by caller using Vote::sign)
         self.last_voted_round = proposal.round;
         let vote = Vote {
             epoch: proposal.epoch,
             round: proposal.round,
             voter_id: self.config.validator_id,
             block_hash: proposal.block_hash,
-            signature: [0u8; 64], // TODO: Sign with private key
+            signature: [0u8; 64], // Caller must sign with Vote::sign()
         };
 
         Ok(Some(vote))
@@ -1012,8 +1098,8 @@ impl HotStuffState {
                 signatures,
             };
 
-            // Store certified block for 3-chain verification
-            self.certified_blocks.insert(qc.round, qc.clone());
+            // Store certified block for 3-chain verification with bounded storage
+            self.add_certified_block(qc.clone());
 
             // Update state
             self.phase = Phase::Certified;
@@ -1032,7 +1118,8 @@ impl HotStuffState {
 
     /// Processes a timeout event.
     ///
-    /// Returns a `NewView` message to broadcast.
+    /// Returns a `NewView` message to broadcast. The caller must sign the
+    /// message using `NewView::sign()` before broadcasting.
     #[must_use]
     pub fn on_timeout(&mut self) -> NewView {
         self.phase = Phase::ViewChange;
@@ -1042,7 +1129,7 @@ impl HotStuffState {
             round: self.round + 1,
             sender_id: self.config.validator_id,
             high_qc: self.high_qc.clone(),
-            signature: [0u8; 64], // TODO: Sign
+            signature: [0u8; 64], // Caller must sign with NewView::sign()
         }
     }
 
@@ -1156,6 +1243,58 @@ impl HotStuffState {
         self.round += 1;
         self.phase = Phase::Idle;
         self.votes_by_block.clear();
+    }
+
+    /// Adds a pending block with bounded storage.
+    ///
+    /// If the storage exceeds `MAX_PENDING_BLOCKS`, older entries are evicted
+    /// (entries with lower rounds). Committed blocks are also removed from
+    /// pending storage.
+    fn add_pending_block(&mut self, block_hash: BlockHash, round: u64, parent_hash: BlockHash) {
+        // Remove committed blocks from pending
+        for committed_hash in &self.committed {
+            self.pending_blocks.remove(committed_hash);
+        }
+
+        // Evict oldest entries if at capacity
+        while self.pending_blocks.len() >= MAX_PENDING_BLOCKS {
+            // Find the entry with the lowest round
+            if let Some((&oldest_hash, _)) = self
+                .pending_blocks
+                .iter()
+                .min_by_key(|(_, (round, _))| *round)
+            {
+                self.pending_blocks.remove(&oldest_hash);
+            } else {
+                break;
+            }
+        }
+
+        self.pending_blocks.insert(block_hash, (round, parent_hash));
+    }
+
+    /// Adds a certified block with bounded storage.
+    ///
+    /// If the storage exceeds `MAX_CERTIFIED_BLOCKS`, older entries are evicted
+    /// (entries with lower rounds). Committed blocks are also removed from
+    /// certified storage.
+    fn add_certified_block(&mut self, qc: QuorumCertificate) {
+        // Remove certified blocks for committed block hashes
+        let committed_set: HashSet<_> = self.committed.iter().collect();
+        self.certified_blocks
+            .retain(|_, qc| !committed_set.contains(&qc.block_hash));
+
+        // Evict oldest entries if at capacity
+        while self.certified_blocks.len() >= MAX_CERTIFIED_BLOCKS {
+            // Find the entry with the lowest round
+            if let Some(&oldest_round) = self.certified_blocks.keys().min() {
+                self.certified_blocks.remove(&oldest_round);
+            } else {
+                break;
+            }
+        }
+
+        self.certified_blocks.insert(qc.round, qc);
     }
 }
 
