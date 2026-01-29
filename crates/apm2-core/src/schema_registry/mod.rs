@@ -60,7 +60,7 @@
 //! let entry = SchemaEntry {
 //!     stable_id: "test:schema.v1".to_string(),
 //!     digest,
-//!     content: content.to_vec(),
+//!     content: content.to_vec().into(),
 //!     canonicalizer_version: "cac-json-v1".to_string(),
 //!     registered_at: 0,
 //!     registered_by: "system".to_string(),
