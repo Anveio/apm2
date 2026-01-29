@@ -382,7 +382,9 @@ pub struct Connection {
 
 impl Connection {
     /// Creates a new connection wrapper.
-    fn new(stream: TlsStream<TcpStream>, peer_addr: SocketAddr) -> Self {
+    ///
+    /// This is `pub(crate)` to allow the tunnel module to create connections.
+    pub(crate) fn new(stream: TlsStream<TcpStream>, peer_addr: SocketAddr) -> Self {
         Self {
             stream,
             peer_addr,
