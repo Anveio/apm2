@@ -20,11 +20,10 @@ use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
 use crate::ticket_status::{
-    CompletedTicketsResult, PrDetails, PrQueryResult, ReviewThread, TimelineEntry,
-    get_completed_tickets, get_in_progress_tickets, get_pr_for_branch, get_pr_timeline,
-    get_unresolved_threads,
+    CompletedTicketsResult, get_completed_tickets, get_in_progress_tickets,
 };
 use crate::util::main_worktree;
+use crate::worktree_health::{diagnose_worktree, print_health_report};
 
 /// Type of target specified for start-ticket command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +79,7 @@ struct TicketInfo {
 ///
 /// * `target` - Optional RFC ID (RFC-XXXX), ticket ID (TCK-XXXXX), or None
 /// * `print_path_only` - If true, only print the worktree path (for scripting)
-/// * `dry_run` - If true, show planned actions without executing them
+/// * `force` - If true, auto-cleanup remediable worktree issues
 ///
 /// # Errors
 ///
@@ -88,7 +87,8 @@ struct TicketInfo {
 /// - No pending tickets are found
 /// - All pending tickets are blocked by incomplete dependencies
 /// - Worktree or branch creation fails
-pub fn run(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result<()> {
+/// - Worktree has issues requiring manual intervention (without --force)
+pub fn run(target: Option<&str>, print_path_only: bool, force: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
     let main_worktree_path = main_worktree(&sh)?;
 
@@ -127,12 +127,13 @@ pub fn run(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result
                 .find(|t| &t.id == ticket_id)
                 .with_context(|| format!("Ticket {ticket_id} not found"))?;
 
-            // Check if already completed
+            // Check if already completed or in progress
             if completed.contains(&ticket.id) {
                 bail!("Ticket {ticket_id} is already completed.");
             }
-
-            // In-progress is fine - we'll resume work on it
+            if in_progress.contains(&ticket.id) {
+                bail!("Ticket {ticket_id} is already in progress.");
+            }
 
             // Warn if dependencies are not met (but proceed anyway)
             let unmet_deps: Vec<&String> = ticket
@@ -212,35 +213,31 @@ pub fn run(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result
         },
     };
 
+    if print_path_only {
+        // Just print the worktree path for scripting
+        let worktree_path = main_worktree_path
+            .parent()
+            .unwrap_or(&main_worktree_path)
+            .join(format!("apm2-{}", ticket.id));
+        println!("{}", worktree_path.display());
+        return Ok(());
+    }
+
+    // Display ticket info
+    if ticket.rfc_id.is_empty() {
+        println!("Starting ticket {}", ticket.id);
+    } else {
+        println!("Starting ticket {} for {}", ticket.id, ticket.rfc_id);
+    }
+    println!("Title: {}", ticket.title);
+    println!();
+
     // Create branch name (with or without RFC based on ticket's rfc_id)
     let branch_name = if ticket.rfc_id.is_empty() {
         format!("ticket/{}", ticket.id)
     } else {
         format!("ticket/{}/{}", ticket.rfc_id, ticket.id)
     };
-
-    // Determine worktree path
-    let worktree_path = main_worktree_path
-        .parent()
-        .unwrap_or(&main_worktree_path)
-        .join(format!("apm2-{}", ticket.id));
-
-    if print_path_only {
-        // Just print the worktree path for scripting
-        println!("{}", worktree_path.display());
-        return Ok(());
-    }
-
-    // Display ticket info
-    let is_resuming = in_progress.contains(&ticket.id);
-    let action = if is_resuming { "Resuming" } else { "Starting" };
-    if ticket.rfc_id.is_empty() {
-        println!("{action} ticket {}", ticket.id);
-    } else {
-        println!("{action} ticket {} for {}", ticket.id, ticket.rfc_id);
-    }
-    println!("Title: {}", ticket.title);
-    println!();
 
     // Check if branch already exists
     let branch_exists = cmd!(sh, "git branch --list {branch_name}")
@@ -256,85 +253,43 @@ pub fn run(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result
 
     let remote_branch_exists = !remote_branch_exists.trim().is_empty();
 
+    // Determine worktree path
+    let worktree_path = main_worktree_path
+        .parent()
+        .unwrap_or(&main_worktree_path)
+        .join(format!("apm2-{}", ticket.id));
+
     // Check if worktree already exists
     let worktree_exists = worktree_path.exists();
 
-    // Dry-run mode: show what would be done without executing
-    if dry_run {
-        println!("=== Dry Run Mode ===");
-        println!("Would perform the following actions:");
-        println!();
-
-        if worktree_exists {
-            println!(
-                "  1. Remove existing worktree at {}",
-                worktree_path.display()
-            );
-            println!(
-                "     $ git worktree remove --force {}",
-                worktree_path.display()
-            );
-        }
-
-        if branch_exists {
-            println!(
-                "  {}. Create worktree for existing local branch",
-                if worktree_exists { 2 } else { 1 }
-            );
-            println!(
-                "     $ git worktree add {} {branch_name}",
-                worktree_path.display()
-            );
-        } else if remote_branch_exists {
-            println!(
-                "  {}. Fetch and create worktree for remote branch",
-                if worktree_exists { 2 } else { 1 }
-            );
-            println!("     $ git fetch origin {branch_name}");
-            println!(
-                "     $ git worktree add {} {branch_name}",
-                worktree_path.display()
-            );
-        } else {
-            println!(
-                "  {}. Create new branch and worktree",
-                if worktree_exists { 2 } else { 1 }
-            );
-            println!(
-                "     $ git worktree add -b {branch_name} {}",
-                worktree_path.display()
-            );
-        }
-
-        println!();
-        println!("Summary:");
-        println!("  Branch: {branch_name}");
-        println!("  Worktree: {}", worktree_path.display());
-        println!("  Branch exists locally: {branch_exists}");
-        println!("  Branch exists on remote: {remote_branch_exists}");
-        println!("  Worktree exists: {worktree_exists}");
-
-        // Check for existing PR
-        let pr_details = get_pr_for_branch(&sh, &branch_name);
-        match pr_details {
-            PrQueryResult::Success(details) => {
-                println!("  Existing PR: {} ({})", details.url, details.state);
-            },
-            PrQueryResult::NotFound => {
-                println!("  Existing PR: None");
-            },
-            PrQueryResult::NetworkError(_) => {
-                println!("  Existing PR: Unknown (network error)");
-            },
-        }
-
-        println!();
-        println!("Run without --dry-run to execute these actions.");
-        return Ok(());
-    }
-
     if worktree_exists {
-        println!("Worktree already exists at {}", worktree_path.display());
+        // Diagnose worktree health before proceeding
+        let health =
+            diagnose_worktree(&sh, &worktree_path).context("Failed to diagnose worktree health")?;
+
+        if health.has_issues() {
+            print_health_report(&health);
+
+            let manual_issues = health.manual_issues();
+            if !manual_issues.is_empty() {
+                bail!(
+                    "Cannot proceed: worktree has issues requiring manual intervention.\n\
+                     Resolve above issues, or commit/stash changes first."
+                );
+            }
+
+            if !force {
+                bail!(
+                    "Worktree has issues that can be auto-cleaned.\n\
+                     Use --force to auto-cleanup, or fix issues manually."
+                );
+            }
+
+            println!("--force specified, proceeding with cleanup...");
+        } else {
+            println!("Worktree already exists at {}", worktree_path.display());
+        }
+
         println!("Removing existing worktree...");
         cmd!(sh, "git worktree remove --force {worktree_path}")
             .run()
@@ -366,23 +321,8 @@ pub fn run(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result
     println!("Worktree created at: {}", worktree_path.display());
     println!();
 
-    // Check for existing PR and output appropriate context
-    let pr_details = get_pr_for_branch(&sh, &branch_name);
-    match pr_details {
-        PrQueryResult::Success(details) => {
-            print_resume_context(&sh, &main_worktree_path, &worktree_path, ticket, &details);
-        },
-        PrQueryResult::NotFound => {
-            print_new_context(&main_worktree_path, &worktree_path, ticket);
-        },
-        PrQueryResult::NetworkError(msg) => {
-            eprintln!("Warning: {msg}");
-            eprintln!("         Unable to check for existing PR.");
-            eprintln!();
-            // Fall back to new ticket context
-            print_new_context(&main_worktree_path, &worktree_path, ticket);
-        },
-    }
+    // Output context for implementation
+    print_context(&main_worktree_path, ticket);
 
     Ok(())
 }
@@ -529,33 +469,48 @@ fn extract_dependencies(content: &str) -> Vec<String> {
     deps
 }
 
-/// Print context information for a NEW ticket (no existing PR).
-fn print_new_context(main_worktree: &Path, worktree_path: &Path, ticket: &TicketInfo) {
-    println!("=== Ticket Context ===");
-    println!("TICKET_ID: {}", ticket.id);
-    if !ticket.rfc_id.is_empty() {
-        println!("RFC_ID: {}", ticket.rfc_id);
-    }
-    println!("WORKTREE_PATH: {}", worktree_path.display());
-    println!("PR_URL: (none)");
+/// Print context information for implementing the ticket.
+fn print_context(main_worktree: &Path, ticket: &TicketInfo) {
+    println!("=== Implementation Context ===");
     println!();
 
-    // Implementation files
-    println!("=== Implementation Files ===");
-    let ticket_yaml = main_worktree.join(format!("documents/work/tickets/{}.yaml", ticket.id));
-    println!("Ticket file: {}", ticket_yaml.display());
+    // Ticket details
+    println!("Ticket: {} - {}", ticket.id, ticket.title);
+    if !ticket.rfc_id.is_empty() {
+        println!("RFC: {}", ticket.rfc_id);
+    }
+    println!();
 
+    // Ticket file
+    let ticket_yaml = main_worktree.join(format!("documents/work/tickets/{}.yaml", ticket.id));
+
+    println!("Ticket file:");
+    println!("  - {}", ticket_yaml.display());
+    println!();
+
+    // RFC files (only if ticket has an RFC)
     if !ticket.rfc_id.is_empty() {
         let rfc_dir = main_worktree.join(format!("documents/rfcs/{}", ticket.rfc_id));
         if rfc_dir.exists() {
-            println!("RFC files: {}/*.yaml", rfc_dir.display());
+            println!("RFC documentation:");
+            if let Ok(entries) = fs::read_dir(&rfc_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .is_some_and(|ext| ext == "yaml" || ext == "md")
+                    {
+                        println!("  - {}", path.display());
+                    }
+                }
+            }
+            println!();
         }
     }
-    println!();
 
     // Dependencies
     if !ticket.dependencies.is_empty() {
-        println!("=== Dependencies (all COMPLETED) ===");
+        println!("Dependencies (all COMPLETED):");
         for dep in &ticket.dependencies {
             println!("  - {dep}");
         }
@@ -563,140 +518,21 @@ fn print_new_context(main_worktree: &Path, worktree_path: &Path, ticket: &Ticket
     }
 
     // Implementation guidance
-    println!("=== Next Steps (New Ticket) ===");
+    println!("Next steps:");
     println!("  1. Read the ticket YAML file for scope, plan, and criteria");
     if ticket.rfc_id.is_empty() {
         println!("  2. Look at existing implementations in xtask/src/tasks/");
         println!("  3. Implement the feature with tests");
-        println!("  4. Run: cargo xtask check");
-        println!("  5. Commit: cargo xtask commit \"<message>\"");
-        println!("  6. Push: cargo xtask push");
+        println!("  4. Run: cargo xtask check (once implemented)");
+        println!("  5. Commit: cargo xtask commit \"<message>\" (once implemented)");
     } else {
         println!("  2. Read RFC design decisions for patterns to follow");
         println!("  3. Look at existing implementations in xtask/src/tasks/");
         println!("  4. Implement the feature with tests");
-        println!("  5. Run: cargo xtask check");
-        println!("  6. Commit: cargo xtask commit \"<message>\"");
-        println!("  7. Push: cargo xtask push");
+        println!("  5. Run: cargo xtask check (once implemented)");
+        println!("  6. Commit: cargo xtask commit \"<message>\" (once implemented)");
     }
     println!();
-}
-
-/// Print context information for RESUMING work on a ticket with an existing PR.
-fn print_resume_context(
-    sh: &Shell,
-    main_worktree: &Path,
-    worktree_path: &Path,
-    ticket: &TicketInfo,
-    pr_details: &PrDetails,
-) {
-    println!("=== Ticket Context ===");
-    println!("TICKET_ID: {}", ticket.id);
-    if !ticket.rfc_id.is_empty() {
-        println!("RFC_ID: {}", ticket.rfc_id);
-    }
-    println!("WORKTREE_PATH: {}", worktree_path.display());
-    println!("PR_URL: {}", pr_details.url);
-    println!("PR_STATE: {}", pr_details.state);
-    println!(
-        "REVIEW_STATE: {}",
-        pr_details.review_decision.as_deref().unwrap_or("PENDING")
-    );
-    println!();
-
-    // Activity Timeline
-    let timeline = get_pr_timeline(sh, pr_details.number);
-    if !timeline.is_empty() {
-        println!("=== Activity Timeline ===");
-        for entry in &timeline {
-            print_timeline_entry(entry);
-        }
-        println!();
-    }
-
-    // Unresolved Review Threads
-    let threads = get_unresolved_threads(sh, pr_details.number);
-    if !threads.is_empty() {
-        println!("=== Unresolved Review Threads ===");
-        for (i, thread) in threads.iter().enumerate() {
-            print_review_thread(i + 1, thread);
-        }
-        println!();
-    }
-
-    // Implementation files
-    println!("=== Implementation Files ===");
-    let ticket_yaml = main_worktree.join(format!("documents/work/tickets/{}.yaml", ticket.id));
-    println!("Ticket file: {}", ticket_yaml.display());
-
-    if !ticket.rfc_id.is_empty() {
-        let rfc_dir = main_worktree.join(format!("documents/rfcs/{}", ticket.rfc_id));
-        if rfc_dir.exists() {
-            println!("RFC files: {}/*.yaml", rfc_dir.display());
-        }
-    }
-    println!();
-
-    // Resume guidance
-    println!("=== Next Steps (Resume) ===");
-    if threads.is_empty() {
-        println!("  1. Review the activity timeline above for context");
-        println!("  2. Continue implementation or address any feedback");
-        println!("  3. Run: cargo xtask check");
-        println!("  4. Commit: cargo xtask commit \"<message>\"");
-        println!("  5. Push: cargo xtask push");
-    } else {
-        println!("  1. Address unresolved review threads above");
-        println!("  2. Run: cargo xtask check");
-        println!("  3. Commit: cargo xtask commit \"<message>\"");
-        println!("  4. Push: cargo xtask push");
-    }
-    println!();
-}
-
-/// Print a single timeline entry in a readable format.
-fn print_timeline_entry(entry: &TimelineEntry) {
-    let short_timestamp = if entry.timestamp.len() >= 19 {
-        &entry.timestamp[..19] // Just date and time portion
-    } else {
-        &entry.timestamp
-    };
-
-    match entry.event_type.as_str() {
-        "COMMIT" => {
-            let sha = entry.metadata.as_deref().unwrap_or("???????");
-            println!("[{}] COMMIT {} - {}", short_timestamp, sha, entry.content);
-        },
-        "COMMENT" => {
-            println!(
-                "[{}] COMMENT @{} - \"{}\"",
-                short_timestamp, entry.author, entry.content
-            );
-        },
-        "REVIEW" => {
-            println!(
-                "[{}] REVIEW {} - {}",
-                short_timestamp,
-                entry.metadata.as_deref().unwrap_or("COMMENTED"),
-                entry.content
-            );
-        },
-        _ => {
-            println!(
-                "[{}] {} - {}",
-                short_timestamp, entry.event_type, entry.content
-            );
-        },
-    }
-}
-
-/// Print a single review thread.
-fn print_review_thread(index: usize, thread: &ReviewThread) {
-    let line_info = thread.line.map(|l| format!(":{l}")).unwrap_or_default();
-    println!("Thread {}: {}{}", index, thread.path, line_info);
-    for comment in &thread.comments {
-        println!("  {comment}");
-    }
 }
 
 #[cfg(test)]

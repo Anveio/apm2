@@ -52,6 +52,7 @@ fn parse_ai_tool(s: &str) -> Result<aat::tool_config::AiTool, aat::tool_config::
 mod tasks;
 pub mod ticket_status;
 pub mod util;
+mod worktree_health;
 
 /// Development automation for apm2.
 #[derive(Parser)]
@@ -84,9 +85,9 @@ enum Commands {
         #[arg(short = 'p', long = "print-path")]
         print_path: bool,
 
-        /// Show planned actions without executing them
-        #[arg(long)]
-        dry_run: bool,
+        /// Auto-cleanup remediable worktree issues (orphaned, locked, etc.)
+        #[arg(short = 'f', long = "force")]
+        force: bool,
     },
 
     /// Run checks and create a commit.
@@ -270,8 +271,8 @@ fn main() -> Result<()> {
         Commands::StartTicket {
             target,
             print_path,
-            dry_run,
-        } => tasks::start_ticket(target.as_deref(), print_path, dry_run),
+            force,
+        } => tasks::start_ticket(target.as_deref(), print_path, force),
         Commands::Commit {
             message,
             skip_checks,
