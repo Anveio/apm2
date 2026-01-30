@@ -82,7 +82,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::manifest::{ContextPackManifest, MAX_PATH_LENGTH, ManifestError};
+use super::manifest::{ContextPackManifest, MAX_PATH_LENGTH, ManifestError, normalize_path};
+use crate::events::ToolDecided as ProtoToolDecided;
 
 // =============================================================================
 // Constants
@@ -193,7 +194,26 @@ pub struct FirewallDecision {
     pub reason: String,
 }
 
+/// Length of the truncation indicator suffix.
+const TRUNCATION_SUFFIX: &str = "...[TRUNCATED]";
+
 impl FirewallDecision {
+    /// Truncates a path to `MAX_PATH_LENGTH` to prevent oversized paths from
+    /// propagating to audit logs.
+    fn truncate_path(path: String) -> String {
+        if path.len() > MAX_PATH_LENGTH {
+            // Truncate and append indicator that path was truncated
+            // Final length: MAX_PATH_LENGTH - suffix_len + suffix_len = MAX_PATH_LENGTH
+            let suffix_len = TRUNCATION_SUFFIX.len();
+            let mut truncated = path;
+            truncated.truncate(MAX_PATH_LENGTH - suffix_len);
+            truncated.push_str(TRUNCATION_SUFFIX);
+            truncated
+        } else {
+            path
+        }
+    }
+
     /// Creates a new DENY event for an allowlist denial.
     #[must_use]
     pub fn deny_allowlist(manifest_id: impl Into<String>, path: impl Into<String>) -> Self {
@@ -201,7 +221,7 @@ impl FirewallDecision {
             decision: ToolDecision::Deny,
             rule_id: CTX_ALLOWLIST_RULE_ID.to_string(),
             manifest_id: manifest_id.into(),
-            path: path.into(),
+            path: Self::truncate_path(path.into()),
             reason: ALLOWLIST_DENIAL_REASON.to_string(),
         }
     }
@@ -213,7 +233,7 @@ impl FirewallDecision {
             decision: ToolDecision::Deny,
             rule_id: CTX_HASH_MISMATCH_RULE_ID.to_string(),
             manifest_id: manifest_id.into(),
-            path: path.into(),
+            path: Self::truncate_path(path.into()),
             reason: HASH_MISMATCH_DENIAL_REASON.to_string(),
         }
     }
@@ -230,8 +250,48 @@ impl FirewallDecision {
             decision: ToolDecision::Deny,
             rule_id: rule_id.into(),
             manifest_id: manifest_id.into(),
-            path: path.into(),
+            path: Self::truncate_path(path.into()),
             reason: reason.into(),
+        }
+    }
+
+    /// Converts this `FirewallDecision` to a Protobuf `ToolDecided` event.
+    ///
+    /// This enables emission of firewall decisions to the kernel event ledger.
+    ///
+    /// # Arguments
+    ///
+    /// * `request_id` - The tool request ID for correlation
+    /// * `policy_hash` - The policy hash (use manifest hash for context
+    ///   firewall)
+    /// * `budget_consumed` - Budget consumed by this operation (typically 0 for
+    ///   denials)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let firewall_event = FirewallDecision::deny_allowlist("manifest-001", "/etc/passwd");
+    /// let proto_event = firewall_event.to_proto_tool_decided(
+    ///     "req-123",
+    ///     &manifest.manifest_hash(),
+    ///     0,
+    /// );
+    /// // Emit proto_event to ledger
+    /// ```
+    #[must_use]
+    pub fn to_proto_tool_decided(
+        &self,
+        request_id: impl Into<String>,
+        policy_hash: &[u8; 32],
+        budget_consumed: u64,
+    ) -> ProtoToolDecided {
+        ProtoToolDecided {
+            request_id: request_id.into(),
+            decision: self.decision.to_string(),
+            rule_id: self.rule_id.clone(),
+            policy_hash: policy_hash.to_vec(),
+            rationale_code: self.reason.clone(),
+            budget_consumed,
         }
     }
 }
@@ -533,25 +593,28 @@ impl ContextAwareValidator for DefaultContextFirewall<'_> {
             });
         }
 
-        // Use the manifest's is_allowed method which handles:
-        // - Path normalization and validation
-        // - Allowlist lookup
-        // - Content hash verification (if provided)
-        match self.manifest.is_allowed(path, content_hash) {
+        // Normalize path ONCE at the start to avoid redundant normalization
+        // in is_allowed_normalized and get_entry_normalized calls below.
+        let normalized = match normalize_path(path) {
+            Ok(n) => n,
+            Err(e) => return Err(ContextFirewallError::InvalidPath(e)),
+        };
+
+        // Use pre-normalized path for all subsequent checks
+        match self
+            .manifest
+            .is_allowed_normalized(&normalized, content_hash)
+        {
             Ok(true) => Ok(ValidationResult::Allowed),
             Ok(false) => {
                 // Path not in allowlist or hash mismatch
-                // Determine which case by checking if path exists
-                match self.manifest.get_entry(path) {
-                    Ok(Some(_entry)) => {
-                        // Path exists but hash mismatch
-                        self.handle_hash_mismatch(path)
-                    },
-                    Ok(None) => {
-                        // Path not in allowlist
-                        self.handle_denial(path)
-                    },
-                    Err(e) => Err(ContextFirewallError::InvalidPath(e)),
+                // Determine which case by checking if path exists (using pre-normalized path)
+                if self.manifest.get_entry_normalized(&normalized).is_some() {
+                    // Path exists but hash mismatch
+                    self.handle_hash_mismatch(&normalized)
+                } else {
+                    // Path not in allowlist
+                    self.handle_denial(&normalized)
                 }
             },
             Err(ManifestError::ContentHashRequired { path }) => {
@@ -696,6 +759,43 @@ pub mod tests {
     fn test_tool_decision_display() {
         assert_eq!(format!("{}", ToolDecision::Allow), "ALLOW");
         assert_eq!(format!("{}", ToolDecision::Deny), "DENY");
+    }
+
+    #[test]
+    fn test_firewall_decision_truncates_long_paths() {
+        // Create a path longer than MAX_PATH_LENGTH
+        let long_path = "/".to_string() + &"x".repeat(MAX_PATH_LENGTH + 100);
+        assert!(long_path.len() > MAX_PATH_LENGTH);
+
+        let event = FirewallDecision::deny_allowlist("manifest-001", long_path);
+
+        // Path should be truncated to MAX_PATH_LENGTH
+        assert!(event.path.len() <= MAX_PATH_LENGTH);
+        assert!(event.path.ends_with("...[TRUNCATED]"));
+    }
+
+    #[test]
+    fn test_firewall_decision_preserves_normal_paths() {
+        let normal_path = "/project/src/main.rs";
+        let event = FirewallDecision::deny_allowlist("manifest-001", normal_path);
+
+        // Path should be unchanged
+        assert_eq!(event.path, normal_path);
+    }
+
+    #[test]
+    fn test_firewall_decision_to_proto_tool_decided() {
+        let event = FirewallDecision::deny_allowlist("manifest-001", "/etc/passwd");
+        let policy_hash = [0x42; 32];
+
+        let proto = event.to_proto_tool_decided("req-123", &policy_hash, 0);
+
+        assert_eq!(proto.request_id, "req-123");
+        assert_eq!(proto.decision, "DENY");
+        assert_eq!(proto.rule_id, CTX_ALLOWLIST_RULE_ID);
+        assert_eq!(proto.policy_hash, policy_hash.to_vec());
+        assert_eq!(proto.rationale_code, ALLOWLIST_DENIAL_REASON);
+        assert_eq!(proto.budget_consumed, 0);
     }
 
     // =========================================================================
