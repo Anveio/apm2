@@ -523,7 +523,7 @@ pub struct LeaseRevoked {
 #[derive(Eq, Hash)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PolicyEvent {
-    #[prost(oneof = "policy_event::Event", tags = "1, 2, 3")]
+    #[prost(oneof = "policy_event::Event", tags = "1, 2, 3, 4")]
     pub event: ::core::option::Option<policy_event::Event>,
 }
 /// Nested message and enum types in `PolicyEvent`.
@@ -537,6 +537,8 @@ pub mod policy_event {
         Violation(super::PolicyViolation),
         #[prost(message, tag = "3")]
         BudgetExceeded(super::BudgetExceeded),
+        #[prost(message, tag = "4")]
+        PolicyResolved(super::PolicyResolvedForChangeSet),
     }
 }
 #[derive(Eq, Hash)]
@@ -573,6 +575,54 @@ pub struct BudgetExceeded {
     pub limit: u64,
     #[prost(uint64, tag = "4")]
     pub consumed: u64,
+}
+/// Anchor event that locks policy decisions for a changeset.
+///
+/// All subsequent lease issuance and receipt validation must reference this
+/// anchor. This event MUST exist before any GateLeaseIssued. The resolver
+/// signature uses POLICY_RESOLVED_FOR_CHANGESET: domain separation.
+#[derive(Eq, Hash)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PolicyResolvedForChangeSet {
+    /// Work item this policy resolution applies to
+    #[prost(string, tag = "1")]
+    pub work_id: ::prost::alloc::string::String,
+    /// Hash binding to specific changeset (matches GateLeaseIssued.changeset_digest)
+    #[prost(bytes = "vec", tag = "2")]
+    pub changeset_digest: ::prost::alloc::vec::Vec<u8>,
+    /// Hash of the resolved policy tuple (risk_tier + determinism + RCP + verifiers)
+    #[prost(bytes = "vec", tag = "3")]
+    pub resolved_policy_hash: ::prost::alloc::vec::Vec<u8>,
+    /// Resolved risk tier (0-4)
+    #[prost(uint32, tag = "4")]
+    pub resolved_risk_tier: u32,
+    /// Resolved determinism class (0=non, 1=soft, 2=fully)
+    #[prost(uint32, tag = "5")]
+    pub resolved_determinism_class: u32,
+    /// Resolved RCP profile IDs (sorted for canonical encoding)
+    #[prost(string, repeated, tag = "6")]
+    pub resolved_rcp_profile_ids: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
+    /// Hashes of resolved RCP manifests (sorted for canonical encoding)
+    #[prost(bytes = "vec", repeated, tag = "7")]
+    pub resolved_rcp_manifest_hashes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::vec::Vec<u8>,
+    >,
+    /// Hashes of resolved verifier policies (sorted for canonical encoding)
+    #[prost(bytes = "vec", repeated, tag = "8")]
+    pub resolved_verifier_policy_hashes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::vec::Vec<u8>,
+    >,
+    /// Actor who performed the policy resolution
+    #[prost(string, tag = "9")]
+    pub resolver_actor_id: ::prost::alloc::string::String,
+    /// Version of the resolver component
+    #[prost(string, tag = "10")]
+    pub resolver_version: ::prost::alloc::string::String,
+    /// Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: prefix
+    #[prost(bytes = "vec", tag = "11")]
+    pub resolver_signature: ::prost::alloc::vec::Vec<u8>,
 }
 /// ============================================================
 /// ADJUDICATION EVENTS

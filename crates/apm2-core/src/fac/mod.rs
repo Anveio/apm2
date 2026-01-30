@@ -46,6 +46,7 @@
 
 mod domain_separator;
 mod lease;
+mod policy_resolution;
 
 // Re-export domain separator constants
 pub use domain_separator::{
@@ -59,4 +60,9 @@ pub use lease::{
     AatLeaseExtension, AatLeaseExtensionProto, GateLease, GateLeaseBuilder, GateLeaseProto,
     GateLeaseScope, LeaseError, LeaseRevoked, LeaseRevokedBuilder, LeaseRevokedProto,
     RevocationReason, is_lease_revoked,
+};
+// Re-export policy resolution types
+pub use policy_resolution::{
+    PolicyResolutionError, PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
+    PolicyResolvedForChangeSetProto,
 };

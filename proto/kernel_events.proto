@@ -325,6 +325,7 @@ message PolicyEvent {
     PolicyLoaded loaded = 1;
     PolicyViolation violation = 2;
     BudgetExceeded budget_exceeded = 3;
+    PolicyResolvedForChangeSet policy_resolved = 4;
   }
 }
 
@@ -346,6 +347,36 @@ message BudgetExceeded {
   string budget_type = 2;  // TOKEN, TIME, TOOL_CALLS
   uint64 limit = 3;
   uint64 consumed = 4;
+}
+
+// Anchor event that locks policy decisions for a changeset.
+//
+// All subsequent lease issuance and receipt validation must reference this
+// anchor. This event MUST exist before any GateLeaseIssued. The resolver
+// signature uses POLICY_RESOLVED_FOR_CHANGESET: domain separation.
+message PolicyResolvedForChangeSet {
+  // Work item this policy resolution applies to
+  string work_id = 1;
+  // Hash binding to specific changeset (matches GateLeaseIssued.changeset_digest)
+  bytes changeset_digest = 2;
+  // Hash of the resolved policy tuple (risk_tier + determinism + RCP + verifiers)
+  bytes resolved_policy_hash = 3;
+  // Resolved risk tier (0-4)
+  uint32 resolved_risk_tier = 4;
+  // Resolved determinism class (0=non, 1=soft, 2=fully)
+  uint32 resolved_determinism_class = 5;
+  // Resolved RCP profile IDs (sorted for canonical encoding)
+  repeated string resolved_rcp_profile_ids = 6;
+  // Hashes of resolved RCP manifests (sorted for canonical encoding)
+  repeated bytes resolved_rcp_manifest_hashes = 7;
+  // Hashes of resolved verifier policies (sorted for canonical encoding)
+  repeated bytes resolved_verifier_policy_hashes = 8;
+  // Actor who performed the policy resolution
+  string resolver_actor_id = 9;
+  // Version of the resolver component
+  string resolver_version = 10;
+  // Ed25519 signature over canonical bytes with POLICY_RESOLVED_FOR_CHANGESET: prefix
+  bytes resolver_signature = 11;
 }
 
 // ============================================================

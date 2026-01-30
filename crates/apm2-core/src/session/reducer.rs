@@ -430,7 +430,8 @@ impl Reducer for SessionReducer {
             return match policy_event.event {
                 Some(policy_event::Event::Violation(ref e)) => self.handle_policy_violation(e),
                 Some(policy_event::Event::BudgetExceeded(ref e)) => self.handle_budget_exceeded(e),
-                Some(policy_event::Event::Loaded(_)) | None => Ok(()),
+                Some(policy_event::Event::Loaded(_) | policy_event::Event::PolicyResolved(_))
+                | None => Ok(()),
             };
         }
 
