@@ -1163,6 +1163,7 @@ impl CapabilityProof {
             if capability.is_expired_at(current_time) {
                 return Err(LeaseError::LeaseExpired {
                     lease_id: entry.capability_id.clone(),
+                    expired_at: capability.expires_at,
                 });
             }
 
