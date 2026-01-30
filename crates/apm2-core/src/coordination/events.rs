@@ -403,6 +403,14 @@ impl CoordinationAborted {
     }
 }
 
+/// Maximum path length in bytes for `missed_path` field.
+/// Matches `MAX_PATH_LENGTH` from context manifest to prevent denial-of-service
+/// via oversized paths.
+pub const MAX_MISSED_PATH_LENGTH: usize = 4096;
+
+/// Truncation indicator appended to oversized paths.
+const MISSED_PATH_TRUNCATION_SUFFIX: &str = "...[TRUNCATED]";
+
 /// Payload for `coordination.context_refinement_request` events.
 ///
 /// Emitted when a CONSUME mode session is terminated due to a `CONTEXT_MISS`.
@@ -420,6 +428,13 @@ impl CoordinationAborted {
 /// - The context pack includes all needed files, or
 /// - A maximum refinement count is reached, or
 /// - The coordinator determines the request is invalid
+///
+/// # Security
+///
+/// The `missed_path` field is truncated to [`MAX_MISSED_PATH_LENGTH`] bytes
+/// to prevent denial-of-service attacks via oversized paths propagating
+/// through the system. Truncation is UTF-8 aware to avoid splitting
+/// multi-byte characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRefinementRequest {
     /// Session ID that was terminated.
@@ -436,6 +451,8 @@ pub struct ContextRefinementRequest {
     pub manifest_id: String,
 
     /// The path that triggered the context miss.
+    ///
+    /// Truncated to [`MAX_MISSED_PATH_LENGTH`] bytes if oversized.
     pub missed_path: String,
 
     /// The rationale code from the session termination.
@@ -449,10 +466,60 @@ pub struct ContextRefinementRequest {
 }
 
 impl ContextRefinementRequest {
+    /// Finds the largest index <= `index` that is a valid UTF-8 character
+    /// boundary.
+    ///
+    /// This is equivalent to `str::floor_char_boundary()` (stable since 1.91.0)
+    /// but implemented manually for MSRV compatibility.
+    #[inline]
+    fn floor_char_boundary(s: &str, index: usize) -> usize {
+        if index >= s.len() {
+            s.len()
+        } else {
+            // Scan backwards from index to find a valid UTF-8 char boundary.
+            // UTF-8 continuation bytes have the bit pattern 10xxxxxx (0x80..0xC0).
+            // Leading bytes and ASCII have patterns 0xxxxxxx or 11xxxxxx.
+            let mut i = index;
+            while i > 0 && !s.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        }
+    }
+
+    /// Truncates a path to [`MAX_MISSED_PATH_LENGTH`] to prevent oversized
+    /// paths from propagating to the coordinator.
+    ///
+    /// # Safety
+    ///
+    /// Uses UTF-8-aware truncation to ensure we never split a multi-byte
+    /// UTF-8 character, which would cause a panic.
+    fn truncate_path(path: String) -> String {
+        if path.len() > MAX_MISSED_PATH_LENGTH {
+            let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+            let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+            // Find the nearest valid UTF-8 character boundary at or before
+            // target_len to prevent panic when truncating multi-byte UTF-8
+            // characters.
+            let safe_len = Self::floor_char_boundary(&path, target_len);
+
+            let mut truncated = path;
+            truncated.truncate(safe_len);
+            truncated.push_str(MISSED_PATH_TRUNCATION_SUFFIX);
+            truncated
+        } else {
+            path
+        }
+    }
+
     /// Creates a new context refinement request.
+    ///
+    /// The `missed_path` is truncated to [`MAX_MISSED_PATH_LENGTH`] if
+    /// oversized.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         session_id: String,
         coordination_id: Option<String>,
         work_id: String,
@@ -467,7 +534,7 @@ impl ContextRefinementRequest {
             coordination_id,
             work_id,
             manifest_id,
-            missed_path,
+            missed_path: Self::truncate_path(missed_path),
             rationale_code,
             refinement_count,
             timestamp,
@@ -475,6 +542,9 @@ impl ContextRefinementRequest {
     }
 
     /// Creates a context refinement request from a context miss result.
+    ///
+    /// The `missed_path` is truncated to [`MAX_MISSED_PATH_LENGTH`] if
+    /// oversized.
     ///
     /// # Arguments
     ///
@@ -500,11 +570,17 @@ impl ContextRefinementRequest {
             coordination_id,
             work_id: work_id.into(),
             manifest_id: manifest_id.into(),
-            missed_path: missed_path.into(),
+            missed_path: Self::truncate_path(missed_path.into()),
             rationale_code: "CONTEXT_MISS".to_string(),
             refinement_count,
             timestamp,
         }
+    }
+
+    /// Returns true if the `missed_path` was truncated.
+    #[must_use]
+    pub fn is_path_truncated(&self) -> bool {
+        self.missed_path.ends_with(MISSED_PATH_TRUNCATION_SUFFIX)
     }
 }
 
@@ -1244,5 +1320,205 @@ mod tests {
                 event.event_type()
             );
         }
+    }
+
+    // ========================================================================
+    // ContextRefinementRequest Tests (TCK-00211 Security Fix)
+    // ========================================================================
+
+    #[test]
+    fn test_context_refinement_request_basic() {
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            Some("coord-001".to_string()),
+            "work-001",
+            "manifest-001",
+            "/project/src/missing.rs",
+            0,
+            1_000_000_000,
+        );
+
+        assert_eq!(request.session_id, "session-001");
+        assert_eq!(request.coordination_id, Some("coord-001".to_string()));
+        assert_eq!(request.work_id, "work-001");
+        assert_eq!(request.manifest_id, "manifest-001");
+        assert_eq!(request.missed_path, "/project/src/missing.rs");
+        assert_eq!(request.rationale_code, "CONTEXT_MISS");
+        assert_eq!(request.refinement_count, 0);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_truncates_long_path() {
+        // Create a path longer than MAX_MISSED_PATH_LENGTH
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+        assert!(long_path.len() > MAX_MISSED_PATH_LENGTH);
+
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            long_path,
+            0,
+            1_000_000_000,
+        );
+
+        // Path should be truncated to MAX_MISSED_PATH_LENGTH
+        assert!(
+            request.missed_path.len() <= MAX_MISSED_PATH_LENGTH,
+            "Truncated path {} should not exceed MAX_MISSED_PATH_LENGTH {}",
+            request.missed_path.len(),
+            MAX_MISSED_PATH_LENGTH
+        );
+        assert!(request.is_path_truncated());
+        assert!(request.missed_path.ends_with("...[TRUNCATED]"));
+    }
+
+    #[test]
+    fn test_context_refinement_request_preserves_normal_path() {
+        let normal_path = "/project/src/main.rs";
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            normal_path,
+            0,
+            1_000_000_000,
+        );
+
+        // Path should be unchanged
+        assert_eq!(request.missed_path, normal_path);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_utf8_safe_truncation() {
+        // Test with emoji (4-byte UTF-8 characters) to ensure we don't panic
+        // when truncating multi-byte characters
+        let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+        let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+        // Build a path where target_len falls inside an emoji
+        let prefix_len = target_len - 2; // emoji starts 2 bytes before target
+        let emoji = "🦀"; // 4 bytes in UTF-8
+        assert_eq!(emoji.len(), 4);
+
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1)); // -1 for leading "/"
+        path.push_str(emoji);
+        path.push_str(&"y".repeat(100)); // exceed MAX_MISSED_PATH_LENGTH
+
+        assert!(path.len() > MAX_MISSED_PATH_LENGTH);
+
+        // This should NOT panic
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            path,
+            0,
+            1_000_000_000,
+        );
+
+        // Verify the path was truncated correctly
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+
+        // Verify valid UTF-8 (would panic on iteration if invalid)
+        for _ in request.missed_path.chars() {}
+    }
+
+    #[test]
+    fn test_context_refinement_request_cjk_truncation() {
+        // CJK characters are 3 bytes in UTF-8
+        let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
+        let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
+
+        let prefix_len = target_len - 1; // CJK char starts 1 byte before target
+        let cjk_char = "中"; // 3 bytes in UTF-8
+        assert_eq!(cjk_char.len(), 3);
+
+        let mut path = "/".to_string();
+        path.push_str(&"x".repeat(prefix_len - 1));
+        path.push_str(cjk_char);
+        path.push_str(&"y".repeat(100));
+
+        assert!(path.len() > MAX_MISSED_PATH_LENGTH);
+
+        // This should NOT panic
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None,
+            "work-001",
+            "manifest-001",
+            path,
+            0,
+            1_000_000_000,
+        );
+
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+
+        // Verify valid UTF-8
+        for _ in request.missed_path.chars() {}
+    }
+
+    #[test]
+    fn test_context_refinement_request_new_also_truncates() {
+        // Test that the ::new() constructor also truncates paths
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+
+        let request = ContextRefinementRequest::new(
+            "session-001".to_string(),
+            None,
+            "work-001".to_string(),
+            "manifest-001".to_string(),
+            long_path,
+            "CONTEXT_MISS".to_string(),
+            0,
+            1_000_000_000,
+        );
+
+        assert!(request.missed_path.len() <= MAX_MISSED_PATH_LENGTH);
+        assert!(request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_serde_roundtrip() {
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            Some("coord-001".to_string()),
+            "work-001",
+            "manifest-001",
+            "/project/src/missing.rs",
+            3,
+            1_000_000_000,
+        );
+
+        let json = serde_json::to_string(&request).unwrap();
+        let restored: ContextRefinementRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, restored);
+    }
+
+    #[test]
+    fn test_context_refinement_request_without_coordination_id() {
+        let request = ContextRefinementRequest::from_context_miss(
+            "session-001",
+            None, // No coordination ID
+            "work-001",
+            "manifest-001",
+            "/project/src/missing.rs",
+            0,
+            1_000_000_000,
+        );
+
+        assert!(request.coordination_id.is_none());
+
+        // Verify serialization skips the field when None
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("coordination_id"));
     }
 }
