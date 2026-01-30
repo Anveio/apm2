@@ -145,6 +145,7 @@ pub struct AatLeaseExtension {
 /// - `aat_extension`: Optional AAT-specific extension (required for AAT gates)
 /// - `issuer_signature`: Ed25519 signature with domain separation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GateLease {
     /// Unique identifier for this lease.
     pub lease_id: String,
@@ -275,6 +276,56 @@ impl GateLease {
         }
 
         bytes
+    }
+
+    /// Validates that the given timestamp falls within the lease's temporal
+    /// bounds.
+    ///
+    /// Returns `true` if `issued_at <= now_ms < expires_at`, `false` otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// * `now_ms` - The current timestamp in milliseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// `true` if the lease is valid at the given time, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::crypto::Signer;
+    /// use apm2_core::fac::GateLeaseBuilder;
+    ///
+    /// let signer = Signer::generate();
+    /// let lease = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+    ///     .changeset_digest([0x42; 32])
+    ///     .executor_actor_id("executor-001")
+    ///     .issued_at(1000)
+    ///     .expires_at(2000)
+    ///     .policy_hash([0xab; 32])
+    ///     .issuer_actor_id("issuer-001")
+    ///     .time_envelope_ref("htf:tick:12345")
+    ///     .build_and_sign(&signer);
+    ///
+    /// assert!(!lease.validate_temporal_bounds(999)); // Before issued_at
+    /// assert!(lease.validate_temporal_bounds(1000)); // At issued_at
+    /// assert!(lease.validate_temporal_bounds(1500)); // Between
+    /// assert!(!lease.validate_temporal_bounds(2000)); // At expires_at (exclusive)
+    /// assert!(!lease.validate_temporal_bounds(2001)); // After expires_at
+    /// ```
+    #[must_use]
+    pub const fn validate_temporal_bounds(&self, now_ms: u64) -> bool {
+        now_ms >= self.issued_at && now_ms < self.expires_at
+    }
+
+    /// Alias for `validate_temporal_bounds` - checks if the lease is valid at
+    /// the given time.
+    ///
+    /// Returns `true` if `issued_at <= now_ms < expires_at`, `false` otherwise.
+    #[must_use]
+    pub const fn is_valid_at(&self, now_ms: u64) -> bool {
+        self.validate_temporal_bounds(now_ms)
     }
 
     /// Validates the lease signature using domain separation.
@@ -774,5 +825,63 @@ pub mod tests {
 
         // Canonical bytes should be different
         assert_ne!(lease1.canonical_bytes(), lease2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_validate_temporal_bounds() {
+        let signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1000)
+            .expires_at(2000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // Before issued_at
+        assert!(!lease.validate_temporal_bounds(999));
+
+        // At issued_at (inclusive)
+        assert!(lease.validate_temporal_bounds(1000));
+
+        // Between issued_at and expires_at
+        assert!(lease.validate_temporal_bounds(1500));
+
+        // At expires_at (exclusive)
+        assert!(!lease.validate_temporal_bounds(2000));
+
+        // After expires_at
+        assert!(!lease.validate_temporal_bounds(2001));
+    }
+
+    #[test]
+    fn test_is_valid_at_alias() {
+        let signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1000)
+            .expires_at(2000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // is_valid_at should behave identically to validate_temporal_bounds
+        assert_eq!(lease.is_valid_at(999), lease.validate_temporal_bounds(999));
+        assert_eq!(
+            lease.is_valid_at(1000),
+            lease.validate_temporal_bounds(1000)
+        );
+        assert_eq!(
+            lease.is_valid_at(1500),
+            lease.validate_temporal_bounds(1500)
+        );
+        assert_eq!(
+            lease.is_valid_at(2000),
+            lease.validate_temporal_bounds(2000)
+        );
     }
 }

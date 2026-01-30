@@ -60,6 +60,7 @@
 //! ```
 
 use prost::Message;
+use subtle::ConstantTimeEq;
 
 // =============================================================================
 // Resource Limits
@@ -77,6 +78,94 @@ pub const MAX_VERIFIER_POLICIES: usize = 256;
 pub const MAX_STRING_LENGTH: usize = 4096;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// =============================================================================
+// Typed Enums for Risk Tier and Determinism Class
+// =============================================================================
+
+/// Risk tier levels (0-4) for policy resolution.
+///
+/// The risk tier indicates the security classification of the changeset:
+/// - `Tier0`: Lowest risk, minimal review required
+/// - `Tier1`: Low risk
+/// - `Tier2`: Medium risk
+/// - `Tier3`: High risk
+/// - `Tier4`: Highest risk, maximum review required
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RiskTier {
+    /// Tier 0: Lowest risk level.
+    Tier0 = 0,
+    /// Tier 1: Low risk level.
+    Tier1 = 1,
+    /// Tier 2: Medium risk level.
+    Tier2 = 2,
+    /// Tier 3: High risk level.
+    Tier3 = 3,
+    /// Tier 4: Highest risk level.
+    Tier4 = 4,
+}
+
+impl TryFrom<u8> for RiskTier {
+    type Error = PolicyResolutionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Tier0),
+            1 => Ok(Self::Tier1),
+            2 => Ok(Self::Tier2),
+            3 => Ok(Self::Tier3),
+            4 => Ok(Self::Tier4),
+            _ => Err(PolicyResolutionError::InvalidData(format!(
+                "invalid risk tier {value}, must be 0-4"
+            ))),
+        }
+    }
+}
+
+impl From<RiskTier> for u8 {
+    fn from(tier: RiskTier) -> Self {
+        tier as Self
+    }
+}
+
+/// Determinism class for policy resolution.
+///
+/// The determinism class indicates the reproducibility requirements:
+/// - `NonDeterministic`: No reproducibility guarantees
+/// - `SoftDeterministic`: Best-effort reproducibility
+/// - `FullyDeterministic`: Strict reproducibility required
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum DeterminismClass {
+    /// Non-deterministic: No reproducibility guarantees.
+    NonDeterministic   = 0,
+    /// Soft-deterministic: Best-effort reproducibility.
+    SoftDeterministic  = 1,
+    /// Fully deterministic: Strict reproducibility required.
+    FullyDeterministic = 2,
+}
+
+impl TryFrom<u8> for DeterminismClass {
+    type Error = PolicyResolutionError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::NonDeterministic),
+            1 => Ok(Self::SoftDeterministic),
+            2 => Ok(Self::FullyDeterministic),
+            _ => Err(PolicyResolutionError::InvalidData(format!(
+                "invalid determinism class {value}, must be 0-2"
+            ))),
+        }
+    }
+}
+
+impl From<DeterminismClass> for u8 {
+    fn from(class: DeterminismClass) -> Self {
+        class as Self
+    }
+}
 
 use super::domain_separator::{POLICY_RESOLVED_PREFIX, sign_with_domain, verify_with_domain};
 use super::lease::GateLease;
@@ -162,6 +251,10 @@ pub enum PolicyResolutionError {
         profile_id: String,
     },
 
+    /// AAT extension missing for AAT gate.
+    #[error("aat_extension is required when gate_id contains 'aat'")]
+    MissingAatExtension,
+
     /// String field exceeds maximum length.
     #[error("string field {field} exceeds max length: {actual} > {max}")]
     StringTooLong {
@@ -215,6 +308,7 @@ pub enum PolicyResolutionError {
 /// The signature uses the `POLICY_RESOLVED_FOR_CHANGESET:` domain prefix to
 /// prevent cross-protocol signature replay attacks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyResolvedForChangeSet {
     /// Work item this policy resolution applies to.
     pub work_id: String,
@@ -547,6 +641,8 @@ impl PolicyResolvedForChangeSet {
     /// changeset digests don't match.
     /// Returns [`PolicyResolutionError::PolicyHashMismatch`] if policy hashes
     /// don't match.
+    /// Returns [`PolicyResolutionError::MissingAatExtension`] if the `gate_id`
+    /// contains "aat" (case-insensitive) but no AAT extension is provided.
     /// Returns [`PolicyResolutionError::RcpManifestHashMismatch`] if the lease
     /// has an AAT extension and its `rcp_manifest_hash` doesn't match the
     /// resolved hash for the corresponding `rcp_profile_id`.
@@ -559,24 +655,31 @@ impl PolicyResolvedForChangeSet {
             });
         }
 
-        // Check changeset_digest matches
-        if self.changeset_digest != lease.changeset_digest {
+        // Check changeset_digest matches using constant-time comparison (RSK-1909)
+        if !bool::from(self.changeset_digest.ct_eq(&lease.changeset_digest)) {
             return Err(PolicyResolutionError::ChangesetDigestMismatch);
         }
 
-        // Check policy_hash matches
-        if self.resolved_policy_hash != lease.policy_hash {
+        // Check policy_hash matches using constant-time comparison (RSK-1909)
+        if !bool::from(self.resolved_policy_hash.ct_eq(&lease.policy_hash)) {
             return Err(PolicyResolutionError::PolicyHashMismatch {
                 resolution_hash: hex_encode(&self.resolved_policy_hash),
                 lease_hash: hex_encode(&lease.policy_hash),
             });
         }
 
+        // Check if gate_id contains "aat" (case-insensitive) - require AAT extension
+        let is_aat_gate = lease.gate_id.to_ascii_lowercase().contains("aat");
+        if is_aat_gate && lease.aat_extension.is_none() {
+            return Err(PolicyResolutionError::MissingAatExtension);
+        }
+
         // If lease has an AAT extension, verify rcp_manifest_hash matches
         if let Some(ref aat_ext) = lease.aat_extension {
             if let Some(resolved_hash) = self.get_manifest_hash_for_profile(&aat_ext.rcp_profile_id)
             {
-                if &aat_ext.rcp_manifest_hash != resolved_hash {
+                // Use constant-time comparison for hash (RSK-1909)
+                if !bool::from(aat_ext.rcp_manifest_hash.ct_eq(resolved_hash)) {
                     return Err(PolicyResolutionError::RcpManifestHashMismatch {
                         profile_id: aat_ext.rcp_profile_id.clone(),
                     });
@@ -613,7 +716,9 @@ impl PolicyResolvedForChangeSet {
         &self,
         receipt_policy_hash: &[u8; 32],
     ) -> Result<(), PolicyResolutionError> {
-        if &self.resolved_policy_hash != receipt_policy_hash {
+        // Use constant-time comparison for security-sensitive hash comparison
+        // (RSK-1909)
+        if !bool::from(self.resolved_policy_hash.ct_eq(receipt_policy_hash)) {
             return Err(PolicyResolutionError::ReceiptPolicyMismatch {
                 expected: hex_encode(&self.resolved_policy_hash),
                 actual: hex_encode(receipt_policy_hash),
@@ -1988,5 +2093,175 @@ pub mod tests {
                 ..
             })
         ));
+    }
+
+    // =========================================================================
+    // Tests for AAT extension enforcement
+    // =========================================================================
+
+    #[test]
+    fn test_verify_lease_match_aat_gate_without_extension_rejected() {
+        let resolver_signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .add_rcp_profile_id("aat-profile-001")
+            .add_rcp_manifest_hash([0x11; 32])
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&resolver_signer);
+
+        // Create a lease with gate_id "aat" but NO AAT extension
+        let issuer_signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash(resolution.resolved_policy_hash())
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            // .aat_extension(...) is NOT called
+            .build_and_sign(&issuer_signer);
+
+        // MUST fail because gate_id is "aat" but extension is missing
+        let result = resolution.verify_lease_match(&lease);
+        assert!(
+            matches!(result, Err(PolicyResolutionError::MissingAatExtension)),
+            "verify_lease_match should fail with MissingAatExtension when aat_extension is missing for gate_id='aat'"
+        );
+    }
+
+    #[test]
+    fn test_verify_lease_match_aat_case_insensitive() {
+        let resolver_signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&resolver_signer);
+
+        // Test various case variations of "aat" in gate_id
+        let test_cases = ["AAT", "Aat", "aAt", "aat-security", "pre-AAT-check"];
+
+        for gate_id in test_cases {
+            let issuer_signer = Signer::generate();
+            let lease = GateLeaseBuilder::new("lease-001", "work-001", gate_id)
+                .changeset_digest([0x42; 32])
+                .executor_actor_id("executor-001")
+                .issued_at(1_704_067_200_000)
+                .expires_at(1_704_070_800_000)
+                .policy_hash(resolution.resolved_policy_hash())
+                .issuer_actor_id("issuer-001")
+                .time_envelope_ref("htf:tick:12345")
+                // Missing AAT extension
+                .build_and_sign(&issuer_signer);
+
+            let result = resolution.verify_lease_match(&lease);
+            assert!(
+                matches!(result, Err(PolicyResolutionError::MissingAatExtension)),
+                "gate_id '{gate_id}' should require aat_extension"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_lease_match_non_aat_gate_without_extension_ok() {
+        let resolver_signer = Signer::generate();
+        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
+            .resolved_risk_tier(1)
+            .resolved_determinism_class(0)
+            .resolver_actor_id("resolver-001")
+            .resolver_version("1.0.0")
+            .build_and_sign(&resolver_signer);
+
+        // Create a lease with gate_id "build" (not AAT) and no extension
+        let issuer_signer = Signer::generate();
+        let lease = GateLeaseBuilder::new("lease-001", "work-001", "build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash(resolution.resolved_policy_hash())
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&issuer_signer);
+
+        // Should succeed - non-AAT gates don't require AAT extension
+        assert!(resolution.verify_lease_match(&lease).is_ok());
+    }
+
+    // =========================================================================
+    // Tests for RiskTier and DeterminismClass enums
+    // =========================================================================
+
+    #[test]
+    fn test_risk_tier_try_from_valid() {
+        assert_eq!(RiskTier::try_from(0).unwrap(), RiskTier::Tier0);
+        assert_eq!(RiskTier::try_from(1).unwrap(), RiskTier::Tier1);
+        assert_eq!(RiskTier::try_from(2).unwrap(), RiskTier::Tier2);
+        assert_eq!(RiskTier::try_from(3).unwrap(), RiskTier::Tier3);
+        assert_eq!(RiskTier::try_from(4).unwrap(), RiskTier::Tier4);
+    }
+
+    #[test]
+    fn test_risk_tier_try_from_invalid() {
+        assert!(RiskTier::try_from(5).is_err());
+        assert!(RiskTier::try_from(255).is_err());
+    }
+
+    #[test]
+    fn test_risk_tier_to_u8() {
+        assert_eq!(u8::from(RiskTier::Tier0), 0);
+        assert_eq!(u8::from(RiskTier::Tier1), 1);
+        assert_eq!(u8::from(RiskTier::Tier2), 2);
+        assert_eq!(u8::from(RiskTier::Tier3), 3);
+        assert_eq!(u8::from(RiskTier::Tier4), 4);
+    }
+
+    #[test]
+    fn test_determinism_class_try_from_valid() {
+        assert_eq!(
+            DeterminismClass::try_from(0).unwrap(),
+            DeterminismClass::NonDeterministic
+        );
+        assert_eq!(
+            DeterminismClass::try_from(1).unwrap(),
+            DeterminismClass::SoftDeterministic
+        );
+        assert_eq!(
+            DeterminismClass::try_from(2).unwrap(),
+            DeterminismClass::FullyDeterministic
+        );
+    }
+
+    #[test]
+    fn test_determinism_class_try_from_invalid() {
+        assert!(DeterminismClass::try_from(3).is_err());
+        assert!(DeterminismClass::try_from(255).is_err());
+    }
+
+    #[test]
+    fn test_determinism_class_to_u8() {
+        assert_eq!(u8::from(DeterminismClass::NonDeterministic), 0);
+        assert_eq!(u8::from(DeterminismClass::SoftDeterministic), 1);
+        assert_eq!(u8::from(DeterminismClass::FullyDeterministic), 2);
+    }
+
+    #[test]
+    fn test_risk_tier_serde_roundtrip() {
+        let tier = RiskTier::Tier3;
+        let serialized = serde_json::to_string(&tier).unwrap();
+        let deserialized: RiskTier = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(tier, deserialized);
+    }
+
+    #[test]
+    fn test_determinism_class_serde_roundtrip() {
+        let class = DeterminismClass::FullyDeterministic;
+        let serialized = serde_json::to_string(&class).unwrap();
+        let deserialized: DeterminismClass = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(class, deserialized);
     }
 }
