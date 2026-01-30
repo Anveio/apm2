@@ -765,9 +765,9 @@ pub fn select_review_model() -> &'static str {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     if nanos % 2 == 0 {
-        "gemini-3-pro"
+        "gemini-3-pro-preview"
     } else {
-        "gemini-3-flash"
+        "gemini-3-flash-preview"
     }
 }
 /// Kill a process with SIGTERM, wait up to 5s, then SIGKILL if needed.
@@ -936,8 +936,8 @@ mod tests {
     fn test_select_review_model_returns_valid_model() {
         let model = select_review_model();
         assert!(
-            model == "gemini-3-pro" || model == "gemini-3-flash",
-            "Expected 'gemini-3-pro' or 'gemini-3-flash', got '{model}'"
+            model == "gemini-3-pro-preview" || model == "gemini-3-flash-preview",
+            "Expected 'gemini-3-pro-preview' or 'gemini-3-flash-preview', got '{model}'"
         );
     }
 
@@ -952,8 +952,8 @@ mod tests {
         for _ in 0..100 {
             let model = select_review_model();
             match model {
-                "gemini-3-pro" => saw_pro = true,
-                "gemini-3-flash" => saw_flash = true,
+                "gemini-3-pro-preview" => saw_pro = true,
+                "gemini-3-flash-preview" => saw_flash = true,
                 _ => panic!("Unexpected model: {model}"),
             }
             if saw_pro && saw_flash {
@@ -963,8 +963,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_nanos(1));
         }
 
-        assert!(saw_pro, "Never saw gemini-3-pro in 100 trials");
-        assert!(saw_flash, "Never saw gemini-3-flash in 100 trials");
+        assert!(saw_pro, "Never saw gemini-3-pro-preview in 100 trials");
+        assert!(saw_flash, "Never saw gemini-3-flash-preview in 100 trials");
     }
 
     #[test]
