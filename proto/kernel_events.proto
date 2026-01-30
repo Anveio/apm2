@@ -52,6 +52,7 @@ message KernelEvent {
     KeyEvent key = 17;
     CapabilityEvent capability = 18;
     GitHubLeaseEvent github_lease = 19;
+    PolicyResolvedForChangeSet policy_resolved_for_changeset = 20;
   }
 }
 

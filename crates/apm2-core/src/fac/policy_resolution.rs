@@ -59,8 +59,11 @@
 //! assert!(resolution.verify_lease_match(&lease).is_ok());
 //! ```
 
-use prost::Message;
 use subtle::ConstantTimeEq;
+
+// Re-export the generated proto type for wire format serialization.
+// This replaces the previously manual struct definition.
+pub use crate::events::PolicyResolvedForChangeSet as PolicyResolvedForChangeSetProto;
 
 // =============================================================================
 // Resource Limits
@@ -1001,44 +1004,6 @@ impl PolicyResolvedForChangeSetBuilder {
 // Proto Message Conversion
 // =============================================================================
 
-/// Proto-generated `PolicyResolvedForChangeSet` message for wire format.
-#[derive(Clone, PartialEq, Eq, Message)]
-#[allow(missing_docs)]
-pub struct PolicyResolvedForChangeSetProto {
-    #[prost(string, tag = "1")]
-    pub work_id: String,
-
-    #[prost(bytes = "vec", tag = "2")]
-    pub changeset_digest: Vec<u8>,
-
-    #[prost(bytes = "vec", tag = "3")]
-    pub resolved_policy_hash: Vec<u8>,
-
-    #[prost(uint32, tag = "4")]
-    pub resolved_risk_tier: u32,
-
-    #[prost(uint32, tag = "5")]
-    pub resolved_determinism_class: u32,
-
-    #[prost(string, repeated, tag = "6")]
-    pub resolved_rcp_profile_ids: Vec<String>,
-
-    #[prost(bytes = "vec", repeated, tag = "7")]
-    pub resolved_rcp_manifest_hashes: Vec<Vec<u8>>,
-
-    #[prost(bytes = "vec", repeated, tag = "8")]
-    pub resolved_verifier_policy_hashes: Vec<Vec<u8>>,
-
-    #[prost(string, tag = "9")]
-    pub resolver_actor_id: String,
-
-    #[prost(string, tag = "10")]
-    pub resolver_version: String,
-
-    #[prost(bytes = "vec", tag = "11")]
-    pub resolver_signature: Vec<u8>,
-}
-
 impl TryFrom<PolicyResolvedForChangeSetProto> for PolicyResolvedForChangeSet {
     type Error = PolicyResolutionError;
 
@@ -1258,6 +1223,8 @@ impl From<PolicyResolvedForChangeSet> for PolicyResolvedForChangeSetProto {
 
 #[cfg(test)]
 pub mod tests {
+    use prost::Message;
+
     use super::*;
     use crate::crypto::Signer;
     use crate::fac::{GateLeaseBuilder, LeaseError};
