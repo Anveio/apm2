@@ -83,6 +83,10 @@ enum Commands {
         /// Only print the worktree path (for scripting)
         #[arg(short = 'p', long = "print-path")]
         print_path: bool,
+
+        /// Show planned actions without executing them
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Run checks and create a commit.
@@ -263,9 +267,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::StartTicket { target, print_path } => {
-            tasks::start_ticket(target.as_deref(), print_path)
-        },
+        Commands::StartTicket {
+            target,
+            print_path,
+            dry_run,
+        } => tasks::start_ticket(target.as_deref(), print_path, dry_run),
         Commands::Commit {
             message,
             skip_checks,

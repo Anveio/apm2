@@ -1,4 +1,4 @@
-title: Dev Ticket Workflow Decision Tree
+title: Ticket Workflow Decision Tree
 
 decision_tree:
   entrypoint: INIT_AND_CLASSIFY

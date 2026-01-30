@@ -31,8 +31,8 @@ use anyhow::Result;
 /// # Errors
 ///
 /// Returns an error if the setup fails. See [`start_ticket::run`] for details.
-pub fn start_ticket(target: Option<&str>, print_path_only: bool) -> Result<()> {
-    start_ticket::run(target, print_path_only)
+pub fn start_ticket(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result<()> {
+    start_ticket::run(target, print_path_only, dry_run)
 }
 
 /// Run checks and create a commit.

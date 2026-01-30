@@ -143,11 +143,40 @@ pub fn get_pr_timeline(sh: &Shell, pr_number: u32) -> Vec<TimelineEntry> {
 ///
 /// Returns threads that have not been marked as resolved.
 /// On network error, returns an empty vector.
+///
+/// Uses GraphQL API since `gh pr view --json` doesn't support reviewThreads.
 pub fn get_unresolved_threads(sh: &Shell, pr_number: u32) -> Vec<ReviewThread> {
-    let pr_num_str = pr_number.to_string();
-    let result = cmd!(sh, "gh pr view {pr_num_str} --json reviewThreads").read();
+    // GraphQL query to get review threads
+    let query = format!(
+        r#"query {{
+  repository(owner: "rumi-engineering", name: "apm2") {{
+    pullRequest(number: {pr_number}) {{
+      reviewThreads(first: 100) {{
+        nodes {{
+          isResolved
+          path
+          line
+          comments(first: 10) {{
+            nodes {{
+              body
+              author {{
+                login
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}"#
+    );
 
-    result.map_or_else(|_| Vec::new(), |output| parse_review_threads_json(&output))
+    let result = cmd!(sh, "gh api graphql -f query={query}").read();
+
+    result.map_or_else(
+        |_| Vec::new(),
+        |output| parse_graphql_review_threads(&output),
+    )
 }
 
 // =============================================================================
@@ -309,6 +338,7 @@ fn parse_reviews_json(json: &str) -> Vec<TimelineEntry> {
 }
 
 /// Parse review threads from JSON.
+#[cfg(test)]
 fn parse_review_threads_json(json: &str) -> Vec<ReviewThread> {
     let mut threads = Vec::new();
 
@@ -356,7 +386,113 @@ fn parse_review_threads_json(json: &str) -> Vec<ReviewThread> {
     threads
 }
 
+/// Parse review threads from GraphQL response.
+///
+/// GraphQL response structure:
+/// ```json
+/// {"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[...]}}}}}
+/// ```
+fn parse_graphql_review_threads(json: &str) -> Vec<ReviewThread> {
+    let mut threads = Vec::new();
+
+    // Navigate to the nodes array in the nested structure
+    let nodes_key = "\"nodes\":";
+    let Some(first_nodes) = json.find(nodes_key) else {
+        return threads;
+    };
+    // Skip the first "nodes" (reviewThreads.nodes) and find actual thread objects
+    let rest = &json[first_nodes + nodes_key.len()..];
+
+    let mut search_pos = 0;
+    while let Some(obj_start) = rest[search_pos..].find('{') {
+        let abs_start = search_pos + obj_start;
+        let obj_rest = &rest[abs_start..];
+
+        let Some(obj_end) = find_matching_brace(obj_rest) else {
+            break;
+        };
+        let obj = &obj_rest[..=obj_end];
+
+        // Check if this looks like a thread object (has isResolved field)
+        if !obj.contains("\"isResolved\":") {
+            search_pos = abs_start + obj_end + 1;
+            continue;
+        }
+
+        // Check if thread is resolved
+        let is_resolved = extract_json_bool(obj, "\"isResolved\":").unwrap_or(false);
+        if is_resolved {
+            search_pos = abs_start + obj_end + 1;
+            continue;
+        }
+
+        // Extract path
+        let path = extract_json_string(obj, "\"path\":").unwrap_or_default();
+        let line = extract_json_number(obj, "\"line\":");
+
+        // Extract comments from the nested nodes
+        let comments = extract_graphql_thread_comments(obj);
+
+        if !path.is_empty() && !comments.is_empty() {
+            threads.push(ReviewThread {
+                path,
+                line,
+                comments,
+            });
+        }
+
+        search_pos = abs_start + obj_end + 1;
+    }
+
+    threads
+}
+
+/// Extract comments from a GraphQL review thread object.
+fn extract_graphql_thread_comments(thread_obj: &str) -> Vec<String> {
+    let mut comments = Vec::new();
+
+    // Find the comments.nodes array
+    let comments_key = "\"comments\":";
+    let Some(comments_start) = thread_obj.find(comments_key) else {
+        return comments;
+    };
+    let rest = &thread_obj[comments_start + comments_key.len()..];
+
+    // Find the nested nodes array
+    let nodes_key = "\"nodes\":";
+    let Some(nodes_start) = rest.find(nodes_key) else {
+        return comments;
+    };
+    let nodes_rest = &rest[nodes_start + nodes_key.len()..];
+
+    let mut search_pos = 0;
+    while let Some(obj_start) = nodes_rest[search_pos..].find('{') {
+        let abs_start = search_pos + obj_start;
+        let obj_rest = &nodes_rest[abs_start..];
+
+        let Some(obj_end) = find_matching_brace(obj_rest) else {
+            break;
+        };
+        let obj = &obj_rest[..=obj_end];
+
+        if let Some(body) = extract_json_string(obj, "\"body\":") {
+            let author = extract_json_string(obj, "\"login\":").unwrap_or_else(|| "?".to_string());
+            let truncated = if body.len() > 100 {
+                format!("{}...", &body[..100])
+            } else {
+                body
+            };
+            comments.push(format!("@{author}: {truncated}"));
+        }
+
+        search_pos = abs_start + obj_end + 1;
+    }
+
+    comments
+}
+
 /// Extract comments from a review thread object.
+#[cfg(test)]
 fn extract_thread_comments(thread_obj: &str) -> Vec<String> {
     let mut comments = Vec::new();
 

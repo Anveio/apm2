@@ -80,6 +80,7 @@ struct TicketInfo {
 ///
 /// * `target` - Optional RFC ID (RFC-XXXX), ticket ID (TCK-XXXXX), or None
 /// * `print_path_only` - If true, only print the worktree path (for scripting)
+/// * `dry_run` - If true, show planned actions without executing them
 ///
 /// # Errors
 ///
@@ -87,7 +88,7 @@ struct TicketInfo {
 /// - No pending tickets are found
 /// - All pending tickets are blocked by incomplete dependencies
 /// - Worktree or branch creation fails
-pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
+pub fn run(target: Option<&str>, print_path_only: bool, dry_run: bool) -> Result<()> {
     let sh = Shell::new().context("Failed to create shell")?;
     let main_worktree_path = main_worktree(&sh)?;
 
@@ -126,13 +127,12 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
                 .find(|t| &t.id == ticket_id)
                 .with_context(|| format!("Ticket {ticket_id} not found"))?;
 
-            // Check if already completed or in progress
+            // Check if already completed
             if completed.contains(&ticket.id) {
                 bail!("Ticket {ticket_id} is already completed.");
             }
-            if in_progress.contains(&ticket.id) {
-                bail!("Ticket {ticket_id} is already in progress.");
-            }
+
+            // In-progress is fine - we'll resume work on it
 
             // Warn if dependencies are not met (but proceed anyway)
             let unmet_deps: Vec<&String> = ticket
@@ -212,31 +212,35 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
         },
     };
 
-    if print_path_only {
-        // Just print the worktree path for scripting
-        let worktree_path = main_worktree_path
-            .parent()
-            .unwrap_or(&main_worktree_path)
-            .join(format!("apm2-{}", ticket.id));
-        println!("{}", worktree_path.display());
-        return Ok(());
-    }
-
-    // Display ticket info
-    if ticket.rfc_id.is_empty() {
-        println!("Starting ticket {}", ticket.id);
-    } else {
-        println!("Starting ticket {} for {}", ticket.id, ticket.rfc_id);
-    }
-    println!("Title: {}", ticket.title);
-    println!();
-
     // Create branch name (with or without RFC based on ticket's rfc_id)
     let branch_name = if ticket.rfc_id.is_empty() {
         format!("ticket/{}", ticket.id)
     } else {
         format!("ticket/{}/{}", ticket.rfc_id, ticket.id)
     };
+
+    // Determine worktree path
+    let worktree_path = main_worktree_path
+        .parent()
+        .unwrap_or(&main_worktree_path)
+        .join(format!("apm2-{}", ticket.id));
+
+    if print_path_only {
+        // Just print the worktree path for scripting
+        println!("{}", worktree_path.display());
+        return Ok(());
+    }
+
+    // Display ticket info
+    let is_resuming = in_progress.contains(&ticket.id);
+    let action = if is_resuming { "Resuming" } else { "Starting" };
+    if ticket.rfc_id.is_empty() {
+        println!("{action} ticket {}", ticket.id);
+    } else {
+        println!("{action} ticket {} for {}", ticket.id, ticket.rfc_id);
+    }
+    println!("Title: {}", ticket.title);
+    println!();
 
     // Check if branch already exists
     let branch_exists = cmd!(sh, "git branch --list {branch_name}")
@@ -252,14 +256,82 @@ pub fn run(target: Option<&str>, print_path_only: bool) -> Result<()> {
 
     let remote_branch_exists = !remote_branch_exists.trim().is_empty();
 
-    // Determine worktree path
-    let worktree_path = main_worktree_path
-        .parent()
-        .unwrap_or(&main_worktree_path)
-        .join(format!("apm2-{}", ticket.id));
-
     // Check if worktree already exists
     let worktree_exists = worktree_path.exists();
+
+    // Dry-run mode: show what would be done without executing
+    if dry_run {
+        println!("=== Dry Run Mode ===");
+        println!("Would perform the following actions:");
+        println!();
+
+        if worktree_exists {
+            println!(
+                "  1. Remove existing worktree at {}",
+                worktree_path.display()
+            );
+            println!(
+                "     $ git worktree remove --force {}",
+                worktree_path.display()
+            );
+        }
+
+        if branch_exists {
+            println!(
+                "  {}. Create worktree for existing local branch",
+                if worktree_exists { 2 } else { 1 }
+            );
+            println!(
+                "     $ git worktree add {} {branch_name}",
+                worktree_path.display()
+            );
+        } else if remote_branch_exists {
+            println!(
+                "  {}. Fetch and create worktree for remote branch",
+                if worktree_exists { 2 } else { 1 }
+            );
+            println!("     $ git fetch origin {branch_name}");
+            println!(
+                "     $ git worktree add {} {branch_name}",
+                worktree_path.display()
+            );
+        } else {
+            println!(
+                "  {}. Create new branch and worktree",
+                if worktree_exists { 2 } else { 1 }
+            );
+            println!(
+                "     $ git worktree add -b {branch_name} {}",
+                worktree_path.display()
+            );
+        }
+
+        println!();
+        println!("Summary:");
+        println!("  Branch: {branch_name}");
+        println!("  Worktree: {}", worktree_path.display());
+        println!("  Branch exists locally: {branch_exists}");
+        println!("  Branch exists on remote: {remote_branch_exists}");
+        println!("  Worktree exists: {worktree_exists}");
+
+        // Check for existing PR
+        let pr_details = get_pr_for_branch(&sh, &branch_name);
+        match pr_details {
+            PrQueryResult::Success(details) => {
+                println!("  Existing PR: {} ({})", details.url, details.state);
+            },
+            PrQueryResult::NotFound => {
+                println!("  Existing PR: None");
+            },
+            PrQueryResult::NetworkError(_) => {
+                println!("  Existing PR: Unknown (network error)");
+            },
+        }
+
+        println!();
+        println!("Run without --dry-run to execute these actions.");
+        return Ok(());
+    }
 
     if worktree_exists {
         println!("Worktree already exists at {}", worktree_path.display());
