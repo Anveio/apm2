@@ -191,6 +191,14 @@ const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Default request timeout in seconds.
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
+/// Default TTL for idempotency cache entries (7 days).
+/// Entries older than this will be cleaned up to prevent unbounded growth.
+const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Maximum number of entries in the idempotency cache.
+/// Oldest entries will be pruned when this limit is exceeded.
+const MAX_CACHE_ENTRIES: usize = 100_000;
+
 /// GitHub projection adapter configuration.
 #[derive(Clone)]
 pub struct GitHubAdapterConfig {
@@ -423,7 +431,10 @@ impl IdempotencyCache {
 
     /// Looks up a cached receipt by idempotency key.
     fn get(&self, key: &IdempotencyKey) -> Result<Option<ProjectionReceipt>, ProjectionError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let result: Option<String> = conn
             .query_row(
@@ -456,7 +467,10 @@ impl IdempotencyCache {
         key: &IdempotencyKey,
         receipt: &ProjectionReceipt,
     ) -> Result<(), ProjectionError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let json = serde_json::to_string(receipt)
             .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
@@ -486,7 +500,10 @@ impl IdempotencyCache {
     /// Returns the number of cached receipts.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn size(&self) -> Result<usize, ProjectionError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM projection_receipts", [], |row| {
@@ -499,7 +516,10 @@ impl IdempotencyCache {
 
     /// Clears all cached receipts.
     fn clear(&self) -> Result<(), ProjectionError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         conn.execute("DELETE FROM projection_receipts", [])
             .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
@@ -514,7 +534,10 @@ impl IdempotencyCache {
         digest: &[u8; 32],
         sha: &str,
     ) -> Result<(), ProjectionError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -534,7 +557,10 @@ impl IdempotencyCache {
 
     /// Looks up the commit SHA for a changeset digest.
     fn get_commit_sha(&self, digest: &[u8; 32]) -> Result<Option<String>, ProjectionError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let result: Option<String> = conn
             .query_row(
@@ -546,6 +572,102 @@ impl IdempotencyCache {
             .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
 
         Ok(result)
+    }
+
+    /// Cleans up expired cache entries based on TTL.
+    ///
+    /// Removes entries older than `ttl_secs` from both `projection_receipts`
+    /// and `digest_sha_mappings` tables.
+    ///
+    /// # Security
+    ///
+    /// This method prevents unbounded cache growth which could lead to
+    /// disk exhaustion in long-running daemons.
+    #[allow(clippy::cast_possible_wrap)] // Timestamp won't overflow until year 2554
+    fn cleanup_expired(&self, ttl_secs: u64) -> Result<usize, ProjectionError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let cutoff = now.saturating_sub(ttl_secs) as i64;
+
+        // Clean up old receipts
+        let receipts_deleted = conn
+            .execute(
+                "DELETE FROM projection_receipts WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+        // Clean up old digest mappings
+        let mappings_deleted = conn
+            .execute(
+                "DELETE FROM digest_sha_mappings WHERE created_at < ?1",
+                params![cutoff],
+            )
+            .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+        Ok(receipts_deleted + mappings_deleted)
+    }
+
+    /// Prunes the cache to stay within max entry limits.
+    ///
+    /// If the number of entries exceeds `max_entries`, the oldest entries
+    /// are deleted to bring the count back to 80% of the limit.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    fn prune_if_needed(&self, max_entries: usize) -> Result<usize, ProjectionError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        // Check current receipt count
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projection_receipts", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+        if (count as usize) <= max_entries {
+            return Ok(0);
+        }
+
+        // Prune to 80% of max to avoid frequent pruning
+        let target = (max_entries * 80) / 100;
+        let to_delete = (count as usize).saturating_sub(target);
+
+        // Delete oldest entries
+        let deleted = conn
+            .execute(
+                "DELETE FROM projection_receipts WHERE id IN (
+                    SELECT id FROM projection_receipts
+                    ORDER BY created_at ASC
+                    LIMIT ?1
+                )",
+                params![to_delete as i64],
+            )
+            .map_err(|e| ProjectionError::DatabaseError(e.to_string()))?;
+
+        Ok(deleted)
+    }
+
+    /// Performs routine cache maintenance.
+    ///
+    /// This combines TTL-based cleanup and size-based pruning.
+    fn maintain(&self) -> Result<usize, ProjectionError> {
+        let expired = self.cleanup_expired(DEFAULT_CACHE_TTL_SECS)?;
+        let pruned = self.prune_if_needed(MAX_CACHE_ENTRIES)?;
+        Ok(expired + pruned)
     }
 }
 
@@ -652,7 +774,6 @@ impl GitHubClient {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        use bytes::Buf;
         use http_body_util::{BodyExt, Limited};
 
         // Wrap body with size limit to prevent OOM (AD-MEM-001)
@@ -661,9 +782,11 @@ impl GitHubClient {
         limited_body.collect().await.map_or_else(
             |_| "[body read error or size limit exceeded]".to_string(),
             |collected| {
-                let bytes = collected.aggregate();
-                String::from_utf8(bytes.chunk().to_vec())
-                    .unwrap_or_else(|_| "[non-UTF8 body]".to_string())
+                // SECURITY: Use to_bytes() to consume full buffer, not chunk() which
+                // only returns the first contiguous slice and may truncate fragmented
+                // responses.
+                let bytes = collected.to_bytes();
+                String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| "[non-UTF8 body]".to_string())
             },
         )
     }
@@ -693,9 +816,11 @@ impl GitHubClient {
         let body_bytes = self.build_status_body(status)?;
 
         // Build the HTTPS connector
+        // SECURITY: Use https_only() to prevent secret exfiltration via HTTP fallback.
+        // API tokens must never be sent over unencrypted connections.
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
-            .https_or_http()
+            .https_only()
             .enable_http1()
             .enable_http2()
             .build();
@@ -890,6 +1015,41 @@ impl GitHubProjectionAdapter {
         changeset_digest: &[u8; 32],
     ) -> Result<Option<String>, ProjectionError> {
         self.cache.get_commit_sha(changeset_digest)
+    }
+
+    /// Performs cache maintenance to prevent unbounded growth.
+    ///
+    /// This method:
+    /// 1. Removes entries older than 7 days (TTL-based cleanup)
+    /// 2. Prunes oldest entries if cache exceeds 100,000 entries
+    ///
+    /// Returns the number of entries removed.
+    ///
+    /// # Security
+    ///
+    /// This method prevents disk exhaustion in long-running daemons by
+    /// ensuring the idempotency cache doesn't grow unboundedly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::DatabaseError`] if maintenance fails.
+    pub fn maintain_cache(&self) -> Result<usize, ProjectionError> {
+        self.cache.maintain()
+    }
+
+    /// Cleans up cache entries older than the specified TTL.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl_secs` - Maximum age in seconds for cache entries
+    ///
+    /// Returns the number of entries removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError::DatabaseError`] if cleanup fails.
+    pub fn cleanup_expired_cache(&self, ttl_secs: u64) -> Result<usize, ProjectionError> {
+        self.cache.cleanup_expired(ttl_secs)
     }
 
     /// Generates a deterministic receipt ID from the idempotency key.
@@ -1406,5 +1566,80 @@ mod tests {
 
         // Verify the signature is valid with the adapter's key
         assert!(receipt.validate_signature(&adapter.verifying_key()).is_ok());
+    }
+
+    // =========================================================================
+    // Cache Maintenance Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_cache_maintenance() {
+        let adapter = create_test_adapter();
+
+        // Add some entries
+        for i in 0..5 {
+            adapter
+                .project_status(
+                    &format!("work-{i:03}"),
+                    [0x42; 32],
+                    [0xAB; 32],
+                    ProjectedStatus::Success,
+                )
+                .await
+                .expect("projection should succeed");
+        }
+
+        assert_eq!(adapter.cache_size().unwrap(), 5);
+
+        // Run maintenance (should not remove recent entries)
+        let removed = adapter.maintain_cache().unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(adapter.cache_size().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_cache() {
+        let adapter = create_test_adapter();
+
+        // Add an entry
+        adapter
+            .project_status("work-001", [0x42; 32], [0xAB; 32], ProjectedStatus::Success)
+            .await
+            .expect("projection should succeed");
+
+        assert_eq!(adapter.cache_size().unwrap(), 1);
+
+        // Cleanup with a very large TTL should remove nothing
+        let removed = adapter.cleanup_expired_cache(u64::MAX).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(adapter.cache_size().unwrap(), 1);
+
+        // Cleanup with TTL=1 should also keep recently created entries
+        // (entry was just created, so it's not older than 1 second)
+        let removed = adapter.cleanup_expired_cache(1).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(adapter.cache_size().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_preserves_recent_mappings() {
+        let adapter = create_test_adapter();
+
+        // Register a mapping
+        adapter
+            .register_commit_sha(&[0x42; 32], "abc123")
+            .expect("registration should succeed");
+
+        // Verify it exists
+        let sha = adapter.get_commit_sha(&[0x42; 32]).unwrap();
+        assert_eq!(sha, Some("abc123".to_string()));
+
+        // Cleanup with large TTL should preserve the mapping
+        let removed = adapter.cleanup_expired_cache(u64::MAX).unwrap();
+        assert_eq!(removed, 0);
+
+        // Verify it still exists
+        let sha = adapter.get_commit_sha(&[0x42; 32]).unwrap();
+        assert_eq!(sha, Some("abc123".to_string()));
     }
 }
