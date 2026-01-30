@@ -80,6 +80,9 @@ keyring.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 
+# UUID generation
+uuid.workspace = true
+
 # TLS (for crypto provider initialization)
 rustls.workspace = true
 
