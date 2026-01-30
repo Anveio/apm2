@@ -400,7 +400,7 @@ impl Capability {
 /// the delegation chain is cryptographically continuous. Each entry's
 /// `delegator_actor_id` must match the previous entry's `holder_actor_id`.
 /// This is enforced during verification via
-/// [`CapabilityProof::validate_chain_continuity`].
+/// [`CapabilityProof::validate_structure`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationChainEntry {
@@ -456,8 +456,8 @@ impl DelegationChainEntry {
     ///
     /// The `delegator_actor_id` is included in the hash to cryptographically
     /// bind the delegation chain. This prevents an attacker from creating a
-    /// fake chain where entry[i] claims to be delegated from a different
-    /// actor than entry[i-1]'s holder.
+    /// fake chain where `entry[i]` claims to be delegated from a different
+    /// actor than `entry[i-1]`'s holder.
     #[must_use]
     pub fn compute_event_hash(&self) -> Vec<u8> {
         Self::compute_event_hash_from_parts(
