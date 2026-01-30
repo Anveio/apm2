@@ -1260,7 +1260,7 @@ impl From<PolicyResolvedForChangeSet> for PolicyResolvedForChangeSetProto {
 pub mod tests {
     use super::*;
     use crate::crypto::Signer;
-    use crate::fac::GateLeaseBuilder;
+    use crate::fac::{GateLeaseBuilder, LeaseError};
 
     fn create_test_resolution(signer: &Signer) -> PolicyResolvedForChangeSet {
         PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
@@ -2101,66 +2101,48 @@ pub mod tests {
 
     #[test]
     fn test_verify_lease_match_aat_gate_without_extension_rejected() {
-        let resolver_signer = Signer::generate();
-        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
-            .resolved_risk_tier(1)
-            .resolved_determinism_class(0)
-            .add_rcp_profile_id("aat-profile-001")
-            .add_rcp_manifest_hash([0x11; 32])
-            .resolver_actor_id("resolver-001")
-            .resolver_version("1.0.0")
-            .build_and_sign(&resolver_signer);
-
-        // Create a lease with gate_id "aat" but NO AAT extension
+        // Attempt to create a lease with gate_id "aat" but NO AAT extension
+        // This should fail at build time with AatExtensionInvariant error
         let issuer_signer = Signer::generate();
-        let lease = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "aat")
             .changeset_digest([0x42; 32])
             .executor_actor_id("executor-001")
             .issued_at(1_704_067_200_000)
             .expires_at(1_704_070_800_000)
-            .policy_hash(resolution.resolved_policy_hash())
+            .policy_hash([0xab; 32])
             .issuer_actor_id("issuer-001")
             .time_envelope_ref("htf:tick:12345")
             // .aat_extension(...) is NOT called
-            .build_and_sign(&issuer_signer);
+            .try_build_and_sign(&issuer_signer);
 
         // MUST fail because gate_id is "aat" but extension is missing
-        let result = resolution.verify_lease_match(&lease);
         assert!(
-            matches!(result, Err(PolicyResolutionError::MissingAatExtension)),
-            "verify_lease_match should fail with MissingAatExtension when aat_extension is missing for gate_id='aat'"
+            matches!(result, Err(LeaseError::AatExtensionInvariant(ref msg)) if msg.contains("requires aat_extension")),
+            "try_build_and_sign should fail with AatExtensionInvariant when aat_extension is missing for gate_id='aat'"
         );
     }
 
     #[test]
     fn test_verify_lease_match_aat_case_insensitive() {
-        let resolver_signer = Signer::generate();
-        let resolution = PolicyResolvedForChangeSetBuilder::new("work-001", [0x42; 32])
-            .resolved_risk_tier(1)
-            .resolved_determinism_class(0)
-            .resolver_actor_id("resolver-001")
-            .resolver_version("1.0.0")
-            .build_and_sign(&resolver_signer);
-
         // Test various case variations of "aat" in gate_id
+        // The builder should reject all of these without an aat_extension
         let test_cases = ["AAT", "Aat", "aAt", "aat-security", "pre-AAT-check"];
 
         for gate_id in test_cases {
             let issuer_signer = Signer::generate();
-            let lease = GateLeaseBuilder::new("lease-001", "work-001", gate_id)
+            let result = GateLeaseBuilder::new("lease-001", "work-001", gate_id)
                 .changeset_digest([0x42; 32])
                 .executor_actor_id("executor-001")
                 .issued_at(1_704_067_200_000)
                 .expires_at(1_704_070_800_000)
-                .policy_hash(resolution.resolved_policy_hash())
+                .policy_hash([0xab; 32])
                 .issuer_actor_id("issuer-001")
                 .time_envelope_ref("htf:tick:12345")
                 // Missing AAT extension
-                .build_and_sign(&issuer_signer);
+                .try_build_and_sign(&issuer_signer);
 
-            let result = resolution.verify_lease_match(&lease);
             assert!(
-                matches!(result, Err(PolicyResolutionError::MissingAatExtension)),
+                matches!(result, Err(LeaseError::AatExtensionInvariant(ref msg)) if msg.contains("requires aat_extension")),
                 "gate_id '{gate_id}' should require aat_extension"
             );
         }

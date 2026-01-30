@@ -86,6 +86,10 @@ pub enum LeaseError {
         /// Maximum allowed length.
         max: usize,
     },
+
+    /// AAT extension invariant violation.
+    #[error("AAT extension invariant violation: {0}")]
+    AatExtensionInvariant(String),
 }
 
 // =============================================================================
@@ -467,6 +471,9 @@ impl GateLeaseBuilder {
     /// Returns [`LeaseError::MissingField`] if any required field is not set.
     /// Returns [`LeaseError::StringTooLong`] if any string field exceeds the
     /// maximum length.
+    /// Returns [`LeaseError::AatExtensionInvariant`] if the AAT extension
+    /// invariant is violated.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build_and_sign(
         self,
         signer: &crate::crypto::Signer,
@@ -551,6 +558,21 @@ impl GateLeaseBuilder {
                     max: MAX_STRING_LENGTH,
                 });
             }
+        }
+
+        // Validate AAT extension invariant:
+        // - If gate_id contains "aat" (case-insensitive), aat_extension MUST be Some
+        // - If gate_id does NOT contain "aat", aat_extension SHOULD be None
+        let is_aat_gate = self.gate_id.to_lowercase().contains("aat");
+        if is_aat_gate && self.aat_extension.is_none() {
+            return Err(LeaseError::AatExtensionInvariant(
+                "AAT gate requires aat_extension to be set".to_string(),
+            ));
+        }
+        if !is_aat_gate && self.aat_extension.is_some() {
+            return Err(LeaseError::AatExtensionInvariant(
+                "non-AAT gate should not have aat_extension set".to_string(),
+            ));
         }
 
         // Create lease with placeholder signature
@@ -733,7 +755,7 @@ pub mod tests {
     fn test_aat_extension_in_canonical_bytes() {
         let signer = Signer::generate();
 
-        // Create lease without AAT extension
+        // Create non-AAT lease without extension
         let lease_without_ext = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
             .changeset_digest([0x42; 32])
             .executor_actor_id("executor-001")
@@ -744,8 +766,9 @@ pub mod tests {
             .time_envelope_ref("htf:tick:12345")
             .build_and_sign(&signer);
 
-        // Create lease with AAT extension
-        let lease_with_ext = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+        // Create AAT lease with extension (use same IDs to isolate extension
+        // difference)
+        let lease_with_ext = GateLeaseBuilder::new("lease-001", "work-001", "aat")
             .changeset_digest([0x42; 32])
             .executor_actor_id("executor-001")
             .issued_at(1_704_067_200_000)
@@ -761,10 +784,34 @@ pub mod tests {
             })
             .build_and_sign(&signer);
 
-        // Canonical bytes should be different
+        // Canonical bytes should be different (different gate_id AND extension
+        // presence)
         assert_ne!(
             lease_without_ext.canonical_bytes(),
             lease_with_ext.canonical_bytes()
+        );
+
+        // Also verify two AAT leases with different extensions have different canonical
+        // bytes
+        let lease_with_ext_2 = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x33; 32], // Different hash
+                rcp_manifest_hash: [0x22; 32],
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .build_and_sign(&signer);
+
+        assert_ne!(
+            lease_with_ext.canonical_bytes(),
+            lease_with_ext_2.canonical_bytes()
         );
     }
 
@@ -883,5 +930,157 @@ pub mod tests {
             lease.is_valid_at(2000),
             lease.validate_temporal_bounds(2000)
         );
+    }
+
+    #[test]
+    fn test_aat_gate_requires_extension() {
+        let signer = Signer::generate();
+
+        // AAT gate without extension should fail
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::AatExtensionInvariant(msg)) if msg.contains("requires aat_extension")
+        ));
+    }
+
+    #[test]
+    fn test_aat_gate_case_insensitive() {
+        let signer = Signer::generate();
+
+        // Uppercase AAT without extension should fail
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "AAT")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::AatExtensionInvariant(msg)) if msg.contains("requires aat_extension")
+        ));
+
+        // Mixed case AAT without extension should fail
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "Aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::AatExtensionInvariant(msg)) if msg.contains("requires aat_extension")
+        ));
+    }
+
+    #[test]
+    fn test_aat_gate_with_prefix_suffix() {
+        let signer = Signer::generate();
+
+        // Gate containing "aat" as substring should require extension
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "pre-aat-post")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::AatExtensionInvariant(msg)) if msg.contains("requires aat_extension")
+        ));
+    }
+
+    #[test]
+    fn test_non_aat_gate_rejects_extension() {
+        let signer = Signer::generate();
+
+        // Non-AAT gate with extension should fail
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x11; 32],
+                rcp_manifest_hash: [0x22; 32],
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .try_build_and_sign(&signer);
+
+        assert!(matches!(
+            result,
+            Err(LeaseError::AatExtensionInvariant(msg)) if msg.contains("should not have aat_extension")
+        ));
+    }
+
+    #[test]
+    fn test_aat_gate_with_extension_succeeds() {
+        let signer = Signer::generate();
+
+        // AAT gate with extension should succeed
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "aat")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .aat_extension(AatLeaseExtension {
+                view_commitment_hash: [0x11; 32],
+                rcp_manifest_hash: [0x22; 32],
+                rcp_profile_id: "aat-profile-001".to_string(),
+                selection_policy_id: "policy-001".to_string(),
+            })
+            .try_build_and_sign(&signer);
+
+        assert!(result.is_ok());
+        let lease = result.unwrap();
+        assert!(lease.aat_extension.is_some());
+    }
+
+    #[test]
+    fn test_non_aat_gate_without_extension_succeeds() {
+        let signer = Signer::generate();
+
+        // Non-AAT gate without extension should succeed
+        let result = GateLeaseBuilder::new("lease-001", "work-001", "gate-build")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("executor-001")
+            .issued_at(1_704_067_200_000)
+            .expires_at(1_704_070_800_000)
+            .policy_hash([0xab; 32])
+            .issuer_actor_id("issuer-001")
+            .time_envelope_ref("htf:tick:12345")
+            .try_build_and_sign(&signer);
+
+        assert!(result.is_ok());
+        let lease = result.unwrap();
+        assert!(lease.aat_extension.is_none());
     }
 }
