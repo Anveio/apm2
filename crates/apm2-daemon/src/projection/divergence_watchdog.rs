@@ -79,6 +79,254 @@ use thiserror::Error;
 /// Maximum length for string fields to prevent denial-of-service attacks.
 pub const MAX_STRING_LENGTH: usize = 1024;
 
+/// Maximum length for freeze IDs (CTR-2602 compliance).
+pub const MAX_FREEZE_ID_LENGTH: usize = 256;
+
+/// Maximum length for defect IDs (CTR-2602 compliance).
+pub const MAX_DEFECT_ID_LENGTH: usize = 256;
+
+/// Maximum length for actor IDs (CTR-2602 compliance).
+pub const MAX_ACTOR_ID_LENGTH: usize = 256;
+
+// =============================================================================
+// Type-Safe Identifiers (CTR-2602)
+// =============================================================================
+
+/// A type-safe wrapper for freeze identifiers.
+///
+/// Per CTR-2602 (Type-Safe Identifiers): Critical domain identifiers should
+/// use newtypes rather than raw `String`s to prevent accidental misuse and
+/// enable compile-time type checking.
+///
+/// # Validation
+///
+/// - Must not be empty
+/// - Must not exceed [`MAX_FREEZE_ID_LENGTH`] bytes
+/// - Must contain only ASCII printable characters (0x20-0x7E)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FreezeId(String);
+
+impl FreezeId {
+    /// Creates a new `FreezeId` after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID is empty, too long, or contains invalid
+    /// characters.
+    pub fn new(id: impl Into<String>) -> Result<Self, DivergenceError> {
+        let id = id.into();
+        Self::validate(&id)?;
+        Ok(Self(id))
+    }
+
+    /// Returns the ID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validates the ID format.
+    fn validate(id: &str) -> Result<(), DivergenceError> {
+        if id.is_empty() {
+            return Err(DivergenceError::InvalidConfiguration(
+                "freeze_id cannot be empty".to_string(),
+            ));
+        }
+        if id.len() > MAX_FREEZE_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "freeze_id",
+                actual: id.len(),
+                max: MAX_FREEZE_ID_LENGTH,
+            });
+        }
+        if !id.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return Err(DivergenceError::InvalidConfiguration(
+                "freeze_id contains invalid characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<String> for FreezeId {
+    type Error = DivergenceError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<FreezeId> for String {
+    fn from(id: FreezeId) -> Self {
+        id.0
+    }
+}
+
+impl std::fmt::Display for FreezeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<str> for FreezeId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A type-safe wrapper for defect identifiers.
+///
+/// Per CTR-2602 (Type-Safe Identifiers): Critical domain identifiers should
+/// use newtypes rather than raw `String`s to prevent accidental misuse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct DefectId(String);
+
+impl DefectId {
+    /// Creates a new `DefectId` after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID is empty, too long, or contains invalid
+    /// characters.
+    pub fn new(id: impl Into<String>) -> Result<Self, DivergenceError> {
+        let id = id.into();
+        Self::validate(&id)?;
+        Ok(Self(id))
+    }
+
+    /// Returns the ID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validates the ID format.
+    fn validate(id: &str) -> Result<(), DivergenceError> {
+        if id.is_empty() {
+            return Err(DivergenceError::InvalidConfiguration(
+                "defect_id cannot be empty".to_string(),
+            ));
+        }
+        if id.len() > MAX_DEFECT_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "defect_id",
+                actual: id.len(),
+                max: MAX_DEFECT_ID_LENGTH,
+            });
+        }
+        if !id.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return Err(DivergenceError::InvalidConfiguration(
+                "defect_id contains invalid characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<String> for DefectId {
+    type Error = DivergenceError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<DefectId> for String {
+    fn from(id: DefectId) -> Self {
+        id.0
+    }
+}
+
+impl std::fmt::Display for DefectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<str> for DefectId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A type-safe wrapper for actor identifiers.
+///
+/// Per CTR-2602 (Type-Safe Identifiers): Critical domain identifiers should
+/// use newtypes rather than raw `String`s to prevent accidental misuse.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ActorId(String);
+
+impl ActorId {
+    /// Creates a new `ActorId` after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID is empty, too long, or contains invalid
+    /// characters.
+    pub fn new(id: impl Into<String>) -> Result<Self, DivergenceError> {
+        let id = id.into();
+        Self::validate(&id)?;
+        Ok(Self(id))
+    }
+
+    /// Returns the ID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validates the ID format.
+    fn validate(id: &str) -> Result<(), DivergenceError> {
+        if id.is_empty() {
+            return Err(DivergenceError::InvalidConfiguration(
+                "actor_id cannot be empty".to_string(),
+            ));
+        }
+        if id.len() > MAX_ACTOR_ID_LENGTH {
+            return Err(DivergenceError::StringTooLong {
+                field: "actor_id",
+                actual: id.len(),
+                max: MAX_ACTOR_ID_LENGTH,
+            });
+        }
+        if !id.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            return Err(DivergenceError::InvalidConfiguration(
+                "actor_id contains invalid characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<String> for ActorId {
+    type Error = DivergenceError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<ActorId> for String {
+    fn from(id: ActorId) -> Self {
+        id.0
+    }
+}
+
+impl std::fmt::Display for ActorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<str> for ActorId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 // =============================================================================
 // DivergenceResult
 // =============================================================================
@@ -1170,13 +1418,41 @@ impl FreezeRegistry {
         Ok(())
     }
 
-    /// Unregisters a freeze from the registry.
+    /// Unregisters a freeze from the registry after verifying the unfreeze
+    /// signature.
+    ///
+    /// Per CTR-2703 (Cryptographically Bound ActorID): Signatures must be
+    /// validated before accepting state mutations. This prevents
+    /// unauthenticated callers from bypassing the watchdog to unfreeze
+    /// repositories without proper authorization.
+    ///
+    /// # Security Rationale
+    ///
+    /// The unfreeze path is as security-critical as the freeze path. Without
+    /// signature verification, any component with access to the registry could
+    /// lift a freeze without cryptographic proof of adjudication or manual
+    /// override authority. This would violate the fail-closed principle for
+    /// SCP state mutations.
+    ///
+    /// # Arguments
+    ///
+    /// * `unfreeze` - The signed unfreeze event
+    /// * `verifying_key` - The key to verify the unfreeze signature against
     ///
     /// # Errors
     ///
+    /// Returns [`DivergenceError::InvalidUnfreezeSignature`] if signature
+    /// verification fails.
     /// Returns [`DivergenceError::FreezeNotFound`] if the freeze is not in the
     /// registry.
-    pub fn unregister(&self, freeze_id: &str) -> Result<(), DivergenceError> {
+    pub(crate) fn unregister(
+        &self,
+        unfreeze: &InterventionUnfreeze,
+        verifying_key: &VerifyingKey,
+    ) -> Result<(), DivergenceError> {
+        // Per CTR-2703: Validate signature before accepting state mutation
+        unfreeze.validate_signature(verifying_key)?;
+
         let mut active = self
             .active_freezes
             .write()
@@ -1186,31 +1462,104 @@ impl FreezeRegistry {
             .write()
             .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
 
-        if !active.remove(freeze_id) {
+        if !active.remove(&unfreeze.freeze_id) {
             return Err(DivergenceError::FreezeNotFound {
-                freeze_id: freeze_id.to_string(),
+                freeze_id: unfreeze.freeze_id.clone(),
             });
         }
 
         // Remove from scope map (find and remove)
-        scope.retain(|_, v| v != freeze_id);
+        scope.retain(|_, v| v != &unfreeze.freeze_id);
 
         Ok(())
     }
 
-    /// Checks if a scope is frozen.
+    /// Checks if a scope is frozen, including hierarchical parent scopes.
     ///
-    /// Returns `Some(freeze_id)` if frozen, `None` otherwise.
+    /// # Hierarchical Freeze Enforcement
+    ///
+    /// Freeze checks are hierarchical: if a parent namespace is frozen, all
+    /// child scopes are also considered frozen. This enforces the following
+    /// invariants:
+    ///
+    /// - A frozen namespace (e.g., `org`) blocks all repositories under it
+    ///   (e.g., `org/repo1`, `org/repo2`)
+    /// - A frozen repository scope (e.g., `org/repo`) blocks all artifacts
+    ///   under it
+    ///
+    /// # Format Support
+    ///
+    /// - Slash-separated: `org/repo` - checks `org/repo`, then `org`
+    /// - Colon-separated: `org:kind` - checks `org:kind`, then `org`
+    ///
+    /// # Returns
+    ///
+    /// `Some(freeze_id)` if the scope or any parent scope is frozen,
+    /// `None` otherwise.
     pub fn is_frozen(&self, scope_value: &str) -> Option<String> {
         let scope = self.scope_map.read().ok()?;
-        scope.get(scope_value).cloned()
+
+        // Check exact match first
+        if let Some(freeze_id) = scope.get(scope_value) {
+            return Some(freeze_id.clone());
+        }
+
+        // Check hierarchical parents for slash-separated format (org/repo)
+        if scope_value.contains('/') {
+            for parent in Self::hierarchical_parents_slash(scope_value) {
+                if let Some(freeze_id) = scope.get(parent) {
+                    return Some(freeze_id.clone());
+                }
+            }
+        }
+
+        // Check hierarchical parents for colon-separated format (org:kind)
+        if scope_value.contains(':') {
+            for parent in Self::hierarchical_parents_colon(scope_value) {
+                if let Some(freeze_id) = scope.get(parent) {
+                    return Some(freeze_id.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Returns an iterator over hierarchical parent scopes for slash-separated
+    /// values.
+    ///
+    /// For `org/repo/artifact`, yields `org/repo`, then `org`.
+    fn hierarchical_parents_slash(scope_value: &str) -> impl Iterator<Item = &str> {
+        let mut current = scope_value;
+        std::iter::from_fn(move || {
+            let pos = current.rfind('/')?;
+            current = &current[..pos];
+            Some(current)
+        })
+    }
+
+    /// Returns an iterator over hierarchical parent scopes for colon-separated
+    /// values.
+    ///
+    /// For `org:kind:id`, yields `org:kind`, then `org`.
+    fn hierarchical_parents_colon(scope_value: &str) -> impl Iterator<Item = &str> {
+        let mut current = scope_value;
+        std::iter::from_fn(move || {
+            let pos = current.rfind(':')?;
+            current = &current[..pos];
+            Some(current)
+        })
     }
 
     /// Checks admission and returns an error if the scope is frozen.
     ///
+    /// This method performs hierarchical freeze checking: if any parent
+    /// scope is frozen, the admission is rejected.
+    ///
     /// # Errors
     ///
-    /// Returns [`DivergenceError::RepoFrozen`] if the scope is frozen.
+    /// Returns [`DivergenceError::RepoFrozen`] if the scope or any parent
+    /// scope is frozen.
     pub fn check_admission(&self, scope_value: &str) -> Result<(), DivergenceError> {
         if let Some(freeze_id) = self.is_frozen(scope_value) {
             return Err(DivergenceError::RepoFrozen { freeze_id });
@@ -1257,8 +1606,17 @@ impl FreezeCheck for FreezeRegistry {
 /// Trait for obtaining the current time.
 ///
 /// This trait abstracts time access, enabling deterministic testing by
-/// allowing injection of mock time sources. Production code should use
-/// [`SystemTimeSource`], while tests can use custom implementations.
+/// allowing injection of mock time sources.
+///
+/// # Production Requirements
+///
+/// **WARNING**: For production deployments, an HTF (Holon Time Fabric) backed
+/// implementation MUST be used. See [`SystemTimeSource`] documentation for the
+/// required integration path.
+///
+/// The poll interval for the divergence watchdog should ideally be bound to
+/// HTF ticks rather than wall-clock `Duration` to ensure deterministic
+/// behavior across distributed nodes.
 ///
 /// # Security
 ///
@@ -1598,8 +1956,8 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     /// // 2. Persist to ledger (may fail)
     /// ledger.persist(&unfreeze).await?;
     ///
-    /// // 3. Apply to local registry AFTER successful persistence
-    /// watchdog.apply_unfreeze(&unfreeze.freeze_id)?;
+    /// // 3. Apply to local registry AFTER successful persistence (signature verified)
+    /// watchdog.apply_unfreeze(&unfreeze)?;
     /// ```
     ///
     /// # Arguments
@@ -1666,12 +2024,21 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     /// that the local registry state matches the ledger state even if the
     /// process crashes.
     ///
+    /// # Security
+    ///
+    /// Per CTR-2703 (Cryptographically Bound ActorID): The unfreeze event's
+    /// signature is verified before accepting the state mutation. This ensures
+    /// that only properly authorized unfreeze events can lift a freeze,
+    /// maintaining the security boundary integrity.
+    ///
     /// # Arguments
     ///
-    /// * `freeze_id` - The ID of the freeze to unregister
+    /// * `unfreeze` - The signed unfreeze event (signature will be verified)
     ///
     /// # Errors
     ///
+    /// Returns [`DivergenceError::InvalidUnfreezeSignature`] if signature
+    /// verification fails.
     /// Returns [`DivergenceError::FreezeNotFound`] if the freeze is not in the
     /// registry.
     ///
@@ -1684,11 +2051,12 @@ impl<T: TimeSource> DivergenceWatchdog<T> {
     /// // Persist to ledger first
     /// ledger.persist_unfreeze(&unfreeze).await?;
     ///
-    /// // Then apply to local registry
-    /// watchdog.apply_unfreeze(&unfreeze.freeze_id)?;
+    /// // Then apply to local registry (signature verified)
+    /// watchdog.apply_unfreeze(&unfreeze)?;
     /// ```
-    pub fn apply_unfreeze(&self, freeze_id: &str) -> Result<(), DivergenceError> {
-        self.registry.unregister(freeze_id)
+    pub fn apply_unfreeze(&self, unfreeze: &InterventionUnfreeze) -> Result<(), DivergenceError> {
+        self.registry
+            .unregister(unfreeze, &self.signer.verifying_key())
     }
 
     /// Checks if admission is allowed for the configured repository.
@@ -1752,6 +2120,94 @@ pub mod tests {
         let signer = Signer::generate();
         let config = create_test_config();
         DivergenceWatchdog::new(signer, config)
+    }
+
+    // =========================================================================
+    // Type-Safe Identifier Tests (CTR-2602)
+    // =========================================================================
+
+    #[test]
+    fn test_freeze_id_valid() {
+        let id = FreezeId::new("freeze-001").unwrap();
+        assert_eq!(id.as_str(), "freeze-001");
+        assert_eq!(id.to_string(), "freeze-001");
+    }
+
+    #[test]
+    fn test_freeze_id_empty_rejected() {
+        let result = FreezeId::new("");
+        assert!(matches!(
+            result,
+            Err(DivergenceError::InvalidConfiguration(msg)) if msg.contains("empty")
+        ));
+    }
+
+    #[test]
+    fn test_freeze_id_too_long_rejected() {
+        let long_id = "x".repeat(MAX_FREEZE_ID_LENGTH + 1);
+        let result = FreezeId::new(long_id);
+        assert!(matches!(
+            result,
+            Err(DivergenceError::StringTooLong {
+                field: "freeze_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_freeze_id_invalid_chars_rejected() {
+        // Control character (tab)
+        let result = FreezeId::new("freeze\t001");
+        assert!(matches!(
+            result,
+            Err(DivergenceError::InvalidConfiguration(msg)) if msg.contains("invalid characters")
+        ));
+    }
+
+    #[test]
+    fn test_defect_id_valid() {
+        let id = DefectId::new("defect-001").unwrap();
+        assert_eq!(id.as_str(), "defect-001");
+    }
+
+    #[test]
+    fn test_defect_id_empty_rejected() {
+        let result = DefectId::new("");
+        assert!(matches!(
+            result,
+            Err(DivergenceError::InvalidConfiguration(msg)) if msg.contains("empty")
+        ));
+    }
+
+    #[test]
+    fn test_actor_id_valid() {
+        let id = ActorId::new("watchdog-001").unwrap();
+        assert_eq!(id.as_str(), "watchdog-001");
+    }
+
+    #[test]
+    fn test_actor_id_empty_rejected() {
+        let result = ActorId::new("");
+        assert!(matches!(
+            result,
+            Err(DivergenceError::InvalidConfiguration(msg)) if msg.contains("empty")
+        ));
+    }
+
+    #[test]
+    fn test_type_safe_ids_serde_roundtrip() {
+        let freeze_id = FreezeId::new("freeze-001").unwrap();
+        let json = serde_json::to_string(&freeze_id).unwrap();
+        let parsed: FreezeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(freeze_id, parsed);
+    }
+
+    #[test]
+    fn test_type_safe_ids_serde_deserialize_invalid() {
+        // Empty string should fail deserialization
+        let result: Result<FreezeId, _> = serde_json::from_str("\"\"");
+        assert!(result.is_err());
     }
 
     // =========================================================================
@@ -2298,20 +2754,73 @@ pub mod tests {
         registry.register(&freeze, &signer.verifying_key()).unwrap();
         assert_eq!(registry.active_count(), 1);
 
-        registry.unregister("freeze-001").unwrap();
+        // Create a signed unfreeze event
+        let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Manual)
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12346")
+            .build_and_sign(&signer);
+
+        registry
+            .unregister(&unfreeze, &signer.verifying_key())
+            .unwrap();
         assert_eq!(registry.active_count(), 0);
         assert!(registry.is_frozen("test-repo").is_none());
     }
 
     #[test]
     fn test_registry_unregister_not_found() {
+        let signer = Signer::generate();
         let registry = FreezeRegistry::new();
 
-        let result = registry.unregister("nonexistent");
+        // Create a signed unfreeze event for a non-existent freeze
+        let unfreeze = InterventionUnfreezeBuilder::new("nonexistent")
+            .resolution_type(ResolutionType::Manual)
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        let result = registry.unregister(&unfreeze, &signer.verifying_key());
         assert!(matches!(
             result,
             Err(DivergenceError::FreezeNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn test_registry_unregister_rejects_invalid_signature() {
+        let signer = Signer::generate();
+        let other_signer = Signer::generate();
+        let registry = FreezeRegistry::new();
+
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
+        assert_eq!(registry.active_count(), 1);
+
+        // Create a signed unfreeze event with correct signer
+        let unfreeze = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Manual)
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12346")
+            .build_and_sign(&signer);
+
+        // Try to unregister with wrong verifying key - should fail
+        let result = registry.unregister(&unfreeze, &other_signer.verifying_key());
+        assert!(matches!(
+            result,
+            Err(DivergenceError::InvalidUnfreezeSignature(_))
+        ));
+        // Freeze should still be active
+        assert_eq!(registry.active_count(), 1);
     }
 
     #[test]
@@ -2340,6 +2849,167 @@ pub mod tests {
 
         // Other repos should still be allowed
         assert!(registry.check_admission("other-repo").is_ok());
+    }
+
+    // =========================================================================
+    // Hierarchical Freeze Tests
+    // =========================================================================
+
+    #[test]
+    fn test_hierarchical_freeze_namespace_blocks_repos_slash() {
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new();
+
+        // Freeze the namespace "myorg"
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Namespace)
+            .scope_value("myorg")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
+
+        // Direct match should be frozen
+        assert!(registry.is_frozen("myorg").is_some());
+
+        // Child scopes under the namespace should also be frozen (hierarchical)
+        assert!(registry.is_frozen("myorg/repo1").is_some());
+        assert!(registry.is_frozen("myorg/repo2").is_some());
+        assert!(registry.is_frozen("myorg/repo/artifact/id").is_some());
+
+        // Other namespaces should not be frozen
+        assert!(registry.is_frozen("otherorg").is_none());
+        assert!(registry.is_frozen("otherorg/repo").is_none());
+    }
+
+    #[test]
+    fn test_hierarchical_freeze_namespace_blocks_repos_colon() {
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new();
+
+        // Freeze the namespace "myorg"
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Namespace)
+            .scope_value("myorg")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
+
+        // Direct match should be frozen
+        assert!(registry.is_frozen("myorg").is_some());
+
+        // Child scopes under the namespace should also be frozen (hierarchical)
+        assert!(registry.is_frozen("myorg:ticket").is_some());
+        assert!(registry.is_frozen("myorg:rfc").is_some());
+        assert!(registry.is_frozen("myorg:ticket:TCK-00213").is_some());
+
+        // Other namespaces should not be frozen
+        assert!(registry.is_frozen("otherorg").is_none());
+        assert!(registry.is_frozen("otherorg:ticket").is_none());
+    }
+
+    #[test]
+    fn test_hierarchical_freeze_repo_blocks_artifacts() {
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new();
+
+        // Freeze the repository "myorg/myrepo"
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("myorg/myrepo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
+
+        // Direct match should be frozen
+        assert!(registry.is_frozen("myorg/myrepo").is_some());
+
+        // Child paths under the repo should be frozen
+        assert!(
+            registry
+                .is_frozen("myorg/myrepo/ticket/TCK-00213")
+                .is_some()
+        );
+        assert!(registry.is_frozen("myorg/myrepo/artifact/id").is_some());
+
+        // Parent namespace should NOT be frozen (freeze is repo-level only)
+        assert!(registry.is_frozen("myorg").is_none());
+
+        // Other repos in same org should not be frozen
+        assert!(registry.is_frozen("myorg/otherrepo").is_none());
+    }
+
+    #[test]
+    fn test_hierarchical_check_admission_blocks_children() {
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new();
+
+        // Freeze the namespace
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Namespace)
+            .scope_value("frozenorg")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
+
+        // check_admission should block all children
+        assert!(registry.check_admission("frozenorg").is_err());
+        assert!(registry.check_admission("frozenorg/repo").is_err());
+        assert!(registry.check_admission("frozenorg/repo/artifact").is_err());
+        assert!(
+            registry
+                .check_admission("frozenorg:ticket:TCK-001")
+                .is_err()
+        );
+
+        // Other orgs should pass
+        assert!(registry.check_admission("allowedorg").is_ok());
+        assert!(registry.check_admission("allowedorg/repo").is_ok());
+    }
+
+    #[test]
+    fn test_hierarchical_parents_slash_iterator() {
+        let parents: Vec<&str> = FreezeRegistry::hierarchical_parents_slash("a/b/c/d").collect();
+        assert_eq!(parents, vec!["a/b/c", "a/b", "a"]);
+    }
+
+    #[test]
+    fn test_hierarchical_parents_colon_iterator() {
+        let parents: Vec<&str> = FreezeRegistry::hierarchical_parents_colon("a:b:c:d").collect();
+        assert_eq!(parents, vec!["a:b:c", "a:b", "a"]);
+    }
+
+    #[test]
+    fn test_hierarchical_parents_no_separator() {
+        assert!(
+            FreezeRegistry::hierarchical_parents_slash("single")
+                .next()
+                .is_none()
+        );
+        assert!(
+            FreezeRegistry::hierarchical_parents_colon("single")
+                .next()
+                .is_none()
+        );
     }
 
     // =========================================================================
@@ -2474,7 +3144,8 @@ pub mod tests {
         assert!(watchdog.check_admission().is_err());
 
         // Now apply the unfreeze (simulating successful ledger persistence)
-        watchdog.apply_unfreeze(&unfreeze.freeze_id).unwrap();
+        // The signature is verified during apply_unfreeze
+        watchdog.apply_unfreeze(&unfreeze).unwrap();
 
         // Should allow admission after applying unfreeze
         assert!(watchdog.check_admission().is_ok());
@@ -2484,8 +3155,15 @@ pub mod tests {
     fn test_watchdog_apply_unfreeze_not_found() {
         let watchdog = create_test_watchdog();
 
+        // Create a fake unfreeze for a non-existent freeze
+        let fake_unfreeze = InterventionUnfreezeBuilder::new("nonexistent")
+            .resolution_type(ResolutionType::Manual)
+            .gate_actor_id("test-actor")
+            .time_envelope_ref("htf:tick:0")
+            .build_and_sign(&watchdog.signer);
+
         // Try to apply unfreeze for non-existent freeze
-        let result = watchdog.apply_unfreeze("nonexistent");
+        let result = watchdog.apply_unfreeze(&fake_unfreeze);
         assert!(matches!(
             result,
             Err(DivergenceError::FreezeNotFound { .. })
@@ -2734,7 +3412,8 @@ pub mod tests {
         // In production: ledger.persist(&unfreeze).await?;
 
         // 9. Apply unfreeze to registry after successful persistence
-        watchdog.apply_unfreeze(&unfreeze.freeze_id).unwrap();
+        // The signature is verified during apply_unfreeze
+        watchdog.apply_unfreeze(&unfreeze).unwrap();
 
         // 10. Admission is allowed again
         assert!(watchdog.check_admission().is_ok());

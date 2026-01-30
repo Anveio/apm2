@@ -789,18 +789,47 @@ impl<C: ContentAddressedStore, F: FreezeCheck> AdmissionGate<C, F> {
 
     /// Extracts the scope value (repository identifier) from a DCP ID.
     ///
-    /// The scope value is used for freeze checking. It extracts the first
-    /// two colon-separated segments of the DCP ID, which typically represent
-    /// the organization and repository.
+    /// The scope value is used for freeze checking. For DCP URIs, this extracts
+    /// the organization and repository segments. For colon-separated DCP IDs,
+    /// it extracts the first two segments.
+    ///
+    /// # DCP URI Format
+    ///
+    /// DCP URIs follow the format: `dcp://org/repo/artifact/id`
+    /// The scope value extracted is: `org/repo`
+    ///
+    /// # Colon-Separated Format
+    ///
+    /// Colon-separated DCP IDs follow: `org:kind:id`
+    /// The scope value extracted is: `org:kind`
     ///
     /// # Examples
     ///
-    /// - `dcp://org/repo/artifact/id` -> `dcp://org/repo`
+    /// - `dcp://org/repo/artifact/id` -> `org/repo`
+    /// - `dcp://myorg/myrepo/ticket/TCK-00213` -> `myorg/myrepo`
     /// - `org:ticket:TCK-00213` -> `org:ticket`
+    ///
+    /// # Security Note
+    ///
+    /// This function is critical for freeze enforcement. The extracted scope
+    /// must match what the `DivergenceWatchdog` uses as its `repo_id` when
+    /// issuing freezes.
     #[must_use]
     fn extract_scope_value(dcp_id: &str) -> String {
-        // For DCP IDs like "org:ticket:TCK-00213", extract "org:ticket"
-        // For URIs like "dcp://org/repo/...", extract "dcp://org/repo"
+        // Handle DCP URI format: dcp://org/repo/...
+        if let Some(rest) = dcp_id.strip_prefix("dcp://") {
+            // Extract org/repo from the path
+            let mut parts = rest.splitn(3, '/');
+            let org = parts.next().unwrap_or("");
+            let repo = parts.next().unwrap_or("");
+            if !org.is_empty() && !repo.is_empty() {
+                return format!("{org}/{repo}");
+            }
+            // Fallback: return the full path if parsing fails
+            return rest.to_string();
+        }
+
+        // Handle colon-separated format: org:kind:id
         let parts: Vec<&str> = dcp_id.splitn(3, ':').collect();
         if parts.len() >= 2 {
             format!("{}:{}", parts[0], parts[1])
@@ -2302,9 +2331,10 @@ mod tests {
             AdmissionGate::<MemoryCas>::extract_scope_value("company:artifact:some-id"),
             "company:artifact"
         );
+        // DCP URI format now extracts org/repo properly
         assert_eq!(
             AdmissionGate::<MemoryCas>::extract_scope_value("dcp://org/repo/path"),
-            "dcp://org/repo/path" // No colon after scheme
+            "org/repo"
         );
         assert_eq!(
             AdmissionGate::<MemoryCas>::extract_scope_value("single"),
@@ -2456,5 +2486,75 @@ mod tests {
             matches!(result, Err(AdmissionError::RepoFrozen { .. })),
             "Freeze check should happen before validation, got: {result:?}"
         );
+    }
+
+    // =========================================================================
+    // Scope Extraction Tests (DCP URI Parsing)
+    // =========================================================================
+
+    #[test]
+    fn test_extract_scope_value_dcp_uri() {
+        // Standard DCP URI format: dcp://org/repo/artifact/id
+        let scope =
+            AdmissionGate::<MemoryCas>::extract_scope_value("dcp://myorg/myrepo/ticket/TCK-00213");
+        assert_eq!(scope, "myorg/myrepo");
+    }
+
+    #[test]
+    fn test_extract_scope_value_dcp_uri_deep_path() {
+        // DCP URI with deeper path
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value(
+            "dcp://acme/project/artifact/type/subtype/id",
+        );
+        assert_eq!(scope, "acme/project");
+    }
+
+    #[test]
+    fn test_extract_scope_value_dcp_uri_minimal() {
+        // DCP URI with just org/repo
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("dcp://org/repo");
+        assert_eq!(scope, "org/repo");
+    }
+
+    #[test]
+    fn test_extract_scope_value_dcp_uri_org_only() {
+        // DCP URI with only org (no repo) - should return the full path
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("dcp://orgonly");
+        assert_eq!(scope, "orgonly");
+    }
+
+    #[test]
+    fn test_extract_scope_value_colon_separated() {
+        // Colon-separated format: org:kind:id
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("myorg:ticket:TCK-00213");
+        assert_eq!(scope, "myorg:ticket");
+    }
+
+    #[test]
+    fn test_extract_scope_value_colon_separated_deep() {
+        // Colon-separated format with more segments
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("org:kind:subkind:id");
+        assert_eq!(scope, "org:kind");
+    }
+
+    #[test]
+    fn test_extract_scope_value_colon_two_segments() {
+        // Only two segments
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("org:kind");
+        assert_eq!(scope, "org:kind");
+    }
+
+    #[test]
+    fn test_extract_scope_value_no_separator() {
+        // No separator - return as-is
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("singlevalue");
+        assert_eq!(scope, "singlevalue");
+    }
+
+    #[test]
+    fn test_extract_scope_value_empty() {
+        // Empty string
+        let scope = AdmissionGate::<MemoryCas>::extract_scope_value("");
+        assert_eq!(scope, "");
     }
 }
