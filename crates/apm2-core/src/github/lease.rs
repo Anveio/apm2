@@ -209,6 +209,10 @@ impl GitHubLease {
         capability_manifest_hash: Vec<u8>,
         issuer_signature: Vec<u8>,
     ) -> Result<Self, GitHubError> {
+        // Constants for cryptographic artifact lengths
+        const SHA256_HASH_LEN: usize = 32;
+        const ED25519_SIGNATURE_LEN: usize = 64;
+
         // Validate input lengths
         validate_length(&lease_id, "lease_id", MAX_LEASE_ID_LEN)?;
         validate_length(&episode_id, "episode_id", MAX_EPISODE_ID_LEN)?;
@@ -238,9 +242,38 @@ impl GitHubLease {
             }
         }
 
-        // Validate signature is present
-        if issuer_signature.is_empty() {
-            return Err(GitHubError::MissingSignature { lease_id });
+        // Validate cryptographic artifact lengths
+        if token_hash.len() != SHA256_HASH_LEN {
+            return Err(GitHubError::InvalidInput {
+                field: "token_hash".to_string(),
+                reason: format!(
+                    "token_hash must be exactly {} bytes (SHA-256), got {}",
+                    SHA256_HASH_LEN,
+                    token_hash.len()
+                ),
+            });
+        }
+
+        if capability_manifest_hash.len() != SHA256_HASH_LEN {
+            return Err(GitHubError::InvalidInput {
+                field: "capability_manifest_hash".to_string(),
+                reason: format!(
+                    "capability_manifest_hash must be exactly {} bytes (SHA-256), got {}",
+                    SHA256_HASH_LEN,
+                    capability_manifest_hash.len()
+                ),
+            });
+        }
+
+        if issuer_signature.len() != ED25519_SIGNATURE_LEN {
+            return Err(GitHubError::InvalidInput {
+                field: "issuer_signature".to_string(),
+                reason: format!(
+                    "issuer_signature must be exactly {} bytes (Ed25519), got {}",
+                    ED25519_SIGNATURE_LEN,
+                    issuer_signature.len()
+                ),
+            });
         }
 
         // Validate expires_at > issued_at
@@ -369,6 +402,21 @@ fn validate_length(value: &str, field: &str, max: usize) -> Result<(), GitHubErr
 mod unit_tests {
     use super::*;
 
+    /// Valid 32-byte SHA-256 hash for tests.
+    fn valid_token_hash() -> Vec<u8> {
+        vec![0u8; 32]
+    }
+
+    /// Valid 32-byte SHA-256 hash for capability manifest.
+    fn valid_capability_manifest_hash() -> Vec<u8> {
+        vec![1u8; 32]
+    }
+
+    /// Valid 64-byte Ed25519 signature for tests.
+    fn valid_issuer_signature() -> Vec<u8> {
+        vec![2u8; 64]
+    }
+
     fn test_lease() -> GitHubLease {
         GitHubLease::new(
             "lease-001".to_string(),
@@ -378,11 +426,11 @@ mod unit_tests {
             GitHubApp::Developer,
             RiskTier::Med,
             vec![GitHubScope::ContentsRead, GitHubScope::PullRequestsWrite],
-            vec![1, 2, 3, 4, 5, 6, 7, 8], // token_hash
-            1_000_000_000,                // issued_at
-            2_000_000_000,                // expires_at
-            vec![10, 20, 30],             // capability_manifest_hash
-            vec![40, 50, 60],             // issuer_signature
+            valid_token_hash(),
+            1_000_000_000, // issued_at
+            2_000_000_000, // expires_at
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
         )
         .unwrap()
     }
@@ -407,11 +455,11 @@ mod unit_tests {
             GitHubApp::Developer,
             RiskTier::Low, // T0 cannot use Developer
             vec![GitHubScope::ContentsRead],
-            vec![1, 2, 3, 4],
+            valid_token_hash(),
             1_000_000_000,
             2_000_000_000,
-            vec![10, 20, 30],
-            vec![40, 50, 60],
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
         );
         assert!(matches!(result, Err(GitHubError::TierAppMismatch { .. })));
     }
@@ -427,17 +475,18 @@ mod unit_tests {
             GitHubApp::Reader,
             RiskTier::Low,
             vec![GitHubScope::PullRequestsWrite], // Not allowed for Reader
-            vec![1, 2, 3, 4],
+            valid_token_hash(),
             1_000_000_000,
             2_000_000_000,
-            vec![10, 20, 30],
-            vec![40, 50, 60],
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
         );
         assert!(matches!(result, Err(GitHubError::ScopeNotAllowed { .. })));
     }
 
     #[test]
-    fn test_lease_missing_signature() {
+    fn test_lease_invalid_signature_length() {
+        // Empty signature
         let result = GitHubLease::new(
             "lease-001".to_string(),
             "episode-001".to_string(),
@@ -446,13 +495,34 @@ mod unit_tests {
             GitHubApp::Reader,
             RiskTier::Low,
             vec![GitHubScope::ContentsRead],
-            vec![1, 2, 3, 4],
+            valid_token_hash(),
             1_000_000_000,
             2_000_000_000,
-            vec![10, 20, 30],
-            vec![], // Empty signature
+            valid_capability_manifest_hash(),
+            vec![], // Empty signature - invalid
         );
-        assert!(matches!(result, Err(GitHubError::MissingSignature { .. })));
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, .. }) if field == "issuer_signature")
+        );
+
+        // Wrong length signature (not 64 bytes)
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            valid_token_hash(),
+            1_000_000_000,
+            2_000_000_000,
+            valid_capability_manifest_hash(),
+            vec![1, 2, 3], // Too short - invalid
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, .. }) if field == "issuer_signature")
+        );
     }
 
     #[test]
@@ -465,11 +535,11 @@ mod unit_tests {
             GitHubApp::Reader,
             RiskTier::Low,
             vec![GitHubScope::ContentsRead],
-            vec![1, 2, 3, 4],
+            valid_token_hash(),
             2_000_000_000, // issued_at
             1_000_000_000, // expires_at < issued_at
-            vec![10, 20, 30],
-            vec![40, 50, 60],
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
         );
         assert!(matches!(result, Err(GitHubError::InvalidInput { .. })));
     }
@@ -607,11 +677,11 @@ mod unit_tests {
             GitHubApp::Reader,
             RiskTier::Low,
             vec![GitHubScope::ContentsRead],
-            vec![1, 2, 3, 4],
+            valid_token_hash(),
             1_000_000_000,
             2_000_000_000,
-            vec![10, 20, 30],
-            vec![40, 50, 60],
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
         );
         assert!(matches!(result, Err(GitHubError::InvalidInput { .. })));
     }
@@ -627,12 +697,154 @@ mod unit_tests {
             GitHubApp::Reader,
             RiskTier::Low,
             scopes,
-            vec![1, 2, 3, 4],
+            valid_token_hash(),
             1_000_000_000,
             2_000_000_000,
-            vec![10, 20, 30],
-            vec![40, 50, 60],
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
         );
         assert!(matches!(result, Err(GitHubError::TooManyScopes { .. })));
+    }
+
+    #[test]
+    fn test_token_hash_must_be_32_bytes() {
+        // Too short
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            vec![0u8; 31], // 31 bytes - too short
+            1_000_000_000,
+            2_000_000_000,
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, reason }) if field == "token_hash" && reason.contains("32 bytes"))
+        );
+
+        // Too long
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            vec![0u8; 33], // 33 bytes - too long
+            1_000_000_000,
+            2_000_000_000,
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, reason }) if field == "token_hash" && reason.contains("32 bytes"))
+        );
+
+        // Empty
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            vec![], // Empty
+            1_000_000_000,
+            2_000_000_000,
+            valid_capability_manifest_hash(),
+            valid_issuer_signature(),
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, .. }) if field == "token_hash")
+        );
+    }
+
+    #[test]
+    fn test_capability_manifest_hash_must_be_32_bytes() {
+        // Too short
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            valid_token_hash(),
+            1_000_000_000,
+            2_000_000_000,
+            vec![1u8; 31], // 31 bytes - too short
+            valid_issuer_signature(),
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, reason }) if field == "capability_manifest_hash" && reason.contains("32 bytes"))
+        );
+
+        // Too long
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            valid_token_hash(),
+            1_000_000_000,
+            2_000_000_000,
+            vec![1u8; 33], // 33 bytes - too long
+            valid_issuer_signature(),
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, reason }) if field == "capability_manifest_hash" && reason.contains("32 bytes"))
+        );
+    }
+
+    #[test]
+    fn test_issuer_signature_must_be_64_bytes() {
+        // Too short
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            valid_token_hash(),
+            1_000_000_000,
+            2_000_000_000,
+            valid_capability_manifest_hash(),
+            vec![2u8; 63], // 63 bytes - too short
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, reason }) if field == "issuer_signature" && reason.contains("64 bytes"))
+        );
+
+        // Too long
+        let result = GitHubLease::new(
+            "lease-001".to_string(),
+            "episode-001".to_string(),
+            "12345".to_string(),
+            "67890".to_string(),
+            GitHubApp::Reader,
+            RiskTier::Low,
+            vec![GitHubScope::ContentsRead],
+            valid_token_hash(),
+            1_000_000_000,
+            2_000_000_000,
+            valid_capability_manifest_hash(),
+            vec![2u8; 65], // 65 bytes - too long
+        );
+        assert!(
+            matches!(result, Err(GitHubError::InvalidInput { field, reason }) if field == "issuer_signature" && reason.contains("64 bytes"))
+        );
     }
 }

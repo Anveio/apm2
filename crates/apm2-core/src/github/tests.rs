@@ -51,8 +51,8 @@ mod integration_tests {
             response.token_hash,
             now_nanos,
             expires_at_nanos,
-            vec![1, 2, 3], // capability_manifest_hash
-            vec![4, 5, 6], // issuer_signature
+            vec![1u8; 32], // capability_manifest_hash: 32 bytes for SHA-256
+            vec![2u8; 64], // issuer_signature: 64 bytes for Ed25519
         )
         .unwrap();
 
@@ -288,11 +288,11 @@ mod integration_tests {
             GitHubApp::Developer,
             RiskTier::Med,
             vec![GitHubScope::ContentsRead, GitHubScope::PullRequestsWrite],
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            vec![0u8; 32], // token_hash: 32 bytes for SHA-256
             1_000_000_000, // issued_at
             2_000_000_000, // expires_at
-            vec![10, 20, 30],
-            vec![40, 50, 60],
+            vec![1u8; 32], // capability_manifest_hash: 32 bytes for SHA-256
+            vec![2u8; 64], // issuer_signature: 64 bytes for Ed25519
         )
         .unwrap()
     }

@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use secrecy::SecretString;
 
+use super::MAX_SCOPES_PER_LEASE;
 use super::error::GitHubError;
 use super::scope::{GitHubApp, GitHubScope, RiskTier};
 
@@ -94,6 +95,7 @@ impl TokenRequest {
     /// Returns an error if:
     /// - Risk tier cannot use the requested app
     /// - App does not allow the requested scopes
+    /// - Too many scopes requested (exceeds `MAX_SCOPES_PER_LEASE`)
     /// - Requested TTL exceeds tier's maximum
     pub fn validate(&self) -> Result<(), GitHubError> {
         // Validate tier can use app
@@ -101,6 +103,14 @@ impl TokenRequest {
             return Err(GitHubError::TierAppMismatch {
                 tier: self.risk_tier,
                 app: self.app,
+            });
+        }
+
+        // Validate scope count
+        if self.scopes.len() > MAX_SCOPES_PER_LEASE {
+            return Err(GitHubError::TooManyScopes {
+                count: self.scopes.len(),
+                max: MAX_SCOPES_PER_LEASE,
             });
         }
 
@@ -688,5 +698,44 @@ mod unit_tests {
             med_limit > high_limit,
             "Med risk should allow more tokens than High"
         );
+    }
+
+    #[test]
+    fn test_token_request_validate_too_many_scopes() {
+        // Create a request with more scopes than MAX_SCOPES_PER_LEASE (16)
+        let scopes = vec![GitHubScope::ContentsRead; MAX_SCOPES_PER_LEASE + 1];
+        let request = TokenRequest::new(
+            GitHubApp::Reader,
+            "12345".to_string(),
+            RiskTier::Low,
+            "episode-001".to_string(),
+        )
+        .with_scopes(scopes);
+
+        let result = request.validate();
+        assert!(matches!(
+            result,
+            Err(GitHubError::TooManyScopes {
+                count,
+                max,
+            }) if count == MAX_SCOPES_PER_LEASE + 1 && max == MAX_SCOPES_PER_LEASE
+        ));
+    }
+
+    #[test]
+    fn test_token_request_validate_exactly_max_scopes() {
+        // Create a request with exactly MAX_SCOPES_PER_LEASE scopes - should pass
+        let scopes = vec![GitHubScope::ContentsRead; MAX_SCOPES_PER_LEASE];
+        let request = TokenRequest::new(
+            GitHubApp::Reader,
+            "12345".to_string(),
+            RiskTier::Low,
+            "episode-001".to_string(),
+        )
+        .with_scopes(scopes);
+
+        // Should not fail on scope count
+        let result = request.validate();
+        assert!(result.is_ok());
     }
 }
