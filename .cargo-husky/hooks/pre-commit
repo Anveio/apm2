@@ -13,16 +13,27 @@ echo -e "${GREEN}Running pre-commit hooks...${NC}"
 echo "Checking for merge conflicts and trailing whitespace..."
 git diff --cached --check
 
+# Capture staged Rust files before auto-fix (preserves partial staging)
+STAGED_RS_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+# Helper function to re-stage only originally staged Rust files
+restage_rust_files() {
+    if [[ -n "$STAGED_RS_FILES" ]]; then
+        echo "$STAGED_RS_FILES" | xargs -r git add
+    fi
+}
+
 # 2. Auto-fix compiler warnings (unused imports, etc.)
 echo "Auto-fixing compiler warnings..."
-cargo fix --allow-dirty --allow-staged --quiet 2>/dev/null || true
-# Re-stage any fixed files
-git add -u
+if ! cargo fix --allow-dirty --allow-staged --quiet 2>/dev/null; then
+    echo -e "${YELLOW}Warning: cargo fix encountered issues, continuing...${NC}"
+fi
+restage_rust_files
 
 # 3. Rust fmt (auto-fix and re-stage)
 echo "Formatting code (cargo fmt)..."
 cargo fmt --all
-git add -u
+restage_rust_files
 
 # 4. Clippy
 echo "Running Clippy..."
