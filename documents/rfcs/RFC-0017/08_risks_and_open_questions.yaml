@@ -1,0 +1,217 @@
+rfc_risks_and_open_questions:
+  schema_version: "2026-01-30"
+  template_version: "2026-01-23"
+
+  # CRITICAL: This is v0 (Discovery) phase.
+  # Open questions and "Known Unknowns" are documented here for investigation
+  # during EXPLORE phase (v0 -> v2 transition).
+
+  risks:
+    - id: RISK-RFC-0017-001
+      name: "Migration surface larger than expected"
+      category: ADOPTION
+      description: |
+        xtask deprecation assumes limited direct usage. If migration surface is
+        larger (undocumented xtask behaviors, external scripts depending on xtask),
+        removal may cause unexpected breakage.
+      likelihood: MEDIUM
+      impact: HIGH
+      mitigation:
+        - "Telemetry gate: removal blocked until <5% direct xtask usage"
+        - "Extended deprecation period if telemetry shows high usage"
+        - "Deprecation warnings with migration guidance"
+      owner: "Implementation team"
+      status: OPEN
+
+    - id: RISK-RFC-0017-002
+      name: "Container UID remapping breaks peer credential validation"
+      category: SECURITY
+      description: |
+        SO_PEERCRED returns container-namespace UID which may not match host UID
+        when user namespaces remap. Could allow authentication bypass.
+      likelihood: MEDIUM
+      impact: HIGH
+      mitigation:
+        - "Require --userns=host for container deployments"
+        - "Document container deployment constraints"
+        - "Test peer credential validation in common runtimes"
+      owner: "Security review"
+      status: OPEN
+
+    - id: RISK-RFC-0017-003
+      name: "Daemon becomes single point of failure"
+      category: RELIABILITY
+      description: |
+        With all work orchestration flowing through daemon, daemon unavailability
+        blocks all agent operations.
+      likelihood: LOW
+      impact: HIGH
+      mitigation:
+        - "Daemon crash recovery within 5s (REQ-DCP-0013)"
+        - "Session recovery via LEASE_REVOKED signals"
+        - "Future: explore daemon clustering"
+      owner: "SRE/Platform team"
+      status: OPEN
+
+    - id: RISK-RFC-0017-004
+      name: "Tool mediation latency impacts productivity"
+      category: PERFORMANCE
+      description: |
+        Adding mediation layer for every tool call introduces latency.
+        If overhead exceeds target (<5ms p50), developer productivity suffers.
+      likelihood: LOW
+      impact: MEDIUM
+      mitigation:
+        - "Benchmark targets in success metrics"
+        - "Optimize hot path: capability check caching"
+        - "Async event emission where possible"
+      owner: "Performance team"
+      status: OPEN
+
+    - id: RISK-RFC-0017-005
+      name: "RFC-0015 breaking changes invalidate design"
+      category: DEPENDENCY
+      description: |
+        RFC depends on RFC-0015 concepts (PolicyResolvedForChangeSet, GateLeaseIssued).
+        Breaking changes in RFC-0015 could require significant rework.
+      likelihood: LOW
+      impact: HIGH
+      mitigation:
+        - "Version pin in metadata: RFC-0015 v4.1+"
+        - "Breaking change policy: coordinated update required"
+        - "Integration tests verify RFC-0015 contract compatibility"
+      owner: "Architecture team"
+      status: OPEN
+
+  open_questions:
+    # Known Unknowns requiring codebase investigation in EXPLORE phase
+
+    - id: OQ-001
+      question: "What existing Unix socket infrastructure exists in apm2-daemon?"
+      context: |
+        Design decision DD-001 proposes Unix socket IPC. Need to understand if
+        there's existing socket handling code to extend or if building from scratch.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "Search for 'UnixListener', 'UnixStream' in crates/apm2-daemon"
+        - "Check for existing IPC patterns in daemon startup code"
+        - "Review any existing socket configuration"
+
+    - id: OQ-002
+      question: "How does daemon currently interact with governance components?"
+      context: |
+        Design decision DD-002 proposes daemon calls HOLON-KERNEL-GOVERNANCE.
+        Need to understand current governance integration patterns.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "Search for governance-related calls in apm2-daemon"
+        - "Review HOLON-KERNEL-GOVERNANCE interface if defined"
+        - "Check for existing policy resolution patterns"
+
+    - id: OQ-003
+      question: "What existing capability/permission structures exist?"
+      context: |
+        Design decision DD-003 proposes capability manifest structure.
+        Need to understand existing permission models to avoid cousin abstractions.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "Search for 'capability', 'permission', 'allowlist' in codebase"
+        - "Review ContextPack structure for read allowlist patterns"
+        - "Check for existing manifest or grant types"
+
+    - id: OQ-004
+      question: "How does current tool execution work in apm2?"
+      context: |
+        Design decision DD-004 proposes tool broker pattern.
+        Need to understand existing tool execution to design mediation layer.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "Review current tool invocation paths"
+        - "Check for existing broker or mediation patterns"
+        - "Identify tools requiring credential access"
+
+    - id: OQ-005
+      question: "Does daemon have persistent state for session tracking?"
+      context: |
+        Design decision DD-005 proposes session recovery from persistent state.
+        Need to understand if daemon has durable state or if it's stateless.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "Review daemon state management code"
+        - "Check for SQLite, file, or other persistence"
+        - "Understand current daemon restart behavior"
+
+    - id: OQ-006
+      question: "What signing infrastructure exists in apm2-core?"
+      context: |
+        Design decision DD-006 proposes Ed25519 signing with domain separation.
+        Need to understand existing signing capabilities.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "Search for 'Ed25519', 'sign', 'signature' in apm2-core"
+        - "Review existing event serialization for ledger"
+        - "Check for key management patterns"
+
+    - id: OQ-007
+      question: "What xtask commands exist and what are their daemon CLI equivalents?"
+      context: |
+        Design decision DD-007 proposes xtask deprecation.
+        Need complete inventory of xtask commands for migration planning.
+      status: REQUIRES_EXPLORATION
+      investigation_plan:
+        - "List all commands in xtask crate"
+        - "Map each to proposed apm2 CLI equivalent"
+        - "Identify any commands without daemon path"
+
+    - id: OQ-008
+      question: "How should daemon handle multi-tenant workstation scenarios?"
+      context: |
+        From PRD-0010 Q-0001. Phase 1 targets single daemon per workstation.
+        For shared environments, additional isolation may be needed.
+      status: DEFERRED
+      proposed_resolution: |
+        Defer to Phase 2. Single daemon with work_id sharding could support
+        multi-tenant. Alternative: per-user daemon instances.
+
+    - id: OQ-009
+      question: "What is the compatibility story for Windows?"
+      context: |
+        From PRD-0010 Q-0002. SO_PEERCRED requires Unix domain sockets.
+        Windows named pipes have different authentication mechanisms.
+      status: DEFERRED
+      proposed_resolution: |
+        Windows support out of scope for Phase 1. Phase 2 could use Windows
+        named pipe security descriptors or JWT tokens via localhost HTTP.
+
+    - id: OQ-010
+      question: "How does tool broker mediate SSH operations without exposing keys?"
+      context: |
+        From PRD-0010 Q-0004. Git operations may require SSH authentication.
+        Broker must mediate without exposing SSH private keys to session.
+      status: PROPOSED
+      proposed_resolution: |
+        Daemon runs SSH agent or git credential helper. Session requests
+        git operations; broker uses internal agent/helper. SSH_AUTH_SOCK
+        not exposed to session process.
+
+  discovery_goals:
+    summary: |
+      The v0 -> v2 (EXPLORE) phase should ground design decisions in codebase
+      evidence. Each open question above has an investigation plan. After
+      exploration, update design decisions with concrete evidence and code
+      references.
+
+    priority_order:
+      - OQ-001  # IPC infrastructure - foundational
+      - OQ-004  # Tool execution - informs mediation design
+      - OQ-003  # Capability structures - avoid cousins
+      - OQ-006  # Signing - affects all events
+      - OQ-005  # Session persistence - affects recovery
+      - OQ-002  # Governance integration
+      - OQ-007  # xtask inventory - migration planning
+
+    success_criteria:
+      - "All REQUIRES_EXPLORATION questions resolved with codebase evidence"
+      - "Design decisions updated with file paths and code references"
+      - "Anti-cousin analysis complete for capability/permission structures"
+      - "v2 version ready for FINALIZE phase"

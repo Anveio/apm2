@@ -37,6 +37,12 @@ rfc_ticket_decomposition:
         - path: "crates/apm2-core/src/htf/types.rs"
           purpose: "LedgerTime, HtfTick, TimeEnvelopeRef, BoundedWallInterval"
       implementation_steps:
+        - step: 0
+          action: "Review existing ordering/time abstractions to avoid cousin types"
+          details: |
+            Inspect existing ordering/sequence types in apm2-core (ledger and evidence
+            modules) and document why HtfTick is distinct. If overlap exists, wrap
+            or reuse existing types instead of introducing a duplicate concept.
         - step: 1
           action: "Define LedgerTime and ordering helpers"
           details: "Include ledger_id, epoch, seq; implement Ord/PartialOrd by (ledger_id, epoch, seq)."
@@ -142,12 +148,47 @@ rfc_ticket_decomposition:
       files_to_modify:
         - path: "crates/apm2-daemon/src/episode/runtime.rs"
           changes: "Stamp envelopes at runtime boundaries"
+        - path: "crates/apm2-daemon/src/protocol/"
+          changes: "Wire HolonicClock into runtime surfaces that issue receipts"
       files_to_create:
         - path: "crates/apm2-daemon/src/htf/clock.rs"
           purpose: "HolonicClock service"
+      implementation_steps:
+        - step: 1
+          action: "Define HolonicClock sources and state"
+          details: |
+            - Monotonic source: CLOCK_MONOTONIC_RAW preferred, fallback CLOCK_MONOTONIC.
+            - Ledger source: hold Arc<dyn LedgerBackend> (or adapter) to query head().
+            - HLC state: store last_wall_ns + last_logical in an internal mutex.
+
+        - step: 2
+          action: "Implement observed_ledger_head()"
+          details: |
+            Call LedgerBackend::head(namespace) to obtain current seq; map into
+            LedgerTime (ledger_id, epoch, seq). Ledger_id + epoch come from daemon
+            config; default epoch=0 in Phase 1. Return error if head query fails.
+
+        - step: 3
+          action: "Initialize and persist HLC state"
+          details: |
+            - On daemon start: attempt to load last HLC from most recent TimeEnvelope
+              stored in ledger/CAS; if unavailable, initialize with SystemTime::now()
+              (best-effort) and logical=0.
+            - On each stamp: update HLC per receive/local rules; persist in memory.
+            - Optional: persist last HLC to daemon state file for restart continuity.
+
+        - step: 4
+          action: "Define error handling for clock source failures"
+          details: |
+            - If monotonic source fails/regresses: emit CLOCK_REGRESSION defect and
+              fail-closed for high-risk receipts.
+            - If ledger head query fails: emit defect, return error from stamping path.
+            - If wall time source unavailable: omit W interval, continue with L+M only.
       acceptance_criteria:
         - criterion: "Episode/tool receipts include time_envelope_ref"
           verification: "Integration tests using daemon test harness"
+        - criterion: "observed_ledger_head() returns LedgerTime using LedgerBackend::head()"
+          verification: "Unit test with in-memory ledger backend"
 
     - ticket_id: TCK-00241
       title: "HTF: Convert leases to tick-based expiry and ignore wall timestamps"
@@ -208,14 +249,23 @@ rfc_ticket_decomposition:
       depends_on:
         - TCK-00236
       summary: |
-        Define metrics primary axes as ledger seq windows and tick deltas.
-        Any wall time shown is bounded or marked best-effort.
+        Update metric definitions and reporting guidance to use ledger sequence
+        windows and tick deltas as primary axes. Wall time is display-only and
+        must be bounded or marked best-effort.
       files_to_modify:
-        - path: "observability/"
-          changes: "Update metrics models and indices"
+        - path: "documents/prds/PRD-0001/05_success_metrics.yaml"
+          changes: "Clarify primary axes and remove wall-time authority"
+        - path: "documents/prds/PRD-0009/05_success_metrics.yaml"
+          changes: "Update FAC metrics to ledger/tick indexing"
+        - path: "documents/standards/cac/volumes/V07_Testing_Rollout_and_Metrics.json"
+          changes: "Align CAC metrics guidance with HTF axes"
+        - path: "documents/standards/cac/workspace/fragments/13_testing_rollout_metrics.json"
+          changes: "Align fragment with HTF axes"
       acceptance_criteria:
         - criterion: "Primary index is ledger seq/ticks"
-          verification: "Metrics schema tests"
+          verification: "Doc review + schema validation"
+        - criterion: "Wall time overlays are bounded or best-effort"
+          verification: "Doc review"
 
     - ticket_id: TCK-00245
       title: "HTF: Doc-lint rule denying human time units in normative artifacts"
@@ -247,9 +297,30 @@ rfc_ticket_decomposition:
       files_to_modify:
         - path: "crates/apm2-core/"
           changes: "Introduce lint gates / deny patterns / annotations"
+        - path: "crates/apm2-core/Cargo.toml"
+          changes: "Add clippy::disallowed_methods configuration for wall-time APIs"
+      implementation_steps:
+        - step: 1
+          action: "Add clippy::disallowed_methods for wall-time authority APIs"
+          details: |
+            Deny SystemTime::now, chrono::Utc::now, and direct wall-time access
+            in privileged modules. Allowlist exceptions only in projection/external
+            adapters with explicit annotation.
+        - step: 2
+          action: "Add module-level deny attributes in privileged paths"
+          details: |
+            Apply `#![deny(clippy::disallowed_methods)]` in reducers/admission/gate
+            modules. Use targeted `#[allow]` only with explicit justification.
+        - step: 3
+          action: "Add tests or lint fixtures"
+          details: |
+            Provide a failing example (guarded by cfg) that triggers the lint,
+            plus a passing example in an allowed external module.
       acceptance_criteria:
         - criterion: "Reducers never call SystemTime::now()"
           verification: "Clippy/lint + targeted tests"
+        - criterion: "Exceptions are explicit and confined to external adapters"
+          verification: "Lint report review"
 
     - ticket_id: TCK-00247
       title: "HTF: CLI rendering of ticks/ledger windows with bounded wall overlay"

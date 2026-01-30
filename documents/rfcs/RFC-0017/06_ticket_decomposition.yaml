@@ -1,0 +1,153 @@
+rfc_ticket_decomposition:
+  schema_version: "2026-01-30"
+  template_version: "2026-01-23"
+
+  status: PLANNED
+  notes: |
+    This is RFC v0 (Discovery phase). Ticket decomposition will be populated
+    during v4 (Standard phase) after design decisions are grounded in codebase
+    evidence. The planned_ticket_structure below outlines expected ticket groups.
+
+  planned_ticket_structure:
+    groups:
+      - group_id: GRP-001
+        name: "IPC Foundation"
+        phase: PHASE-1
+        requirements_covered:
+          - REQ-DCP-0001
+          - REQ-DCP-0008
+        estimated_tickets:
+          - title: "Implement Unix socket IPC handler with SO_PEERCRED"
+            scope: "Socket setup, peer credential extraction, connection lifecycle"
+          - title: "Add per-connection capability token issuance"
+            scope: "Token generation, validation, session binding"
+          - title: "Implement privileged endpoint handler"
+            scope: "ClaimWork, SpawnEpisode, IssueCapability, Shutdown routing"
+          - title: "Implement session-scoped endpoint handler"
+            scope: "RequestTool, EmitEvent, PublishEvidence routing"
+
+      - group_id: GRP-002
+        name: "Work Orchestration"
+        phase: PHASE-1
+        requirements_covered:
+          - REQ-DCP-0002
+        estimated_tickets:
+          - title: "Implement ClaimWork with governance policy resolution"
+            scope: "Actor/role validation, governance query, capability minting"
+          - title: "Implement capability manifest structure and sealing"
+            scope: "Manifest schema, sealing, hash generation"
+          - title: "Implement context pack sealing"
+            scope: "Pack construction from policy, sealing, hash generation"
+
+      - group_id: GRP-003
+        name: "Episode Spawn"
+        phase: PHASE-2
+        requirements_covered:
+          - REQ-DCP-0002
+          - REQ-DCP-0003
+          - REQ-DCP-0006
+        estimated_tickets:
+          - title: "Implement SpawnEpisode with PolicyResolvedForChangeSet check"
+            scope: "Ledger query for policy resolution, validation"
+          - title: "Add GateLeaseIssued validation for GATE_EXECUTOR"
+            scope: "Lease binding validation, lease_id parameter"
+          - title: "Implement SoD custody domain validation"
+            scope: "Custody domain extraction, overlap detection, rejection"
+          - title: "Implement ephemeral session handle generation"
+            scope: "Handle generation, session registration, no credential exposure"
+
+      - group_id: GRP-004
+        name: "Tool Mediation"
+        phase: PHASE-3
+        requirements_covered:
+          - REQ-DCP-0004
+          - REQ-DCP-0005
+          - REQ-DCP-0011
+        estimated_tickets:
+          - title: "Implement tool broker with capability validation"
+            scope: "Tool allowlist check, argument validation"
+          - title: "Implement context firewall with deny + terminate"
+            scope: "Allowlist validation, denial event, session termination"
+          - title: "Implement credential broker for GitHub operations"
+            scope: "Token storage, mediated calls, no credential exposure"
+          - title: "Implement credential broker for SSH operations"
+            scope: "SSH agent integration, mediated git operations"
+
+      - group_id: GRP-005
+        name: "Event Signing"
+        phase: PHASE-1
+        requirements_covered:
+          - REQ-DCP-0007
+        estimated_tickets:
+          - title: "Implement Ed25519 event signing with domain separation"
+            scope: "Signing key management, domain prefix, signature generation"
+          - title: "Add signature verification on ledger ingestion"
+            scope: "Verification hook, rejection of unsigned events"
+
+      - group_id: GRP-006
+        name: "Session Lifecycle"
+        phase: PHASE-3
+        requirements_covered:
+          - REQ-DCP-0013
+        estimated_tickets:
+          - title: "Implement session manager with persistent registry"
+            scope: "Session tracking, state persistence, lifecycle hooks"
+          - title: "Implement daemon crash recovery with LEASE_REVOKED"
+            scope: "Recovery detection, signal broadcast, cleanup"
+
+      - group_id: GRP-007
+        name: "Metrics and Observability"
+        phase: PHASE-4
+        requirements_covered:
+          - REQ-DCP-0012
+        estimated_tickets:
+          - title: "Add Prometheus metrics for daemon health"
+            scope: "Metric registration, instrumentation, /metrics endpoint"
+          - title: "Add latency benchmarks for spawn and mediation"
+            scope: "Benchmark harness, REQ-0009/0010/0011 validation"
+
+      - group_id: GRP-008
+        name: "CLI Migration"
+        phase: PHASE-4
+        requirements_covered: []
+        estimated_tickets:
+          - title: "Implement apm2 work claim command"
+            scope: "CLI parsing, daemon IPC call, output formatting"
+          - title: "Implement apm2 episode spawn command"
+            scope: "CLI parsing, daemon IPC call, output formatting"
+          - title: "Implement apm2 fac ingest command"
+            scope: "CLI parsing, daemon IPC call, output formatting"
+          - title: "Implement apm2 work status command"
+            scope: "CLI parsing, daemon IPC call, output formatting"
+
+      - group_id: GRP-009
+        name: "xtask Deprecation"
+        phase: PHASE-5
+        requirements_covered: []
+        estimated_tickets:
+          - title: "Add deprecation warnings to xtask commands"
+            scope: "Warning emission, migration guidance"
+          - title: "Add --allow-deprecated flag"
+            scope: "Flag parsing, gate logic"
+          - title: "Add xtask usage telemetry"
+            scope: "Telemetry emission, aggregation"
+          - title: "Remove xtask crate"
+            scope: "Crate deletion, Cargo.toml cleanup"
+
+  dependencies_overview:
+    critical_path:
+      - "GRP-001 (IPC Foundation) -> GRP-002 (Work Orchestration)"
+      - "GRP-001 -> GRP-005 (Event Signing)"
+      - "GRP-002 -> GRP-003 (Episode Spawn)"
+      - "GRP-003 -> GRP-004 (Tool Mediation)"
+      - "GRP-003 -> GRP-006 (Session Lifecycle)"
+      - "GRP-004 -> GRP-007 (Metrics)"
+      - "GRP-007 -> GRP-008 (CLI Migration)"
+      - "GRP-008 -> GRP-009 (xtask Deprecation)"
+
+    parallelizable:
+      - "GRP-005 (Event Signing) can proceed in parallel with GRP-002, GRP-003"
+      - "GRP-007 (Metrics) can proceed in parallel with GRP-006"
+
+  tickets: []
+  # Tickets will be populated in v4 phase after DECOMPOSE mode runs

@@ -1,0 +1,250 @@
+rfc_design_decisions:
+  schema_version: "2026-01-30"
+  template_version: "2026-01-23"
+
+  design_hypotheses:
+    # v0 (Discovery) phase: These are initial design hypotheses to be grounded
+    # in codebase evidence during EXPLORE phase (v0 -> v2 transition).
+
+    - id: DD-001
+      title: "IPC Handler Architecture"
+      decision: |
+        Implement daemon IPC using Unix domain sockets with peer credential
+        validation (SO_PEERCRED) for authentication. Route requests to privileged
+        or session-scoped handlers based on authentication level.
+      alternatives_considered:
+        - id: ALT-001-A
+          description: "HTTP/REST API on localhost"
+          pros:
+            - "Standard tooling (curl, debugging)"
+            - "Cross-platform compatibility"
+          cons:
+            - "Weaker authentication (no peer credentials)"
+            - "Higher latency for IPC"
+          rejected_because: "Peer credential authentication is critical for privilege separation"
+
+        - id: ALT-001-B
+          description: "gRPC with TLS mutual auth"
+          pros:
+            - "Strong authentication"
+            - "Type-safe protocol"
+          cons:
+            - "Certificate management overhead"
+            - "Higher complexity for local IPC"
+          rejected_because: "Unix socket peer creds simpler for single-workstation use"
+
+      open_questions:
+        - question: "What existing Unix socket infrastructure exists in apm2-daemon?"
+          status: REQUIRES_EXPLORATION
+        - question: "How does the current daemon handle authentication, if at all?"
+          status: REQUIRES_EXPLORATION
+
+      evidence_needed:
+        - "Codebase search for existing socket handling in apm2-daemon"
+        - "Review current IPC implementation patterns"
+
+    - id: DD-002
+      title: "Policy Resolution Delegation"
+      decision: |
+        Daemon calls HOLON-KERNEL-GOVERNANCE for policy resolution. Daemon does not
+        embed governance logic. Governance holon returns resolved policy tuple; daemon
+        mints capability manifest based on that resolution.
+      rationale: |
+        Separation ensures governance logic remains centralized and auditable.
+        Daemon is execution substrate, not policy authority.
+      alternatives_considered:
+        - id: ALT-002-A
+          description: "Embed policy engine in daemon"
+          pros:
+            - "Lower latency (no holon call)"
+            - "Simpler deployment"
+          cons:
+            - "Duplicates governance logic"
+            - "Policy changes require daemon restart"
+          rejected_because: "Violates single source of truth for governance policy"
+
+      open_questions:
+        - question: "How does daemon currently interact with governance components?"
+          status: REQUIRES_EXPLORATION
+        - question: "What is the interface for HOLON-KERNEL-GOVERNANCE?"
+          status: REQUIRES_EXPLORATION
+
+    - id: DD-003
+      title: "Capability Manifest Structure"
+      decision: |
+        Capability manifests are structured documents with:
+        - tool_allowlist: Tools the session can invoke
+        - read_allowlist: Paths the session can read
+        - write_allowlist: Paths the session can write (if applicable)
+        - budget: Token/time limits for the episode
+        - dedupe_scope: Idempotency key namespace
+      rationale: |
+        Structured manifests enable mechanical enforcement at tool mediation layer.
+        Budget limits support LAW-12 (episode budget enforcement).
+
+      open_questions:
+        - question: "What existing capability/permission structures exist in apm2?"
+          status: REQUIRES_EXPLORATION
+        - question: "How does ContextPack currently define read allowlists?"
+          status: REQUIRES_EXPLORATION
+
+    - id: DD-004
+      title: "Tool Broker Mediation Pattern"
+      decision: |
+        Tool broker validates requests against capability manifest before execution.
+        For authenticated operations (GitHub, SSH), broker holds credentials and
+        mediates without exposing them to session.
+
+        Pattern:
+        1. Session calls RequestTool(tool_id, args, dedupe_key)
+        2. Broker validates tool_id against manifest.tool_allowlist
+        3. Broker validates args against manifest read/write allowlists
+        4. If validation passes: broker executes tool with held credentials
+        5. If validation fails: broker emits DENY, terminates session
+
+      alternatives_considered:
+        - id: ALT-004-A
+          description: "Credential injection into session environment"
+          pros:
+            - "Lower latency (no mediation per call)"
+            - "Standard tool usage"
+          cons:
+            - "Credentials exposed to session"
+            - "No fine-grained access control"
+          rejected_because: "Violates OCAP containment; credentials must be broker-held"
+
+      open_questions:
+        - question: "How does the current tool execution work in apm2?"
+          status: REQUIRES_EXPLORATION
+        - question: "What tools require credential mediation (GitHub, SSH, etc.)?"
+          status: REQUIRES_EXPLORATION
+
+    - id: DD-005
+      title: "Session Lifecycle and Recovery"
+      decision: |
+        Session manager tracks all active sessions with their lease references.
+        On daemon crash/restart:
+        1. Daemon recovers session list from persistent state
+        2. Emits LEASE_REVOKED signal to each session within 5s
+        3. Sessions receiving LEASE_REVOKED terminate gracefully
+        4. Ledger records SessionTerminated with rationale=DAEMON_RESTART
+
+      alternatives_considered:
+        - id: ALT-005-A
+          description: "Sessions self-terminate on daemon heartbeat loss"
+          pros:
+            - "Simpler daemon recovery"
+            - "Sessions don't depend on daemon signal"
+          cons:
+            - "Heartbeat overhead"
+            - "False positives on network glitches"
+          rejected_because: "LEASE_REVOKED signal more reliable than heartbeat timeout"
+
+      open_questions:
+        - question: "Does daemon currently have persistent state for session tracking?"
+          status: REQUIRES_EXPLORATION
+        - question: "What is the current crash recovery behavior?"
+          status: REQUIRES_EXPLORATION
+
+    - id: DD-006
+      title: "Event Signing Architecture"
+      decision: |
+        All state transition events (WorkClaimed, EpisodeSpawned, ToolDecided,
+        ToolExecuted, SessionTerminated) are Ed25519 signed with domain-separated
+        prefixes to prevent cross-context replay.
+
+        Domain prefixes:
+        - "apm2.event.work_claimed:"
+        - "apm2.event.episode_spawned:"
+        - "apm2.event.tool_decided:"
+        - etc.
+
+      rationale: |
+        Domain separation ensures signatures are bound to specific event types.
+        Prevents replay attacks where a signature from one context is used in another.
+
+      open_questions:
+        - question: "What signing infrastructure exists in apm2-core?"
+          status: REQUIRES_EXPLORATION
+        - question: "How are events currently serialized for the ledger?"
+          status: REQUIRES_EXPLORATION
+
+    - id: DD-007
+      title: "xtask Deprecation Strategy"
+      decision: |
+        Three-phase deprecation:
+        1. Phase 1: Add deprecation warnings pointing to apm2 CLI equivalents
+        2. Phase 2: Require --allow-deprecated flag for continued use
+        3. Phase 3: Remove xtask crate after telemetry gate (<5% usage)
+
+        During deprecation, divergence from xtask direct writes emits WARNING but
+        does NOT trigger freeze. Full freeze enforcement starts after Phase 3.
+
+      rationale: |
+        Gradual deprecation prevents breakage for existing workflows while driving
+        migration. Telemetry gate ensures removal only when safe.
+
+      open_questions:
+        - question: "What xtask commands exist and what are their daemon CLI equivalents?"
+          status: REQUIRES_EXPLORATION
+        - question: "How can we add telemetry to track xtask usage?"
+          status: REQUIRES_EXPLORATION
+
+  architecture_overview:
+    components:
+      - name: "Daemon IPC Handler"
+        responsibility: "Authenticate clients, route to privileged/session handlers"
+        location_hypothesis: "crates/apm2-daemon/src/ipc/"
+
+      - name: "Work Orchestrator"
+        responsibility: "Handle ClaimWork, query governance, mint capabilities"
+        location_hypothesis: "crates/apm2-daemon/src/work/"
+
+      - name: "Episode Spawner"
+        responsibility: "Spawn episodes with FAC precondition validation"
+        location_hypothesis: "crates/apm2-daemon/src/episode/"
+
+      - name: "Tool Broker"
+        responsibility: "Mediate tool calls, enforce context firewall"
+        location_hypothesis: "crates/apm2-daemon/src/tools/"
+
+      - name: "Session Manager"
+        responsibility: "Track sessions, handle crash recovery"
+        location_hypothesis: "crates/apm2-daemon/src/session/"
+
+      - name: "Event Signer"
+        responsibility: "Sign state transition events with Ed25519"
+        location_hypothesis: "crates/apm2-core/src/signing/"
+
+    data_flows:
+      - name: "Work Claim Flow"
+        steps:
+          - "Operator calls ClaimWork(actor_id, role) via IPC"
+          - "IPC handler validates operator credential"
+          - "Work orchestrator queries governance for policy"
+          - "Governance returns resolved policy tuple"
+          - "Work orchestrator mints capability manifest"
+          - "Work orchestrator seals context pack"
+          - "WorkClaimed event emitted and signed"
+          - "WorkAssignment returned to operator"
+
+      - name: "Episode Spawn Flow"
+        steps:
+          - "Operator calls SpawnEpisode(work_id, role, lease_id?) via IPC"
+          - "IPC handler validates operator credential"
+          - "Episode spawner verifies PolicyResolvedForChangeSet"
+          - "If GATE_EXECUTOR: verify GateLeaseIssued"
+          - "Episode spawner validates SoD custody domains"
+          - "Session manager creates session with ephemeral handle"
+          - "EpisodeSpawned event emitted and signed"
+          - "Session handle returned to operator"
+
+      - name: "Tool Mediation Flow"
+        steps:
+          - "Session calls RequestTool(tool_id, args, dedupe_key) via IPC"
+          - "IPC handler validates session_id"
+          - "Tool broker validates against capability manifest"
+          - "If violation: emit DENY, terminate session"
+          - "If allowed: broker executes tool with held credentials"
+          - "ToolDecided and ToolExecuted events emitted and signed"
+          - "Result returned to session"
