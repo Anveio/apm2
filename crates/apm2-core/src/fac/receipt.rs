@@ -19,16 +19,16 @@
 //! - Receipt versions: `[1]` (see [`SUPPORTED_RECEIPT_VERSIONS`])
 //! - Payload kinds: `["aat", "quality", "security"]` (see
 //!   [`SUPPORTED_PAYLOAD_KINDS`])
+//! - Payload schema versions: `[1]` (see [`SUPPORTED_PAYLOAD_SCHEMA_VERSIONS`])
 //!
 //! # Validation Modes
 //!
-//! The [`validate_version`] function supports two modes:
+//! The [`GateReceipt::validate_version`] method supports two modes:
 //!
 //! - **Enforce mode** (`enforce: true`): Unknown versions are rejected with an
 //!   error. Use this for processing receipts that must be fully validated.
-//! - **Permissive mode** (`enforce: false`): Unknown versions return
-//!   `Ok(false)` to allow forward compatibility. Use this for logging or
-//!   archival.
+//! - **Permissive mode** (`enforce: false`): Unknown versions return `Ok(())`
+//!   silently. Use this for logging or archival.
 //!
 //! # Security Model
 //!
@@ -40,7 +40,7 @@
 //!
 //! ```rust
 //! use apm2_core::crypto::Signer;
-//! use apm2_core::fac::{GateReceipt, GateReceiptBuilder, validate_version};
+//! use apm2_core::fac::{GateReceipt, GateReceiptBuilder};
 //!
 //! // Create a gate receipt
 //! let signer = Signer::generate();
@@ -56,7 +56,7 @@
 //!         .build_and_sign(&signer);
 //!
 //! // Validate version in enforce mode
-//! assert!(validate_version(&receipt, true).is_ok());
+//! assert!(receipt.validate_version(true).is_ok());
 //!
 //! // Verify signature
 //! assert!(receipt.validate_signature(&signer.verifying_key()).is_ok());
@@ -87,6 +87,12 @@ pub const SUPPORTED_RECEIPT_VERSIONS: &[u32] = &[1];
 /// - `"quality"`: Quality gate payload (linting, tests, etc.)
 /// - `"security"`: Security gate payload (vulnerability scans, etc.)
 pub const SUPPORTED_PAYLOAD_KINDS: &[&str] = &["aat", "quality", "security"];
+
+/// Supported payload schema versions.
+///
+/// Currently only version 1 is supported for all payload kinds. New versions
+/// may be added as payload schemas evolve.
+pub const SUPPORTED_PAYLOAD_SCHEMA_VERSIONS: &[u32] = &[1];
 
 // =============================================================================
 // Error Types
@@ -135,6 +141,15 @@ pub enum ReceiptError {
         kind: String,
         /// List of supported payload kinds.
         supported: Vec<String>,
+    },
+
+    /// Unsupported payload schema version.
+    #[error("unsupported payload schema version: {version}, supported: {supported:?}")]
+    UnsupportedPayloadSchemaVersion {
+        /// The unsupported payload schema version.
+        version: u32,
+        /// List of supported payload schema versions.
+        supported: Vec<u32>,
     },
 }
 
@@ -293,91 +308,100 @@ impl GateReceipt {
         verify_with_domain(verifying_key, GATE_RECEIPT_PREFIX, &canonical, &signature)
             .map_err(|e| ReceiptError::InvalidSignature(e.to_string()))
     }
-}
 
-// =============================================================================
-// Version Validation
-// =============================================================================
-
-/// Validates the receipt version and payload kind.
-///
-/// # Arguments
-///
-/// * `receipt` - The gate receipt to validate
-/// * `enforce` - If `true`, unknown versions/kinds return an error. If `false`,
-///   unknown versions/kinds return `Ok(false)`.
-///
-/// # Returns
-///
-/// - `Ok(true)` if both receipt version and payload kind are supported
-/// - `Ok(false)` if `enforce` is `false` and version/kind is unsupported
-/// - `Err(ReceiptError::UnsupportedVersion)` if `enforce` is `true` and version
-///   is unsupported
-/// - `Err(ReceiptError::UnsupportedPayloadKind)` if `enforce` is `true` and
-///   kind is unsupported
-///
-/// # Errors
-///
-/// Returns [`ReceiptError::UnsupportedVersion`] if `enforce` is `true` and
-/// the receipt version is not in [`SUPPORTED_RECEIPT_VERSIONS`].
-///
-/// Returns [`ReceiptError::UnsupportedPayloadKind`] if `enforce` is `true` and
-/// the payload kind is not in [`SUPPORTED_PAYLOAD_KINDS`].
-///
-/// # Example
-///
-/// ```rust
-/// use apm2_core::crypto::Signer;
-/// use apm2_core::fac::{GateReceiptBuilder, validate_version};
-///
-/// let signer = Signer::generate();
-/// let receipt =
-///     GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
-///         .changeset_digest([0x42; 32])
-///         .executor_actor_id("executor-001")
-///         .receipt_version(1)
-///         .payload_kind("aat")
-///         .payload_schema_version(1)
-///         .payload_hash([0xAB; 32])
-///         .evidence_bundle_hash([0xCD; 32])
-///         .build_and_sign(&signer);
-///
-/// // Enforce mode: errors on unknown versions
-/// assert!(validate_version(&receipt, true).unwrap());
-///
-/// // Permissive mode: returns false for unknown versions
-/// // (this receipt uses valid versions, so it returns true)
-/// assert!(validate_version(&receipt, false).unwrap());
-/// ```
-pub fn validate_version(receipt: &GateReceipt, enforce: bool) -> Result<bool, ReceiptError> {
-    // Check receipt version
-    let version_supported = SUPPORTED_RECEIPT_VERSIONS.contains(&receipt.receipt_version);
-    if !version_supported {
-        if enforce {
-            return Err(ReceiptError::UnsupportedVersion {
-                version: receipt.receipt_version,
-                supported: SUPPORTED_RECEIPT_VERSIONS.to_vec(),
-            });
+    /// Validates the receipt version, payload kind, and payload schema version.
+    ///
+    /// # Arguments
+    ///
+    /// * `enforce` - If `true`, unknown versions/kinds return an error. If
+    ///   `false`, unknown versions/kinds are silently accepted (permissive
+    ///   mode).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` if validation passes (or permissive mode is enabled)
+    /// - `Err(ReceiptError::UnsupportedVersion)` if `enforce` is `true` and
+    ///   receipt version is unsupported
+    /// - `Err(ReceiptError::UnsupportedPayloadKind)` if `enforce` is `true` and
+    ///   payload kind is unsupported
+    /// - `Err(ReceiptError::UnsupportedPayloadSchemaVersion)` if `enforce` is
+    ///   `true` and payload schema version is unsupported
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReceiptError::UnsupportedVersion`] if `enforce` is `true` and
+    /// the receipt version is not in [`SUPPORTED_RECEIPT_VERSIONS`].
+    ///
+    /// Returns [`ReceiptError::UnsupportedPayloadKind`] if `enforce` is `true`
+    /// and the payload kind is not in [`SUPPORTED_PAYLOAD_KINDS`].
+    ///
+    /// Returns [`ReceiptError::UnsupportedPayloadSchemaVersion`] if `enforce`
+    /// is `true` and the payload schema version is not in
+    /// [`SUPPORTED_PAYLOAD_SCHEMA_VERSIONS`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use apm2_core::crypto::Signer;
+    /// use apm2_core::fac::GateReceiptBuilder;
+    ///
+    /// let signer = Signer::generate();
+    /// let receipt =
+    ///     GateReceiptBuilder::new("receipt-001", "gate-aat", "lease-001")
+    ///         .changeset_digest([0x42; 32])
+    ///         .executor_actor_id("executor-001")
+    ///         .receipt_version(1)
+    ///         .payload_kind("aat")
+    ///         .payload_schema_version(1)
+    ///         .payload_hash([0xAB; 32])
+    ///         .evidence_bundle_hash([0xCD; 32])
+    ///         .build_and_sign(&signer);
+    ///
+    /// // Enforce mode: errors on unknown versions
+    /// assert!(receipt.validate_version(true).is_ok());
+    ///
+    /// // Permissive mode: silently accepts unknown versions
+    /// assert!(receipt.validate_version(false).is_ok());
+    /// ```
+    pub fn validate_version(&self, enforce: bool) -> Result<(), ReceiptError> {
+        // Check receipt version
+        if !SUPPORTED_RECEIPT_VERSIONS.contains(&self.receipt_version) {
+            if enforce {
+                return Err(ReceiptError::UnsupportedVersion {
+                    version: self.receipt_version,
+                    supported: SUPPORTED_RECEIPT_VERSIONS.to_vec(),
+                });
+            }
+            return Ok(());
         }
-        return Ok(false);
-    }
 
-    // Check payload kind
-    let kind_supported = SUPPORTED_PAYLOAD_KINDS.contains(&receipt.payload_kind.as_str());
-    if !kind_supported {
-        if enforce {
-            return Err(ReceiptError::UnsupportedPayloadKind {
-                kind: receipt.payload_kind.clone(),
-                supported: SUPPORTED_PAYLOAD_KINDS
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect(),
-            });
+        // Check payload kind
+        if !SUPPORTED_PAYLOAD_KINDS.contains(&self.payload_kind.as_str()) {
+            if enforce {
+                return Err(ReceiptError::UnsupportedPayloadKind {
+                    kind: self.payload_kind.clone(),
+                    supported: SUPPORTED_PAYLOAD_KINDS
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
+                });
+            }
+            return Ok(());
         }
-        return Ok(false);
-    }
 
-    Ok(true)
+        // Check payload schema version
+        if !SUPPORTED_PAYLOAD_SCHEMA_VERSIONS.contains(&self.payload_schema_version) {
+            if enforce {
+                return Err(ReceiptError::UnsupportedPayloadSchemaVersion {
+                    version: self.payload_schema_version,
+                    supported: SUPPORTED_PAYLOAD_SCHEMA_VERSIONS.to_vec(),
+                });
+            }
+            return Ok(());
+        }
+
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -829,15 +853,11 @@ pub mod tests {
         let signer = Signer::generate();
         let receipt = create_test_receipt(&signer);
 
-        // Enforce mode
-        let result = validate_version(&receipt, true);
-        assert!(result.is_ok());
-        assert!(result.unwrap());
+        // Enforce mode - valid receipt should return Ok(())
+        assert!(receipt.validate_version(true).is_ok());
 
-        // Permissive mode
-        let result = validate_version(&receipt, false);
-        assert!(result.is_ok());
-        assert!(result.unwrap());
+        // Permissive mode - valid receipt should return Ok(())
+        assert!(receipt.validate_version(false).is_ok());
     }
 
     #[test]
@@ -846,7 +866,7 @@ pub mod tests {
         let mut receipt = create_test_receipt(&signer);
         receipt.receipt_version = 999; // Unsupported version
 
-        let result = validate_version(&receipt, true);
+        let result = receipt.validate_version(true);
         assert!(matches!(
             result,
             Err(ReceiptError::UnsupportedVersion { version: 999, .. })
@@ -859,9 +879,8 @@ pub mod tests {
         let mut receipt = create_test_receipt(&signer);
         receipt.receipt_version = 999; // Unsupported version
 
-        let result = validate_version(&receipt, false);
-        assert!(result.is_ok());
-        assert!(!result.unwrap()); // Returns false, not error
+        // Permissive mode: returns Ok(()) even for unsupported versions
+        assert!(receipt.validate_version(false).is_ok());
     }
 
     #[test]
@@ -870,7 +889,7 @@ pub mod tests {
         let mut receipt = create_test_receipt(&signer);
         receipt.payload_kind = "unknown".to_string(); // Unsupported kind
 
-        let result = validate_version(&receipt, true);
+        let result = receipt.validate_version(true);
         assert!(matches!(
             result,
             Err(ReceiptError::UnsupportedPayloadKind { kind, .. }) if kind == "unknown"
@@ -883,9 +902,31 @@ pub mod tests {
         let mut receipt = create_test_receipt(&signer);
         receipt.payload_kind = "unknown".to_string(); // Unsupported kind
 
-        let result = validate_version(&receipt, false);
-        assert!(result.is_ok());
-        assert!(!result.unwrap()); // Returns false, not error
+        // Permissive mode: returns Ok(()) even for unsupported payload kinds
+        assert!(receipt.validate_version(false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_version_unsupported_payload_schema_version_enforce() {
+        let signer = Signer::generate();
+        let mut receipt = create_test_receipt(&signer);
+        receipt.payload_schema_version = 999; // Unsupported payload schema version
+
+        let result = receipt.validate_version(true);
+        assert!(matches!(
+            result,
+            Err(ReceiptError::UnsupportedPayloadSchemaVersion { version: 999, .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_version_unsupported_payload_schema_version_permissive() {
+        let signer = Signer::generate();
+        let mut receipt = create_test_receipt(&signer);
+        receipt.payload_schema_version = 999; // Unsupported payload schema version
+
+        // Permissive mode: returns Ok(()) even for unsupported payload schema versions
+        assert!(receipt.validate_version(false).is_ok());
     }
 
     #[test]
@@ -903,9 +944,8 @@ pub mod tests {
                 .evidence_bundle_hash([0xCD; 32])
                 .build_and_sign(&signer);
 
-            let result = validate_version(&receipt, true);
             assert!(
-                result.is_ok() && result.unwrap(),
+                receipt.validate_version(true).is_ok(),
                 "payload_kind '{kind}' should be supported"
             );
         }
@@ -923,6 +963,12 @@ pub mod tests {
         assert!(SUPPORTED_PAYLOAD_KINDS.contains(&"aat"));
         assert!(SUPPORTED_PAYLOAD_KINDS.contains(&"quality"));
         assert!(SUPPORTED_PAYLOAD_KINDS.contains(&"security"));
+    }
+
+    #[test]
+    fn test_supported_payload_schema_versions_constant() {
+        // Verify version 1 is supported
+        assert!(SUPPORTED_PAYLOAD_SCHEMA_VERSIONS.contains(&1));
     }
 
     // =========================================================================

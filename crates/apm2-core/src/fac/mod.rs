@@ -86,5 +86,5 @@ pub use policy_resolution::{
 // Re-export receipt types
 pub use receipt::{
     GateReceipt, GateReceiptBuilder, GateReceiptProto, ReceiptError, SUPPORTED_PAYLOAD_KINDS,
-    SUPPORTED_RECEIPT_VERSIONS, validate_version,
+    SUPPORTED_PAYLOAD_SCHEMA_VERSIONS, SUPPORTED_RECEIPT_VERSIONS,
 };
