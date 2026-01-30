@@ -51,6 +51,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::error::LeaseError;
+use crate::crypto::{parse_signature, parse_verifying_key, verify_signature};
 
 // =============================================================================
 // Size Limits (CTR-1303: Explicit size bounds)
@@ -698,6 +699,301 @@ impl CapabilityProof {
                 });
             }
         }
+
+        Ok(())
+    }
+
+    /// Validates cryptographic signatures in the delegation chain.
+    ///
+    /// This verifies:
+    /// 1. The root grant's registrar signature over the root event hash
+    /// 2. Each delegation's signature by the delegator (previous holder)
+    ///
+    /// # Arguments
+    ///
+    /// * `get_public_key` - A function that resolves actor IDs to their public
+    ///   keys. For the root entry (depth 0), this is called with the registrar
+    ///   ID. For delegations (depth > 0), this is called with the delegator's
+    ///   actor ID (the previous entry's holder).
+    ///
+    /// # Errors
+    ///
+    /// Returns `LeaseError::InvalidSignature` if any signature is invalid.
+    /// Returns `LeaseError::MissingSignature` if a signature is empty.
+    /// Returns `LeaseError::InvalidInput` if a public key cannot be resolved.
+    ///
+    /// # Security
+    ///
+    /// This method is deterministic: the same inputs always produce the same
+    /// result. The verification order is fixed (root first, then
+    /// delegations in chain order).
+    pub fn validate_signatures<F>(&self, get_public_key: F) -> Result<(), LeaseError>
+    where
+        F: Fn(&str) -> Option<Vec<u8>>,
+    {
+        if self.delegation_chain.is_empty() {
+            return Err(LeaseError::InvalidInput {
+                field: "delegation_chain".to_string(),
+                reason: "cannot be empty; must contain at least the root grant".to_string(),
+            });
+        }
+
+        // Verify each entry in the chain
+        for (i, entry) in self.delegation_chain.iter().enumerate() {
+            // Check signature is not empty
+            if entry.signature.is_empty() {
+                return Err(LeaseError::MissingSignature {
+                    lease_id: entry.capability_id.clone(),
+                });
+            }
+
+            // Check event_hash is not empty
+            if entry.event_hash.is_empty() {
+                return Err(LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}].event_hash"),
+                    reason: "event hash cannot be empty".to_string(),
+                });
+            }
+
+            // Determine whose public key to use for verification
+            let signer_id = if i == 0 {
+                // Root entry: we need the registrar's key
+                // The registrar ID is typically the grantor of the root capability
+                // For verification, the caller must provide it via the lookup function
+                // We use a special convention: "_registrar_" prefix + capability_id
+                // to allow the resolver to identify this is the registrar lookup
+                format!("_registrar_{}", entry.capability_id)
+            } else {
+                // Delegation entry: signed by the previous holder (delegator)
+                self.delegation_chain[i - 1].holder_actor_id.clone()
+            };
+
+            // Resolve the public key
+            let public_key_bytes =
+                get_public_key(&signer_id).ok_or_else(|| LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}]"),
+                    reason: format!("cannot resolve public key for signer: {signer_id}"),
+                })?;
+
+            // Parse the public key
+            let verifying_key = parse_verifying_key(&public_key_bytes).map_err(|_| {
+                LeaseError::InvalidSignature {
+                    lease_id: entry.capability_id.clone(),
+                }
+            })?;
+
+            // Parse the signature
+            let signature =
+                parse_signature(&entry.signature).map_err(|_| LeaseError::InvalidSignature {
+                    lease_id: entry.capability_id.clone(),
+                })?;
+
+            // Verify the signature over the event hash
+            verify_signature(&verifying_key, &entry.event_hash, &signature).map_err(|_| {
+                LeaseError::InvalidSignature {
+                    lease_id: entry.capability_id.clone(),
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Validates cryptographic signatures using a direct public key lookup.
+    ///
+    /// This is an alternative to `validate_signatures` that takes a simpler
+    /// lookup function that maps actor IDs directly to public keys, plus an
+    /// explicit registrar public key for verifying the root grant.
+    ///
+    /// # Arguments
+    ///
+    /// * `registrar_public_key` - The public key of the registrar who signed
+    ///   the root grant
+    /// * `get_actor_public_key` - A function that resolves actor IDs to their
+    ///   public keys
+    ///
+    /// # Errors
+    ///
+    /// Returns `LeaseError::InvalidSignature` if any signature is invalid.
+    /// Returns `LeaseError::MissingSignature` if a signature is empty.
+    /// Returns `LeaseError::InvalidInput` if a public key cannot be resolved.
+    pub fn validate_signatures_with_registrar<F>(
+        &self,
+        registrar_public_key: &[u8],
+        get_actor_public_key: F,
+    ) -> Result<(), LeaseError>
+    where
+        F: Fn(&str) -> Option<Vec<u8>>,
+    {
+        if self.delegation_chain.is_empty() {
+            return Err(LeaseError::InvalidInput {
+                field: "delegation_chain".to_string(),
+                reason: "cannot be empty; must contain at least the root grant".to_string(),
+            });
+        }
+
+        // Verify each entry in the chain
+        for (i, entry) in self.delegation_chain.iter().enumerate() {
+            // Check signature is not empty
+            if entry.signature.is_empty() {
+                return Err(LeaseError::MissingSignature {
+                    lease_id: entry.capability_id.clone(),
+                });
+            }
+
+            // Check event_hash is not empty
+            if entry.event_hash.is_empty() {
+                return Err(LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{i}].event_hash"),
+                    reason: "event hash cannot be empty".to_string(),
+                });
+            }
+
+            // Determine which public key to use for verification
+            let public_key_bytes: &[u8] = if i == 0 {
+                // Root entry: use the registrar's key
+                registrar_public_key
+            } else {
+                // Delegation entry: signed by the previous holder (delegator)
+                let delegator_id = &self.delegation_chain[i - 1].holder_actor_id;
+                return self.verify_delegation_entry(i, entry, delegator_id, &get_actor_public_key);
+            };
+
+            // Parse and verify for root entry
+            let verifying_key = parse_verifying_key(public_key_bytes).map_err(|_| {
+                LeaseError::InvalidSignature {
+                    lease_id: entry.capability_id.clone(),
+                }
+            })?;
+
+            let signature =
+                parse_signature(&entry.signature).map_err(|_| LeaseError::InvalidSignature {
+                    lease_id: entry.capability_id.clone(),
+                })?;
+
+            verify_signature(&verifying_key, &entry.event_hash, &signature).map_err(|_| {
+                LeaseError::InvalidSignature {
+                    lease_id: entry.capability_id.clone(),
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Helper to verify a delegation entry's signature.
+    fn verify_delegation_entry<F>(
+        &self,
+        index: usize,
+        entry: &DelegationChainEntry,
+        delegator_id: &str,
+        get_actor_public_key: &F,
+    ) -> Result<(), LeaseError>
+    where
+        F: Fn(&str) -> Option<Vec<u8>>,
+    {
+        let public_key_bytes =
+            get_actor_public_key(delegator_id).ok_or_else(|| LeaseError::InvalidInput {
+                field: format!("delegation_chain[{index}]"),
+                reason: format!("cannot resolve public key for delegator: {delegator_id}"),
+            })?;
+
+        let verifying_key =
+            parse_verifying_key(&public_key_bytes).map_err(|_| LeaseError::InvalidSignature {
+                lease_id: entry.capability_id.clone(),
+            })?;
+
+        let signature =
+            parse_signature(&entry.signature).map_err(|_| LeaseError::InvalidSignature {
+                lease_id: entry.capability_id.clone(),
+            })?;
+
+        verify_signature(&verifying_key, &entry.event_hash, &signature).map_err(|_| {
+            LeaseError::InvalidSignature {
+                lease_id: entry.capability_id.clone(),
+            }
+        })?;
+
+        // Continue verifying remaining entries
+        for (j, subsequent_entry) in self.delegation_chain.iter().enumerate().skip(index + 1) {
+            if subsequent_entry.signature.is_empty() {
+                return Err(LeaseError::MissingSignature {
+                    lease_id: subsequent_entry.capability_id.clone(),
+                });
+            }
+
+            if subsequent_entry.event_hash.is_empty() {
+                return Err(LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{j}].event_hash"),
+                    reason: "event hash cannot be empty".to_string(),
+                });
+            }
+
+            let prev_holder_id = &self.delegation_chain[j - 1].holder_actor_id;
+            let pk_bytes =
+                get_actor_public_key(prev_holder_id).ok_or_else(|| LeaseError::InvalidInput {
+                    field: format!("delegation_chain[{j}]"),
+                    reason: format!("cannot resolve public key for delegator: {prev_holder_id}"),
+                })?;
+
+            let vk = parse_verifying_key(&pk_bytes).map_err(|_| LeaseError::InvalidSignature {
+                lease_id: subsequent_entry.capability_id.clone(),
+            })?;
+
+            let sig = parse_signature(&subsequent_entry.signature).map_err(|_| {
+                LeaseError::InvalidSignature {
+                    lease_id: subsequent_entry.capability_id.clone(),
+                }
+            })?;
+
+            verify_signature(&vk, &subsequent_entry.event_hash, &sig).map_err(|_| {
+                LeaseError::InvalidSignature {
+                    lease_id: subsequent_entry.capability_id.clone(),
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Performs full verification of the capability proof.
+    ///
+    /// This combines structural validation and signature verification into
+    /// a single deterministic verification operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_time` - The current time in Unix nanoseconds
+    /// * `registrar_public_key` - The public key of the registrar who signed
+    ///   the root grant
+    /// * `get_actor_public_key` - A function that resolves actor IDs to their
+    ///   public keys
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either structural validation or signature
+    /// verification fails.
+    ///
+    /// # Determinism
+    ///
+    /// This method is fully deterministic: given the same inputs, it will
+    /// always produce the same result. This property is essential for
+    /// cross-node verification where multiple nodes must independently
+    /// arrive at the same conclusion.
+    pub fn verify<F>(
+        &self,
+        current_time: u64,
+        registrar_public_key: &[u8],
+        get_actor_public_key: F,
+    ) -> Result<(), LeaseError>
+    where
+        F: Fn(&str) -> Option<Vec<u8>>,
+    {
+        // Step 1: Structural validation
+        self.validate_structure(current_time)?;
+
+        // Step 2: Signature verification
+        self.validate_signatures_with_registrar(registrar_public_key, get_actor_public_key)?;
 
         Ok(())
     }
@@ -2414,5 +2710,562 @@ mod tck_00199_tests {
         // Test get_all_descendants for non-existent capability
         let descendants = state.get_all_descendants("cap-nonexistent");
         assert!(descendants.is_empty());
+    }
+}
+
+// =============================================================================
+// TCK-00200: Signature Verification Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tck_00200_signature_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::crypto::{EventHasher, Signer};
+
+    /// Helper to create a test signer and return (signer, `public_key_bytes`).
+    fn create_test_signer() -> (Signer, Vec<u8>) {
+        let signer = Signer::generate();
+        let public_key = signer.public_key_bytes().to_vec();
+        (signer, public_key)
+    }
+
+    /// Helper to create a signed delegation chain entry
+    fn create_signed_entry(
+        capability_id: &str,
+        holder_actor_id: &str,
+        depth: u32,
+        signer: &Signer,
+    ) -> DelegationChainEntry {
+        // Create a deterministic event hash from the entry data
+        let event_data = format!("{capability_id}:{holder_actor_id}:{depth}");
+        let event_hash = EventHasher::hash_content(event_data.as_bytes());
+
+        // Sign the event hash
+        let signature = signer.sign(&event_hash);
+
+        DelegationChainEntry {
+            capability_id: capability_id.to_string(),
+            holder_actor_id: holder_actor_id.to_string(),
+            event_hash: event_hash.to_vec(),
+            signature: signature.to_bytes().to_vec(),
+            depth,
+        }
+    }
+
+    // =========================================================================
+    // Test: Valid proof verification succeeds
+    // =========================================================================
+
+    #[test]
+    fn test_valid_root_proof_verification_succeeds() {
+        // Create registrar signer
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        // Create a root capability proof with valid signature
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3], // scope_hash
+            vec![],        // budget_hash
+            2_000_000_000, // expires_at
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // Create public key lookup
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verify signatures
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(result.is_ok(), "Valid root proof should verify: {result:?}");
+    }
+
+    #[test]
+    fn test_valid_delegated_proof_verification_succeeds() {
+        // Create signers for registrar, alice (root holder), and bob (delegated holder)
+        let (registrar_signer, registrar_pk) = create_test_signer();
+        let (alice_signer, alice_pk) = create_test_signer();
+
+        // Create root entry signed by registrar
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        // Create delegation entry signed by alice (delegating to bob)
+        let delegation_entry = create_signed_entry("cap-delegated", "bob", 1, &alice_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-delegated".to_string(),
+            "ns-1".to_string(),
+            "bob".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry, delegation_entry],
+        )
+        .unwrap();
+
+        // Create public key lookup that resolves alice's key
+        let mut keys: HashMap<String, Vec<u8>> = HashMap::new();
+        keys.insert("alice".to_string(), alice_pk);
+
+        let get_actor_pk = |actor_id: &str| -> Option<Vec<u8>> { keys.get(actor_id).cloned() };
+
+        // Verify signatures
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            result.is_ok(),
+            "Valid delegated proof should verify: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_valid_multi_level_delegation_verification_succeeds() {
+        // Create signers for registrar, alice, bob, and carol
+        let (registrar_signer, registrar_pk) = create_test_signer();
+        let (alice_signer, alice_pk) = create_test_signer();
+        let (bob_signer, bob_pk) = create_test_signer();
+
+        // Create chain: registrar -> alice -> bob -> carol
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+        let delegation1 = create_signed_entry("cap-d1", "bob", 1, &alice_signer);
+        let delegation2 = create_signed_entry("cap-d2", "carol", 2, &bob_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-d2".to_string(),
+            "ns-1".to_string(),
+            "carol".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry, delegation1, delegation2],
+        )
+        .unwrap();
+
+        // Create public key lookup
+        let mut keys: HashMap<String, Vec<u8>> = HashMap::new();
+        keys.insert("alice".to_string(), alice_pk);
+        keys.insert("bob".to_string(), bob_pk);
+
+        let get_actor_pk = |actor_id: &str| -> Option<Vec<u8>> { keys.get(actor_id).cloned() };
+
+        // Verify signatures
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            result.is_ok(),
+            "Valid multi-level delegation should verify: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: Invalid signature is rejected
+    // =========================================================================
+
+    #[test]
+    fn test_invalid_root_signature_rejected() {
+        // Create registrar signer and a different (wrong) signer
+        let (_registrar_signer, registrar_pk) = create_test_signer();
+        let (wrong_signer, _wrong_pk) = create_test_signer();
+
+        // Create root entry signed by WRONG signer
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &wrong_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verification should fail
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidSignature { .. })),
+            "Invalid root signature should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_delegation_signature_rejected() {
+        // Create signers
+        let (registrar_signer, registrar_pk) = create_test_signer();
+        let (_alice_signer, alice_pk) = create_test_signer();
+        let (wrong_signer, _wrong_pk) = create_test_signer();
+
+        // Valid root entry
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        // Delegation entry signed by WRONG signer (not alice)
+        let delegation_entry = create_signed_entry("cap-delegated", "bob", 1, &wrong_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-delegated".to_string(),
+            "ns-1".to_string(),
+            "bob".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry, delegation_entry],
+        )
+        .unwrap();
+
+        let mut keys: HashMap<String, Vec<u8>> = HashMap::new();
+        keys.insert("alice".to_string(), alice_pk);
+
+        let get_actor_pk = |actor_id: &str| -> Option<Vec<u8>> { keys.get(actor_id).cloned() };
+
+        // Verification should fail
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidSignature { .. })),
+            "Invalid delegation signature should be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: Tampered chain entry is rejected
+    // =========================================================================
+
+    #[test]
+    fn test_tampered_event_hash_rejected() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        // Create a valid signed entry
+        let mut root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        // Tamper with the event hash after signing
+        root_entry.event_hash[0] ^= 0xFF;
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verification should fail because signature doesn't match tampered hash
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidSignature { .. })),
+            "Tampered event hash should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_tampered_signature_rejected() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        // Create a valid signed entry
+        let mut root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        // Tamper with the signature
+        root_entry.signature[0] ^= 0xFF;
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verification should fail
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidSignature { .. })),
+            "Tampered signature should be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: Missing signature is rejected
+    // =========================================================================
+
+    #[test]
+    fn test_empty_signature_rejected() {
+        let (_registrar_signer, registrar_pk) = create_test_signer();
+
+        // Create entry with empty signature
+        let root_entry = DelegationChainEntry {
+            capability_id: "cap-root".to_string(),
+            holder_actor_id: "alice".to_string(),
+            event_hash: vec![1, 2, 3, 4],
+            signature: vec![], // Empty signature!
+            depth: 0,
+        };
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verification should fail with MissingSignature
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::MissingSignature { .. })),
+            "Empty signature should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_empty_event_hash_rejected() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        // Create entry with empty event hash
+        let signature = registrar_signer.sign(&[1, 2, 3]);
+        let root_entry = DelegationChainEntry {
+            capability_id: "cap-root".to_string(),
+            holder_actor_id: "alice".to_string(),
+            event_hash: vec![], // Empty event hash!
+            signature: signature.to_bytes().to_vec(),
+            depth: 0,
+        };
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verification should fail with InvalidInput
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidInput { .. })),
+            "Empty event hash should be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: Missing public key is rejected
+    // =========================================================================
+
+    #[test]
+    fn test_missing_delegator_public_key_rejected() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+        let (alice_signer, _alice_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+        let delegation_entry = create_signed_entry("cap-delegated", "bob", 1, &alice_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-delegated".to_string(),
+            "ns-1".to_string(),
+            "bob".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry, delegation_entry],
+        )
+        .unwrap();
+
+        // Don't provide alice's public key
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Verification should fail because alice's key cannot be resolved
+        let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, .. }) if field.contains("delegation_chain")),
+            "Missing delegator public key should be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: Full verify() method combines structural + signature validation
+    // =========================================================================
+
+    #[test]
+    fn test_verify_combines_structural_and_signature_validation() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Full verification at time before expiration
+        let result = proof.verify(1_500_000_000, &registrar_pk, get_actor_pk);
+        assert!(result.is_ok(), "Full verify should succeed: {result:?}");
+    }
+
+    #[test]
+    fn test_verify_rejects_expired_proof() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000, // expires at 2s
+            vec![root_entry],
+        )
+        .unwrap();
+
+        let get_actor_pk = |_actor_id: &str| -> Option<Vec<u8>> { None };
+
+        // Full verification at time AFTER expiration
+        let result = proof.verify(2_500_000_000, &registrar_pk, get_actor_pk);
+        assert!(
+            matches!(&result, Err(LeaseError::InvalidInput { field, .. }) if field == "expires_at"),
+            "verify() should reject expired proof: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: Determinism - same inputs always produce same result
+    // =========================================================================
+
+    #[test]
+    fn test_verification_is_deterministic() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+        let (alice_signer, alice_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+        let delegation_entry = create_signed_entry("cap-delegated", "bob", 1, &alice_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-delegated".to_string(),
+            "ns-1".to_string(),
+            "bob".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry, delegation_entry],
+        )
+        .unwrap();
+
+        let mut keys: HashMap<String, Vec<u8>> = HashMap::new();
+        keys.insert("alice".to_string(), alice_pk);
+
+        let get_actor_pk = |actor_id: &str| -> Option<Vec<u8>> { keys.get(actor_id).cloned() };
+
+        // Verify multiple times - should always get the same result
+        for _ in 0..10 {
+            let result = proof.validate_signatures_with_registrar(&registrar_pk, get_actor_pk);
+            assert!(result.is_ok(), "Verification should be deterministic");
+        }
+    }
+
+    // =========================================================================
+    // Test: Invalid public key format is rejected
+    // =========================================================================
+
+    #[test]
+    fn test_malformed_public_key_rejected() {
+        let (registrar_signer, _registrar_pk) = create_test_signer();
+        let (alice_signer, _alice_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+        let delegation_entry = create_signed_entry("cap-delegated", "bob", 1, &alice_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-delegated".to_string(),
+            "ns-1".to_string(),
+            "bob".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry, delegation_entry],
+        )
+        .unwrap();
+
+        // Provide malformed registrar public key
+        let bad_registrar_pk = vec![0u8; 16]; // Wrong size
+
+        let mut keys: HashMap<String, Vec<u8>> = HashMap::new();
+        keys.insert("alice".to_string(), vec![0u8; 32]); // Also malformed
+
+        let get_actor_pk = |actor_id: &str| -> Option<Vec<u8>> { keys.get(actor_id).cloned() };
+
+        let result = proof.validate_signatures_with_registrar(&bad_registrar_pk, get_actor_pk);
+        assert!(
+            matches!(result, Err(LeaseError::InvalidSignature { .. })),
+            "Malformed public key should be rejected: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // Test: validate_signatures (with _registrar_ convention)
+    // =========================================================================
+
+    #[test]
+    fn test_validate_signatures_with_registrar_convention() {
+        let (registrar_signer, registrar_pk) = create_test_signer();
+
+        let root_entry = create_signed_entry("cap-root", "alice", 0, &registrar_signer);
+
+        let proof = CapabilityProof::with_delegation_chain(
+            "cap-root".to_string(),
+            "ns-1".to_string(),
+            "alice".to_string(),
+            vec![1, 2, 3],
+            vec![],
+            2_000_000_000,
+            vec![root_entry],
+        )
+        .unwrap();
+
+        // Use the _registrar_ convention lookup
+        let get_pk = |actor_id: &str| -> Option<Vec<u8>> {
+            if actor_id == "_registrar_cap-root" {
+                Some(registrar_pk.clone())
+            } else {
+                None
+            }
+        };
+
+        let result = proof.validate_signatures(get_pk);
+        assert!(
+            result.is_ok(),
+            "validate_signatures with _registrar_ convention should work: {result:?}"
+        );
     }
 }
