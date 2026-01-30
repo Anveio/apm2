@@ -490,11 +490,16 @@ impl ContextRefinementRequest {
     /// Truncates a path to [`MAX_MISSED_PATH_LENGTH`] to prevent oversized
     /// paths from propagating to the coordinator.
     ///
+    /// Use this method when creating a [`ContextRefinementRequest`] via
+    /// [`Self::new`] with untrusted input. The [`Self::from_context_miss`]
+    /// builder applies truncation automatically.
+    ///
     /// # Safety
     ///
     /// Uses UTF-8-aware truncation to ensure we never split a multi-byte
     /// UTF-8 character, which would cause a panic.
-    fn truncate_path(path: String) -> String {
+    #[must_use]
+    pub fn truncate_path(path: String) -> String {
         if path.len() > MAX_MISSED_PATH_LENGTH {
             let suffix_len = MISSED_PATH_TRUNCATION_SUFFIX.len();
             let target_len = MAX_MISSED_PATH_LENGTH - suffix_len;
@@ -515,11 +520,13 @@ impl ContextRefinementRequest {
 
     /// Creates a new context refinement request.
     ///
-    /// The `missed_path` is truncated to [`MAX_MISSED_PATH_LENGTH`] if
-    /// oversized.
+    /// Note: This constructor does NOT truncate `missed_path`. If you need
+    /// truncation (e.g., when creating from untrusted input), use
+    /// [`Self::from_context_miss`] instead, or call [`Self::truncate_path`]
+    /// on the path before passing it.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub const fn new(
         session_id: String,
         coordination_id: Option<String>,
         work_id: String,
@@ -534,7 +541,7 @@ impl ContextRefinementRequest {
             coordination_id,
             work_id,
             manifest_id,
-            missed_path: Self::truncate_path(missed_path),
+            missed_path,
             rationale_code,
             refinement_count,
             timestamp,
@@ -1467,9 +1474,11 @@ mod tests {
     }
 
     #[test]
-    fn test_context_refinement_request_new_also_truncates() {
-        // Test that the ::new() constructor also truncates paths
+    fn test_context_refinement_request_new_does_not_truncate() {
+        // Test that ::new() does NOT truncate (it's const fn, so can't do heap ops)
+        // Callers needing truncation should use from_context_miss() or truncate_path()
         let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+        let original_len = long_path.len();
 
         let request = ContextRefinementRequest::new(
             "session-001".to_string(),
@@ -1477,6 +1486,27 @@ mod tests {
             "work-001".to_string(),
             "manifest-001".to_string(),
             long_path,
+            "CONTEXT_MISS".to_string(),
+            0,
+            1_000_000_000,
+        );
+
+        // new() preserves the original path without truncation
+        assert_eq!(request.missed_path.len(), original_len);
+        assert!(!request.is_path_truncated());
+    }
+
+    #[test]
+    fn test_context_refinement_request_truncate_path_helper() {
+        // Test that truncate_path() can be used with new() for truncation
+        let long_path = "/".to_string() + &"x".repeat(MAX_MISSED_PATH_LENGTH + 100);
+
+        let request = ContextRefinementRequest::new(
+            "session-001".to_string(),
+            None,
+            "work-001".to_string(),
+            "manifest-001".to_string(),
+            ContextRefinementRequest::truncate_path(long_path),
             "CONTEXT_MISS".to_string(),
             0,
             1_000_000_000,
