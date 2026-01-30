@@ -460,7 +460,7 @@ impl DelegationChainEntry {
     /// actor than `entry[i-1]`'s holder.
     #[must_use]
     pub fn compute_event_hash(&self) -> Vec<u8> {
-        Self::compute_event_hash_from_parts(
+        Self::compute_event_hash_from_parts_with_delegator(
             &self.capability_id,
             &self.holder_actor_id,
             &self.delegator_actor_id,
@@ -471,9 +471,72 @@ impl DelegationChainEntry {
         )
     }
 
-    /// Computes the event hash from individual fields.
+    /// Computes the event hash from individual fields (legacy version).
     ///
-    /// This is useful for creating new entries with a correct event hash.
+    /// # Deprecated
+    ///
+    /// This method is deprecated because it does not include
+    /// `delegator_actor_id` in the hash computation, which is required for
+    /// secure delegation chain binding (HIGH-02 security fix). Use
+    /// [`Self::compute_event_hash_from_parts_with_delegator`] instead.
+    ///
+    /// # Security Warning
+    ///
+    /// Hashes computed with this method are vulnerable to delegation chain
+    /// substitution attacks. New code MUST use
+    /// [`Self::compute_event_hash_from_parts_with_delegator`]
+    /// which includes `delegator_actor_id`.
+    #[must_use]
+    #[deprecated(
+        since = "0.3.0",
+        note = "Use compute_event_hash_from_parts_with_delegator for secure delegation chain binding (HIGH-02 fix)"
+    )]
+    #[allow(clippy::cast_possible_truncation)] // ID lengths are bounded by MAX_ID_LEN (128)
+    pub fn compute_event_hash_from_parts(
+        capability_id: &str,
+        holder_actor_id: &str,
+        namespace: &str,
+        scope_hash: &[u8],
+        expires_at: u64,
+        depth: u32,
+    ) -> Vec<u8> {
+        // Legacy canonical serialization WITHOUT delegator_actor_id
+        // WARNING: This produces insecure hashes - for backward compatibility only
+        let mut data = Vec::new();
+
+        // capability_id (length-prefixed)
+        data.extend_from_slice(&(capability_id.len() as u32).to_le_bytes());
+        data.extend_from_slice(capability_id.as_bytes());
+
+        // holder_actor_id (length-prefixed)
+        data.extend_from_slice(&(holder_actor_id.len() as u32).to_le_bytes());
+        data.extend_from_slice(holder_actor_id.as_bytes());
+
+        // NOTE: delegator_actor_id is NOT included in this legacy version
+        // This is the security vulnerability that HIGH-02 addresses
+
+        // namespace (length-prefixed)
+        data.extend_from_slice(&(namespace.len() as u32).to_le_bytes());
+        data.extend_from_slice(namespace.as_bytes());
+
+        // scope_hash (length-prefixed)
+        data.extend_from_slice(&(scope_hash.len() as u32).to_le_bytes());
+        data.extend_from_slice(scope_hash);
+
+        // expires_at (fixed size)
+        data.extend_from_slice(&expires_at.to_le_bytes());
+
+        // depth (fixed size)
+        data.extend_from_slice(&depth.to_le_bytes());
+
+        EventHasher::hash_content(&data).to_vec()
+    }
+
+    /// Computes the event hash from individual fields with delegator binding.
+    ///
+    /// This is the secure version that includes `delegator_actor_id` in the
+    /// hash computation, which cryptographically binds the delegation chain
+    /// (HIGH-02 fix).
     ///
     /// # Arguments
     ///
@@ -483,7 +546,7 @@ impl DelegationChainEntry {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // ID lengths are bounded by MAX_ID_LEN (128)
     #[allow(clippy::too_many_arguments)]
-    pub fn compute_event_hash_from_parts(
+    pub fn compute_event_hash_from_parts_with_delegator(
         capability_id: &str,
         holder_actor_id: &str,
         delegator_actor_id: &str,
@@ -612,8 +675,8 @@ impl CapabilityProof {
     /// Creates a new capability proof for a root capability (no delegation).
     ///
     /// The `root_event_hash` should be computed using
-    /// [`DelegationChainEntry::compute_event_hash_from_parts`] to ensure
-    /// correct binding between metadata and the signed hash.
+    /// [`DelegationChainEntry::compute_event_hash_from_parts_with_delegator`]
+    /// to ensure correct binding between metadata and the signed hash.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new_root(
@@ -3089,7 +3152,7 @@ mod tck_00200_signature_tests {
         signer: &Signer,
     ) -> DelegationChainEntry {
         // Compute the canonical event hash from metadata (CRITICAL-01, HIGH-02)
-        let event_hash = DelegationChainEntry::compute_event_hash_from_parts(
+        let event_hash = DelegationChainEntry::compute_event_hash_from_parts_with_delegator(
             capability_id,
             holder_actor_id,
             delegator_actor_id,
@@ -3478,7 +3541,7 @@ mod tck_00200_signature_tests {
         let (_registrar_signer, registrar_pk) = create_test_signer();
 
         // Create entry with empty signature - compute correct event hash first
-        let event_hash = DelegationChainEntry::compute_event_hash_from_parts(
+        let event_hash = DelegationChainEntry::compute_event_hash_from_parts_with_delegator(
             "cap-root",
             "alice",
             TEST_REGISTRAR_ID,
