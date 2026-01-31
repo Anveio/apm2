@@ -1417,40 +1417,55 @@ impl Default for FreezeRegistry {
 }
 
 impl FreezeRegistry {
-    /// Creates a new freeze registry in hydrated mode (for testing).
+    /// Creates a new freeze registry in fail-closed mode (default).
     ///
-    /// **WARNING**: In production, use [`Self::new_fail_closed`] to ensure
-    /// the fail-closed security model is enforced until ledger rehydration.
+    /// Per CTR-2617 (Fail-Closed Default): The registry blocks ALL admissions
+    /// until [`Self::mark_hydrated`] is called. This ensures that a daemon
+    /// restart cannot clear freeze state and allow work on compromised repos.
+    ///
+    /// # Production Usage
+    ///
+    /// ```rust,ignore
+    /// let registry = FreezeRegistry::new_hydrated_for_testing();
+    ///
+    /// // Replay freeze events from ledger
+    /// for event in ledger.iter_intervention_freezes() {
+    ///     registry.replay_freeze(&event, &watchdog_key)?;
+    /// }
+    ///
+    /// // Mark hydrated to allow normal operation
+    /// registry.mark_hydrated();
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self {
             active_freezes: RwLock::default(),
             scope_map: RwLock::default(),
-            hydrated: std::sync::atomic::AtomicBool::new(true), // Default to hydrated for tests
+            hydrated: std::sync::atomic::AtomicBool::new(false), // CTR-2617: fail-closed by default
         }
     }
 
     /// Creates a new freeze registry in fail-closed mode.
     ///
-    /// The registry will block ALL admissions until [`Self::mark_hydrated`] is
-    /// called. This ensures that a daemon restart cannot clear freeze state.
-    ///
-    /// # Usage
-    ///
-    /// Use this constructor in production code to enforce the fail-closed
-    /// security model:
-    ///
-    /// ```rust,ignore
-    /// let registry = FreezeRegistry::new_fail_closed();
-    /// // ... replay ledger freeze events ...
-    /// registry.mark_hydrated();
-    /// ```
+    /// This is an alias for [`Self::new`] for explicit intent.
     #[must_use]
     pub fn new_fail_closed() -> Self {
+        Self::new()
+    }
+
+    /// Creates a new freeze registry in hydrated mode (for testing only).
+    ///
+    /// # Safety
+    ///
+    /// This constructor bypasses the fail-closed security model and should
+    /// ONLY be used in tests. Using this in production code violates CTR-2617.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_hydrated_for_testing() -> Self {
         Self {
             active_freezes: RwLock::default(),
             scope_map: RwLock::default(),
-            hydrated: std::sync::atomic::AtomicBool::new(false),
+            hydrated: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -2274,7 +2289,9 @@ pub mod tests {
     fn create_test_watchdog() -> DivergenceWatchdog {
         let signer = Signer::generate();
         let config = create_test_config();
-        DivergenceWatchdog::new(signer, config)
+        // Use a hydrated registry for tests to bypass fail-closed checks
+        let registry = Arc::new(FreezeRegistry::new_hydrated_for_testing());
+        DivergenceWatchdog::with_registry(signer, config, registry)
     }
 
     // =========================================================================
@@ -2847,7 +2864,7 @@ pub mod tests {
     #[test]
     fn test_registry_register_and_check() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
@@ -2870,7 +2887,7 @@ pub mod tests {
     fn test_registry_register_rejects_invalid_signature() {
         let signer = Signer::generate();
         let other_signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
@@ -2894,7 +2911,7 @@ pub mod tests {
     #[test]
     fn test_registry_unregister() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
@@ -2926,7 +2943,7 @@ pub mod tests {
     #[test]
     fn test_registry_unregister_not_found() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         // Create a signed unfreeze event for a non-existent freeze
         let unfreeze = InterventionUnfreezeBuilder::new("nonexistent")
@@ -2946,7 +2963,7 @@ pub mod tests {
     fn test_registry_unregister_rejects_invalid_signature() {
         let signer = Signer::generate();
         let other_signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         let freeze = InterventionFreezeBuilder::new("freeze-001")
             .scope(FreezeScope::Repository)
@@ -2981,7 +2998,7 @@ pub mod tests {
     #[test]
     fn test_registry_check_admission() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         // Should allow admission when not frozen
         assert!(registry.check_admission("test-repo").is_ok());
@@ -3013,7 +3030,7 @@ pub mod tests {
     #[test]
     fn test_hierarchical_freeze_namespace_blocks_repos_slash() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         // Freeze the namespace "myorg"
         let freeze = InterventionFreezeBuilder::new("freeze-001")
@@ -3044,7 +3061,7 @@ pub mod tests {
     #[test]
     fn test_hierarchical_freeze_namespace_blocks_repos_colon() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         // Freeze the namespace "myorg"
         let freeze = InterventionFreezeBuilder::new("freeze-001")
@@ -3075,7 +3092,7 @@ pub mod tests {
     #[test]
     fn test_hierarchical_freeze_repo_blocks_artifacts() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         // Freeze the repository "myorg/myrepo"
         let freeze = InterventionFreezeBuilder::new("freeze-001")
@@ -3111,7 +3128,7 @@ pub mod tests {
     #[test]
     fn test_hierarchical_check_admission_blocks_children() {
         let signer = Signer::generate();
-        let registry = FreezeRegistry::new();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
 
         // Freeze the namespace
         let freeze = InterventionFreezeBuilder::new("freeze-001")
@@ -3271,9 +3288,25 @@ pub mod tests {
     }
 
     #[test]
-    fn test_registry_default_is_hydrated() {
-        // Default new() should be hydrated (for backwards compatibility in tests)
+    fn test_registry_new_is_fail_closed_by_default() {
+        // CTR-2617: new() should be fail-closed by default
         let registry = FreezeRegistry::new();
+        assert!(!registry.is_hydrated());
+
+        // Should block all admissions before hydration
+        let result = registry.check_admission("any-repo");
+        assert!(matches!(result, Err(DivergenceError::RepoFrozen { .. })));
+
+        // After hydration, normal operation resumes
+        registry.mark_hydrated();
+        assert!(registry.is_hydrated());
+        assert!(registry.check_admission("any-repo").is_ok());
+    }
+
+    #[test]
+    fn test_registry_hydrated_for_testing() {
+        // Test helper should be hydrated for test convenience
+        let registry = FreezeRegistry::new_hydrated_for_testing();
         assert!(registry.is_hydrated());
         assert!(registry.check_admission("any-repo").is_ok());
     }
