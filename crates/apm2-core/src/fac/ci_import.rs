@@ -989,6 +989,8 @@ fn hex_encode(hash: &Hash) -> String {
 /// Returns [`CiImportError`] if:
 /// - [`CiImportError::CiEvidenceMissing`]: CI gating is enabled but no import
 ///   was provided
+/// - [`CiImportError::WebhookSignatureNotVerified`]: The webhook signature was
+///   not verified (SEC-CTRL-FAC-0017)
 /// - [`CiImportError::InsufficientAttestationLevel`]: The attestation level is
 ///   L0 (status-only)
 ///
@@ -996,8 +998,10 @@ fn hex_encode(hash: &Hash) -> String {
 ///
 /// When CI gating is enabled:
 /// - Plain "success" status without evidence is rejected (`CiEvidenceMissing`)
+/// - Unverified webhook signatures are rejected (`WebhookSignatureNotVerified`)
 /// - L0 attestation (status-only) is rejected (`InsufficientAttestationLevel`)
-/// - L1+ attestation is required for transition approval
+/// - L1+ attestation with verified webhook signature is required for transition
+///   approval
 ///
 /// # Example
 ///
@@ -1013,6 +1017,25 @@ fn hex_encode(hash: &Hash) -> String {
 /// // CI gating enabled with no evidence - rejected
 /// let result = can_transition_to_ready_for_review(true, None);
 /// assert!(matches!(result, Err(CiImportError::CiEvidenceMissing)));
+///
+/// // CI gating enabled with unverified signature - rejected
+/// let unverified_attestation = CiAttestation::builder()
+///     .level(CiAttestationLevel::L1)
+///     .workflow_run_id("run-001")
+///     .build()
+///     .unwrap();
+/// let unverified_import = CiEvidenceImport::builder()
+///     .workflow_run_id("run-001")
+///     .webhook_signature_verified(false)
+///     .attestation(unverified_attestation)
+///     .build()
+///     .unwrap();
+/// let result =
+///     can_transition_to_ready_for_review(true, Some(&unverified_import));
+/// assert!(matches!(
+///     result,
+///     Err(CiImportError::WebhookSignatureNotVerified)
+/// ));
 ///
 /// // CI gating enabled with L0 - rejected
 /// let l0_attestation = CiAttestation::builder()
@@ -1056,6 +1079,12 @@ pub fn can_transition_to_ready_for_review(
 
     // CI gating is enabled - evidence is required
     let import = import.ok_or(CiImportError::CiEvidenceMissing)?;
+
+    // SEC-CTRL-FAC-0017: Webhook signature must be verified
+    // This prevents spoofed/unverified CI evidence from authorizing transitions
+    if !import.webhook_signature_verified() {
+        return Err(CiImportError::WebhookSignatureNotVerified);
+    }
 
     // Check attestation level - L0 is insufficient
     let level = import.attestation.level();
@@ -2224,6 +2253,83 @@ pub mod tests {
                     })
                 ),
                 "Expected InsufficientAttestationLevel for L0, got: {result:?}"
+            );
+        }
+
+        /// SEC-CTRL-FAC-0017: Tests that unverified webhook signatures are
+        /// rejected even when attestation level is sufficient. This
+        /// prevents spoofed/unverified CI evidence from authorizing
+        /// transitions.
+        #[test]
+        fn test_ci_enabled_rejects_unverified_webhook_signature() {
+            // CI gating enabled with L1 attestation but UNVERIFIED signature - rejected
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L1)
+                .workflow_run_id("run-unverified")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-unverified")
+                .webhook_signature_verified(false) // Unverified!
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result = can_transition_to_ready_for_review(true, Some(&import));
+            assert!(
+                matches!(result, Err(CiImportError::WebhookSignatureNotVerified)),
+                "Expected WebhookSignatureNotVerified error, got: {result:?}"
+            );
+        }
+
+        /// Tests the error message for unverified webhook signature rejection.
+        #[test]
+        fn test_error_message_for_unverified_webhook_signature() {
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L1)
+                .workflow_run_id("run-err-msg")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-err-msg")
+                .webhook_signature_verified(false)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result = can_transition_to_ready_for_review(true, Some(&import));
+            let err = result.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "webhook signature was not verified",
+                "Error message should clearly indicate webhook signature issue"
+            );
+        }
+
+        /// Tests that L2 attestation with unverified signature is still
+        /// rejected. The signature check must happen before the
+        /// attestation level check.
+        #[test]
+        fn test_unverified_signature_rejected_even_with_l2() {
+            let attestation = CiAttestation::builder()
+                .level(CiAttestationLevel::L2)
+                .workflow_run_id("run-l2-unverified")
+                .build()
+                .unwrap();
+
+            let import = CiEvidenceImport::builder()
+                .workflow_run_id("run-l2-unverified")
+                .webhook_signature_verified(false)
+                .attestation(attestation)
+                .build()
+                .unwrap();
+
+            let result = can_transition_to_ready_for_review(true, Some(&import));
+            assert!(
+                matches!(result, Err(CiImportError::WebhookSignatureNotVerified)),
+                "Unverified signature must be rejected even with L2 attestation"
             );
         }
 
