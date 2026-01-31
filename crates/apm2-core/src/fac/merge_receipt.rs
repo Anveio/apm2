@@ -21,7 +21,7 @@
 //!
 //! - Signed with `MERGE_RECEIPT:` domain separator
 //! - Canonical encoding enforces deterministic serialization
-//! - Resource limits prevent denial-of-service attacks
+//! - Resource limits prevent DoS attacks
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -29,6 +29,7 @@ use thiserror::Error;
 use super::domain_separator::{MERGE_RECEIPT_PREFIX, sign_with_domain, verify_with_domain};
 use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, Signer, VerifyingKey};
+
 // Re-export proto type
 pub use crate::events::MergeReceipt as MergeReceiptProto;
 
@@ -43,7 +44,7 @@ pub const MAX_GATE_RECEIPTS: usize = 64;
 // Error Types
 // =============================================================================
 
-/// Errors that can occur during [`MergeReceipt`] operations.
+/// Errors that can occur during MergeReceipt operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MergeReceiptError {
     /// Missing required field.
@@ -111,7 +112,7 @@ pub struct MergeReceipt {
     /// Actor who performed the merge.
     pub gate_actor_id: String,
 
-    /// Ed25519 signature over canonical bytes with `MERGE_RECEIPT:` domain.
+    /// Ed25519 signature over canonical bytes with MERGE_RECEIPT: domain.
     #[serde(with = "serde_bytes")]
     pub gate_signature: [u8; 64],
 }
@@ -120,9 +121,8 @@ impl MergeReceipt {
     /// Creates a new `MergeReceipt` after observing the merge result.
     ///
     /// This method enforces the atomic binding between inputs and the observed
-    /// result. It canonicalizes the data, signs it with the provided signer
-    /// using the `MERGE_RECEIPT:` domain separator, and returns the signed
-    /// receipt.
+    /// result. It canonicalizes the data, signs it with the provided signer using
+    /// the `MERGE_RECEIPT:` domain separator, and returns the signed receipt.
     ///
     /// # Arguments
     ///
@@ -138,12 +138,6 @@ impl MergeReceipt {
     /// # Returns
     ///
     /// A signed `MergeReceipt` or error if validation fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MergeReceiptError::StringTooLong`] if any string field exceeds
-    /// `MAX_STRING_LENGTH`, or [`MergeReceiptError::CollectionTooLarge`] if
-    /// `gate_receipt_ids` exceeds `MAX_GATE_RECEIPTS`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_after_observation(
         base_selector: String,
@@ -217,15 +211,13 @@ impl MergeReceipt {
     /// Computes the canonical bytes for signing/verification.
     ///
     /// Encoding:
-    /// - `base_selector` (len + bytes)
-    /// - `changeset_digest` (32 bytes)
-    /// - `gate_receipt_ids` (count + (len + bytes)...) - sorted!
-    /// - `policy_hash` (32 bytes)
-    /// - `result_selector` (len + bytes)
-    /// - `merged_at` (8 bytes BE)
-    /// - `gate_actor_id` (len + bytes)
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
+    /// - base_selector (len + bytes)
+    /// - changeset_digest (32 bytes)
+    /// - gate_receipt_ids (count + (len + bytes)...) - sorted!
+    /// - policy_hash (32 bytes)
+    /// - result_selector (len + bytes)
+    /// - merged_at (8 bytes BE)
+    /// - gate_actor_id (len + bytes)
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -263,11 +255,6 @@ impl MergeReceipt {
     }
 
     /// Verifies the receipt signature.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MergeReceiptError::SignatureVerificationFailed`] if the
-    /// signature does not match the canonical bytes.
     pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), MergeReceiptError> {
         let canonical = self.canonical_bytes();
         let signature = Signature::from_bytes(&self.gate_signature);
@@ -324,18 +311,20 @@ impl TryFrom<MergeReceiptProto> for MergeReceipt {
             }
         }
 
-        let changeset_digest = proto.changeset_digest.try_into().map_err(|_| {
-            MergeReceiptError::InvalidData("changeset_digest must be 32 bytes".into())
-        })?;
+        let changeset_digest = proto
+            .changeset_digest
+            .try_into()
+            .map_err(|_| MergeReceiptError::InvalidData("changeset_digest must be 32 bytes".into()))?;
 
         let policy_hash = proto
             .policy_hash
             .try_into()
             .map_err(|_| MergeReceiptError::InvalidData("policy_hash must be 32 bytes".into()))?;
 
-        let gate_signature = proto.gate_signature.try_into().map_err(|_| {
-            MergeReceiptError::InvalidData("gate_signature must be 64 bytes".into())
-        })?;
+        let gate_signature = proto
+            .gate_signature
+            .try_into()
+            .map_err(|_| MergeReceiptError::InvalidData("gate_signature must be 64 bytes".into()))?;
 
         Ok(Self {
             base_selector: proto.base_selector,
@@ -416,7 +405,7 @@ mod tests {
     #[test]
     fn test_limit_gate_receipts() {
         let signer = Signer::generate();
-        let ids = vec!["id".to_string(); MAX_GATE_RECEIPTS + 1];
+        let ids =vec!["id".to_string(); MAX_GATE_RECEIPTS + 1];
 
         let result = MergeReceipt::create_after_observation(
             "main".to_string(),
