@@ -124,6 +124,16 @@ Goal: keep project-specific guidance compact and point to deeper contracts in Ch
 - ENFORCE BY: Use `enum` for all finite states; use `String` only for arbitrary user input or unbounded identifiers.
 - PROVENANCE: Enables compiler-checked exhaustive matching and prevents invalid states.
 
+[CONTRACT: CTR-2627] Coding Agents May Execute With Full Permissions in Sandboxed Environments.
+- ACCEPT IF: agent execution uses `--dangerously-skip-permissions` (Claude) or `--yolo` (Gemini) when the agent is spawned within a pre-configured sandbox.
+- RATIONALE: The Markov blanket (execution environment boundary) ensures agents cannot exceed their permitted scope regardless of internal permission flags. The sandbox is established before agent spawn and restricts filesystem access, network egress, and process capabilities.
+- ENFORCE BY:
+  - Agent spawn occurs only within worktrees or containers with explicit capability limits.
+  - The outer orchestrator (xtask, CI runner) is responsible for sandbox setup, not the agent.
+  - Use `build_ai_tool_command` from `shell_escape.rs` for secure command construction.
+- REJECT IF: agents are spawned with elevated permissions outside of a sandbox boundary (e.g., directly on the host without isolation).
+- PROVENANCE: Holonic architecture principle; agents inherit their capabilities from the holon that spawns them, not from their internal flags.
+
 [RISK: RSK-2625] Unbounded Channels.
 - APPLY: CTR-1004 (Bounded Concurrency).
 - REJECT IF: `std::sync::mpsc::channel()` or `tokio::sync::mpsc::unbounded_channel()` is used without strict, proven upper bounds on production rates.
