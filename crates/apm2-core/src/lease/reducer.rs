@@ -107,12 +107,20 @@ impl LeaseReducerState {
     /// marked as expired yet (still in Active state).
     ///
     /// This is the RFC-0016 HTF compliant method using monotonic ticks.
-    /// Wall time changes do not affect this check.
+    /// Wall time changes do not affect this check for tick-based leases.
     ///
-    /// # SEC-CTRL-FAC-0015: Fail-Closed Behavior
+    /// # SEC-HTF-003: Tick Rate Validation
     ///
-    /// Leases without tick-based timing will be included in the result
-    /// (treated as expired) per fail-closed security policy.
+    /// Only checks leases with matching tick rates. Leases with mismatched
+    /// rates are treated as expired (fail-closed).
+    ///
+    /// # Note
+    ///
+    /// This method only checks tick-based expiry. Legacy leases without tick
+    /// data will NOT be included. Use
+    /// [`LeaseReducerState::get_expired_but_active_at_tick_or_wall`] for
+    /// comprehensive expiry detection that handles both tick-based and legacy
+    /// leases.
     #[must_use]
     pub fn get_expired_but_active_at_tick(&self, current_tick: &HtfTick) -> Vec<&Lease> {
         self.leases
@@ -121,16 +129,45 @@ impl LeaseReducerState {
             .collect()
     }
 
+    /// Returns all leases that have expired, using tick-based comparison with
+    /// wall-clock fallback for legacy leases.
+    ///
+    /// # SEC-CTRL-FAC-0015: Migration Path for Legacy Leases
+    ///
+    /// This method provides a migration path for pre-existing leases:
+    ///
+    /// - Tick-based leases: Uses tick comparison (immune to wall-clock changes)
+    /// - Legacy leases (no tick data): Falls back to wall-clock comparison
+    ///
+    /// This is the recommended method for production use as it handles both
+    /// new and legacy leases correctly.
+    ///
+    /// # SEC-HTF-003: Tick Rate Validation
+    ///
+    /// For tick-based leases, mismatched tick rates result in fail-closed
+    /// behavior (treated as expired).
+    #[must_use]
+    pub fn get_expired_but_active_at_tick_or_wall(
+        &self,
+        current_tick: &HtfTick,
+        current_wall_ns: u64,
+    ) -> Vec<&Lease> {
+        self.leases
+            .values()
+            .filter(|l| l.is_expired_at_tick_or_wall(current_tick, current_wall_ns))
+            .collect()
+    }
+
     /// Returns all leases that have expired by the given time but haven't been
     /// marked as expired yet (still in Active state).
     ///
     /// **DEPRECATED**: This method uses wall time which can be manipulated.
-    /// Use [`LeaseReducerState::get_expired_but_active_at_tick`] for RFC-0016
-    /// HTF compliant expiry detection.
+    /// Use [`LeaseReducerState::get_expired_but_active_at_tick_or_wall`] for
+    /// RFC-0016 HTF compliant expiry detection with legacy fallback.
     #[must_use]
     #[deprecated(
         since = "0.4.0",
-        note = "use get_expired_but_active_at_tick for tick-based expiry (RFC-0016 HTF)"
+        note = "use get_expired_but_active_at_tick_or_wall for tick-based expiry with legacy fallback (RFC-0016 HTF)"
     )]
     #[allow(deprecated)]
     pub fn get_expired_but_active(&self, current_time: u64) -> Vec<&Lease> {
@@ -312,6 +349,17 @@ impl LeaseReducer {
                     "expires_at ({}) must be after issued_at ({})",
                     event.expires_at, event.issued_at
                 ),
+            });
+        }
+
+        // SEC-HTF-003: Validate tick timing if tick data is present.
+        // expires_at_tick must be greater than issued_at_tick to prevent
+        // malformed events from entering the ledger.
+        if event.tick_rate_hz > 0 && event.expires_at_tick <= event.issued_at_tick {
+            return Err(LeaseError::InvalidTickTiming {
+                lease_id,
+                issued_at_tick: event.issued_at_tick,
+                expires_at_tick: event.expires_at_tick,
             });
         }
 

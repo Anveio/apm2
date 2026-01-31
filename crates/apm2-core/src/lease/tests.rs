@@ -1229,12 +1229,15 @@ mod tck_00241 {
         HtfTick::new(value, TICK_RATE_HZ)
     }
 
-    /// TCK-00241: `get_expired_but_active_at_tick` uses tick-based comparison.
+    /// TCK-00241: SEC-CTRL-FAC-0015 Legacy leases not included in tick-only
+    /// method.
     ///
-    /// This test verifies that the `LeaseReducerState` method correctly
-    /// identifies expired leases using tick-based timing.
+    /// Legacy leases (without tick data) are NOT returned by
+    /// `get_expired_but_active_at_tick`. Callers should use
+    /// `get_expired_but_active_at_tick_or_wall` for comprehensive expiry
+    /// detection.
     #[test]
-    fn get_expired_but_active_at_tick_uses_ticks() {
+    fn legacy_leases_not_returned_by_tick_only_method() {
         let mut reducer = LeaseReducer::new();
         let ctx = ReducerContext::new(1);
 
@@ -1252,12 +1255,57 @@ mod tck_00241 {
             .apply(&create_event("lease.issued", "s", payload1), &ctx)
             .unwrap();
 
-        // Since leases created via the helper don't have tick data,
-        // they should be treated as expired (fail-closed per SEC-CTRL-FAC-0015)
+        // Legacy leases are NOT returned by tick-only method
+        // (caller should use get_expired_but_active_at_tick_or_wall)
         let expired = reducer.state().get_expired_but_active_at_tick(&tick(1500));
+        assert!(
+            expired.is_empty(),
+            "Legacy lease should not be returned by tick-only method"
+        );
+    }
 
-        // Lease without tick data is fail-closed to expired
-        assert_eq!(expired.len(), 1);
+    /// TCK-00241: SEC-CTRL-FAC-0015 Legacy leases use wall-clock fallback.
+    ///
+    /// When using `get_expired_but_active_at_tick_or_wall`, legacy leases
+    /// fall back to wall-clock comparison for expiry detection.
+    #[test]
+    fn legacy_leases_use_wall_clock_fallback() {
+        let mut reducer = LeaseReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Create legacy lease (no tick data)
+        let payload1 = helpers::lease_issued_payload(
+            "lease-1",
+            "work-1",
+            "actor-1",
+            1_000_000_000, // issued at 1s
+            2_000_000_000, // expires at 2s
+            vec![1],
+        );
+        reducer
+            .apply(&create_event("lease.issued", "s", payload1), &ctx)
+            .unwrap();
+
+        // Before wall time expiry: not expired
+        let expired = reducer.state().get_expired_but_active_at_tick_or_wall(
+            &tick(1500),
+            1_500_000_000, // wall time = 1.5s
+        );
+        assert!(
+            expired.is_empty(),
+            "Legacy lease should not be expired before wall time"
+        );
+
+        // After wall time expiry: expired
+        let expired = reducer.state().get_expired_but_active_at_tick_or_wall(
+            &tick(1500),
+            2_500_000_000, // wall time = 2.5s
+        );
+        assert_eq!(
+            expired.len(),
+            1,
+            "Legacy lease should be expired after wall time"
+        );
         assert_eq!(expired[0].lease_id, "lease-1");
     }
 
@@ -1343,5 +1391,110 @@ mod tck_00241 {
             1,
             "Lease SHOULD be expired at tick 15000 (expires at tick 10000)"
         );
+    }
+
+    /// TCK-00241: SEC-HTF-003 Tick rate mismatch fails closed.
+    ///
+    /// When the current tick has a different rate than the lease's expiry tick,
+    /// the comparison is invalid. The method fails closed (treats as expired).
+    #[test]
+    fn tick_rate_mismatch_fails_closed() {
+        let mut reducer = LeaseReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Create lease via helper
+        let payload = helpers::lease_issued_payload(
+            "lease-1",
+            "work-1",
+            "actor-1",
+            1_000_000_000,
+            2_000_000_000,
+            vec![1],
+        );
+        reducer
+            .apply(&create_event("lease.issued", "s", payload), &ctx)
+            .unwrap();
+
+        // Add tick data at 1MHz
+        {
+            let lease = reducer.state_mut().leases.get_mut("lease-1").unwrap();
+            lease.issued_at_tick = Some(tick(1000));
+            lease.expires_at_tick = Some(tick(5000)); // Expires at tick 5000 @ 1MHz
+        }
+
+        // Same rate: not expired at tick 4000
+        let expired = reducer.state().get_expired_but_active_at_tick(&tick(4000));
+        assert!(expired.is_empty());
+
+        // Different rate (10MHz): fails closed - treated as expired
+        let mismatched_tick = HtfTick::new(4000, 10_000_000);
+        let expired = reducer
+            .state()
+            .get_expired_but_active_at_tick(&mismatched_tick);
+        assert_eq!(expired.len(), 1, "Mismatched tick rate should fail closed");
+        assert_eq!(expired[0].lease_id, "lease-1");
+    }
+
+    /// TCK-00241: Tick timing validation in reducer rejects invalid events.
+    ///
+    /// Events where `expires_at_tick <= issued_at_tick` should be rejected.
+    #[test]
+    fn tick_timing_validation_rejects_invalid_events() {
+        let mut reducer = LeaseReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Create event with invalid tick timing (expires_at_tick <= issued_at_tick)
+        let payload = helpers::lease_issued_payload_with_ticks(
+            "lease-1",
+            "work-1",
+            "actor-1",
+            1_000_000_000,
+            2_000_000_000,
+            &tick(1000),
+            &tick(1000), // Same as issued_at_tick - invalid!
+            vec![1, 2, 3],
+        );
+        let result = reducer.apply(&create_event("lease.issued", "s", payload), &ctx);
+        assert!(matches!(result, Err(LeaseError::InvalidTickTiming { .. })));
+
+        // Also reject when expires_at_tick < issued_at_tick
+        let payload2 = helpers::lease_issued_payload_with_ticks(
+            "lease-2",
+            "work-2",
+            "actor-1",
+            1_000_000_000,
+            2_000_000_000,
+            &tick(2000),
+            &tick(1000), // Less than issued_at_tick - invalid!
+            vec![1, 2, 3],
+        );
+        let result2 = reducer.apply(&create_event("lease.issued", "s", payload2), &ctx);
+        assert!(matches!(result2, Err(LeaseError::InvalidTickTiming { .. })));
+    }
+
+    /// TCK-00241: Valid tick timing is accepted.
+    #[test]
+    fn valid_tick_timing_accepted() {
+        let mut reducer = LeaseReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Create event with valid tick timing
+        let payload = helpers::lease_issued_payload_with_ticks(
+            "lease-1",
+            "work-1",
+            "actor-1",
+            1_000_000_000,
+            2_000_000_000,
+            &tick(1000),
+            &tick(2000), // Greater than issued_at_tick - valid!
+            vec![1, 2, 3],
+        );
+        let result = reducer.apply(&create_event("lease.issued", "s", payload), &ctx);
+        assert!(result.is_ok());
+
+        let lease = reducer.state().get("lease-1").unwrap();
+        assert_eq!(lease.issued_at_tick, Some(tick(1000)));
+        assert_eq!(lease.expires_at_tick, Some(tick(2000)));
+        assert!(!lease.is_legacy_lease());
     }
 }

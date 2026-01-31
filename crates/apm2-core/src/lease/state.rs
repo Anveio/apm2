@@ -266,11 +266,24 @@ impl Lease {
     /// Returns true if the current tick is past the lease's expiration tick
     /// AND the lease is still in the Active state.
     ///
-    /// # SEC-CTRL-FAC-0015: Fail-Closed Behavior
+    /// # SEC-HTF-003: Tick Rate Validation
     ///
-    /// If tick-based timing is not available (`expires_at_tick` is `None`),
-    /// this method returns `true` (fail-closed), treating the lease as expired.
-    /// This prevents clock manipulation bypass attacks.
+    /// Ticks are node-local and their rates can vary. Comparing raw values
+    /// without rate-equality enforcement is dangerous. This method enforces
+    /// that `current_tick.tick_rate_hz() == expires_at_tick.tick_rate_hz()`.
+    /// If rates differ, returns `true` (fail-closed) to prevent incorrect
+    /// expiry decisions.
+    ///
+    /// # SEC-CTRL-FAC-0015: Legacy Fallback
+    ///
+    /// For leases WITHOUT tick data (legacy leases), this method returns
+    /// `false` to indicate "not expired via tick logic" - the caller should
+    /// use the wall-clock fallback via [`Lease::is_expired_at`] for such
+    /// leases. Use [`Lease::is_expired_at_tick_or_wall`] for automatic
+    /// fallback handling.
+    ///
+    /// Only when tick data IS present but invalid (mismatched rates), we
+    /// fail-closed and return `true`.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // let-else not stable in const fn
     pub fn is_expired_at_tick(&self, current_tick: &HtfTick) -> bool {
@@ -278,13 +291,69 @@ impl Lease {
             return false;
         }
 
-        // SEC-CTRL-FAC-0015: Fail-closed if tick data is missing
+        // SEC-CTRL-FAC-0015: For legacy leases without tick data, return false.
+        // Caller should use is_expired_at_tick_or_wall() for automatic fallback.
         let Some(expires_at_tick) = &self.expires_at_tick else {
-            return true;
+            return false;
         };
 
-        // Compare tick values (ticks are node-local and monotonic)
+        // SEC-HTF-003: Enforce tick rate equality. If rates differ, fail-closed.
+        // Ticks are node-local and comparing values across different rates is invalid.
+        if current_tick.tick_rate_hz() != expires_at_tick.tick_rate_hz() {
+            return true; // Fail-closed: treat as expired
+        }
+
+        // Compare tick values (same rate, safe to compare)
         current_tick.value() >= expires_at_tick.value()
+    }
+
+    /// Checks if the lease has expired, using tick-based comparison with
+    /// wall-clock fallback for legacy leases.
+    ///
+    /// # SEC-CTRL-FAC-0015: Migration Path for Legacy Leases
+    ///
+    /// This method provides a migration path for pre-existing leases that
+    /// lack tick data:
+    ///
+    /// - For leases WITH tick data: Uses tick-based comparison (RFC-0016 HTF)
+    /// - For leases WITHOUT tick data: Falls back to wall-clock comparison
+    ///
+    /// This prevents all legacy leases from expiring simultaneously upon
+    /// deployment while maintaining security for new tick-based leases.
+    ///
+    /// # SEC-HTF-003: Tick Rate Validation
+    ///
+    /// When tick data is present, tick rates must match. Mismatched rates
+    /// result in fail-closed behavior (returns `true`).
+    #[must_use]
+    #[allow(deprecated)] // We intentionally use is_expired_at for legacy fallback
+    #[allow(clippy::missing_const_for_fn)] // Uses Option::is_some pattern
+    pub fn is_expired_at_tick_or_wall(&self, current_tick: &HtfTick, current_wall_ns: u64) -> bool {
+        if !self.state.is_active() {
+            return false;
+        }
+
+        // Check if tick data is available
+        if let Some(expires_at_tick) = &self.expires_at_tick {
+            // SEC-HTF-003: Enforce tick rate equality
+            if current_tick.tick_rate_hz() != expires_at_tick.tick_rate_hz() {
+                return true; // Fail-closed: treat as expired
+            }
+            // Tick data present and valid: use tick comparison
+            current_tick.value() >= expires_at_tick.value()
+        } else {
+            // SEC-CTRL-FAC-0015: Legacy lease without tick data.
+            // Fall back to wall-clock comparison for migration compatibility.
+            current_wall_ns >= self.expires_at
+        }
+    }
+
+    /// Returns true if this is a legacy lease without tick-based timing.
+    ///
+    /// Legacy leases should use wall-clock fallback for expiry checks.
+    #[must_use]
+    pub const fn is_legacy_lease(&self) -> bool {
+        self.expires_at_tick.is_none()
     }
 
     /// Returns the remaining ticks until expiration, or 0 if expired.
@@ -292,17 +361,27 @@ impl Lease {
     /// This is the RFC-0016 HTF compliant method using monotonic ticks.
     /// Only meaningful for active leases with tick-based timing.
     ///
-    /// # SEC-CTRL-FAC-0015: Fail-Closed Behavior
+    /// # SEC-HTF-003: Tick Rate Validation
     ///
-    /// Returns 0 if tick-based timing is not available, treating the lease
-    /// as effectively expired.
+    /// Returns 0 if tick rates differ, as comparing ticks across different
+    /// rates is invalid.
+    ///
+    /// # SEC-CTRL-FAC-0015: Legacy Fallback
+    ///
+    /// Returns 0 if tick-based timing is not available. For legacy leases,
+    /// use wall-clock remaining time calculation instead.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // let-else not stable in const fn
     pub fn ticks_remaining(&self, current_tick: &HtfTick) -> u64 {
-        // SEC-CTRL-FAC-0015: Fail-closed if tick data is missing
+        // SEC-CTRL-FAC-0015: Return 0 if tick data is missing (legacy lease)
         let Some(expires_at_tick) = &self.expires_at_tick else {
             return 0;
         };
+
+        // SEC-HTF-003: Return 0 if tick rates differ (fail-closed)
+        if current_tick.tick_rate_hz() != expires_at_tick.tick_rate_hz() {
+            return 0;
+        }
 
         expires_at_tick.value().saturating_sub(current_tick.value())
     }
@@ -621,12 +700,13 @@ mod tck_00241 {
         assert_eq!(lease.ticks_remaining(&tick(2001)), 0);
     }
 
-    /// TCK-00241: SEC-CTRL-FAC-0015 fail-closed behavior.
+    /// TCK-00241: SEC-CTRL-FAC-0015 legacy lease handling.
     ///
-    /// If tick-based timing is not available, the lease should be treated
-    /// as expired (fail-closed) to prevent bypass attacks.
+    /// Legacy leases without tick data should NOT be treated as expired by
+    /// tick-only methods. Instead, callers should use the wall-clock fallback
+    /// method `is_expired_at_tick_or_wall`.
     #[test]
-    fn fail_closed_when_tick_data_missing() {
+    fn legacy_lease_tick_methods_return_false_or_zero() {
         // Create lease WITHOUT tick data (using legacy constructor)
         let lease = Lease::new(
             "lease-1".to_string(),
@@ -640,10 +720,38 @@ mod tck_00241 {
         // Verify tick fields are None
         assert!(lease.issued_at_tick.is_none());
         assert!(lease.expires_at_tick.is_none());
+        assert!(lease.is_legacy_lease());
 
-        // SEC-CTRL-FAC-0015: Should fail-closed (treat as expired)
-        assert!(lease.is_expired_at_tick(&tick(1500))); // Even before wall expiry
+        // is_expired_at_tick returns false for legacy leases
+        // (caller should use is_expired_at_tick_or_wall for full check)
+        assert!(!lease.is_expired_at_tick(&tick(1500)));
         assert_eq!(lease.ticks_remaining(&tick(1500)), 0);
+    }
+
+    /// TCK-00241: SEC-CTRL-FAC-0015 wall-clock fallback for legacy leases.
+    ///
+    /// Legacy leases should use wall-clock comparison when tick data is
+    /// not available. This provides a migration path for existing leases.
+    #[test]
+    fn legacy_lease_uses_wall_clock_fallback() {
+        // Create lease WITHOUT tick data (using legacy constructor)
+        let lease = Lease::new(
+            "lease-1".to_string(),
+            "work-1".to_string(),
+            "actor-1".to_string(),
+            1_000_000_000, // issued at 1s
+            2_000_000_000, // expires at 2s
+            vec![1],
+        );
+
+        // Before wall time expiration
+        assert!(!lease.is_expired_at_tick_or_wall(&tick(1000), 1_500_000_000));
+
+        // At wall time expiration boundary
+        assert!(lease.is_expired_at_tick_or_wall(&tick(1000), 2_000_000_000));
+
+        // After wall time expiration
+        assert!(lease.is_expired_at_tick_or_wall(&tick(1000), 3_000_000_000));
     }
 
     /// TCK-00241: Terminal leases are not considered expired.
@@ -711,13 +819,13 @@ mod tck_00241 {
         }
     }
 
-    /// TCK-00241: Different tick rates are supported.
+    /// TCK-00241: SEC-HTF-003 Tick rate mismatch fails closed.
     ///
-    /// Tick comparison uses raw tick values, not converted times.
-    /// This test verifies that even with different tick rates in the
-    /// metadata, the comparison uses raw values correctly.
+    /// When tick rates differ between current tick and lease expiry tick,
+    /// the comparison is invalid. The method fails closed (returns true
+    /// for expired) to prevent incorrect expiry decisions.
     #[test]
-    fn tick_comparison_uses_raw_values() {
+    fn tick_rate_mismatch_fails_closed() {
         // Lease with 1MHz tick rate
         let lease = Lease::new_with_ticks(
             "lease-1".to_string(),
@@ -730,18 +838,48 @@ mod tck_00241 {
             vec![1],
         );
 
-        // Current tick with different rate metadata (but same value)
-        // The comparison should use raw tick values
+        // Same rate: normal comparison works
         let current_same_rate = HtfTick::new(1500, 1_000_000);
-        let current_diff_rate = HtfTick::new(1500, 10_000_000);
-
-        // Both should give same result: value 1500 < expiry 2000
         assert!(!lease.is_expired_at_tick(&current_same_rate));
-        assert!(!lease.is_expired_at_tick(&current_diff_rate));
+        assert_eq!(lease.ticks_remaining(&current_same_rate), 500);
 
-        // Test expiry
+        // Different rate: SEC-HTF-003 fail-closed (treated as expired)
+        let current_diff_rate = HtfTick::new(1500, 10_000_000);
+        assert!(lease.is_expired_at_tick(&current_diff_rate)); // Fail-closed!
+        assert_eq!(lease.ticks_remaining(&current_diff_rate), 0); // Also fails closed
+
+        // Test normal expiry with same rate
         let expired_tick = HtfTick::new(2500, 1_000_000);
         assert!(lease.is_expired_at_tick(&expired_tick));
+    }
+
+    /// TCK-00241: Same tick rates allow proper comparison.
+    ///
+    /// When tick rates match, raw tick values are compared directly.
+    #[test]
+    fn same_tick_rate_comparison_works() {
+        let lease = Lease::new_with_ticks(
+            "lease-1".to_string(),
+            "work-1".to_string(),
+            "actor-1".to_string(),
+            0,
+            0,
+            HtfTick::new(1000, 1_000_000),
+            HtfTick::new(2000, 1_000_000),
+            vec![1],
+        );
+
+        // Before expiry
+        assert!(!lease.is_expired_at_tick(&HtfTick::new(1999, 1_000_000)));
+        assert_eq!(lease.ticks_remaining(&HtfTick::new(1999, 1_000_000)), 1);
+
+        // At expiry
+        assert!(lease.is_expired_at_tick(&HtfTick::new(2000, 1_000_000)));
+        assert_eq!(lease.ticks_remaining(&HtfTick::new(2000, 1_000_000)), 0);
+
+        // After expiry
+        assert!(lease.is_expired_at_tick(&HtfTick::new(2001, 1_000_000)));
+        assert_eq!(lease.ticks_remaining(&HtfTick::new(2001, 1_000_000)), 0);
     }
 
     /// TCK-00241: `Lease::new_with_ticks` sets all fields correctly.
@@ -777,5 +915,71 @@ mod tck_00241 {
         assert!(lease.terminated_at.is_none());
         assert!(lease.is_active());
         assert!(!lease.is_terminal());
+        assert!(!lease.is_legacy_lease());
+    }
+
+    /// TCK-00241: Tick-based lease uses tick comparison, ignores wall time.
+    ///
+    /// When tick data is present, `is_expired_at_tick_or_wall` uses tick
+    /// comparison and ignores the wall time parameter.
+    #[test]
+    fn tick_based_lease_ignores_wall_time_in_combined_method() {
+        let lease = Lease::new_with_ticks(
+            "lease-1".to_string(),
+            "work-1".to_string(),
+            "actor-1".to_string(),
+            1_000_000_000, // wall issued at 1s
+            2_000_000_000, // wall expires at 2s
+            tick(1000),
+            tick(2000), // tick expires at 2000
+            vec![1],
+        );
+
+        // Not expired by tick (1500 < 2000), even if wall time says expired
+        assert!(!lease.is_expired_at_tick_or_wall(&tick(1500), 3_000_000_000));
+
+        // Expired by tick (2500 >= 2000), even if wall time says not expired
+        assert!(lease.is_expired_at_tick_or_wall(&tick(2500), 1_500_000_000));
+    }
+
+    /// TCK-00241: SEC-HTF-003 tick rate mismatch in combined method.
+    ///
+    /// When tick rates mismatch, the combined method also fails closed.
+    #[test]
+    fn tick_rate_mismatch_in_combined_method_fails_closed() {
+        let lease = Lease::new_with_ticks(
+            "lease-1".to_string(),
+            "work-1".to_string(),
+            "actor-1".to_string(),
+            1_000_000_000,
+            2_000_000_000,
+            HtfTick::new(1000, 1_000_000), // 1MHz
+            HtfTick::new(2000, 1_000_000), // expires at tick 2000
+            vec![1],
+        );
+
+        // Different rate: fails closed even though tick value 1500 < 2000
+        let mismatched_tick = HtfTick::new(1500, 10_000_000); // 10MHz
+        assert!(lease.is_expired_at_tick_or_wall(&mismatched_tick, 1_500_000_000));
+    }
+
+    /// TCK-00241: Terminal lease returns false from all expiry methods.
+    #[test]
+    fn terminal_lease_not_expired_in_combined_method() {
+        let mut lease = Lease::new_with_ticks(
+            "lease-1".to_string(),
+            "work-1".to_string(),
+            "actor-1".to_string(),
+            1_000_000_000,
+            2_000_000_000,
+            tick(1000),
+            tick(2000),
+            vec![1],
+        );
+
+        lease.state = LeaseState::Released;
+
+        // Terminal lease returns false even when tick and wall both say expired
+        assert!(!lease.is_expired_at_tick_or_wall(&tick(3000), 3_000_000_000));
     }
 }
