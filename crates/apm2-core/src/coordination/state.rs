@@ -262,7 +262,7 @@ pub enum CoordinationError {
     },
     /// Budget values must be positive (non-zero).
     ///
-    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ms` are
+    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ticks` are
     /// required positive integers.
     InvalidBudget {
         /// Description of which budget field is invalid.
@@ -290,15 +290,32 @@ impl std::error::Error for CoordinationError {}
 
 /// Budget constraints for a coordination.
 ///
-/// Per AD-COORD-004: `max_episodes` and `max_duration_ms` are required.
+/// Per AD-COORD-004: `max_episodes` and `max_duration_ticks` are required.
 /// `max_tokens` is optional but recommended.
+///
+/// # HTF Compliance (TCK-00242)
+///
+/// Duration budgets use tick-based tracking for replay stability. The tick
+/// rate is carried alongside the budget to enable conversion when needed.
+/// See RFC-0016 for the HTF time model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinationBudget {
     /// Maximum number of session episodes (required).
     pub max_episodes: u32,
 
-    /// Maximum duration in milliseconds (required).
-    pub max_duration_ms: u64,
+    /// Maximum duration in ticks (required).
+    ///
+    /// Ticks are node-local monotonic units; the interpretation depends on
+    /// `tick_rate_hz`. This field replaces the wall-clock based
+    /// `max_duration_ticks` for replay stability.
+    pub max_duration_ticks: u64,
+
+    /// Tick rate in Hz (ticks per second) for interpreting duration.
+    ///
+    /// Must match the system's HTF tick rate. Common values:
+    /// - `1_000_000` (1MHz): 1 tick = 1 microsecond
+    /// - `1_000_000_000` (1GHz): 1 tick = 1 nanosecond
+    pub tick_rate_hz: u64,
 
     /// Maximum token consumption (optional).
     ///
@@ -307,19 +324,28 @@ pub struct CoordinationBudget {
 }
 
 impl CoordinationBudget {
-    /// Creates a new coordination budget.
+    /// Creates a new coordination budget with tick-based duration.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_episodes` - Maximum number of session episodes (must be >= 1)
+    /// * `max_duration_ticks` - Maximum duration in ticks (must be >= 1)
+    /// * `tick_rate_hz` - Tick rate in Hz (must be >= 1)
+    /// * `max_tokens` - Optional maximum token consumption
     ///
     /// # Errors
     ///
     /// Returns [`CoordinationError::InvalidBudget`] if:
     /// - `max_episodes` is zero
-    /// - `max_duration_ms` is zero
+    /// - `max_duration_ticks` is zero
+    /// - `tick_rate_hz` is zero
     ///
-    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ms` are
-    /// required positive integers.
+    /// Per RFC-0012/TB-COORD-004 and TCK-00242: Budget constraints use
+    /// tick-based durations for replay stability.
     pub const fn new(
         max_episodes: u32,
-        max_duration_ms: u64,
+        max_duration_ticks: u64,
+        tick_rate_hz: u64,
         max_tokens: Option<u64>,
     ) -> Result<Self, CoordinationError> {
         if max_episodes == 0 {
@@ -327,14 +353,20 @@ impl CoordinationBudget {
                 field: "max_episodes",
             });
         }
-        if max_duration_ms == 0 {
+        if max_duration_ticks == 0 {
             return Err(CoordinationError::InvalidBudget {
-                field: "max_duration_ms",
+                field: "max_duration_ticks",
+            });
+        }
+        if tick_rate_hz == 0 {
+            return Err(CoordinationError::InvalidBudget {
+                field: "tick_rate_hz",
             });
         }
         Ok(Self {
             max_episodes,
-            max_duration_ms,
+            max_duration_ticks,
+            tick_rate_hz,
             max_tokens,
         })
     }
@@ -346,27 +378,48 @@ impl CoordinationBudget {
     #[must_use]
     pub const fn new_unchecked(
         max_episodes: u32,
-        max_duration_ms: u64,
+        max_duration_ticks: u64,
+        tick_rate_hz: u64,
         max_tokens: Option<u64>,
     ) -> Self {
         Self {
             max_episodes,
-            max_duration_ms,
+            max_duration_ticks,
+            tick_rate_hz,
             max_tokens,
         }
+    }
+
+    /// Returns the tick rate in Hz.
+    #[must_use]
+    pub const fn tick_rate_hz(&self) -> u64 {
+        self.tick_rate_hz
     }
 }
 
 /// Current budget consumption tracking.
 ///
 /// All counters are monotonically non-decreasing within a coordination.
+///
+/// # HTF Compliance (TCK-00242)
+///
+/// Elapsed time is tracked in ticks rather than wall-clock milliseconds
+/// for replay stability. The tick rate is stored alongside for conversion.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetUsage {
     /// Number of episodes (sessions) consumed.
     pub consumed_episodes: u32,
 
-    /// Elapsed time in milliseconds since coordination started.
-    pub elapsed_ms: u64,
+    /// Elapsed time in ticks since coordination started.
+    ///
+    /// Ticks are node-local monotonic units. This replaces `elapsed_ms`
+    /// for replay stability per TCK-00242.
+    pub elapsed_ticks: u64,
+
+    /// Tick rate in Hz for interpreting `elapsed_ticks`.
+    ///
+    /// Should match the budget's tick rate and system HTF configuration.
+    pub tick_rate_hz: u64,
 
     /// Total tokens consumed across all sessions.
     ///
@@ -376,17 +429,38 @@ pub struct BudgetUsage {
 
 impl BudgetUsage {
     /// Creates a new empty budget usage tracker.
+    ///
+    /// # Note
+    ///
+    /// The `tick_rate_hz` defaults to 0 and should be set via `with_tick_rate`
+    /// or by calling `update_elapsed_ticks`.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             consumed_episodes: 0,
-            elapsed_ms: 0,
+            elapsed_ticks: 0,
+            tick_rate_hz: 0,
+            consumed_tokens: 0,
+        }
+    }
+
+    /// Creates a new budget usage tracker with specified tick rate.
+    ///
+    /// # Arguments
+    ///
+    /// * `tick_rate_hz` - The tick rate in Hz for this coordination
+    #[must_use]
+    pub const fn with_tick_rate(tick_rate_hz: u64) -> Self {
+        Self {
+            consumed_episodes: 0,
+            elapsed_ticks: 0,
+            tick_rate_hz,
             consumed_tokens: 0,
         }
     }
 
     // =========================================================================
-    // Budget Tracking Helper Methods (TCK-00151)
+    // Budget Tracking Helper Methods (TCK-00151, TCK-00242)
     // =========================================================================
 
     /// Checks if the episode budget is exhausted.
@@ -408,7 +482,8 @@ impl BudgetUsage {
 
     /// Checks if the duration budget is exhausted.
     ///
-    /// Per AD-COORD-004: Returns `true` when `elapsed_ms >= max_duration_ms`.
+    /// Per AD-COORD-004 and TCK-00242: Returns `true` when `elapsed_ticks >=
+    /// max_duration_ticks`.
     ///
     /// # Arguments
     ///
@@ -419,7 +494,7 @@ impl BudgetUsage {
     /// `true` if duration budget is exhausted, `false` otherwise.
     #[must_use]
     pub const fn is_duration_budget_exhausted(&self, budget: &CoordinationBudget) -> bool {
-        self.elapsed_ms >= budget.max_duration_ms
+        self.elapsed_ticks >= budget.max_duration_ticks
     }
 
     /// Checks if the token budget is exhausted.
@@ -492,21 +567,29 @@ impl BudgetUsage {
         self.consumed_episodes = self.consumed_episodes.saturating_add(1);
     }
 
-    /// Updates the elapsed time from a start instant.
+    /// Updates the elapsed time from tick values.
     ///
-    /// Uses `checked_duration_since` for defensive time handling per RSK-2504.
+    /// Per TCK-00242: Uses tick-based tracking for replay stability.
+    /// This replaces the wall-clock based `update_elapsed_from`.
     ///
     /// # Arguments
     ///
-    /// * `started_at` - The instant when coordination started
+    /// * `start_tick` - The tick value when coordination started
+    /// * `current_tick` - The current tick value
+    /// * `tick_rate_hz` - The tick rate in Hz
     ///
-    /// # Note
+    /// # Panics
     ///
-    /// Truncation from `u128` to `u64` is safe as `u64` can hold approximately
-    /// 584 million years in milliseconds.
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn update_elapsed_from(&mut self, started_at: std::time::Instant) {
-        self.elapsed_ms = started_at.elapsed().as_millis() as u64;
+    /// This function does not panic. If `current_tick < start_tick`, elapsed
+    /// saturates to 0 (defensive handling per RSK-2504).
+    pub const fn update_elapsed_ticks(
+        &mut self,
+        start_tick: u64,
+        current_tick: u64,
+        tick_rate_hz: u64,
+    ) {
+        self.elapsed_ticks = current_tick.saturating_sub(start_tick);
+        self.tick_rate_hz = tick_rate_hz;
     }
 
     /// Returns the remaining episodes before budget exhaustion.
@@ -523,7 +606,9 @@ impl BudgetUsage {
         budget.max_episodes.saturating_sub(self.consumed_episodes)
     }
 
-    /// Returns the remaining duration in milliseconds before budget exhaustion.
+    /// Returns the remaining duration in ticks before budget exhaustion.
+    ///
+    /// Per TCK-00242: Duration tracking uses ticks for replay stability.
     ///
     /// # Arguments
     ///
@@ -531,10 +616,10 @@ impl BudgetUsage {
     ///
     /// # Returns
     ///
-    /// Remaining duration in milliseconds, or 0 if budget is exhausted.
+    /// Remaining duration in ticks, or 0 if budget is exhausted.
     #[must_use]
-    pub const fn remaining_duration_ms(&self, budget: &CoordinationBudget) -> u64 {
-        budget.max_duration_ms.saturating_sub(self.elapsed_ms)
+    pub const fn remaining_duration_ticks(&self, budget: &CoordinationBudget) -> u64 {
+        budget.max_duration_ticks.saturating_sub(self.elapsed_ticks)
     }
 
     /// Returns the remaining tokens before budget exhaustion, if a token limit
@@ -553,6 +638,12 @@ impl BudgetUsage {
             Some(max) => Some(max.saturating_sub(self.consumed_tokens)),
             None => None,
         }
+    }
+
+    /// Returns the tick rate in Hz.
+    #[must_use]
+    pub const fn tick_rate_hz(&self) -> u64 {
+        self.tick_rate_hz
     }
 }
 
@@ -1049,42 +1140,50 @@ impl CoordinationState {
 mod tests {
     use super::*;
 
+    /// Test tick rate: 1MHz (1 tick = 1 microsecond)
+    const TEST_TICK_RATE_HZ: u64 = 1_000_000;
+
     // ========================================================================
-    // CoordinationBudget Tests
+    // CoordinationBudget Tests (TCK-00242: tick-based)
     // ========================================================================
 
     #[test]
     fn test_coordination_budget_new() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        // 10 episodes, 60_000_000 ticks (60 seconds at 1MHz), 100_000 tokens
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         assert_eq!(budget.max_episodes, 10);
-        assert_eq!(budget.max_duration_ms, 60_000);
+        assert_eq!(budget.max_duration_ticks, 60_000_000);
+        assert_eq!(budget.tick_rate_hz, TEST_TICK_RATE_HZ);
         assert_eq!(budget.max_tokens, Some(100_000));
     }
 
     #[test]
     fn test_coordination_budget_no_tokens() {
-        let budget = CoordinationBudget::new(5, 30_000, None).unwrap();
+        let budget = CoordinationBudget::new(5, 30_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         assert_eq!(budget.max_episodes, 5);
-        assert_eq!(budget.max_duration_ms, 30_000);
+        assert_eq!(budget.max_duration_ticks, 30_000_000);
+        assert_eq!(budget.tick_rate_hz, TEST_TICK_RATE_HZ);
         assert_eq!(budget.max_tokens, None);
     }
 
     #[test]
     fn test_coordination_budget_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let json = serde_json::to_string(&budget).unwrap();
         let restored: CoordinationBudget = serde_json::from_str(&json).unwrap();
         assert_eq!(budget, restored);
     }
 
-    /// TCK-00148: Test that zero budget values are rejected.
+    /// TCK-00148, TCK-00242: Test that zero budget values are rejected.
     ///
-    /// Per RFC-0012/TB-COORD-004: `max_episodes` and `max_duration_ms` are
-    /// required positive integers.
+    /// Per RFC-0012/TB-COORD-004 and TCK-00242: `max_episodes`,
+    /// `max_duration_ticks`, and `tick_rate_hz` are required positive integers.
     #[test]
     fn test_coordination_budget_requires_positive() {
         // Zero max_episodes should fail
-        let result = CoordinationBudget::new(0, 60_000, None);
+        let result = CoordinationBudget::new(0, 60_000_000, TEST_TICK_RATE_HZ, None);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1093,40 +1192,50 @@ mod tests {
             }
         ));
 
-        // Zero max_duration_ms should fail
-        let result = CoordinationBudget::new(10, 0, None);
+        // Zero max_duration_ticks should fail
+        let result = CoordinationBudget::new(10, 0, TEST_TICK_RATE_HZ, None);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             CoordinationError::InvalidBudget {
-                field: "max_duration_ms"
+                field: "max_duration_ticks"
             }
         ));
 
-        // Both zero should fail (max_episodes checked first)
-        let result = CoordinationBudget::new(0, 0, None);
+        // Zero tick_rate_hz should fail
+        let result = CoordinationBudget::new(10, 60_000_000, 0, None);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             CoordinationError::InvalidBudget {
-                field: "max_episodes"
+                field: "tick_rate_hz"
             }
         ));
 
         // Valid positive values should succeed
-        let result = CoordinationBudget::new(1, 1, None);
+        let result = CoordinationBudget::new(1, 1, 1, None);
         assert!(result.is_ok());
     }
 
     // ========================================================================
-    // BudgetUsage Tests
+    // BudgetUsage Tests (TCK-00242: tick-based)
     // ========================================================================
 
     #[test]
     fn test_budget_usage_new() {
         let usage = BudgetUsage::new();
         assert_eq!(usage.consumed_episodes, 0);
-        assert_eq!(usage.elapsed_ms, 0);
+        assert_eq!(usage.elapsed_ticks, 0);
+        assert_eq!(usage.tick_rate_hz, 0);
+        assert_eq!(usage.consumed_tokens, 0);
+    }
+
+    #[test]
+    fn test_budget_usage_with_tick_rate() {
+        let usage = BudgetUsage::with_tick_rate(TEST_TICK_RATE_HZ);
+        assert_eq!(usage.consumed_episodes, 0);
+        assert_eq!(usage.elapsed_ticks, 0);
+        assert_eq!(usage.tick_rate_hz, TEST_TICK_RATE_HZ);
         assert_eq!(usage.consumed_tokens, 0);
     }
 
@@ -1140,7 +1249,8 @@ mod tests {
     fn test_budget_usage_serde_roundtrip() {
         let usage = BudgetUsage {
             consumed_episodes: 5,
-            elapsed_ms: 30_000,
+            elapsed_ticks: 30_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 50_000,
         };
         let json = serde_json::to_string(&usage).unwrap();
@@ -1283,7 +1393,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_new() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let work_queue = vec!["work-1".to_string(), "work-2".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -1306,7 +1416,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_current_work_id() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let work_queue = vec!["work-1".to_string(), "work-2".to_string()];
         let mut session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -1326,7 +1436,7 @@ mod tests {
 
     #[test]
     fn test_coordination_session_work_queue_exhausted() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let work_queue = vec!["work-1".to_string()];
         let mut session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -1344,7 +1454,8 @@ mod tests {
 
     #[test]
     fn test_coordination_session_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let work_queue = vec!["work-1".to_string(), "work-2".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -1375,7 +1486,7 @@ mod tests {
     #[test]
     fn test_coordination_state_get() {
         let mut state = CoordinationState::new();
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let work_queue = vec!["work-1".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -1395,7 +1506,7 @@ mod tests {
     #[test]
     fn test_coordination_state_counts() {
         let mut state = CoordinationState::new();
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
 
         // Add an active coordination
         let mut active =
@@ -1418,7 +1529,7 @@ mod tests {
     #[test]
     fn test_coordination_state_serde_roundtrip() {
         let mut state = CoordinationState::new();
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let work_queue = vec!["work-1".to_string()];
         let session = CoordinationSession::new(
             "coord-123".to_string(),
@@ -1451,14 +1562,16 @@ mod tests {
     #[test]
     fn tck_00148_serde_roundtrip_all_types() {
         // CoordinationBudget
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let json = serde_json::to_string(&budget).unwrap();
         assert_eq!(budget, serde_json::from_str(&json).unwrap());
 
         // BudgetUsage
         let usage = BudgetUsage {
             consumed_episodes: 5,
-            elapsed_ms: 30_000,
+            elapsed_ticks: 30_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 50_000,
         };
         let json = serde_json::to_string(&usage).unwrap();
@@ -1519,7 +1632,7 @@ mod tests {
     /// TCK-00148: Test that work queue size limit is enforced.
     #[test]
     fn test_coordination_session_queue_limit() {
-        let budget = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
 
         // Create a work queue that exceeds the limit
         let oversized_queue: Vec<String> = (0..=MAX_WORK_QUEUE_SIZE)
@@ -1595,12 +1708,14 @@ mod tests {
             "work_tracking": work_tracking,
             "budget": {
                 "max_episodes": 10,
-                "max_duration_ms": 60000,
+                "max_duration_ticks": 60000,
+                "tick_rate_hz": 1_000_000,
                 "max_tokens": null
             },
             "budget_usage": {
                 "consumed_episodes": 0,
-                "elapsed_ms": 0,
+                "elapsed_ticks": 0,
+                "tick_rate_hz": 1_000_000,
                 "consumed_tokens": 0
             },
             "consecutive_failures": 0,
@@ -1647,12 +1762,14 @@ mod tests {
             "work_tracking": oversized_tracking,
             "budget": {
                 "max_episodes": 10,
-                "max_duration_ms": 60000,
+                "max_duration_ticks": 60000,
+                "tick_rate_hz": 1_000_000,
                 "max_tokens": null
             },
             "budget_usage": {
                 "consumed_episodes": 0,
-                "elapsed_ms": 0,
+                "elapsed_ticks": 0,
+                "tick_rate_hz": 1_000_000,
                 "consumed_tokens": 0
             },
             "consecutive_failures": 0,
@@ -1679,7 +1796,8 @@ mod tests {
         // For efficiency, we use minimal valid coordination session objects
         let budget_json = serde_json::json!({
             "max_episodes": 10,
-            "max_duration_ms": 60000,
+            "max_duration_ticks": 60000,
+            "tick_rate_hz": 1_000_000,
             "max_tokens": null
         });
 
@@ -1696,7 +1814,8 @@ mod tests {
                         "budget": budget_json,
                         "budget_usage": {
                             "consumed_episodes": 0,
-                            "elapsed_ms": 0,
+                            "elapsed_ticks": 0,
+                            "tick_rate_hz": 1_000_000,
                             "consumed_tokens": 0
                         },
                         "consecutive_failures": 0,
@@ -1778,7 +1897,8 @@ mod tests {
             "work_ids": oversized_queue,
             "budget": {
                 "max_episodes": 10,
-                "max_duration_ms": 60000,
+                "max_duration_ticks": 60000,
+                "tick_rate_hz": 1_000_000,
                 "max_tokens": null
             },
             "max_attempts_per_work": 3,
@@ -1858,7 +1978,7 @@ mod tests {
     /// Verification: Coordination stops at `max_episodes`.
     #[test]
     fn tck_00151_episode_budget_exhausted() {
-        let budget = CoordinationBudget::new(5, 60_000, None).unwrap();
+        let budget = CoordinationBudget::new(5, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut usage = BudgetUsage::new();
 
         // Not exhausted initially
@@ -1883,30 +2003,30 @@ mod tests {
 
     /// TCK-00151: Test duration budget exhaustion detection.
     ///
-    /// Verification: Coordination stops at `max_duration_ms`.
+    /// Verification: Coordination stops at `max_duration_ticks`.
     #[test]
     fn tck_00151_duration_budget_exhausted() {
-        let budget = CoordinationBudget::new(10, 30_000, None).unwrap();
+        let budget = CoordinationBudget::new(10, 30_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         let mut usage = BudgetUsage::new();
 
         // Not exhausted initially
         assert!(!usage.is_duration_budget_exhausted(&budget));
-        assert_eq!(usage.remaining_duration_ms(&budget), 30_000);
+        assert_eq!(usage.remaining_duration_ticks(&budget), 30_000_000);
 
-        // Consume 29 seconds - still not exhausted
-        usage.elapsed_ms = 29_000;
+        // Consume 29 seconds (29M ticks) - still not exhausted
+        usage.elapsed_ticks = 29_000_000;
         assert!(!usage.is_duration_budget_exhausted(&budget));
-        assert_eq!(usage.remaining_duration_ms(&budget), 1_000);
+        assert_eq!(usage.remaining_duration_ticks(&budget), 1_000_000);
 
-        // Consume exactly 30 seconds - now exhausted
-        usage.elapsed_ms = 30_000;
+        // Consume exactly 30 seconds (30M ticks) - now exhausted
+        usage.elapsed_ticks = 30_000_000;
         assert!(usage.is_duration_budget_exhausted(&budget));
-        assert_eq!(usage.remaining_duration_ms(&budget), 0);
+        assert_eq!(usage.remaining_duration_ticks(&budget), 0);
 
         // Over budget - still exhausted
-        usage.elapsed_ms = 45_000;
+        usage.elapsed_ticks = 45_000_000;
         assert!(usage.is_duration_budget_exhausted(&budget));
-        assert_eq!(usage.remaining_duration_ms(&budget), 0);
+        assert_eq!(usage.remaining_duration_ticks(&budget), 0);
     }
 
     /// TCK-00151: Test token budget exhaustion detection.
@@ -1915,7 +2035,8 @@ mod tests {
     #[test]
     fn tck_00151_token_budget_exhausted() {
         // With token limit set
-        let budget_with_tokens = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget_with_tokens =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let mut usage = BudgetUsage::new();
 
         // Not exhausted initially
@@ -1938,7 +2059,8 @@ mod tests {
         assert_eq!(usage.remaining_tokens(&budget_with_tokens), Some(0));
 
         // Without token limit - never exhausted
-        let budget_no_tokens = CoordinationBudget::new(10, 60_000, None).unwrap();
+        let budget_no_tokens =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, None).unwrap();
         assert!(!usage.is_token_budget_exhausted(&budget_no_tokens));
         assert_eq!(usage.remaining_tokens(&budget_no_tokens), None);
     }
@@ -1948,7 +2070,8 @@ mod tests {
     /// Per AD-COORD-013: Duration > Tokens > Episodes priority.
     #[test]
     fn tck_00151_budget_exhaustion_priority() {
-        let budget = CoordinationBudget::new(5, 10_000, Some(50_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(5, 10_000_000, TEST_TICK_RATE_HZ, Some(50_000)).unwrap();
         let mut usage = BudgetUsage::new();
 
         // No budget exhausted
@@ -1969,7 +2092,7 @@ mod tests {
         );
 
         // All three exhausted - returns Duration (highest priority)
-        usage.elapsed_ms = 10_000;
+        usage.elapsed_ticks = 10_000_000;
         assert_eq!(
             usage.check_budget_exhausted(&budget),
             Some(BudgetType::Duration)
@@ -1978,7 +2101,7 @@ mod tests {
         // Reset and test duration alone
         usage.consumed_episodes = 0;
         usage.consumed_tokens = 0;
-        usage.elapsed_ms = 10_000;
+        usage.elapsed_ticks = 10_000_000;
         assert_eq!(
             usage.check_budget_exhausted(&budget),
             Some(BudgetType::Duration)
@@ -2035,26 +2158,29 @@ mod tests {
     /// TCK-00151: Test remaining budget calculations at boundary conditions.
     #[test]
     fn tck_00151_remaining_budget_boundaries() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
 
         // Test at exactly budget limit
         let usage_at_limit = BudgetUsage {
             consumed_episodes: 10,
-            elapsed_ms: 60_000,
+            elapsed_ticks: 60_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 100_000,
         };
         assert_eq!(usage_at_limit.remaining_episodes(&budget), 0);
-        assert_eq!(usage_at_limit.remaining_duration_ms(&budget), 0);
+        assert_eq!(usage_at_limit.remaining_duration_ticks(&budget), 0);
         assert_eq!(usage_at_limit.remaining_tokens(&budget), Some(0));
 
         // Test over budget (should saturate to 0, not underflow)
         let usage_over_limit = BudgetUsage {
             consumed_episodes: 15,
-            elapsed_ms: 90_000,
+            elapsed_ticks: 90_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 150_000,
         };
         assert_eq!(usage_over_limit.remaining_episodes(&budget), 0);
-        assert_eq!(usage_over_limit.remaining_duration_ms(&budget), 0);
+        assert_eq!(usage_over_limit.remaining_duration_ticks(&budget), 0);
         assert_eq!(usage_over_limit.remaining_tokens(&budget), Some(0));
     }
 
@@ -2062,7 +2188,12 @@ mod tests {
     #[test]
     fn tck_00151_budget_large_values() {
         // Create budget with large values
-        let budget = CoordinationBudget::new_unchecked(u32::MAX, u64::MAX, Some(u64::MAX));
+        let budget = CoordinationBudget::new_unchecked(
+            u32::MAX,
+            u64::MAX,
+            TEST_TICK_RATE_HZ,
+            Some(u64::MAX),
+        );
         let mut usage = BudgetUsage::new();
 
         // Not exhausted with large budget
@@ -2072,7 +2203,7 @@ mod tests {
 
         // Consume large amounts - still not exhausted
         usage.consumed_episodes = u32::MAX - 1;
-        usage.elapsed_ms = u64::MAX - 1;
+        usage.elapsed_ticks = u64::MAX - 1;
         usage.consumed_tokens = u64::MAX - 1;
         assert!(!usage.is_episode_budget_exhausted(&budget));
         assert!(!usage.is_duration_budget_exhausted(&budget));
@@ -2080,7 +2211,7 @@ mod tests {
 
         // At max - now exhausted
         usage.consumed_episodes = u32::MAX;
-        usage.elapsed_ms = u64::MAX;
+        usage.elapsed_ticks = u64::MAX;
         usage.consumed_tokens = u64::MAX;
         assert!(usage.is_episode_budget_exhausted(&budget));
         assert!(usage.is_duration_budget_exhausted(&budget));
@@ -2090,10 +2221,12 @@ mod tests {
     /// TCK-00151: Test budget usage serde roundtrip preserves helper behavior.
     #[test]
     fn tck_00151_budget_usage_serde_roundtrip() {
-        let budget = CoordinationBudget::new(10, 60_000, Some(100_000)).unwrap();
+        let budget =
+            CoordinationBudget::new(10, 60_000_000, TEST_TICK_RATE_HZ, Some(100_000)).unwrap();
         let usage = BudgetUsage {
             consumed_episodes: 5,
-            elapsed_ms: 30_000,
+            elapsed_ticks: 30_000_000,
+            tick_rate_hz: TEST_TICK_RATE_HZ,
             consumed_tokens: 50_000,
         };
 
@@ -2123,8 +2256,8 @@ mod tests {
             restored.remaining_episodes(&budget)
         );
         assert_eq!(
-            usage.remaining_duration_ms(&budget),
-            restored.remaining_duration_ms(&budget)
+            usage.remaining_duration_ticks(&budget),
+            restored.remaining_duration_ticks(&budget)
         );
         assert_eq!(
             usage.remaining_tokens(&budget),
