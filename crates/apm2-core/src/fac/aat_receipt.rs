@@ -69,6 +69,16 @@
 //!     TerminalVerifierOutput,
 //! };
 //!
+//! // Components for stability_digest computation
+//! let terminal_evidence_digest = [0x77; 32];
+//! let terminal_verifier_outputs_digest = [0x99; 32];
+//! let verdict = AatVerdict::Pass;
+//! let stability_digest = AatGateReceipt::compute_stability_digest(
+//!     verdict,
+//!     &terminal_evidence_digest,
+//!     &terminal_verifier_outputs_digest,
+//! );
+//!
 //! let receipt = AatGateReceiptBuilder::new()
 //!     .view_commitment_hash([0x11; 32])
 //!     .rcp_manifest_hash([0x22; 32])
@@ -79,11 +89,11 @@
 //!     .flake_class(FlakeClass::DeterministicFail)
 //!     .run_count(3)
 //!     .run_receipt_hashes(vec![[0x44; 32], [0x55; 32], [0x66; 32]])
-//!     .terminal_evidence_digest([0x77; 32])
+//!     .terminal_evidence_digest(terminal_evidence_digest)
 //!     .observational_evidence_digest([0x88; 32])
-//!     .terminal_verifier_outputs_digest([0x99; 32])
-//!     .stability_digest([0xAA; 32])
-//!     .verdict(AatVerdict::Pass)
+//!     .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+//!     .stability_digest(stability_digest)
+//!     .verdict(verdict)
 //!     .transcript_chain_root_hash([0xBB; 32])
 //!     .transcript_bundle_hash([0xCC; 32])
 //!     .artifact_manifest_hash([0xDD; 32])
@@ -104,7 +114,7 @@
 //!     .build()
 //!     .expect("valid receipt");
 //!
-//! // Validate required fields and run count invariant
+//! // Validate required fields, stability_digest, and run count invariant
 //! assert!(receipt.validate_required_fields().is_ok());
 //! ```
 
@@ -484,6 +494,10 @@ pub enum AatReceiptError {
     /// PASS verdict with unsatisfied predicate.
     #[error("PASS verdict requires all verifier predicates to be satisfied")]
     PassVerdictUnsatisfiedPredicate,
+
+    /// `stability_digest` does not match computed value.
+    #[error("stability_digest mismatch: expected hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest)")]
+    StabilityDigestMismatch,
 }
 
 // =============================================================================
@@ -591,11 +605,32 @@ pub struct AatGateReceipt {
 }
 
 impl AatGateReceipt {
+    /// Computes the stability digest from its components.
+    ///
+    /// The stability digest is defined as:
+    /// `hash(verdict || terminal_evidence_digest || terminal_verifier_outputs_digest)`
+    ///
+    /// This provides a single hash that captures the "stable" aspects of the AAT
+    /// result, allowing quick comparison across runs.
+    #[must_use]
+    pub fn compute_stability_digest(
+        verdict: AatVerdict,
+        terminal_evidence_digest: &[u8; 32],
+        terminal_verifier_outputs_digest: &[u8; 32],
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&[verdict.as_u8()]);
+        hasher.update(terminal_evidence_digest);
+        hasher.update(terminal_verifier_outputs_digest);
+        *hasher.finalize().as_bytes()
+    }
+
     /// Validates all required fields are present and invariants are satisfied.
     ///
     /// # Invariants Checked
     ///
     /// - `run_receipt_hashes.len()` equals `run_count`
+    /// - `stability_digest` matches computed value from components
     /// - For PASS verdict: at least one `terminal_verifier_output` is present
     /// - For PASS verdict: all `predicate_satisfied` are `true`
     /// - All string fields are within length limits
@@ -615,6 +650,16 @@ impl AatGateReceipt {
                 run_count: self.run_count,
                 hash_count: self.run_receipt_hashes.len(),
             });
+        }
+
+        // Validate stability_digest matches computed value
+        let computed_stability = Self::compute_stability_digest(
+            self.verdict,
+            &self.terminal_evidence_digest,
+            &self.terminal_verifier_outputs_digest,
+        );
+        if self.stability_digest != computed_stability {
+            return Err(AatReceiptError::StabilityDigestMismatch);
         }
 
         // Validate string lengths
@@ -1109,17 +1154,21 @@ impl TryFrom<AatGateReceiptProto> for AatGateReceipt {
         let determinism_status = DeterminismStatus::try_from(proto.determinism_status)?;
         let flake_class = FlakeClass::try_from(proto.flake_class)?;
         let verdict = AatVerdict::try_from(proto.verdict)?;
-        let risk_tier = match proto.risk_tier {
-            1 => RiskTier::Tier3, // HIGH maps to Tier3
-            2 => RiskTier::Tier2, // MED maps to Tier2
-            3 => RiskTier::Tier1, // LOW maps to Tier1
-            _ => {
-                return Err(AatReceiptError::InvalidEnumValue {
+        // risk_tier is stored as uint32 (0-4) for fidelity preservation
+        let risk_tier_u8: u8 =
+            proto
+                .risk_tier
+                .try_into()
+                .map_err(|_| AatReceiptError::InvalidEnumValue {
                     field: "risk_tier",
-                    value: proto.risk_tier,
-                });
-            },
-        };
+                    value: i32::try_from(proto.risk_tier).unwrap_or(i32::MAX),
+                })?;
+        let risk_tier = RiskTier::try_from(risk_tier_u8).map_err(|_| {
+            AatReceiptError::InvalidEnumValue {
+                field: "risk_tier",
+                value: i32::from(risk_tier_u8),
+            }
+        })?;
 
         // Convert attestation
         let attestation_proto = proto
@@ -1237,11 +1286,8 @@ impl From<AatGateReceipt> for AatGateReceiptProto {
                 .collect(),
             verifier_policy_hash: receipt.verifier_policy_hash.to_vec(),
             selection_policy_id: receipt.selection_policy_id,
-            risk_tier: match receipt.risk_tier {
-                RiskTier::Tier3 | RiskTier::Tier4 => 1, // HIGH
-                RiskTier::Tier2 => 2,                   // MED
-                RiskTier::Tier1 | RiskTier::Tier0 => 3, // LOW
-            },
+            // risk_tier stored as uint32 (0-4) for fidelity preservation
+            risk_tier: u32::from(u8::from(receipt.risk_tier)),
             attestation: Some(AatAttestationProto {
                 container_image_digest: receipt.attestation.container_image_digest.to_vec(),
                 toolchain_digests: receipt
@@ -1268,6 +1314,19 @@ impl From<AatGateReceipt> for AatGateReceiptProto {
 pub mod tests {
     use super::*;
 
+    /// Helper to compute stability_digest for test fixtures.
+    fn test_stability_digest(
+        verdict: AatVerdict,
+        terminal_evidence_digest: &[u8; 32],
+        terminal_verifier_outputs_digest: &[u8; 32],
+    ) -> [u8; 32] {
+        AatGateReceipt::compute_stability_digest(
+            verdict,
+            terminal_evidence_digest,
+            terminal_verifier_outputs_digest,
+        )
+    }
+
     fn create_test_attestation() -> AatAttestation {
         AatAttestation {
             container_image_digest: [0x01; 32],
@@ -1286,6 +1345,16 @@ pub mod tests {
     }
 
     fn create_valid_receipt() -> AatGateReceipt {
+        // Compute the correct stability_digest for the test data
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Pass;
+        let stability_digest = AatGateReceipt::compute_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
+
         AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1296,11 +1365,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(3)
             .run_receipt_hashes(vec![[0x44; 32], [0x55; 32], [0x66; 32]])
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Pass)
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict)
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1381,6 +1450,12 @@ pub mod tests {
 
     #[test]
     fn test_run_count_mismatch_rejected() {
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Fail;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1391,11 +1466,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(5) // Mismatch: says 5 runs
             .run_receipt_hashes(vec![[0x44; 32], [0x55; 32], [0x66; 32]]) // But only 3 hashes
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Fail) // FAIL doesn't require verifier outputs
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict) // FAIL doesn't require verifier outputs
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1417,6 +1492,12 @@ pub mod tests {
 
     #[test]
     fn test_pass_verdict_requires_verifier_outputs() {
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Pass;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1427,11 +1508,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(1)
             .run_receipt_hashes(vec![[0x44; 32]])
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Pass) // PASS requires verifiers
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict) // PASS requires verifiers
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1450,6 +1531,12 @@ pub mod tests {
 
     #[test]
     fn test_pass_verdict_requires_satisfied_predicates() {
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Pass;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1460,11 +1547,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(1)
             .run_receipt_hashes(vec![[0x44; 32]])
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Pass)
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict)
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1483,6 +1570,12 @@ pub mod tests {
 
     #[test]
     fn test_fail_verdict_without_verifiers_ok() {
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Fail;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1493,10 +1586,10 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(1)
             .run_receipt_hashes(vec![[0x44; 32]])
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
             .verdict(AatVerdict::Fail) // FAIL doesn't require verifiers
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
@@ -1514,6 +1607,11 @@ pub mod tests {
     #[test]
     fn test_string_too_long_rejected() {
         let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Fail;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1525,11 +1623,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(1)
             .run_receipt_hashes(vec![[0x44; 32]])
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Fail)
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict)
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1553,6 +1651,11 @@ pub mod tests {
     fn test_collection_too_large_rejected() {
         let too_many_hashes: Vec<[u8; 32]> =
             (0..=MAX_RUN_RECEIPT_HASHES).map(|_| [0x44; 32]).collect();
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Fail;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1564,11 +1667,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(u32::try_from(MAX_RUN_RECEIPT_HASHES + 1).unwrap())
             .run_receipt_hashes(too_many_hashes)
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Fail)
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict)
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1782,6 +1885,12 @@ pub mod tests {
 
     #[test]
     fn test_zero_run_count() {
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Fail;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1792,11 +1901,11 @@ pub mod tests {
             .flake_class(FlakeClass::DeterministicFail)
             .run_count(0) // Zero runs
             .run_receipt_hashes(vec![]) // Empty
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::Fail)
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict)
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1813,6 +1922,12 @@ pub mod tests {
 
     #[test]
     fn test_needs_input_verdict() {
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::NeedsInput;
+        let stability_digest =
+            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
             .rcp_manifest_hash([0x22; 32])
@@ -1823,11 +1938,11 @@ pub mod tests {
             .flake_class(FlakeClass::Unknown)
             .run_count(1)
             .run_receipt_hashes(vec![[0x44; 32]])
-            .terminal_evidence_digest([0x77; 32])
+            .terminal_evidence_digest(terminal_evidence_digest)
             .observational_evidence_digest([0x88; 32])
-            .terminal_verifier_outputs_digest([0x99; 32])
-            .stability_digest([0xAA; 32])
-            .verdict(AatVerdict::NeedsInput) // NEEDS_INPUT doesn't require verifiers
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(stability_digest)
+            .verdict(verdict) // NEEDS_INPUT doesn't require verifiers
             .transcript_chain_root_hash([0xBB; 32])
             .transcript_bundle_hash([0xCC; 32])
             .artifact_manifest_hash([0xDD; 32])
@@ -1839,5 +1954,138 @@ pub mod tests {
             .build();
 
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Stability Digest Tests
+    // =========================================================================
+
+    #[test]
+    fn test_stability_digest_validation() {
+        // Test that a receipt with incorrect stability_digest is rejected
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+        let verdict = AatVerdict::Fail;
+        // Use wrong stability_digest
+        let wrong_stability_digest = [0xAA; 32];
+
+        let result = AatGateReceiptBuilder::new()
+            .view_commitment_hash([0x11; 32])
+            .rcp_manifest_hash([0x22; 32])
+            .rcp_profile_id("profile-001")
+            .policy_hash([0x33; 32])
+            .determinism_class(DeterminismClass::FullyDeterministic)
+            .determinism_status(DeterminismStatus::Stable)
+            .flake_class(FlakeClass::DeterministicFail)
+            .run_count(1)
+            .run_receipt_hashes(vec![[0x44; 32]])
+            .terminal_evidence_digest(terminal_evidence_digest)
+            .observational_evidence_digest([0x88; 32])
+            .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+            .stability_digest(wrong_stability_digest)
+            .verdict(verdict)
+            .transcript_chain_root_hash([0xBB; 32])
+            .transcript_bundle_hash([0xCC; 32])
+            .artifact_manifest_hash([0xDD; 32])
+            .terminal_verifier_outputs(vec![])
+            .verifier_policy_hash([0xFF; 32])
+            .selection_policy_id("policy-001")
+            .risk_tier(RiskTier::Tier1)
+            .attestation(create_test_attestation())
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(AatReceiptError::StabilityDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn test_stability_digest_computation() {
+        // Test that compute_stability_digest produces deterministic results
+        let terminal_evidence_digest = [0x77; 32];
+        let terminal_verifier_outputs_digest = [0x99; 32];
+
+        let digest1 = AatGateReceipt::compute_stability_digest(
+            AatVerdict::Pass,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
+        let digest2 = AatGateReceipt::compute_stability_digest(
+            AatVerdict::Pass,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
+        assert_eq!(digest1, digest2);
+
+        // Different verdict should produce different digest
+        let digest3 = AatGateReceipt::compute_stability_digest(
+            AatVerdict::Fail,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
+        assert_ne!(digest1, digest3);
+    }
+
+    // =========================================================================
+    // RiskTier Fidelity Tests
+    // =========================================================================
+
+    #[test]
+    fn test_risk_tier_proto_roundtrip_preserves_all_tiers() {
+        // Test that all 5 RiskTier values survive proto roundtrip
+        for tier in [
+            RiskTier::Tier0,
+            RiskTier::Tier1,
+            RiskTier::Tier2,
+            RiskTier::Tier3,
+            RiskTier::Tier4,
+        ] {
+            let terminal_evidence_digest = [0x77; 32];
+            let terminal_verifier_outputs_digest = [0x99; 32];
+            let verdict = AatVerdict::Fail;
+            let stability_digest = test_stability_digest(
+                verdict,
+                &terminal_evidence_digest,
+                &terminal_verifier_outputs_digest,
+            );
+
+            let receipt = AatGateReceiptBuilder::new()
+                .view_commitment_hash([0x11; 32])
+                .rcp_manifest_hash([0x22; 32])
+                .rcp_profile_id("profile-001")
+                .policy_hash([0x33; 32])
+                .determinism_class(DeterminismClass::FullyDeterministic)
+                .determinism_status(DeterminismStatus::Stable)
+                .flake_class(FlakeClass::DeterministicFail)
+                .run_count(1)
+                .run_receipt_hashes(vec![[0x44; 32]])
+                .terminal_evidence_digest(terminal_evidence_digest)
+                .observational_evidence_digest([0x88; 32])
+                .terminal_verifier_outputs_digest(terminal_verifier_outputs_digest)
+                .stability_digest(stability_digest)
+                .verdict(verdict)
+                .transcript_chain_root_hash([0xBB; 32])
+                .transcript_bundle_hash([0xCC; 32])
+                .artifact_manifest_hash([0xDD; 32])
+                .terminal_verifier_outputs(vec![])
+                .verifier_policy_hash([0xFF; 32])
+                .selection_policy_id("policy-001")
+                .risk_tier(tier)
+                .attestation(create_test_attestation())
+                .build()
+                .expect("valid receipt");
+
+            // Convert to proto and back
+            let proto: AatGateReceiptProto = receipt.into();
+            let recovered = AatGateReceipt::try_from(proto).expect("valid proto");
+
+            // Verify the tier is preserved exactly
+            assert_eq!(
+                recovered.risk_tier, tier,
+                "RiskTier {:?} not preserved through proto roundtrip",
+                tier
+            );
+        }
     }
 }

@@ -1165,9 +1165,10 @@ pub struct AatGateReceipt {
     /// Selection policy identifier.
     #[prost(string, tag = "20")]
     pub selection_policy_id: ::prost::alloc::string::String,
-    /// Risk tier for AAT selection.
-    #[prost(enumeration = "AatRiskTier", tag = "21")]
-    pub risk_tier: i32,
+    /// Risk tier for AAT selection (0-4: Tier0-Tier4).
+    /// Stored as uint32 for fidelity preservation across proto roundtrips.
+    #[prost(uint32, tag = "21")]
+    pub risk_tier: u32,
     /// ============== Attestation (field 22) ==============
     /// Execution environment attestation.
     #[prost(message, optional, tag = "22")]

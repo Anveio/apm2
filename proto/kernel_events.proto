@@ -840,8 +840,9 @@ message AatGateReceipt {
   // ============== Risk tier (fields 20-21) ==============
   // Selection policy identifier.
   string selection_policy_id = 20;
-  // Risk tier for AAT selection.
-  AatRiskTier risk_tier = 21;
+  // Risk tier for AAT selection (0-4: Tier0-Tier4).
+  // Stored as uint32 for fidelity preservation across proto roundtrips.
+  uint32 risk_tier = 21;
 
   // ============== Attestation (field 22) ==============
   // Execution environment attestation.
