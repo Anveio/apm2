@@ -24,11 +24,17 @@
 //! - `determinism_class`: The required determinism level.
 //!
 //! All fields must match exactly for reuse to be permitted.
+//!
+//! # Security
+//!
+//! Hash comparisons use constant-time operations via the `subtle` crate to
+//! prevent timing side-channel attacks.
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
-use super::policy_resolution::{DeterminismClass, RiskTier};
+use super::policy_resolution::{DeterminismClass, MAX_STRING_LENGTH, RiskTier};
 // Re-export proto types
 pub use crate::events::{
     AatProvenanceTuple as AatProvenanceTupleProto, AatResultReused as AATResultReusedProto,
@@ -73,6 +79,17 @@ pub enum ReuseError {
     /// Missing required field.
     #[error("missing required field: {0}")]
     MissingField(&'static str),
+
+    /// String field exceeds maximum length.
+    #[error("string field '{field}' exceeds maximum length ({len} > {max})")]
+    StringTooLong {
+        /// The field name.
+        field: &'static str,
+        /// Actual length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
 }
 
 // =============================================================================
@@ -104,6 +121,11 @@ pub struct AatProvenanceTuple {
 impl AatProvenanceTuple {
     /// Checks if this tuple matches another tuple exactly.
     ///
+    /// # Security
+    ///
+    /// Hash comparisons use constant-time operations to prevent timing
+    /// side-channel attacks.
+    ///
     /// # Returns
     ///
     /// `Ok(())` if they match, `Err(ReuseError::ProvenanceMismatch)` otherwise.
@@ -113,20 +135,31 @@ impl AatProvenanceTuple {
     /// Returns `ReuseError::ProvenanceMismatch` if any field differs between
     /// the tuples.
     pub fn verify_match(&self, other: &Self) -> Result<(), ReuseError> {
-        if self.changeset_digest != other.changeset_digest {
+        // Use constant-time comparison for hash fields to prevent timing attacks
+        if self.changeset_digest.ct_eq(&other.changeset_digest).into() {
+            // Match - continue
+        } else {
             return Err(ReuseError::ProvenanceMismatch {
                 field: "changeset_digest",
                 original: hex::encode(self.changeset_digest),
                 current: hex::encode(other.changeset_digest),
             });
         }
-        if self.view_commitment_hash != other.view_commitment_hash {
+
+        if self
+            .view_commitment_hash
+            .ct_eq(&other.view_commitment_hash)
+            .into()
+        {
+            // Match - continue
+        } else {
             return Err(ReuseError::ProvenanceMismatch {
                 field: "view_commitment_hash",
                 original: hex::encode(self.view_commitment_hash),
                 current: hex::encode(other.view_commitment_hash),
             });
         }
+
         if self.rcp_profile_id != other.rcp_profile_id {
             return Err(ReuseError::ProvenanceMismatch {
                 field: "rcp_profile_id",
@@ -134,13 +167,21 @@ impl AatProvenanceTuple {
                 current: other.rcp_profile_id.clone(),
             });
         }
-        if self.verifier_policy_hash != other.verifier_policy_hash {
+
+        if self
+            .verifier_policy_hash
+            .ct_eq(&other.verifier_policy_hash)
+            .into()
+        {
+            // Match - continue
+        } else {
             return Err(ReuseError::ProvenanceMismatch {
                 field: "verifier_policy_hash",
                 original: hex::encode(self.verifier_policy_hash),
                 current: hex::encode(other.verifier_policy_hash),
             });
         }
+
         if self.determinism_class != other.determinism_class {
             return Err(ReuseError::ProvenanceMismatch {
                 field: "determinism_class",
@@ -170,6 +211,15 @@ pub struct AATResultReused {
     pub justification: String,
 
     /// Gate signature proving authorization.
+    ///
+    /// # TODO: Signature Verification
+    ///
+    /// This field stores the raw signature bytes. Full signature verification
+    /// requires:
+    /// 1. `canonical_bytes()` method to produce the signed message
+    /// 2. `validate_signature()` method to verify against the gate's public key
+    ///
+    /// These are deferred pending integration with the gate key registry.
     #[serde(with = "serde_bytes")]
     pub gate_signature: [u8; 64],
 }
@@ -225,6 +275,15 @@ impl TryFrom<AatProvenanceTupleProto> for AatProvenanceTuple {
     type Error = ReuseError;
 
     fn try_from(proto: AatProvenanceTupleProto) -> Result<Self, Self::Error> {
+        // Validate string field lengths
+        if proto.rcp_profile_id.len() > MAX_STRING_LENGTH {
+            return Err(ReuseError::StringTooLong {
+                field: "rcp_profile_id",
+                len: proto.rcp_profile_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
         let changeset_digest = proto
             .changeset_digest
             .try_into()
@@ -270,6 +329,15 @@ impl TryFrom<AATResultReusedProto> for AATResultReused {
     type Error = ReuseError;
 
     fn try_from(proto: AATResultReusedProto) -> Result<Self, Self::Error> {
+        // Validate string field lengths
+        if proto.justification.len() > MAX_STRING_LENGTH {
+            return Err(ReuseError::StringTooLong {
+                field: "justification",
+                len: proto.justification.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
         let from_receipt_hash = proto
             .from_receipt_hash
             .try_into()
@@ -403,5 +471,73 @@ mod tests {
         let recovered: AATResultReused = proto.try_into().unwrap();
 
         assert_eq!(original, recovered);
+    }
+
+    #[test]
+    fn test_rcp_profile_id_too_long() {
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let proto = AatProvenanceTupleProto {
+            changeset_digest: vec![0; 32],
+            view_commitment_hash: vec![0; 32],
+            rcp_profile_id: long_string,
+            verifier_policy_hash: vec![0; 32],
+            determinism_class: 0,
+        };
+
+        let result: Result<AatProvenanceTuple, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(ReuseError::StringTooLong {
+                field: "rcp_profile_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_justification_too_long() {
+        let long_string = "x".repeat(MAX_STRING_LENGTH + 1);
+        let proto = AATResultReusedProto {
+            from_receipt_hash: vec![0; 32],
+            provenance: Some(AatProvenanceTupleProto {
+                changeset_digest: vec![0; 32],
+                view_commitment_hash: vec![0; 32],
+                rcp_profile_id: "valid".to_string(),
+                verifier_policy_hash: vec![0; 32],
+                determinism_class: 0,
+            }),
+            policy_hash: vec![0; 32],
+            justification: long_string,
+            gate_signature: vec![0; 64],
+        };
+
+        let result: Result<AATResultReused, _> = proto.try_into();
+        assert!(matches!(
+            result,
+            Err(ReuseError::StringTooLong {
+                field: "justification",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_constant_time_comparison_behavior() {
+        // This test verifies the constant-time comparison is used correctly.
+        // We can't directly test timing, but we can verify the logic works.
+        let t1 = create_tuple(1);
+        let mut t2 = create_tuple(1);
+
+        // Same values should match
+        assert!(t1.verify_match(&t2).is_ok());
+
+        // Different first byte should fail
+        t2.changeset_digest[0] = 0xFF;
+        assert!(t1.verify_match(&t2).is_err());
+
+        // Different last byte should fail
+        t2.changeset_digest[0] = 1;
+        t2.changeset_digest[31] = 0xFF;
+        assert!(t1.verify_match(&t2).is_err());
     }
 }
