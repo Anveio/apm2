@@ -408,6 +408,15 @@ pub enum DivergenceError {
     /// Adjudication required but not provided.
     #[error("adjudication ID required for resolution type")]
     AdjudicationRequired,
+
+    /// Scope is already frozen.
+    #[error("scope already frozen: {scope_value} (freeze_id: {existing_freeze_id})")]
+    ScopeAlreadyFrozen {
+        /// The scope value that is already frozen.
+        scope_value: String,
+        /// The existing freeze ID for this scope.
+        existing_freeze_id: String,
+    },
 }
 
 // =============================================================================
@@ -1534,7 +1543,10 @@ impl FreezeRegistry {
     /// # Errors
     ///
     /// Returns [`DivergenceError::InvalidFreezeSignature`] if signature
-    /// verification fails. Returns an error if the lock is poisoned.
+    /// verification fails.
+    /// Returns [`DivergenceError::ScopeAlreadyFrozen`] if the scope is already
+    /// frozen (idempotency protection).
+    /// Returns an error if the lock is poisoned.
     pub(crate) fn register(
         &self,
         freeze: &InterventionFreeze,
@@ -1552,6 +1564,16 @@ impl FreezeRegistry {
             .write()
             .map_err(|e| DivergenceError::InvalidConfiguration(format!("lock poisoned: {e}")))?;
 
+        // Prevent duplicate registrations for the same scope.
+        // This prevents unbounded memory growth in active_freezes if multiple
+        // freeze events are registered for the same scope without unfreeze.
+        if let Some(existing_freeze_id) = scope.get(&freeze.scope_value) {
+            return Err(DivergenceError::ScopeAlreadyFrozen {
+                scope_value: freeze.scope_value.clone(),
+                existing_freeze_id: existing_freeze_id.clone(),
+            });
+        }
+
         active.insert(freeze.freeze_id.clone());
         scope.insert(freeze.scope_value.clone(), freeze.freeze_id.clone());
 
@@ -1559,7 +1581,7 @@ impl FreezeRegistry {
     }
 
     /// Unregisters a freeze from the registry after verifying the unfreeze
-    /// signature.
+    /// signature and adjudication requirements.
     ///
     /// Per CTR-2703 (Cryptographically Bound ActorID): Signatures must be
     /// validated before accepting state mutations. This prevents
@@ -1574,6 +1596,12 @@ impl FreezeRegistry {
     /// override authority. This would violate the fail-closed principle for
     /// SCP state mutations.
     ///
+    /// # Adjudication Enforcement
+    ///
+    /// If the `resolution_type` is `Adjudication`, the `adjudication_id` field
+    /// MUST be present. This ensures all non-emergency unfreezes have a
+    /// traceable adjudication reference for audit purposes.
+    ///
     /// # Arguments
     ///
     /// * `unfreeze` - The signed unfreeze event
@@ -1583,6 +1611,8 @@ impl FreezeRegistry {
     ///
     /// Returns [`DivergenceError::InvalidUnfreezeSignature`] if signature
     /// verification fails.
+    /// Returns [`DivergenceError::AdjudicationRequired`] if `resolution_type`
+    /// is Adjudication but `adjudication_id` is missing.
     /// Returns [`DivergenceError::FreezeNotFound`] if the freeze is not in the
     /// registry.
     pub(crate) fn unregister(
@@ -1592,6 +1622,11 @@ impl FreezeRegistry {
     ) -> Result<(), DivergenceError> {
         // Per CTR-2703: Validate signature before accepting state mutation
         unfreeze.validate_signature(verifying_key)?;
+
+        // Enforce adjudication_id requirement for Adjudication resolution type
+        if unfreeze.resolution_type.requires_adjudication() && unfreeze.adjudication_id.is_none() {
+            return Err(DivergenceError::AdjudicationRequired);
+        }
 
         let mut active = self
             .active_freezes
@@ -1631,6 +1666,16 @@ impl FreezeRegistry {
     ///
     /// - Slash-separated: `org/repo` - checks `org/repo`, then `org`
     /// - Colon-separated: `org:kind` - checks `org:kind`, then `org`
+    ///
+    /// # Unfreeze Independence
+    ///
+    /// **Important:** While freeze checks are hierarchical (parent freezes
+    /// affect children), unfreezes are NOT hierarchical. Each freeze must be
+    /// explicitly unfrozen by its own `freeze_id`. Unfreezing a parent scope
+    /// does NOT automatically lift freezes on child scopes.
+    ///
+    /// This is intentional - it enforces a "most-restrictive" security posture
+    /// where explicit unfreezes are required for each frozen entity.
     ///
     /// # Returns
     ///
@@ -2993,6 +3038,86 @@ pub mod tests {
         ));
         // Freeze should still be active
         assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn test_registry_rejects_duplicate_scope_freeze() {
+        // Security fix: Prevent unbounded memory growth by rejecting duplicate
+        // scope registrations
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
+
+        let freeze1 = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        // First registration should succeed
+        registry
+            .register(&freeze1, &signer.verifying_key())
+            .unwrap();
+        assert_eq!(registry.active_count(), 1);
+
+        // Second freeze for the same scope should be rejected
+        let freeze2 = InterventionFreezeBuilder::new("freeze-002")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo") // Same scope as freeze1
+            .trigger_defect_id("defect-002")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x88; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12346")
+            .build_and_sign(&signer);
+
+        let result = registry.register(&freeze2, &signer.verifying_key());
+        assert!(matches!(
+            result,
+            Err(DivergenceError::ScopeAlreadyFrozen { .. })
+        ));
+
+        // Still only one freeze registered
+        assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn test_registry_unregister_with_adjudication_succeeds() {
+        // Verify that unfreeze with Adjudication type + adjudication_id works
+        let signer = Signer::generate();
+        let registry = FreezeRegistry::new_hydrated_for_testing();
+
+        let freeze = InterventionFreezeBuilder::new("freeze-001")
+            .scope(FreezeScope::Repository)
+            .scope_value("test-repo")
+            .trigger_defect_id("defect-001")
+            .expected_trunk_head([0x42; 32])
+            .actual_trunk_head([0x99; 32])
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12345")
+            .build_and_sign(&signer);
+
+        registry.register(&freeze, &signer.verifying_key()).unwrap();
+        assert_eq!(registry.active_count(), 1);
+
+        // Unfreeze with Adjudication type requires adjudication_id
+        // Note: The builder enforces this at build time
+        // (test_unfreeze_adjudication_required) The registry also enforces this
+        // as defense-in-depth
+        let unfreeze_with_adj = InterventionUnfreezeBuilder::new("freeze-001")
+            .resolution_type(ResolutionType::Adjudication)
+            .adjudication_id("adj-001") // Required for Adjudication type
+            .gate_actor_id("watchdog-001")
+            .time_envelope_ref("htf:tick:12347")
+            .build_and_sign(&signer);
+
+        registry
+            .unregister(&unfreeze_with_adj, &signer.verifying_key())
+            .unwrap();
+        assert_eq!(registry.active_count(), 0);
     }
 
     #[test]
