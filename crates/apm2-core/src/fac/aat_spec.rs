@@ -251,6 +251,33 @@ impl Invariant {
                 reason: e.to_string(),
             })
     }
+
+    /// Validates resource limits for defense against deserialization bypass.
+    ///
+    /// This method enforces string length limits that are normally checked
+    /// during construction via the builder. When deserializing untrusted
+    /// input, call this to prevent denial-of-service attacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AatSpecError::StringTooLong`] if string fields exceed limits.
+    pub fn validate_resource_limits(&self) -> Result<(), AatSpecError> {
+        if self.invariant_id.len() > MAX_STRING_LENGTH {
+            return Err(AatSpecError::StringTooLong {
+                field: "invariant_id",
+                actual: self.invariant_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.statement.len() > MAX_STATEMENT_LENGTH {
+            return Err(AatSpecError::StringTooLong {
+                field: "statement",
+                actual: self.statement.len(),
+                max: MAX_STATEMENT_LENGTH,
+            });
+        }
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -412,6 +439,33 @@ impl AatStep {
     #[must_use]
     pub const fn observational(&self) -> bool {
         self.observational
+    }
+
+    /// Validates resource limits for defense against deserialization bypass.
+    ///
+    /// This method enforces string length limits that are normally checked
+    /// during construction via the builder. When deserializing untrusted
+    /// input, call this to prevent denial-of-service attacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AatSpecError::StringTooLong`] if string fields exceed limits.
+    pub fn validate_resource_limits(&self) -> Result<(), AatSpecError> {
+        if self.step_id.len() > MAX_STRING_LENGTH {
+            return Err(AatSpecError::StringTooLong {
+                field: "step_id",
+                actual: self.step_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.action.len() > MAX_ACTION_LENGTH {
+            return Err(AatSpecError::StringTooLong {
+                field: "action",
+                actual: self.action.len(),
+                max: MAX_ACTION_LENGTH,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -613,6 +667,37 @@ impl AatSpec {
     /// assert!(spec.validate().is_ok());
     /// ```
     pub fn validate(&self) -> Result<(), AatSpecError> {
+        // 0. Check resource limits (defense against deserialization bypass)
+        // These checks prevent DoS attacks via unbounded collections or strings
+        if self.invariants.len() > MAX_INVARIANTS {
+            return Err(AatSpecError::CollectionTooLarge {
+                field: "invariants",
+                actual: self.invariants.len(),
+                max: MAX_INVARIANTS,
+            });
+        }
+        if self.steps.len() > MAX_STEPS {
+            return Err(AatSpecError::CollectionTooLarge {
+                field: "steps",
+                actual: self.steps.len(),
+                max: MAX_STEPS,
+            });
+        }
+        if self.spec_id.len() > MAX_STRING_LENGTH {
+            return Err(AatSpecError::StringTooLong {
+                field: "spec_id",
+                actual: self.spec_id.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+        if self.scenario_type.len() > MAX_STRING_LENGTH {
+            return Err(AatSpecError::StringTooLong {
+                field: "scenario_type",
+                actual: self.scenario_type.len(),
+                max: MAX_STRING_LENGTH,
+            });
+        }
+
         // 1. Check at least one invariant exists
         if self.invariants.is_empty() {
             return Err(AatSpecError::NoInvariants);
@@ -620,6 +705,9 @@ impl AatSpec {
 
         // 2. Check for duplicate invariant IDs and validate each invariant
         for (i, invariant) in self.invariants.iter().enumerate() {
+            // Validate invariant string lengths (defense against deserialization bypass)
+            invariant.validate_resource_limits()?;
+
             // Check for duplicates
             for (j, other) in self.invariants.iter().enumerate() {
                 if i != j && invariant.invariant_id() == other.invariant_id() {
@@ -635,6 +723,9 @@ impl AatSpec {
 
         // 3. Check all steps are observational and check for duplicates
         for (i, step) in self.steps.iter().enumerate() {
+            // Validate step string lengths (defense against deserialization bypass)
+            step.validate_resource_limits()?;
+
             // Check for duplicates
             for (j, other) in self.steps.iter().enumerate() {
                 if i != j && step.step_id() == other.step_id() {
@@ -1466,5 +1557,141 @@ pub mod tests {
         };
         assert!(err.to_string().contains("duplicate"));
         assert!(err.to_string().contains("inv-001"));
+    }
+
+    // =========================================================================
+    // Deserialization Bypass Defense Tests
+    // =========================================================================
+
+    /// Test that `validate()` catches resource limit violations on deserialized
+    /// data. This defends against attackers bypassing builder validation
+    /// via direct JSON/YAML deserialization.
+    #[test]
+    fn test_validate_catches_deserialized_too_many_invariants() {
+        // Create a spec with too many invariants via deserialization (simulated)
+        let invariants: Vec<Invariant> = (0..=MAX_INVARIANTS)
+            .map(|i| create_test_invariant(&format!("inv-{i:04}")))
+            .collect();
+
+        // Construct the spec directly (as if deserialized), bypassing the builder
+        let spec = AatSpec {
+            spec_id: "spec-001".to_string(),
+            scenario_type: "build".to_string(),
+            invariants,
+            steps: vec![],
+        };
+
+        // validate() must catch the resource limit violation
+        let result = spec.validate();
+        assert!(matches!(
+            result,
+            Err(AatSpecError::CollectionTooLarge {
+                field: "invariants",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_catches_deserialized_too_many_steps() {
+        let invariants = vec![create_test_invariant("inv-001")];
+        let steps: Vec<AatStep> = (0..=MAX_STEPS)
+            .map(|i| create_test_step(&format!("step-{i:04}")))
+            .collect();
+
+        // Construct the spec directly (as if deserialized), bypassing the builder
+        let spec = AatSpec {
+            spec_id: "spec-001".to_string(),
+            scenario_type: "build".to_string(),
+            invariants,
+            steps,
+        };
+
+        // validate() must catch the resource limit violation
+        let result = spec.validate();
+        assert!(matches!(
+            result,
+            Err(AatSpecError::CollectionTooLarge { field: "steps", .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_catches_deserialized_long_spec_id() {
+        let invariants = vec![create_test_invariant("inv-001")];
+
+        // Construct the spec directly with overly long spec_id
+        let spec = AatSpec {
+            spec_id: "x".repeat(MAX_STRING_LENGTH + 1),
+            scenario_type: "build".to_string(),
+            invariants,
+            steps: vec![],
+        };
+
+        // validate() must catch the string length violation
+        let result = spec.validate();
+        assert!(matches!(
+            result,
+            Err(AatSpecError::StringTooLong {
+                field: "spec_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_catches_deserialized_long_invariant_id() {
+        // Construct an invariant directly with overly long ID
+        let long_id_invariant = Invariant {
+            invariant_id: "x".repeat(MAX_STRING_LENGTH + 1),
+            statement: "Test".to_string(),
+            verifier_kind: VerifierKind::ExitCode,
+            machine_predicate: Predicate::literal(0),
+        };
+
+        let spec = AatSpec {
+            spec_id: "spec-001".to_string(),
+            scenario_type: "build".to_string(),
+            invariants: vec![long_id_invariant],
+            steps: vec![],
+        };
+
+        // validate() must catch the string length violation
+        let result = spec.validate();
+        assert!(matches!(
+            result,
+            Err(AatSpecError::StringTooLong {
+                field: "invariant_id",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_catches_deserialized_long_step_action() {
+        let invariants = vec![create_test_invariant("inv-001")];
+
+        // Construct a step directly with overly long action
+        let long_action_step = AatStep {
+            step_id: "step-001".to_string(),
+            action: "x".repeat(MAX_ACTION_LENGTH + 1),
+            observational: true,
+        };
+
+        let spec = AatSpec {
+            spec_id: "spec-001".to_string(),
+            scenario_type: "build".to_string(),
+            invariants,
+            steps: vec![long_action_step],
+        };
+
+        // validate() must catch the string length violation
+        let result = spec.validate();
+        assert!(matches!(
+            result,
+            Err(AatSpecError::StringTooLong {
+                field: "action",
+                ..
+            })
+        ));
     }
 }
