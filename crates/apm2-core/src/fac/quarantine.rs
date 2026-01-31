@@ -83,6 +83,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::domain_separator::{QUARANTINE_EVENT_PREFIX, verify_with_domain};
+use crate::crypto::{Signature, VerifyingKey};
 // Re-export proto types
 pub use crate::events::{
     AatSpecQuarantined as AATSpecQuarantinedProto, QuarantineCleared as QuarantineClearedProto,
@@ -154,6 +156,10 @@ pub enum QuarantineError {
         /// Actual length.
         len: usize,
     },
+
+    /// Signature verification failed.
+    #[error("signature verification failed")]
+    SignatureVerificationFailed,
 }
 
 // =============================================================================
@@ -186,6 +192,79 @@ pub struct RunnerPoolQuarantined {
     pub issuer_signature: [u8; 64],
 }
 
+impl RunnerPoolQuarantined {
+    /// Computes the canonical bytes for signing/verification.
+    ///
+    /// The canonical encoding includes all fields EXCEPT the signature itself,
+    /// in a deterministic order:
+    /// - `quarantine_id` (length-prefixed)
+    /// - `pool_id` (length-prefixed)
+    /// - `reason` (length-prefixed)
+    /// - `evidence_refs` count + each ref (length-prefixed, sorted)
+    /// - `time_envelope_ref` (length-prefixed)
+    /// - `issuer_actor_id` (length-prefixed)
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // quarantine_id (length-prefixed)
+        bytes.extend_from_slice(&(self.quarantine_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.quarantine_id.as_bytes());
+
+        // pool_id (length-prefixed)
+        bytes.extend_from_slice(&(self.pool_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.pool_id.as_bytes());
+
+        // reason (length-prefixed)
+        bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.reason.as_bytes());
+
+        // evidence_refs (count + each ref length-prefixed, sorted for determinism)
+        let mut sorted_refs = self.evidence_refs.clone();
+        sorted_refs.sort();
+        bytes.extend_from_slice(&(sorted_refs.len() as u32).to_be_bytes());
+        for r in &sorted_refs {
+            bytes.extend_from_slice(&(r.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(r.as_bytes());
+        }
+
+        // time_envelope_ref (length-prefixed)
+        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+
+        // issuer_actor_id (length-prefixed)
+        bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.issuer_actor_id.as_bytes());
+
+        bytes
+    }
+
+    /// Verifies the issuer signature using the `QUARANTINE_EVENT:` domain
+    /// prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `verifying_key` - The public key of the expected signer
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuarantineError::SignatureVerificationFailed`] if the
+    /// signature does not match the canonical bytes.
+    pub fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<(), QuarantineError> {
+        let canonical = self.canonical_bytes();
+        let signature = Signature::from_bytes(&self.issuer_signature);
+
+        verify_with_domain(
+            verifying_key,
+            QUARANTINE_EVENT_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .map_err(|_| QuarantineError::SignatureVerificationFailed)
+    }
+}
+
 /// Event indicating an AAT spec has been quarantined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AATSpecQuarantined {
@@ -212,6 +291,79 @@ pub struct AATSpecQuarantined {
     pub issuer_signature: [u8; 64],
 }
 
+impl AATSpecQuarantined {
+    /// Computes the canonical bytes for signing/verification.
+    ///
+    /// The canonical encoding includes all fields EXCEPT the signature itself,
+    /// in a deterministic order:
+    /// - `quarantine_id` (length-prefixed)
+    /// - `spec_id` (length-prefixed)
+    /// - `reason` (length-prefixed)
+    /// - `evidence_refs` count + each ref (length-prefixed, sorted)
+    /// - `time_envelope_ref` (length-prefixed)
+    /// - `issuer_actor_id` (length-prefixed)
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // quarantine_id (length-prefixed)
+        bytes.extend_from_slice(&(self.quarantine_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.quarantine_id.as_bytes());
+
+        // spec_id (length-prefixed)
+        bytes.extend_from_slice(&(self.spec_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.spec_id.as_bytes());
+
+        // reason (length-prefixed)
+        bytes.extend_from_slice(&(self.reason.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.reason.as_bytes());
+
+        // evidence_refs (count + each ref length-prefixed, sorted for determinism)
+        let mut sorted_refs = self.evidence_refs.clone();
+        sorted_refs.sort();
+        bytes.extend_from_slice(&(sorted_refs.len() as u32).to_be_bytes());
+        for r in &sorted_refs {
+            bytes.extend_from_slice(&(r.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(r.as_bytes());
+        }
+
+        // time_envelope_ref (length-prefixed)
+        bytes.extend_from_slice(&(self.time_envelope_ref.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.time_envelope_ref.as_bytes());
+
+        // issuer_actor_id (length-prefixed)
+        bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.issuer_actor_id.as_bytes());
+
+        bytes
+    }
+
+    /// Verifies the issuer signature using the `QUARANTINE_EVENT:` domain
+    /// prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `verifying_key` - The public key of the expected signer
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuarantineError::SignatureVerificationFailed`] if the
+    /// signature does not match the canonical bytes.
+    pub fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<(), QuarantineError> {
+        let canonical = self.canonical_bytes();
+        let signature = Signature::from_bytes(&self.issuer_signature);
+
+        verify_with_domain(
+            verifying_key,
+            QUARANTINE_EVENT_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .map_err(|_| QuarantineError::SignatureVerificationFailed)
+    }
+}
+
 /// Event indicating a quarantine has been cleared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuarantineCleared {
@@ -230,6 +382,63 @@ pub struct QuarantineCleared {
     /// Ed25519 signature over canonical bytes.
     #[serde(with = "serde_bytes")]
     pub issuer_signature: [u8; 64],
+}
+
+impl QuarantineCleared {
+    /// Computes the canonical bytes for signing/verification.
+    ///
+    /// The canonical encoding includes all fields EXCEPT the signature itself,
+    /// in a deterministic order:
+    /// - `quarantine_id` (length-prefixed)
+    /// - `target_id` (length-prefixed)
+    /// - `cleared_at` (8 bytes big-endian)
+    /// - `issuer_actor_id` (length-prefixed)
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH < u32::MAX
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // quarantine_id (length-prefixed)
+        bytes.extend_from_slice(&(self.quarantine_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.quarantine_id.as_bytes());
+
+        // target_id (length-prefixed)
+        bytes.extend_from_slice(&(self.target_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.target_id.as_bytes());
+
+        // cleared_at (8 bytes big-endian)
+        bytes.extend_from_slice(&self.cleared_at.to_be_bytes());
+
+        // issuer_actor_id (length-prefixed)
+        bytes.extend_from_slice(&(self.issuer_actor_id.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(self.issuer_actor_id.as_bytes());
+
+        bytes
+    }
+
+    /// Verifies the issuer signature using the `QUARANTINE_EVENT:` domain
+    /// prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `verifying_key` - The public key of the expected signer
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuarantineError::SignatureVerificationFailed`] if the
+    /// signature does not match the canonical bytes.
+    pub fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<(), QuarantineError> {
+        let canonical = self.canonical_bytes();
+        let signature = Signature::from_bytes(&self.issuer_signature);
+
+        verify_with_domain(
+            verifying_key,
+            QUARANTINE_EVENT_PREFIX,
+            &canonical,
+            &signature,
+        )
+        .map_err(|_| QuarantineError::SignatureVerificationFailed)
+    }
 }
 
 /// Union of all quarantine event types.
@@ -1267,5 +1476,185 @@ pub mod tests {
         let result: Result<QuarantineEvent, _> = payload.try_into();
 
         assert!(matches!(result, Err(QuarantineError::InvalidData(_))));
+    }
+
+    // =========================================================================
+    // Cryptographic Verification Tests (SEC-FAC-01, SEC-FAC-02)
+    // =========================================================================
+
+    use super::super::domain_separator::{QUARANTINE_EVENT_PREFIX, sign_with_domain};
+    use crate::crypto::Signer;
+
+    /// Helper to create a signed `RunnerPoolQuarantined` event.
+    fn create_signed_pool_quarantined(pool_id: &str, signer: &Signer) -> RunnerPoolQuarantined {
+        let mut event = RunnerPoolQuarantined {
+            quarantine_id: format!("q-{pool_id}"),
+            pool_id: pool_id.to_string(),
+            reason: "Test flakiness".to_string(),
+            evidence_refs: vec!["evidence-001".to_string()],
+            time_envelope_ref: "htf:tick:12345".to_string(),
+            issuer_actor_id: "gate-001".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let canonical = event.canonical_bytes();
+        let signature = sign_with_domain(signer, QUARANTINE_EVENT_PREFIX, &canonical);
+        event.issuer_signature = signature.to_bytes();
+
+        event
+    }
+
+    /// Helper to create a signed `AATSpecQuarantined` event.
+    fn create_signed_spec_quarantined(spec_id: &str, signer: &Signer) -> AATSpecQuarantined {
+        let mut event = AATSpecQuarantined {
+            quarantine_id: format!("q-{spec_id}"),
+            spec_id: spec_id.to_string(),
+            reason: "Non-deterministic output".to_string(),
+            evidence_refs: vec!["evidence-002".to_string()],
+            time_envelope_ref: "htf:tick:12346".to_string(),
+            issuer_actor_id: "gate-002".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let canonical = event.canonical_bytes();
+        let signature = sign_with_domain(signer, QUARANTINE_EVENT_PREFIX, &canonical);
+        event.issuer_signature = signature.to_bytes();
+
+        event
+    }
+
+    /// Helper to create a signed `QuarantineCleared` event.
+    fn create_signed_cleared(target_id: &str, signer: &Signer) -> QuarantineCleared {
+        let mut event = QuarantineCleared {
+            quarantine_id: format!("q-{target_id}"),
+            target_id: target_id.to_string(),
+            cleared_at: 1_704_067_200_000,
+            issuer_actor_id: "gate-001".to_string(),
+            issuer_signature: [0u8; 64],
+        };
+
+        let canonical = event.canonical_bytes();
+        let signature = sign_with_domain(signer, QUARANTINE_EVENT_PREFIX, &canonical);
+        event.issuer_signature = signature.to_bytes();
+
+        event
+    }
+
+    #[test]
+    fn test_pool_quarantined_canonical_bytes_deterministic() {
+        let event1 = create_pool_quarantined("pool-001");
+        let event2 = create_pool_quarantined("pool-001");
+
+        // Canonical bytes should be identical for identical events
+        assert_eq!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_pool_quarantined_canonical_bytes_different_for_different_events() {
+        let event1 = create_pool_quarantined("pool-001");
+        let event2 = create_pool_quarantined("pool-002");
+
+        // Canonical bytes should differ for different events
+        assert_ne!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_pool_quarantined_verify_signature_success() {
+        let signer = Signer::generate();
+        let event = create_signed_pool_quarantined("pool-001", &signer);
+
+        // Verification should succeed with correct key
+        assert!(event.verify_signature(&signer.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_pool_quarantined_verify_signature_wrong_key() {
+        let signer1 = Signer::generate();
+        let signer2 = Signer::generate();
+        let event = create_signed_pool_quarantined("pool-001", &signer1);
+
+        // Verification should fail with wrong key
+        assert!(event.verify_signature(&signer2.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_pool_quarantined_verify_signature_tampered_data() {
+        let signer = Signer::generate();
+        let mut event = create_signed_pool_quarantined("pool-001", &signer);
+
+        // Tamper with the data
+        event.reason = "Different reason".to_string();
+
+        // Verification should fail
+        assert!(event.verify_signature(&signer.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_spec_quarantined_canonical_bytes_deterministic() {
+        let event1 = create_spec_quarantined("spec-001");
+        let event2 = create_spec_quarantined("spec-001");
+
+        // Canonical bytes should be identical for identical events
+        assert_eq!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_spec_quarantined_verify_signature_success() {
+        let signer = Signer::generate();
+        let event = create_signed_spec_quarantined("spec-001", &signer);
+
+        // Verification should succeed with correct key
+        assert!(event.verify_signature(&signer.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_spec_quarantined_verify_signature_wrong_key() {
+        let signer1 = Signer::generate();
+        let signer2 = Signer::generate();
+        let event = create_signed_spec_quarantined("spec-001", &signer1);
+
+        // Verification should fail with wrong key
+        assert!(event.verify_signature(&signer2.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_cleared_canonical_bytes_deterministic() {
+        let event1 = create_cleared("target-001");
+        let event2 = create_cleared("target-001");
+
+        // Canonical bytes should be identical for identical events
+        assert_eq!(event1.canonical_bytes(), event2.canonical_bytes());
+    }
+
+    #[test]
+    fn test_cleared_verify_signature_success() {
+        let signer = Signer::generate();
+        let event = create_signed_cleared("target-001", &signer);
+
+        // Verification should succeed with correct key
+        assert!(event.verify_signature(&signer.verifying_key()).is_ok());
+    }
+
+    #[test]
+    fn test_cleared_verify_signature_wrong_key() {
+        let signer1 = Signer::generate();
+        let signer2 = Signer::generate();
+        let event = create_signed_cleared("target-001", &signer1);
+
+        // Verification should fail with wrong key
+        assert!(event.verify_signature(&signer2.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn test_evidence_refs_sorted_in_canonical_bytes() {
+        // Create events with evidence refs in different orders
+        let mut event1 = create_pool_quarantined("pool-001");
+        event1.evidence_refs = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+
+        let mut event2 = create_pool_quarantined("pool-001");
+        event2.evidence_refs = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+
+        // Canonical bytes should be identical because evidence_refs are sorted
+        assert_eq!(event1.canonical_bytes(), event2.canonical_bytes());
     }
 }
