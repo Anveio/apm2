@@ -355,37 +355,76 @@ pub struct AatTranscriptBinding {
     run_transcript_hashes: Vec<Hash>,
 }
 
-/// Custom serde for Vec<[u8; 32]>.
+/// Custom serde for `Vec<[u8; 32]>` with bounded deserialization.
+///
+/// Uses a custom visitor that:
+/// 1. Limits the number of elements to `MAX_RUN_TRANSCRIPT_HASHES`
+/// 2. Enforces exactly 32 bytes per element during read (not after allocation)
 mod vec_hash_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::de::{SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
+
+    use super::MAX_RUN_TRANSCRIPT_HASHES;
 
     pub fn serialize<S>(hashes: &[[u8; 32]], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
+        // Serialize as array of fixed-size byte arrays
         let vec_of_vecs: Vec<&[u8]> = hashes.iter().map(<[u8; 32]>::as_slice).collect();
         vec_of_vecs.serialize(serializer)
+    }
+
+    struct HashVecVisitor;
+
+    impl<'de> Visitor<'de> for HashVecVisitor {
+        type Value = Vec<[u8; 32]>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_RUN_TRANSCRIPT_HASHES} 32-byte hashes",
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            // Pre-allocate with a reasonable hint, but cap at max
+            let size_hint = seq.size_hint().unwrap_or(0).min(MAX_RUN_TRANSCRIPT_HASHES);
+            let mut hashes = Vec::with_capacity(size_hint);
+
+            while let Some(bytes) = seq.next_element::<serde_bytes::ByteBuf>()? {
+                // Enforce count limit BEFORE allocation
+                if hashes.len() >= MAX_RUN_TRANSCRIPT_HASHES {
+                    return Err(serde::de::Error::custom(format!(
+                        "too many run transcript hashes: > {MAX_RUN_TRANSCRIPT_HASHES}"
+                    )));
+                }
+
+                // Enforce 32-byte constraint
+                if bytes.len() != 32 {
+                    return Err(serde::de::Error::custom(format!(
+                        "expected 32 bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                hashes.push(arr);
+            }
+
+            Ok(hashes)
+        }
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<[u8; 32]>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let vec_of_vecs = Vec::<Vec<u8>>::deserialize(deserializer)?;
-        vec_of_vecs
-            .into_iter()
-            .map(|v| {
-                if v.len() != 32 {
-                    return Err(serde::de::Error::custom(format!(
-                        "expected 32 bytes, got {}",
-                        v.len()
-                    )));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&v);
-                Ok(arr)
-            })
-            .collect()
+        deserializer.deserialize_seq(HashVecVisitor)
     }
 }
 
@@ -635,15 +674,10 @@ impl<'de> Deserialize<'de> for AatTranscriptBinding {
             )));
         }
 
-        if wire.run_transcript_hashes.len() > MAX_RUN_TRANSCRIPT_HASHES {
-            return Err(serde::de::Error::custom(format!(
-                "too many run transcript hashes: {} > {}",
-                wire.run_transcript_hashes.len(),
-                MAX_RUN_TRANSCRIPT_HASHES
-            )));
-        }
+        // Note: run_transcript_hashes limit is already enforced by vec_hash_serde
+        // during deserialization via the custom visitor
 
-        let transcript_chunks = wire
+        let transcript_chunks: Vec<TranscriptChunk> = wire
             .transcript_chunks
             .into_iter()
             .map(|w| TranscriptChunk {
@@ -653,11 +687,18 @@ impl<'de> Deserialize<'de> for AatTranscriptBinding {
             })
             .collect();
 
-        Ok(Self {
+        let binding = Self {
             transcript_chunks,
             transcript_chain_root_hash: wire.transcript_chain_root_hash,
             run_transcript_hashes: wire.run_transcript_hashes,
-        })
+        };
+
+        // SECURITY: Validate integrity to prevent fail-open.
+        // Ensures the stored chain root hash matches the computed Merkle root,
+        // preventing acceptance of tampered evidence.
+        binding.validate().map_err(serde::de::Error::custom)?;
+
+        Ok(binding)
     }
 }
 
@@ -1113,6 +1154,78 @@ pub mod tests {
 
         let result: Result<AatTranscriptBinding, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // Fail-Closed Deserialization Tests (Security)
+    // =========================================================================
+
+    #[test]
+    fn test_deserialize_validates_merkle_root() {
+        // SECURITY TEST: Ensures deserialization validates the Merkle root,
+        // preventing acceptance of tampered evidence.
+        let chunk = TranscriptChunk::try_new(b"Content", 0).unwrap();
+        let valid_binding = AatTranscriptBinding::try_new(vec![chunk], vec![]).unwrap();
+
+        // Serialize valid binding, then tamper with the root
+        let mut wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&valid_binding).unwrap()).unwrap();
+
+        // Tamper: replace root hash with wrong value
+        wire["transcript_chain_root_hash"] = serde_json::json!([
+            0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+            0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+            0xAB, 0xAB, 0xAB, 0xAB
+        ]);
+
+        let tampered_json = serde_json::to_string(&wire).unwrap();
+        let result: Result<AatTranscriptBinding, _> = serde_json::from_str(&tampered_json);
+
+        // Should fail during deserialization due to validation
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("chain root hash mismatch")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_validates_sequence_order() {
+        // SECURITY TEST: Ensures deserialization validates sequence numbers.
+        // Create wire format with out-of-order sequences
+        let chunks = vec![
+            TranscriptChunkWire {
+                content_hash: [0x11; 32],
+                sequence: 0,
+                content_size: 10,
+            },
+            TranscriptChunkWire {
+                content_hash: [0x22; 32],
+                sequence: 5, // Should be 1
+                content_size: 10,
+            },
+        ];
+
+        // Compute a "valid" root for these chunks (doesn't matter, sequence check comes
+        // first)
+        let wire = AatTranscriptBindingWire {
+            transcript_chunks: chunks,
+            transcript_chain_root_hash: [0u8; 32], // Will fail anyway
+            run_transcript_hashes: vec![],
+        };
+
+        let json = serde_json::to_string(&wire).unwrap();
+        let result: Result<AatTranscriptBinding, _> = serde_json::from_str(&json);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("sequence number out of order")
+        );
     }
 
     // =========================================================================
