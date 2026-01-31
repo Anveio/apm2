@@ -41,5 +41,6 @@ mod clock;
 
 pub use clock::{
     ClockConfig, ClockConfigBuilder, ClockError, ClockRegression, HolonicClock,
-    HolonicClockBuilder, MAX_BUILD_FINGERPRINT_LEN, MAX_NAMESPACE_LEN, MAX_POLICY_ID_LEN,
+    HolonicClockBuilder, MAX_BUILD_FINGERPRINT_LEN, MAX_HLC_OFFSET_NS, MAX_NAMESPACE_LEN,
+    MAX_POLICY_ID_LEN,
 };

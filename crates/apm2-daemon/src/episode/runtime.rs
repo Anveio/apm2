@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use apm2_core::htf::TimeEnvelopeRef;
+use apm2_core::htf::{TimeEnvelope, TimeEnvelopeRef};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -49,6 +49,12 @@ use crate::htf::HolonicClock;
 /// This limit prevents unbounded memory growth per CTR-1303.
 pub const MAX_CONCURRENT_EPISODES: usize = 10_000;
 
+/// Maximum number of events in the buffer before mandatory drainage.
+///
+/// This prevents unbounded memory growth per CTR-1303. When this limit
+/// is reached, new events will evict the oldest events.
+pub const MAX_EVENTS_BUFFER_SIZE: usize = 100_000;
+
 /// Hash type (BLAKE3-256).
 pub type Hash = [u8; 32];
 
@@ -57,6 +63,13 @@ pub type Hash = [u8; 32];
 /// These events are designed to be persisted to the ledger for audit
 /// and replay. Per RFC-0016 (HTF), all episode events include an optional
 /// `time_envelope_ref` for temporal ordering and causality tracking.
+///
+/// # Security: Time Envelope Preimage Preservation
+///
+/// The `time_envelope` field contains the full `TimeEnvelope` preimage
+/// alongside the `time_envelope_ref` hash. This ensures the envelope data
+/// (monotonic ticks, wall bounds, ledger anchor) is persisted and verifiable.
+/// Without the preimage, the hash reference would be unresolvable.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum EpisodeEvent {
@@ -70,6 +83,8 @@ pub enum EpisodeEvent {
         created_at_ns: u64,
         /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
         time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
     },
     /// Episode started running.
     Started {
@@ -83,6 +98,8 @@ pub enum EpisodeEvent {
         started_at_ns: u64,
         /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
         time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
     },
     /// Episode terminated normally.
     Stopped {
@@ -94,6 +111,8 @@ pub enum EpisodeEvent {
         terminated_at_ns: u64,
         /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
         time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
     },
     /// Episode was quarantined.
     Quarantined {
@@ -105,6 +124,8 @@ pub enum EpisodeEvent {
         quarantined_at_ns: u64,
         /// Reference to the `TimeEnvelope` for this event (RFC-0016 HTF).
         time_envelope_ref: Option<TimeEnvelopeRef>,
+        /// The full `TimeEnvelope` preimage for verification.
+        time_envelope: Option<TimeEnvelope>,
     },
 }
 
@@ -147,6 +168,20 @@ impl EpisodeEvent {
             | Self::Quarantined {
                 time_envelope_ref, ..
             } => time_envelope_ref.as_ref(),
+        }
+    }
+
+    /// Returns the time envelope preimage for this event (RFC-0016 HTF).
+    ///
+    /// The preimage is stored alongside the reference to ensure the temporal
+    /// assertions remain verifiable.
+    #[must_use]
+    pub const fn time_envelope(&self) -> Option<&TimeEnvelope> {
+        match self {
+            Self::Created { time_envelope, .. }
+            | Self::Started { time_envelope, .. }
+            | Self::Stopped { time_envelope, .. }
+            | Self::Quarantined { time_envelope, .. } => time_envelope.as_ref(),
         }
     }
 }
@@ -296,11 +331,12 @@ impl EpisodeRuntime {
         self.clock.as_ref()
     }
 
-    /// Stamps a time envelope and returns the reference.
+    /// Stamps a time envelope and returns both the envelope and its reference.
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(ref))` if clock is configured and stamping succeeds
+    /// - `Ok(Some((envelope, ref)))` if clock is configured and stamping
+    ///   succeeds
     /// - `Ok(None)` if no clock is configured
     /// - `Err(ClockFailure)` if clock is configured but stamping fails
     ///
@@ -310,15 +346,22 @@ impl EpisodeRuntime {
     /// fails to stamp, the error is propagated rather than silently returning
     /// `None`. This ensures events are not emitted without timestamps when
     /// temporal authority is expected.
+    ///
+    /// # Security: Preimage Preservation
+    ///
+    /// Both the `TimeEnvelope` (preimage) and `TimeEnvelopeRef` (hash) are
+    /// returned to ensure the full temporal data is persisted alongside
+    /// events. Without the preimage, the hash reference would be unresolvable
+    /// and the timestamps unverifiable.
     async fn stamp_envelope(
         &self,
         notes: Option<String>,
-    ) -> Result<Option<TimeEnvelopeRef>, EpisodeError> {
+    ) -> Result<Option<(TimeEnvelope, TimeEnvelopeRef)>, EpisodeError> {
         let Some(clock) = self.clock.as_ref() else {
             return Ok(None);
         };
         match clock.stamp_envelope(notes).await {
-            Ok((_, envelope_ref)) => Ok(Some(envelope_ref)),
+            Ok((envelope, envelope_ref)) => Ok(Some((envelope, envelope_ref))),
             Err(e) => {
                 warn!("failed to stamp time envelope: {e}");
                 Err(EpisodeError::ClockFailure {
@@ -404,14 +447,20 @@ impl EpisodeRuntime {
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
             // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
-            let time_envelope_ref = self
+            // Returns both envelope (preimage) and ref (hash) for verifiability
+            let (time_envelope, time_envelope_ref) = match self
                 .stamp_envelope(Some(format!("episode.created:{}", episode_id.as_str())))
-                .await?;
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
             self.emit_event(EpisodeEvent::Created {
                 episode_id: episode_id.clone(),
                 envelope_hash,
                 created_at_ns: timestamp_ns,
                 time_envelope_ref,
+                time_envelope,
             })
             .await;
         }
@@ -520,15 +569,21 @@ impl EpisodeRuntime {
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
             // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
-            let time_envelope_ref = self
+            // Returns both envelope (preimage) and ref (hash) for verifiability
+            let (time_envelope, time_envelope_ref) = match self
                 .stamp_envelope(Some(format!("episode.started:{}", episode_id.as_str())))
-                .await?;
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
             self.emit_event(EpisodeEvent::Started {
                 episode_id: episode_id.clone(),
                 session_id: handle.session_id().to_string(),
                 lease_id: handle.lease_id().to_string(),
                 started_at_ns: timestamp_ns,
                 time_envelope_ref,
+                time_envelope,
             })
             .await;
         }
@@ -617,14 +672,20 @@ impl EpisodeRuntime {
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
             // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
-            let time_envelope_ref = self
+            // Returns both envelope (preimage) and ref (hash) for verifiability
+            let (time_envelope, time_envelope_ref) = match self
                 .stamp_envelope(Some(format!("episode.stopped:{}", episode_id.as_str())))
-                .await?;
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
             self.emit_event(EpisodeEvent::Stopped {
                 episode_id: episode_id.clone(),
                 termination_class,
                 terminated_at_ns: timestamp_ns,
                 time_envelope_ref,
+                time_envelope,
             })
             .await;
         }
@@ -713,14 +774,20 @@ impl EpisodeRuntime {
         if self.config.emit_events {
             // Stamp time envelope for temporal ordering (RFC-0016 HTF)
             // Per SEC-CTRL-FAC-0015 (Fail-Closed), propagate clock errors
-            let time_envelope_ref = self
+            // Returns both envelope (preimage) and ref (hash) for verifiability
+            let (time_envelope, time_envelope_ref) = match self
                 .stamp_envelope(Some(format!("episode.quarantined:{}", episode_id.as_str())))
-                .await?;
+                .await?
+            {
+                Some((env, env_ref)) => (Some(env), Some(env_ref)),
+                None => (None, None),
+            };
             self.emit_event(EpisodeEvent::Quarantined {
                 episode_id: episode_id.clone(),
                 reason,
                 quarantined_at_ns: timestamp_ns,
                 time_envelope_ref,
+                time_envelope,
             })
             .await;
         }
@@ -828,8 +895,31 @@ impl EpisodeRuntime {
     }
 
     /// Emits an event to the internal buffer.
+    ///
+    /// # Bounded Buffer (CTR-1303)
+    ///
+    /// The events buffer is bounded by `MAX_EVENTS_BUFFER_SIZE`. When the
+    /// buffer reaches capacity, the oldest events are evicted to make room
+    /// for new events. This prevents unbounded memory growth.
+    ///
+    /// In production, events should be drained regularly via `drain_events()`
+    /// to prevent eviction of important audit data.
     async fn emit_event(&self, event: EpisodeEvent) {
         let mut events = self.events.write().await;
+
+        // Enforce bounded buffer size (CTR-1303)
+        // Evict oldest events if at capacity
+        if events.len() >= MAX_EVENTS_BUFFER_SIZE {
+            let evict_count = events.len() - MAX_EVENTS_BUFFER_SIZE + 1;
+            warn!(
+                evict_count = evict_count,
+                buffer_size = events.len(),
+                max_size = MAX_EVENTS_BUFFER_SIZE,
+                "evicting oldest events from buffer to maintain size limit"
+            );
+            events.drain(0..evict_count);
+        }
+
         events.push(event);
     }
 }
