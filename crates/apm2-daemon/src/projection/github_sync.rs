@@ -56,6 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use apm2_core::crypto::Signer;
+use apm2_holon::defect::DefectRecord;
 use async_trait::async_trait;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use secrecy::{ExposeSecret, SecretString};
@@ -120,6 +121,107 @@ pub enum ProjectionError {
         /// The digest that was not found.
         digest: String,
     },
+
+    /// Defect record creation failed.
+    #[error("failed to create defect record: {0}")]
+    DefectRecordFailed(String),
+}
+
+// =============================================================================
+// TamperEvent
+// =============================================================================
+
+/// Event emitted when tamper is detected between ledger and GitHub status.
+///
+/// Per RFC-0015, tamper detection identifies when the GitHub status has been
+/// modified by a non-adapter identity. This differs from divergence detection
+/// (which detects trunk HEAD mismatch). Tamper detection:
+///
+/// 1. Compares expected status (from ledger) with actual status (from GitHub)
+/// 2. If they differ, emits a `DefectRecord(PROJECTION_TAMPER)`
+/// 3. Overwrites GitHub status to match ledger truth
+///
+/// # Security
+///
+/// Tamper detection is a security control that ensures the ledger remains
+/// the authoritative source of truth for admission status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TamperEvent {
+    /// The expected status from the ledger.
+    pub expected_status: ProjectedStatus,
+
+    /// The actual status observed on GitHub.
+    pub actual_status: ProjectedStatus,
+
+    /// When the tamper was detected (Unix nanoseconds).
+    pub detected_at: u64,
+
+    /// The work ID associated with this tamper event.
+    pub work_id: String,
+
+    /// The changeset digest for the affected commit.
+    pub changeset_digest: [u8; 32],
+}
+
+impl TamperEvent {
+    /// Creates a new tamper event.
+    #[must_use]
+    pub fn new(
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: impl Into<String>,
+        changeset_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            expected_status,
+            actual_status,
+            detected_at: current_timestamp_ns(),
+            work_id: work_id.into(),
+            changeset_digest,
+        }
+    }
+
+    /// Creates a new tamper event with a specific timestamp.
+    #[must_use]
+    pub fn with_timestamp(
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: impl Into<String>,
+        changeset_digest: [u8; 32],
+        detected_at: u64,
+    ) -> Self {
+        Self {
+            expected_status,
+            actual_status,
+            detected_at,
+            work_id: work_id.into(),
+            changeset_digest,
+        }
+    }
+}
+
+/// Result of handling a tamper event.
+///
+/// Contains the `DefectRecord` emitted and the `ProjectionReceipt` from
+/// overwriting the tampered status.
+#[derive(Debug, Clone)]
+pub struct TamperResult {
+    /// The defect record emitted for this tamper event.
+    pub defect: DefectRecord,
+
+    /// The projection receipt from overwriting the tampered status.
+    pub receipt: ProjectionReceipt,
+}
+
+/// Returns the current timestamp in nanoseconds since epoch.
+fn current_timestamp_ns() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[allow(clippy::cast_possible_truncation)]
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 // =============================================================================
@@ -1101,6 +1203,178 @@ impl GitHubProjectionAdapter {
         // Post the status to GitHub
         self.client.post_commit_status(&commit_sha, status).await
     }
+
+    // =========================================================================
+    // Tamper Detection (TCK-00214)
+    // =========================================================================
+
+    /// Detects tamper between the expected status (from ledger) and actual
+    /// status (from GitHub).
+    ///
+    /// Per RFC-0015, tamper detection identifies when the GitHub status has
+    /// been modified by a non-adapter identity. If the statuses differ, a
+    /// [`TamperEvent`] is returned for handling.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_status` - The status expected from the ledger
+    /// * `actual_status` - The status observed on GitHub
+    /// * `work_id` - The work ID associated with this status
+    /// * `changeset_digest` - The changeset digest for the affected commit
+    ///
+    /// # Returns
+    ///
+    /// `Some(TamperEvent)` if the statuses differ, `None` otherwise.
+    #[must_use]
+    pub fn detect_tamper(
+        &self,
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+    ) -> Option<TamperEvent> {
+        if expected_status == actual_status {
+            None
+        } else {
+            debug!(
+                expected = %expected_status,
+                actual = %actual_status,
+                work_id = %work_id,
+                "tamper detected: status mismatch"
+            );
+            Some(TamperEvent::new(
+                expected_status,
+                actual_status,
+                work_id,
+                changeset_digest,
+            ))
+        }
+    }
+
+    /// Generates a unique defect ID for a tamper event.
+    fn generate_defect_id(event: &TamperEvent) -> String {
+        // Use BLAKE3 hash of (work_id, changeset_digest, detected_at) for uniqueness
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(event.work_id.as_bytes());
+        hasher.update(&event.changeset_digest);
+        hasher.update(&event.detected_at.to_be_bytes());
+        let hash = hasher.finalize();
+        format!("tamper-{}", hex::encode(&hash.as_bytes()[..8]))
+    }
+
+    /// Handles a tamper event by emitting a `DefectRecord` and overwriting the
+    /// tampered status.
+    ///
+    /// Per RFC-0015, on tamper:
+    /// 1. Emit `DefectRecord(PROJECTION_TAMPER)`
+    /// 2. Overwrite GitHub status to match ledger truth via `project_status()`
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The tamper event to handle
+    /// * `ledger_head` - The current ledger head for the overwrite projection
+    ///
+    /// # Returns
+    ///
+    /// A [`TamperResult`] containing the emitted defect and projection receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] if defect creation or projection fails.
+    pub async fn on_tamper(
+        &self,
+        event: TamperEvent,
+        ledger_head: [u8; 32],
+    ) -> Result<TamperResult, ProjectionError> {
+        debug!(
+            work_id = %event.work_id,
+            expected = %event.expected_status,
+            actual = %event.actual_status,
+            "handling tamper event"
+        );
+
+        // 1. Create DefectRecord(PROJECTION_TAMPER)
+        let defect_id = Self::generate_defect_id(&event);
+        let defect = DefectRecord::projection_tamper(
+            defect_id,
+            &event.work_id,
+            event.expected_status.as_str(),
+            event.actual_status.as_str(),
+            event.detected_at,
+        )
+        .map_err(|e| ProjectionError::DefectRecordFailed(e.to_string()))?;
+
+        debug!(
+            defect_id = %defect.defect_id(),
+            "emitted PROJECTION_TAMPER defect"
+        );
+
+        // 2. Overwrite GitHub status to match ledger truth
+        // Note: We clear the cache entry for this key to ensure a fresh projection
+        // is made, even if there's a cached receipt from before the tamper.
+        let key = IdempotencyKey::new(&event.work_id, event.changeset_digest, ledger_head);
+
+        // For tamper handling, we bypass the idempotency cache to force overwrite
+        self.do_github_projection(&event.changeset_digest, event.expected_status)
+            .await?;
+
+        // Generate the receipt for the overwrite
+        let receipt_id = Self::generate_receipt_id(&key);
+        let receipt = ProjectionReceiptBuilder::new(receipt_id, &event.work_id)
+            .changeset_digest(event.changeset_digest)
+            .ledger_head(ledger_head)
+            .projected_status(event.expected_status)
+            .try_build_and_sign(&self.signer)
+            .map_err(|e| ProjectionError::ReceiptGenerationFailed(e.to_string()))?;
+
+        // Store in cache for future idempotency
+        self.cache.put(&key, &receipt)?;
+
+        debug!(
+            receipt_id = %receipt.receipt_id,
+            "overwrote tampered status with ledger truth"
+        );
+
+        Ok(TamperResult { defect, receipt })
+    }
+
+    /// Convenience method to detect tamper and handle it in one call.
+    ///
+    /// This combines `detect_tamper` and `on_tamper` for the common case
+    /// where you want to check for tamper and immediately handle it.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_status` - The status expected from the ledger
+    /// * `actual_status` - The status observed on GitHub
+    /// * `work_id` - The work ID associated with this status
+    /// * `changeset_digest` - The changeset digest for the affected commit
+    /// * `ledger_head` - The current ledger head for overwrite projection
+    ///
+    /// # Returns
+    ///
+    /// `Some(TamperResult)` if tamper was detected and handled, `None` if
+    /// no tamper was detected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectionError`] if tamper handling fails.
+    pub async fn detect_and_handle_tamper(
+        &self,
+        expected_status: ProjectedStatus,
+        actual_status: ProjectedStatus,
+        work_id: &str,
+        changeset_digest: [u8; 32],
+        ledger_head: [u8; 32],
+    ) -> Result<Option<TamperResult>, ProjectionError> {
+        match self.detect_tamper(expected_status, actual_status, work_id, changeset_digest) {
+            Some(event) => {
+                let result = self.on_tamper(event, ledger_head).await?;
+                Ok(Some(result))
+            },
+            None => Ok(None),
+        }
+    }
 }
 
 #[async_trait]
@@ -1641,5 +1915,412 @@ mod tests {
         // Verify it still exists
         let sha = adapter.get_commit_sha(&[0x42; 32]).unwrap();
         assert_eq!(sha, Some("abc123".to_string()));
+    }
+
+    // =========================================================================
+    // Tamper Detection Tests (TCK-00214)
+    // =========================================================================
+
+    /// Submodule for tamper detection tests.
+    ///
+    /// Per the ticket requirements, these tests verify:
+    /// - Tamper is detected when GitHub status differs from ledger
+    /// - `DefectRecord(PROJECTION_TAMPER)` is emitted
+    /// - Tampered status is overwritten with ledger truth
+    pub mod tamper {
+        use super::*;
+
+        // =====================================================================
+        // TamperEvent Tests
+        // =====================================================================
+
+        #[test]
+        fn test_tamper_event_creation() {
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            assert_eq!(event.expected_status, ProjectedStatus::Success);
+            assert_eq!(event.actual_status, ProjectedStatus::Failure);
+            assert_eq!(event.work_id, "work-001");
+            assert_eq!(event.changeset_digest, [0x42; 32]);
+            assert!(event.detected_at > 0);
+        }
+
+        #[test]
+        fn test_tamper_event_with_timestamp() {
+            let timestamp = 1_000_000_000u64;
+            let event = TamperEvent::with_timestamp(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                timestamp,
+            );
+
+            assert_eq!(event.detected_at, timestamp);
+        }
+
+        // =====================================================================
+        // detect_tamper() Tests
+        // =====================================================================
+
+        #[test]
+        fn test_detect_tamper_status_mismatch() {
+            let adapter = create_test_adapter();
+
+            let result = adapter.detect_tamper(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            assert!(result.is_some());
+            let event = result.unwrap();
+            assert_eq!(event.expected_status, ProjectedStatus::Success);
+            assert_eq!(event.actual_status, ProjectedStatus::Failure);
+        }
+
+        #[test]
+        fn test_detect_tamper_no_mismatch() {
+            let adapter = create_test_adapter();
+
+            let result = adapter.detect_tamper(
+                ProjectedStatus::Success,
+                ProjectedStatus::Success,
+                "work-001",
+                [0x42; 32],
+            );
+
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_detect_tamper_all_status_pairs() {
+            let adapter = create_test_adapter();
+
+            let statuses = [
+                ProjectedStatus::Pending,
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                ProjectedStatus::Cancelled,
+                ProjectedStatus::Error,
+            ];
+
+            // Test all pairs where expected != actual
+            for expected in &statuses {
+                for actual in &statuses {
+                    let result = adapter.detect_tamper(*expected, *actual, "work-001", [0x42; 32]);
+
+                    if expected == actual {
+                        assert!(result.is_none(), "same status should not be tamper");
+                    } else {
+                        assert!(result.is_some(), "different status should be tamper");
+                        let event = result.unwrap();
+                        assert_eq!(event.expected_status, *expected);
+                        assert_eq!(event.actual_status, *actual);
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // on_tamper() Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_on_tamper_emits_defect_record() {
+            let adapter = create_test_adapter();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            let tamper_result = result.unwrap();
+
+            // Verify DefectRecord was created
+            assert_eq!(tamper_result.defect.defect_class(), "PROJECTION_TAMPER");
+            assert!(tamper_result.defect.defect_id().starts_with("tamper-"));
+            assert_eq!(tamper_result.defect.work_id(), "work-001");
+            assert!(tamper_result.defect.signal().details().contains("success"));
+            assert!(tamper_result.defect.signal().details().contains("failure"));
+        }
+
+        #[tokio::test]
+        async fn test_on_tamper_overwrites_status() {
+            let adapter = create_test_adapter();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            let tamper_result = result.unwrap();
+
+            // Verify projection receipt was created with correct status
+            assert_eq!(tamper_result.receipt.work_id, "work-001");
+            assert_eq!(tamper_result.receipt.changeset_digest, [0x42; 32]);
+            assert_eq!(tamper_result.receipt.ledger_head, [0xAB; 32]);
+            assert_eq!(
+                tamper_result.receipt.projected_status,
+                ProjectedStatus::Success
+            );
+        }
+
+        #[tokio::test]
+        async fn test_on_tamper_receipt_signature_valid() {
+            let adapter = create_test_adapter();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            let tamper_result = result.unwrap();
+
+            // Verify receipt signature is valid
+            assert!(
+                tamper_result
+                    .receipt
+                    .validate_signature(&adapter.verifying_key())
+                    .is_ok()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_on_tamper_caches_receipt() {
+            let adapter = create_test_adapter();
+            let initial_size = adapter.cache_size().unwrap();
+
+            let event = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            let result = adapter.on_tamper(event, [0xAB; 32]).await;
+            assert!(result.is_ok());
+
+            // Cache should have one more entry
+            assert_eq!(adapter.cache_size().unwrap(), initial_size + 1);
+        }
+
+        // =====================================================================
+        // detect_and_handle_tamper() Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_detect_and_handle_tamper_detected() {
+            let adapter = create_test_adapter();
+
+            let result = adapter
+                .detect_and_handle_tamper(
+                    ProjectedStatus::Success,
+                    ProjectedStatus::Failure,
+                    "work-001",
+                    [0x42; 32],
+                    [0xAB; 32],
+                )
+                .await;
+
+            assert!(result.is_ok());
+            let maybe_result = result.unwrap();
+            assert!(maybe_result.is_some());
+
+            let tamper_result = maybe_result.unwrap();
+            assert_eq!(tamper_result.defect.defect_class(), "PROJECTION_TAMPER");
+            assert_eq!(
+                tamper_result.receipt.projected_status,
+                ProjectedStatus::Success
+            );
+        }
+
+        #[tokio::test]
+        async fn test_detect_and_handle_tamper_not_detected() {
+            let adapter = create_test_adapter();
+
+            let result = adapter
+                .detect_and_handle_tamper(
+                    ProjectedStatus::Success,
+                    ProjectedStatus::Success,
+                    "work-001",
+                    [0x42; 32],
+                    [0xAB; 32],
+                )
+                .await;
+
+            assert!(result.is_ok());
+            let maybe_result = result.unwrap();
+            assert!(maybe_result.is_none());
+        }
+
+        // =====================================================================
+        // Defect ID Generation Tests
+        // =====================================================================
+
+        #[test]
+        fn test_defect_id_deterministic() {
+            let event1 = TamperEvent::with_timestamp(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event2 = TamperEvent::with_timestamp(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let id1 = GitHubProjectionAdapter::generate_defect_id(&event1);
+            let id2 = GitHubProjectionAdapter::generate_defect_id(&event2);
+
+            assert_eq!(id1, id2);
+            assert!(id1.starts_with("tamper-"));
+        }
+
+        #[test]
+        fn test_defect_id_unique_for_different_events() {
+            let event1 = TamperEvent::with_timestamp(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event2 = TamperEvent::with_timestamp(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-002", // Different work_id
+                [0x42; 32],
+                1_000_000_000,
+            );
+
+            let event3 = TamperEvent::with_timestamp(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x99; 32], // Different changeset_digest
+                1_000_000_000,
+            );
+
+            let id1 = GitHubProjectionAdapter::generate_defect_id(&event1);
+            let id2 = GitHubProjectionAdapter::generate_defect_id(&event2);
+            let id3 = GitHubProjectionAdapter::generate_defect_id(&event3);
+
+            assert_ne!(id1, id2);
+            assert_ne!(id1, id3);
+            assert_ne!(id2, id3);
+        }
+
+        // =====================================================================
+        // Integration Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_tamper_detection_end_to_end() {
+            // Simulate the full tamper detection workflow:
+            // 1. Initial projection (ledger says Success)
+            // 2. External tamper (GitHub now shows Failure)
+            // 3. Detect tamper
+            // 4. Handle tamper (emit defect, overwrite)
+            // 5. Verify final state
+
+            let adapter = create_test_adapter();
+
+            // 1. Initial projection
+            let initial_receipt = adapter
+                .project_status("work-001", [0x42; 32], [0xAB; 32], ProjectedStatus::Success)
+                .await
+                .expect("initial projection should succeed");
+
+            assert_eq!(initial_receipt.projected_status, ProjectedStatus::Success);
+
+            // 2. Simulate external tamper (in real scenario, this would be detected by
+            //    polling GitHub)
+            let ledger_status = ProjectedStatus::Success;
+            let github_status = ProjectedStatus::Failure; // Tampered!
+
+            // 3 & 4. Detect and handle tamper
+            let tamper_result = adapter
+                .detect_and_handle_tamper(
+                    ledger_status,
+                    github_status,
+                    "work-001",
+                    [0x42; 32],
+                    [0xCD; 32], // New ledger head after tamper
+                )
+                .await
+                .expect("tamper handling should succeed");
+
+            assert!(tamper_result.is_some());
+            let result = tamper_result.unwrap();
+
+            // 5. Verify final state
+            // Defect record was emitted
+            assert_eq!(result.defect.defect_class(), "PROJECTION_TAMPER");
+
+            // Status was overwritten to match ledger truth
+            assert_eq!(result.receipt.projected_status, ProjectedStatus::Success);
+
+            // New ledger head is in the receipt
+            assert_eq!(result.receipt.ledger_head, [0xCD; 32]);
+        }
+
+        #[tokio::test]
+        async fn test_multiple_tamper_events_unique_defect_ids() {
+            let adapter = create_test_adapter();
+
+            // Handle multiple tamper events for different work items
+            let event1 = TamperEvent::new(
+                ProjectedStatus::Success,
+                ProjectedStatus::Failure,
+                "work-001",
+                [0x42; 32],
+            );
+
+            let event2 = TamperEvent::new(
+                ProjectedStatus::Pending,
+                ProjectedStatus::Cancelled,
+                "work-002",
+                [0x99; 32],
+            );
+
+            let result1 = adapter.on_tamper(event1, [0xAB; 32]).await.unwrap();
+            let result2 = adapter.on_tamper(event2, [0xCD; 32]).await.unwrap();
+
+            // Each event should get a unique defect ID
+            assert_ne!(result1.defect.defect_id(), result2.defect.defect_id());
+
+            // Both should be PROJECTION_TAMPER
+            assert_eq!(result1.defect.defect_class(), "PROJECTION_TAMPER");
+            assert_eq!(result2.defect.defect_class(), "PROJECTION_TAMPER");
+        }
     }
 }
