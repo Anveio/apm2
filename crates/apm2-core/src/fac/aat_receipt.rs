@@ -496,7 +496,9 @@ pub enum AatReceiptError {
     PassVerdictUnsatisfiedPredicate,
 
     /// `stability_digest` does not match computed value.
-    #[error("stability_digest mismatch: expected hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest)")]
+    #[error(
+        "stability_digest mismatch: expected hash(verdict, terminal_evidence_digest, terminal_verifier_outputs_digest)"
+    )]
     StabilityDigestMismatch,
 }
 
@@ -608,10 +610,11 @@ impl AatGateReceipt {
     /// Computes the stability digest from its components.
     ///
     /// The stability digest is defined as:
-    /// `hash(verdict || terminal_evidence_digest || terminal_verifier_outputs_digest)`
+    /// `hash(verdict || terminal_evidence_digest ||
+    /// terminal_verifier_outputs_digest)`
     ///
-    /// This provides a single hash that captures the "stable" aspects of the AAT
-    /// result, allowing quick comparison across runs.
+    /// This provides a single hash that captures the "stable" aspects of the
+    /// AAT result, allowing quick comparison across runs.
     #[must_use]
     pub fn compute_stability_digest(
         verdict: AatVerdict,
@@ -1163,12 +1166,11 @@ impl TryFrom<AatGateReceiptProto> for AatGateReceipt {
                     field: "risk_tier",
                     value: i32::try_from(proto.risk_tier).unwrap_or(i32::MAX),
                 })?;
-        let risk_tier = RiskTier::try_from(risk_tier_u8).map_err(|_| {
-            AatReceiptError::InvalidEnumValue {
+        let risk_tier =
+            RiskTier::try_from(risk_tier_u8).map_err(|_| AatReceiptError::InvalidEnumValue {
                 field: "risk_tier",
                 value: i32::from(risk_tier_u8),
-            }
-        })?;
+            })?;
 
         // Convert attestation
         let attestation_proto = proto
@@ -1314,7 +1316,7 @@ impl From<AatGateReceipt> for AatGateReceiptProto {
 pub mod tests {
     use super::*;
 
-    /// Helper to compute stability_digest for test fixtures.
+    /// Helper to compute `stability_digest` for test fixtures.
     fn test_stability_digest(
         verdict: AatVerdict,
         terminal_evidence_digest: &[u8; 32],
@@ -1453,8 +1455,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Fail;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1495,8 +1500,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Pass;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1534,8 +1542,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Pass;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1573,8 +1584,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Fail;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1610,8 +1624,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Fail;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1654,8 +1671,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Fail;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1888,8 +1908,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::Fail;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -1925,8 +1948,11 @@ pub mod tests {
         let terminal_evidence_digest = [0x77; 32];
         let terminal_verifier_outputs_digest = [0x99; 32];
         let verdict = AatVerdict::NeedsInput;
-        let stability_digest =
-            test_stability_digest(verdict, &terminal_evidence_digest, &terminal_verifier_outputs_digest);
+        let stability_digest = test_stability_digest(
+            verdict,
+            &terminal_evidence_digest,
+            &terminal_verifier_outputs_digest,
+        );
 
         let result = AatGateReceiptBuilder::new()
             .view_commitment_hash([0x11; 32])
@@ -2083,8 +2109,7 @@ pub mod tests {
             // Verify the tier is preserved exactly
             assert_eq!(
                 recovered.risk_tier, tier,
-                "RiskTier {:?} not preserved through proto roundtrip",
-                tier
+                "RiskTier {tier:?} not preserved through proto roundtrip"
             );
         }
     }
