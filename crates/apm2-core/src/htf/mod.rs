@@ -32,6 +32,13 @@
 //! - Tick arithmetic is authoritative for deadlines within a node
 //! - Cross-node time comparison MUST use [`LedgerTime`]
 //!
+//! # Resource Limits (Denial-of-Service Protection)
+//!
+//! - [`MAX_STRING_LENGTH`]: Maximum length for string fields (4096 bytes)
+//! - [`MAX_OBSERVATIONS`]: Maximum observations in `TimeSyncObservation` (1000)
+//! - [`MAX_ATTESTATION_SIZE`]: Maximum serialized size for attestation (65536
+//!   bytes)
+//!
 //! # Example
 //!
 //! ```rust
@@ -69,7 +76,22 @@ mod types;
 // Re-export all public types
 pub use canonical::{Canonicalizable, CanonicalizationError};
 pub use types::{
-    BoundedWallInterval, BoundedWallIntervalError, ClockProfile, Hlc, HtfTick, LedgerTime,
-    LedgerTimeError, MAX_STRING_LENGTH, MonotonicReading, MonotonicSource, ObservationRecord,
-    TimeEnvelope, TimeEnvelopeRef, TimeSyncObservation, WallTimeSource,
+    BoundedWallInterval,
+    BoundedWallIntervalError,
+    ClockProfile,
+    Hlc,
+    HtfTick,
+    LedgerTime,
+    LedgerTimeError,
+    // Resource limit constants (DoS protection)
+    MAX_ATTESTATION_SIZE,
+    MAX_OBSERVATIONS,
+    MAX_STRING_LENGTH,
+    MonotonicReading,
+    MonotonicSource,
+    ObservationRecord,
+    TimeEnvelope,
+    TimeEnvelopeRef,
+    TimeSyncObservation,
+    WallTimeSource,
 };
