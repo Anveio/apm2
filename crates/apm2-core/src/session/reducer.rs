@@ -2320,7 +2320,7 @@ mod unit_tests {
     }
 
     /// TCK-00243: SEC-HTF-003 Tests that restart is rejected when
-    /// time_envelope_ref is missing for tick-based quarantine (fail-closed).
+    /// `time_envelope_ref` is missing for tick-based quarantine (fail-closed).
     #[test]
     fn tck_00243_missing_time_envelope_ref_fails_closed() {
         let mut reducer = SessionReducer::new();
