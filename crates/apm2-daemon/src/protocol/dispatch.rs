@@ -26,7 +26,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -987,7 +987,7 @@ impl std::error::Error for SessionRegistryError {}
 #[derive(Debug, Default)]
 pub struct StubSessionRegistry {
     /// Sessions stored with insertion order for LRU eviction.
-    sessions: std::sync::RwLock<(Vec<String>, HashMap<String, SessionState>)>,
+    sessions: std::sync::RwLock<(VecDeque<String>, HashMap<String, SessionState>)>,
     /// Sessions indexed by ephemeral handle for efficient lookup.
     sessions_by_handle: std::sync::RwLock<HashMap<String, String>>,
 }
@@ -1006,8 +1006,7 @@ impl SessionRegistry for StubSessionRegistry {
 
         // CTR-1303: Evict oldest entry if at capacity
         while sessions.len() >= MAX_SESSIONS {
-            if let Some(oldest_key) = order.first().cloned() {
-                order.remove(0);
+            if let Some(oldest_key) = order.pop_front() {
                 if let Some(evicted) = sessions.remove(&oldest_key) {
                     handles.remove(&evicted.ephemeral_handle);
                 }
@@ -1022,7 +1021,7 @@ impl SessionRegistry for StubSessionRegistry {
 
         let session_id = session.session_id.clone();
         let handle = session.ephemeral_handle.clone();
-        order.push(session_id.clone());
+        order.push_back(session_id.clone());
         handles.insert(handle, session_id.clone());
         sessions.insert(session_id, session);
         Ok(())
@@ -1485,10 +1484,8 @@ impl PrivilegedDispatcher {
         // SEC-SCP-FAC-0020: Validate lease_id matches the claimed lease_id
         // This prevents authorization bypass where a caller provides an arbitrary
         // lease_id. All roles must provide the correct lease_id from ClaimWork.
-        // For GateExecutor, we already checked that lease_id.is_some() above.
-        // For all roles, the lease_id must match the claim if provided.
         let provided_lease_id = request.lease_id.as_deref().unwrap_or("");
-        if !provided_lease_id.is_empty() && provided_lease_id != claim.lease_id {
+        if provided_lease_id != claim.lease_id {
             warn!(
                 work_id = %request.work_id,
                 "SpawnEpisode rejected: lease_id mismatch"
@@ -1500,6 +1497,7 @@ impl PrivilegedDispatcher {
         }
 
         // For GateExecutor, the lease_id is required and must match
+        // (Redundant but explicit check preserved for clarity per logic)
         if request.role == WorkRole::GateExecutor as i32 {
             if let Some(ref lease_id) = request.lease_id {
                 if lease_id != &claim.lease_id {
@@ -1738,8 +1736,8 @@ mod tests {
             let claim_frame = encode_claim_work_request(&claim_request);
             let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
 
-            let work_id = match claim_response {
-                PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
                 _ => panic!("Expected ClaimWork response"),
             };
 
@@ -1747,7 +1745,7 @@ mod tests {
             let request = SpawnEpisodeRequest {
                 work_id,
                 role: WorkRole::Implementer.into(),
-                lease_id: None,
+                lease_id: Some(lease_id),
             };
             let frame = encode_spawn_episode_request(&request);
 
@@ -2000,8 +1998,8 @@ mod tests {
         let claim_frame = encode_claim_work_request(&claim_request);
         let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
 
-        let work_id = match claim_response {
-            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
             _ => panic!("Expected ClaimWork response"),
         };
 
@@ -2009,7 +2007,7 @@ mod tests {
         let request = SpawnEpisodeRequest {
             work_id,
             role: WorkRole::Implementer.into(),
-            lease_id: None,
+            lease_id: Some(lease_id),
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -2643,6 +2641,57 @@ mod tests {
         }
     }
 
+    /// SEC-SCP-FAC-0020: `SpawnEpisode` with MISSING `lease_id` fails.
+    ///
+    /// Security Fix Verification: Ensure that omitting `lease_id` (None) is NOT
+    /// treated as a valid bypass. It must match the claimed `lease_id`.
+    #[test]
+    fn tck_00256_spawn_with_missing_lease_id_fails() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Claim work with Implementer role
+        let claim_request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let work_id = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Try to spawn with NO lease_id (None)
+        let request = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: None, // Missing! Should fail because claim has a lease_id
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                    "Should return CapabilityRequestRejected for missing lease_id"
+                );
+                assert!(
+                    err.message.contains("lease_id"),
+                    "Error message should mention lease_id: {}",
+                    err.message
+                );
+            },
+            _ => panic!("Expected lease_id mismatch error for Missing ID, got: {response:?}"),
+        }
+    }
+
     /// SEC-SCP-FAC-0020: `SpawnEpisode` with correct `lease_id` succeeds.
     #[test]
     fn tck_00256_spawn_with_correct_lease_id_succeeds() {
@@ -2701,8 +2750,8 @@ mod tests {
         let claim_frame = encode_claim_work_request(&claim_request);
         let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
 
-        let work_id = match claim_response {
-            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
             _ => panic!("Expected ClaimWork response"),
         };
 
@@ -2710,7 +2759,7 @@ mod tests {
         let request = SpawnEpisodeRequest {
             work_id: work_id.clone(),
             role: WorkRole::Implementer.into(),
-            lease_id: None,
+            lease_id: Some(lease_id),
         };
         let frame = encode_spawn_episode_request(&request);
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -2894,8 +2943,10 @@ mod tests {
         let claim_frame = encode_claim_work_request(&claim_req);
         let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
 
-        let (work_id, expected_manifest_hash) = match claim_response {
-            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.capability_manifest_hash),
+        let (work_id, expected_manifest_hash, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => {
+                (resp.work_id, resp.capability_manifest_hash, resp.lease_id)
+            },
             _ => panic!("Expected ClaimWork response"),
         };
 
@@ -2903,7 +2954,7 @@ mod tests {
         let spawn_req = SpawnEpisodeRequest {
             work_id,
             role: WorkRole::Implementer.into(),
-            lease_id: None,
+            lease_id: Some(lease_id),
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
 
@@ -3010,11 +3061,12 @@ mod tests {
         let claim_frame = encode_claim_work_request(&claim_req);
         let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
 
-        let (work_id, claim_manifest_hash, _claim_context_hash) = match claim_response {
+        let (work_id, claim_manifest_hash, _claim_context_hash, lease_id) = match claim_response {
             PrivilegedResponse::ClaimWork(resp) => (
                 resp.work_id,
                 resp.capability_manifest_hash,
                 resp.context_pack_hash,
+                resp.lease_id,
             ),
             _ => panic!("Expected ClaimWork response"),
         };
@@ -3023,7 +3075,7 @@ mod tests {
         let spawn_req = SpawnEpisodeRequest {
             work_id,
             role: WorkRole::Implementer.into(),
-            lease_id: None,
+            lease_id: Some(lease_id),
         };
         let spawn_frame = encode_spawn_episode_request(&spawn_req);
         let spawn_response = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
