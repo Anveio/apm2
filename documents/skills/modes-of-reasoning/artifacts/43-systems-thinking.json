@@ -1,0 +1,83 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/systems-thinking@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 43,
+    "name": "systems-thinking",
+    "cat": "causal",
+    "core": "Reason about interacting components whose behavior over time cannot be predicted from parts alone. Core primitives: reinforcing loops (R), balancing loops (B), delays, stocks, and emergence.",
+    "out": [
+      "causal_loop_diagram",
+      "leverage_points",
+      "dynamic_hypothesis",
+      "boundary_chart"
+    ],
+    "proc": [
+      "Define problem dynamically: state undesired behavior pattern over time",
+      "Identify 5-15 key variables; name stocks explicitly",
+      "Draw influence arrows with +/- signs",
+      "Trace loops back to origin; even sign flips = R, odd = B",
+      "Insert delays where effect lags cause > 1 time unit",
+      "Locate leverage points: structure changes > parameter changes",
+      "Write dynamic hypothesis: problem pattern + dominant loop + condition + consequence",
+      "Validate: predict novel scenario; check against data or simulation"
+    ],
+    "check": [
+      "Every loop labeled R/B with descriptive name",
+      "At least one stock with inflow/outflow named",
+      "Delays marked where lag > 1 time unit",
+      "Boundary explicit: exogenous vars identified",
+      "Dynamic hypothesis is falsifiable"
+    ],
+    "diff": {
+      "mechanistic": "Mechanistic = how component works inside; Systems = how components interact over time for emergent patterns",
+      "model-based-simulation": "Simulation runs quantitative models forward; Systems builds qualitative structure (loops, delays) first",
+      "qualitative": "Qualitative = directional sign propagation; Systems adds loop closure and delay analysis",
+      "counterfactual": "Counterfactual asks what-if; Systems asks what structure causes behavior"
+    },
+    "fail": {
+      "mode": "Vague loop stories without measurable hypotheses",
+      "signal": "Cannot name stocks, specify dominant loop, or state falsifiable prediction",
+      "mit": [
+        "Require at least one stock with units and initial value",
+        "Name dominant loop: under [condition], loop [name] dominates",
+        "Specify delay magnitude: order-of-magnitude lag with evidence",
+        "Derive falsifiable prediction with measurable variable and timeframe"
+      ]
+    },
+    "use": [
+      "Org design: hiring velocity, onboarding capacity, incentives",
+      "Markets: supply/demand, network effects, platform ecosystems",
+      "Reliability engineering: alert fatigue, incident cascades, capacity planning",
+      "Long-term planning: policy resistance, unintended consequences"
+    ],
+    "rel": [
+      {"id": 40, "name": "mechanistic", "note": "use before systems to understand parts"},
+      {"id": 42, "name": "model-based-simulation", "note": "use after systems to run scenarios"},
+      {"id": 29, "name": "qualitative", "note": "simpler, no loops required"},
+      {"id": 39, "name": "counterfactual", "note": "queries alternate histories using systems model"}
+    ],
+    "ex": {
+      "problem": "Why does on-call team burn out despite hiring?",
+      "vars": [
+        {"name": "on-call load", "type": "stock", "unit": "pages/person/week"},
+        {"name": "team size", "type": "stock", "unit": "headcount"},
+        {"name": "burnout rate", "type": "flow", "unit": "people/month"},
+        {"name": "hiring rate", "type": "flow", "unit": "people/month"}
+      ],
+      "loops": [
+        {"name": "R1", "label": "Burnout spiral", "path": "high load -> burnout -> attrition -> fewer people -> higher load"},
+        {"name": "B1", "label": "Hiring response", "path": "high load -> visible pain -> hiring approved -> new hires -> lower load"}
+      ],
+      "delay": "New hires take 3 months to ramp up",
+      "hypothesis": "R1 dominates when hiring delayed or ramp-up > 2 months, causing attrition to outpace hiring",
+      "prediction": "If ramp-up cut to 1 month, attrition drops within 6 months"
+    }
+  }
+}

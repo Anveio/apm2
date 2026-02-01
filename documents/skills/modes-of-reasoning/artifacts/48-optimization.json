@@ -1,0 +1,84 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/optimization@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 48,
+    "name": "optimization",
+    "cat": "search",
+    "core": "Choose the best solution relative to an objective function subject to constraints. Moves beyond feasibility to optimality.",
+    "out": [
+      "optimal_or_near_optimal_solution",
+      "tradeoff_curves",
+      "shadow_prices",
+      "sensitivity_analysis"
+    ],
+    "proc": [
+      "define_objective_function",
+      "enumerate_constraints",
+      "select_solver_method",
+      "compute_optimal_solution",
+      "analyze_shadow_prices",
+      "perform_sensitivity_analysis",
+      "validate_against_unmodeled_constraints"
+    ],
+    "check": [
+      "objective_captures_true_goal",
+      "all_constraints_modeled",
+      "solver_appropriate_for_problem_class",
+      "solution_is_feasible",
+      "optimality_conditions_verified",
+      "sensitivity_analysis_performed",
+      "unmodeled_constraints_checked"
+    ],
+    "diff": {
+      "constraint-satisfiability": "satisfaction asks any feasible; optimization asks best feasible",
+      "decision-theoretic": "decision-theoretic handles uncertainty; optimization assumes known consequences",
+      "multi-criteria-decision-analysis": "mcda balances multiple objectives; optimization targets single objective"
+    },
+    "fail": {
+      "mode": "wrong_objective",
+      "signals": [
+        "optimal_solution_feels_wrong",
+        "stakeholders_reject_optimal",
+        "important_factor_missing",
+        "gaming_the_objective",
+        "solution_violates_unmodeled_constraint"
+      ],
+      "mit": [
+        "validate_objective_with_stakeholders",
+        "list_unmodeled_factors",
+        "premortem_optimal_solution",
+        "multi_objective_reformulation",
+        "constraint_completeness_review"
+      ]
+    },
+    "use": [
+      "resource_allocation",
+      "routing_problems",
+      "scheduling",
+      "design_tradeoffs",
+      "pricing_decisions",
+      "supply_chain_planning"
+    ],
+    "rel": [
+      "constraint-satisfiability",
+      "decision-theoretic",
+      "multi-criteria-decision-analysis",
+      "robust-worst-case",
+      "planning-policy"
+    ],
+    "ex": {
+      "situation": "Warehouse assigns delivery routes to minimize total distance",
+      "objective": "minimize_total_distance",
+      "constraints": ["vehicle_capacity", "time_windows", "driver_hours"],
+      "method": "vehicle_routing_solver",
+      "result": "optimal_routes_found_sensitivity_shows_adding_one_vehicle_reduces_distance_15pct"
+    }
+  }
+}

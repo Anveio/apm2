@@ -1,0 +1,54 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/constructive-intuitionistic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 3,
+    "name": "constructive-intuitionistic",
+    "cat": "formal",
+    "core": "A proof of existence must provide a construction/witness; some classical principles (like excluded middle) are restricted.",
+    "out": [
+      "proofs as programs (algorithms)",
+      "constructive witnesses for existence claims",
+      "computationally meaningful derivations"
+    ],
+    "proc": [
+      "identify existence claim to prove",
+      "construct explicit witness or algorithm",
+      "derive properties via constructive logic",
+      "verify witness satisfies requirements"
+    ],
+    "check": [
+      "witness explicitly constructed?",
+      "no reliance on excluded middle?",
+      "derivation computationally extractable?"
+    ],
+    "diff": {
+      "vs_classical": "stronger link between proved and computable; must show how to construct, not just prove by contradiction"
+    },
+    "fail": {
+      "mode": "over-constraining",
+      "desc": "applying constructive requirements when classical reasoning is acceptable and simpler"
+    },
+    "use": [
+      "verified software",
+      "protocol design",
+      "constructive mathematics",
+      "show-me-the-witness requirements",
+      "program extraction from proofs"
+    ],
+    "rel": [
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "broader proof theory"},
+      {"id": 7, "name": "type-theoretic", "link": "Curry-Howard correspondence"}
+    ],
+    "ex": {
+      "scenario": "proving a sorting algorithm exists",
+      "approach": "construct the algorithm itself as the proof witness"
+    }
+  }
+}

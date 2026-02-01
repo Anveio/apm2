@@ -1,0 +1,91 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/belief-revision@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 33,
+    "name": "belief-revision",
+    "cat": "nonmonotonic",
+    "core": "Formal framework for modifying beliefs when new information conflicts. AGM postulates define expansion (+A), contraction (-A), and revision (*A) with minimal change constraint.",
+    "out": [
+      {"n": "belief_inventory", "d": "explicit list of accepted propositions"},
+      {"n": "conflict_diagnosis", "d": "beliefs contradicting new information"},
+      {"n": "entrenchment_ranking", "d": "core vs peripheral belief ordering"},
+      {"n": "contraction_candidates", "d": "minimal sets for consistency restoration"},
+      {"n": "revised_belief_set", "d": "consistent set after contraction + expansion"},
+      {"n": "revision_justification", "d": "rationale for dropped beliefs"}
+    ],
+    "proc": [
+      "enumerate belief set K: list accepted propositions",
+      "identify incoming A: state new proposition and direct conflicts",
+      "rank entrenchment: foundational vs revisable beliefs",
+      "compute minimal contractions: smallest sets restoring K+A consistency",
+      "execute revision: apply contraction, add A, document drops"
+    ],
+    "check": [
+      "existing beliefs made explicit",
+      "new information precisely stated",
+      "conflict identified at propositional level",
+      "entrenchment ranking articulated before revision",
+      "multiple contraction options considered",
+      "contraction is minimal",
+      "revision justified (why X not Y)",
+      "post-revision consistency verified"
+    ],
+    "diff": {
+      "bayesian": "updates acceptance in/out vs degrees of belief",
+      "non-monotonic": "restructures belief set vs handles defaults at inference",
+      "defeasible": "operates on propositions vs defeat relations between rules",
+      "paraconsistent": "eliminates contradictions vs tolerates them"
+    },
+    "fail": {
+      "mode": "entrenchment_inertia",
+      "signals": [
+        "rankings never questioned",
+        "same beliefs always survive",
+        "peripheral drops fail to restore consistency",
+        "new info rejected as wrong",
+        "protecting beliefs vs truth-seeking"
+      ],
+      "mitigations": [
+        "periodically re-evaluate entrenchment",
+        "track revision history",
+        "devils advocate contraction",
+        "external entrenchment audit",
+        "evidence-based entrenchment"
+      ]
+    },
+    "use": [
+      "requirements evolution",
+      "knowledge base maintenance",
+      "source reconciliation",
+      "theory revision",
+      "configuration management",
+      "policy updates"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian", "r": "degree-based updating"},
+      {"id": 30, "n": "non-monotonic", "r": "exception handling at inference"},
+      {"id": 32, "n": "defeasible", "r": "defeat relations"},
+      {"id": 34, "n": "paraconsistent", "r": "contradiction tolerance"},
+      {"id": 8, "n": "counterexample-guided", "r": "iterative refinement"},
+      {"id": 75, "n": "meta-reasoning", "r": "when to revise vs hold"}
+    ],
+    "ex": {
+      "sit": "Beliefs: all swans white, this bird is swan, white reflects light. Observe: this bird is black.",
+      "steps": [
+        "K = {all swans white, this is swan, white reflects light}",
+        "A = this bird is black, contradicts via swan + all-swans-white",
+        "entrenchment: definition > observation > generalization",
+        "options: drop all-swans-white OR drop this-is-swan",
+        "revise: drop all-swans-white (lower entrenchment), add A"
+      ],
+      "insight": "generalization most revisable as induction, not definition or observation"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/evidential-dempster-shafer@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 22,
+    "name": "evidential-dempster-shafer",
+    "cat": "uncertain",
+    "core": "Allocate probability mass to sets of possibilities rather than single hypotheses. Combine evidence via Dempster's rule into belief (minimum support) and plausibility (maximum support) intervals, explicitly representing ignorance.",
+    "out": [
+      {"n": "frame_of_discernment", "d": "exhaustive set of hypotheses"},
+      {"n": "mass_function", "d": "allocation of evidence to focal elements"},
+      {"n": "belief_values", "d": "minimum support for each hypothesis/set"},
+      {"n": "plausibility_values", "d": "maximum possible support"},
+      {"n": "fused_mass", "d": "combined evidence from multiple sources"},
+      {"n": "ignorance_measure", "d": "explicit quantification of unknown"}
+    ],
+    "proc": [
+      "define frame: enumerate mutually exclusive hypotheses",
+      "assign mass: allocate evidence weights to focal sets",
+      "compute belief: sum mass of all subsets for each hypothesis",
+      "compute plausibility: 1 minus belief in complement",
+      "combine sources: apply Dempster's rule if independent",
+      "interpret intervals: [Bel, Pl] bounds true probability"
+    ],
+    "check": [
+      "frame is exhaustive and mutually exclusive",
+      "mass sums to 1 with m({})=0",
+      "focal elements justified by evidence",
+      "source independence verified before combination",
+      "belief <= plausibility for all sets",
+      "ignorance explicitly represented vs hidden",
+      "conflict between sources assessed",
+      "interval interpretation stated"
+    ],
+    "diff": {
+      "bayesian": "mass on sets vs point probabilities; explicit ignorance vs prior selection",
+      "imprecise-probability": "structural approach vs interval-valued probabilities",
+      "fuzzy-logic": "uncertainty about membership vs vagueness of concept boundaries"
+    },
+    "fail": {
+      "mode": "independence_violation",
+      "signals": [
+        "sources share common origin",
+        "counterintuitive fusion results",
+        "high conflict normalization",
+        "mass on empty set before normalization",
+        "overconfident intervals"
+      ],
+      "mitigations": [
+        "verify source independence",
+        "use cautious combination rules",
+        "report conflict coefficient",
+        "consider alternative fusion (Yager, PCR)",
+        "sensitivity analysis on independence"
+      ]
+    },
+    "use": [
+      "multi-source fusion",
+      "ambiguous evidence",
+      "partial identification",
+      "sensor fusion",
+      "expert opinion aggregation",
+      "forensic analysis"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "alternative probabilistic framework"},
+      {"id": 21, "n": "imprecise-probability", "r": "related uncertainty representation"},
+      {"id": 25, "n": "fuzzy-logic", "r": "vagueness vs uncertainty distinction"}
+    ],
+    "ex": {
+      "sit": "Two sensors assess object type: {car, truck, bus}. Sensor A: 0.6 to {car}, 0.4 to {car,truck}. Sensor B: 0.7 to {car,bus}, 0.3 to frame.",
+      "steps": [
+        "frame = {car, truck, bus}",
+        "A: m({car})=0.6, m({car,truck})=0.4",
+        "B: m({car,bus})=0.7, m(frame)=0.3",
+        "combine via Dempster: compute intersections, normalize",
+        "fused: Bel(car)=0.72, Pl(car)=0.91"
+      ],
+      "insight": "evidence converges on car despite different focal elements; ignorance reduced through fusion"
+    }
+  }
+}

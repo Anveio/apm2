@@ -1,0 +1,79 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/historical-investigative@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 73,
+    "name": "historical-investigative",
+    "cat": "domain",
+    "core": "Reconstruct what happened from incomplete sources; triangulate evidence; assess credibility; compare hypotheses under uncertainty",
+    "out": [
+      "best_available_reconstructions",
+      "source_assessments",
+      "confidence_statements",
+      "evidence_chains"
+    ],
+    "proc": [
+      "gather_available_sources_and_evidence",
+      "assess_source_credibility_and_bias",
+      "triangulate_across_independent_sources",
+      "construct_timeline_of_events",
+      "generate_alternative_hypotheses",
+      "evaluate_hypotheses_against_evidence",
+      "identify_gaps_and_uncertainties",
+      "document_provenance_and_confidence"
+    ],
+    "check": [
+      "sources_triangulated_not_single_source",
+      "source_bias_assessed",
+      "alternative_hypotheses_considered",
+      "provenance_documented",
+      "confidence_explicit",
+      "disconfirming_evidence_sought"
+    ],
+    "diff": {
+      "abductive": "focuses_on_reconstruction_from_evidence_not_hypothesis_generation",
+      "counterfactual": "asks_what_did_happen_not_what_would_have_happened",
+      "narrative-causal-storytelling": "prioritizes_evidence_over_narrative_coherence"
+    },
+    "fail": {
+      "mode": "narrative_overfit",
+      "desc": "overfitting_to_compelling_narrative_while_neglecting_disconfirming_evidence",
+      "signals": [
+        "single_narrative_no_alternatives",
+        "disconfirming_evidence_dismissed",
+        "source_bias_ignored",
+        "gaps_filled_with_speculation"
+      ],
+      "mit": [
+        "require_multiple_hypotheses",
+        "actively_seek_disconfirming_evidence",
+        "assess_source_provenance_and_bias",
+        "mark_speculation_vs_evidence"
+      ]
+    },
+    "use": [
+      "audits",
+      "incident_reconstruction",
+      "due_diligence",
+      "fraud_investigations",
+      "postmortems"
+    ],
+    "rel": [
+      "abductive",
+      "counterfactual",
+      "narrative-causal-storytelling"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_narrative": "narrative_seeks_coherent_story_investigative_prioritizes_evidence",
+        "vs_abductive": "abductive_generates_hypotheses_investigative_reconstructs_events"
+      }
+    }
+  }
+}

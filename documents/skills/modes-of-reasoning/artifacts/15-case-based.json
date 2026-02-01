@@ -1,0 +1,58 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/case-based@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 15,
+    "name": "case-based",
+    "cat": "ampliative",
+    "core": "Retrieve similar past cases from a library and adapt their solutions to current problem; learning from specific experiences via retrieval metrics and adaptation operators.",
+    "out": [
+      "proposed solution justified by precedent",
+      "playbook actions",
+      "adapted prior solutions"
+    ],
+    "proc": [
+      "identify key features of current problem",
+      "search case library for similar past cases",
+      "rank retrieved cases by similarity metrics",
+      "select most relevant case(s)",
+      "adapt prior solution to current context",
+      "validate adapted solution fits new constraints"
+    ],
+    "check": [
+      "retrieved case sufficiently similar?",
+      "context differences identified and addressed?",
+      "adaptation preserves relevant solution properties?",
+      "precedent still valid in current environment?"
+    ],
+    "diff": {
+      "vs_analogical": "more operational; emphasizes retrieval metrics, adaptation operators, and structured case libraries rather than structural mapping"
+    },
+    "fail": {
+      "mode": "cargo-culting",
+      "desc": "applying precedent without checking context changes; past solutions may not apply when circumstances differ in important ways"
+    },
+    "use": [
+      "legal reasoning (precedent)",
+      "customer support",
+      "clinical decision support",
+      "ops playbooks",
+      "design reuse"
+    ],
+    "rel": [
+      {"id": 14, "name": "analogical", "link": "underlying cognitive mechanism"},
+      {"id": 18, "name": "reference-class-outside-view", "link": "statistical version of case retrieval"},
+      {"id": 71, "name": "legal", "link": "formal precedent-based reasoning"}
+    ],
+    "ex": {
+      "scenario": "resolving a production incident",
+      "approach": "retrieve similar past incidents from runbook; adapt previous fix considering current infrastructure differences"
+    }
+  }
+}

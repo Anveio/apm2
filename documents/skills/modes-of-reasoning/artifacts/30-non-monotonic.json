@@ -1,0 +1,81 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/non-monotonic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 30,
+    "name": "non-monotonic",
+    "cat": "nonmonotonic",
+    "core": "Adding information can retract previous conclusions. Unlike classical logic where more premises yield more conclusions, new facts may invalidate earlier defaults ('birds fly' until 'penguin').",
+    "out": [
+      {"n": "default_conclusions", "d": "tentative inferences from incomplete information"},
+      {"n": "exception_catalog", "d": "conditions that defeat default rules"},
+      {"n": "revision_triggers", "d": "new facts that retract previous conclusions"},
+      {"n": "priority_ordering", "d": "specificity or preference among conflicting defaults"}
+    ],
+    "proc": [
+      "identify default rules: 'normally X implies Y'",
+      "apply defaults in absence of contradicting information",
+      "check for exceptions: does new info defeat any active default",
+      "resolve conflicts via priority or specificity",
+      "retract conclusions no longer supported"
+    ],
+    "check": [
+      "defaults explicitly stated with 'normally' qualifier",
+      "exceptions enumerated and prioritized",
+      "conflict resolution rules defined",
+      "conclusions marked as tentative vs certain",
+      "revision behavior documented"
+    ],
+    "diff": {
+      "deductive": "deduction is monotonic; non-monotonic allows retraction",
+      "belief-revision": "revision updates belief sets; non-monotonic handles defaults at inference time",
+      "defeasible": "defeasible tracks defeat relations; non-monotonic focuses on exception patterns",
+      "default-typicality": "typicality is specific mechanism; non-monotonic is broader framework"
+    },
+    "fail": {
+      "mode": "priority_ambiguity",
+      "signals": [
+        "conflicting defaults with no resolution rule",
+        "inconsistent conclusions from same premises",
+        "surprising retractions users cannot predict",
+        "exception explosion undermining defaults"
+      ],
+      "mitigations": [
+        "explicit priority ordering for all default pairs",
+        "specificity principle: more specific defeats general",
+        "document retraction behavior in rules",
+        "test suite for exception interactions"
+      ]
+    },
+    "use": [
+      "rule systems with exceptions",
+      "policy engines",
+      "commonsense reasoning",
+      "knowledge bases with incomplete information",
+      "legal reasoning with overrides"
+    ],
+    "rel": [
+      {"id": 1, "n": "deductive", "r": "monotonic baseline contrasted"},
+      {"id": 31, "n": "default-typicality", "r": "specific non-monotonic mechanism"},
+      {"id": 33, "n": "belief-revision", "r": "principles for updating beliefs"},
+      {"id": 32, "n": "defeasible", "r": "defeat relation approach"}
+    ],
+    "ex": {
+      "sit": "Policy: employees get standard leave. Exception: contractors get reduced leave. Exception: senior contractors get standard leave.",
+      "steps": [
+        "defaults: employee->standard, contractor->reduced, senior-contractor->standard",
+        "input: Bob is senior contractor",
+        "apply specificity: senior-contractor more specific than contractor",
+        "conclude: Bob gets standard leave (not reduced)",
+        "if learn Bob is intern: retract, re-evaluate"
+      ],
+      "insight": "more specific exception defeats general default; new info can retract"
+    }
+  }
+}

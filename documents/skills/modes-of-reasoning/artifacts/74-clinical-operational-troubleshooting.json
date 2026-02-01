@@ -1,0 +1,74 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/clinical-operational-troubleshooting@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 74,
+    "name": "clinical-operational-troubleshooting",
+    "cat": "domain",
+    "core": "Blend pattern recognition from past cases, mechanistic models, targeted tests, triage logic, and risk constraints under time pressure for rapid diagnosis.",
+    "out": [
+      "triage decisions with priority levels",
+      "ordered test sequences",
+      "interventions with safety checks",
+      "diagnosis pathways with escalation points"
+    ],
+    "proc": [
+      "triage: assess severity and time constraints immediately",
+      "pattern match: recall similar cases and common failure modes",
+      "form initial hypothesis: use mechanistic models to explain symptoms",
+      "select discriminating tests: choose high-value, low-risk tests first",
+      "act/intervene: apply safe, reversible fixes while gathering data",
+      "iterate rapidly: update hypothesis as results arrive; escalate if stuck"
+    ],
+    "check": [
+      "triage priority justified by impact and urgency",
+      "hypothesis formed before intervention",
+      "tests selected for discriminative power under time pressure",
+      "safety checks applied before risky actions",
+      "escalation criteria defined and honored"
+    ],
+    "diff": {
+      "diagnostic-41": "time-critical hybrid vs structured fault-model approach",
+      "satisficing-51": "good-enough solutions vs full optimization; overlaps in accepting partial info",
+      "case-based-15": "uses case patterns as input vs pure case matching"
+    },
+    "fail": {
+      "mode": "confirmation bias under pressure",
+      "signal": "skipping confirmatory tests; treating correlations as mechanisms; making things worse with untested fixes",
+      "mitigations": [
+        "require at least one confirmatory test before invasive action",
+        "state what evidence would disprove current hypothesis",
+        "prefer reversible interventions when uncertain",
+        "set explicit time-box before mandatory escalation",
+        "document reasoning trail even under pressure"
+      ]
+    },
+    "use": [
+      "SRE/ops incident response",
+      "support escalation triage",
+      "medical-style diagnostic workflows",
+      "emergency response coordination",
+      "production incident management"
+    ],
+    "rel": [
+      "diagnostic-41",
+      "satisficing-51",
+      "case-based-15"
+    ],
+    "ex": {
+      "task": "Production service unresponsive during peak traffic",
+      "triage": "P1 - customer-facing, revenue impact, escalate immediately",
+      "pattern_match": "similar to last month's connection pool exhaustion incident",
+      "hypothesis": "connection pool saturated or downstream dependency timeout",
+      "tests": ["check connection pool metrics", "verify downstream health", "review recent deploys"],
+      "intervention": "increase pool size (safe, reversible) while continuing diagnosis",
+      "result": "pool metrics confirm exhaustion; recent deploy reduced pool size; rollback resolves"
+    }
+  }
+}

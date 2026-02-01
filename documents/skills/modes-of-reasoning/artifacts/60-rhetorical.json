@@ -1,0 +1,86 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/rhetorical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 60,
+    "name": "rhetorical",
+    "cat": "argumentation",
+    "core": "Reasoning aimed at belief-change and coordination, considering audience, framing, and the classical triad of ethos (credibility), pathos (emotion), and logos (logic). Prioritizes adoption over pure truth-preservation.",
+    "out": [
+      {"n": "persuasive_arguments", "d": "claims structured for audience acceptance"},
+      {"n": "narratives", "d": "stories that frame issues compellingly"},
+      {"n": "positioning", "d": "strategic placement of ideas relative to alternatives"},
+      {"n": "communication_strategies", "d": "tailored approaches for specific audiences"}
+    ],
+    "proc": [
+      "analyze audience: identify values, concerns, prior beliefs",
+      "select framing: choose perspective that resonates with audience",
+      "balance appeals: weigh ethos, pathos, logos for context",
+      "construct narrative: build coherent story around key claims",
+      "anticipate objections: prepare responses to likely resistance",
+      "validate alignment: ensure message serves legitimate goals"
+    ],
+    "check": [
+      "audience properly characterized",
+      "framing honest and non-manipulative",
+      "appeals balanced appropriately",
+      "claims grounded in truth",
+      "long-term trust preserved",
+      "ethical boundaries respected"
+    ],
+    "diff": {
+      "argumentation-theory": "persuasion effectiveness vs logical structure",
+      "theory-of-mind": "applies audience model vs builds mental model",
+      "narrative": "uses story for persuasion vs story for understanding",
+      "deductive": "adoption-oriented vs truth-preserving"
+    },
+    "fail": {
+      "mode": "manipulative_persuasion",
+      "signals": [
+        "truth subordinated to persuasion",
+        "audience exploited rather than served",
+        "short-term wins prioritized over trust",
+        "emotional manipulation without substance",
+        "deceptive framing employed"
+      ],
+      "mitigations": [
+        "anchor rhetoric in verified facts",
+        "consider audience long-term interests",
+        "maintain transparency about intent",
+        "balance pathos with logos",
+        "seek feedback on perceived authenticity"
+      ]
+    },
+    "use": [
+      "change management",
+      "stakeholder alignment",
+      "external communication",
+      "marketing",
+      "policy advocacy",
+      "executive presentations"
+    ],
+    "rel": [
+      {"id": 35, "n": "argumentation-theory", "r": "logical structure of arguments"},
+      {"id": 56, "n": "theory-of-mind", "r": "audience modeling"},
+      {"id": 62, "n": "narrative", "r": "storytelling for persuasion"}
+    ],
+    "ex": {
+      "sit": "Engineering team must convince leadership to invest in technical debt reduction. Leadership values speed and features.",
+      "steps": [
+        "audience: executives value ROI, speed, competitive advantage",
+        "framing: debt as velocity tax, not cleanup",
+        "ethos: cite past delivery success and credibility",
+        "logos: show metrics on defect rates and slowdown",
+        "pathos: paint vision of faster future releases",
+        "narrative: investment now enables Q3 feature acceleration"
+      ],
+      "insight": "reframing technical debt as velocity enablement aligns engineering needs with leadership values"
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/mechanistic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 40,
+    "name": "mechanistic",
+    "cat": "causal",
+    "core": "Explain and predict system behavior by identifying constituent parts, their properties, and how they interact. Reveals intervention points and failure modes by understanding internal structure rather than just input-output correlations.",
+    "out": [
+      "mechanistic_explanation",
+      "intervention_levers",
+      "failure_modes",
+      "component_model"
+    ],
+    "proc": [
+      "Decompose system into constituent parts with defined boundaries",
+      "Identify properties and capacities of each component",
+      "Map interactions: what triggers what, through which interface",
+      "Trace causal chain from input through components to output",
+      "Identify critical dependencies and single points of failure",
+      "Validate mechanism against known behavior; check edge cases",
+      "Derive intervention points: where can chain be modified",
+      "Document assumptions about component behavior"
+    ],
+    "check": [
+      "All components named with clear boundaries",
+      "Interaction types specified (chemical, electrical, logical, etc.)",
+      "Causal chain traceable end-to-end without gaps",
+      "At least one intervention point identified",
+      "Mechanism validated against at least one known outcome"
+    ],
+    "diff": {
+      "causal-inference": "Causal inference = statistical estimation of causal effects; Mechanistic = internal structure explanation",
+      "systems-thinking": "Systems = emergent behavior from component interactions over time; Mechanistic = how each component works inside",
+      "diagnostic": "Diagnostic uses mechanistic models to localize faults; Mechanistic builds the models",
+      "counterfactual": "Counterfactual = what-if queries; Mechanistic = why it works that way"
+    },
+    "fail": {
+      "mode": "Just-so mechanisms: plausible-sounding stories without validation",
+      "signal": "Mechanism not tested against edge cases or novel conditions; no falsifiable predictions",
+      "mit": [
+        "Require at least one validated prediction from mechanism",
+        "Identify assumptions that could break the mechanism",
+        "Test mechanism against failure cases, not just success cases",
+        "Distinguish known vs hypothesized component behavior"
+      ]
+    },
+    "use": [
+      "Engineering: circuit design, software architecture, failure analysis",
+      "Debugging: tracing root cause through component chain",
+      "Safety analysis: identifying failure modes and cascades",
+      "Biology/medicine: drug mechanism of action, disease pathways",
+      "System design: ensuring components interact correctly"
+    ],
+    "rel": [
+      {"id": 37, "name": "causal-inference", "note": "statistical causal estimation"},
+      {"id": 41, "name": "diagnostic", "note": "uses mechanistic models to localize faults"},
+      {"id": 43, "name": "systems-thinking", "note": "multi-component dynamics and emergence"}
+    ],
+    "ex": {
+      "problem": "Why does the service timeout under load?",
+      "components": [
+        {"name": "load balancer", "role": "distributes requests to backends"},
+        {"name": "backend pool", "role": "processes requests, pool size = 10"},
+        {"name": "database", "role": "stores state, max connections = 100"}
+      ],
+      "mechanism": "Each backend holds DB connection for request duration. At >10 concurrent requests per backend, DB pool exhausted, new requests block waiting for connection.",
+      "intervention": "Add connection pooling with timeout, or increase DB max connections",
+      "validation": "Reproduces at 100+ concurrent requests; resolved by connection pool"
+    }
+  }
+}

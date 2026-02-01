@@ -1,0 +1,57 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/analogical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 14,
+    "name": "analogical",
+    "cat": "ampliative",
+    "core": "Transfer relational structure from a known domain/case to a new one, focusing on structural correspondence rather than surface similarity.",
+    "out": [
+      "candidate inferences",
+      "adapted solutions",
+      "conceptual models/metaphors",
+      "design patterns"
+    ],
+    "proc": [
+      "identify source domain with known structure",
+      "map relational structure to target domain",
+      "transfer inferences based on structural alignment",
+      "validate that mapping preserves causal relationships"
+    ],
+    "check": [
+      "structural correspondence verified?",
+      "causal mechanisms similar, not just surface traits?",
+      "unmapped elements identified and assessed?"
+    ],
+    "diff": {
+      "vs_case_based": "focuses on structural mapping; case-based adds retrieval and adaptation mechanisms",
+      "vs_abductive": "particular-to-particular transfer; often seeds abductive hypotheses"
+    },
+    "fail": {
+      "mode": "false-analogy",
+      "desc": "shared surface traits but different causal structure leads to invalid transfers"
+    },
+    "use": [
+      "innovation",
+      "design",
+      "teaching",
+      "cross-domain problem solving",
+      "understanding unfamiliar systems"
+    ],
+    "rel": [
+      {"id": 15, "name": "case-based", "link": "operational version with retrieval and adaptation"},
+      {"id": 13, "name": "abductive", "link": "analogy often seeds hypotheses"},
+      {"id": 16, "name": "explanation-based-learning", "link": "explains why the analogy works"}
+    ],
+    "ex": {
+      "scenario": "designing a new distributed system by analogy to biological immune systems",
+      "approach": "map immune system's decentralized detection and response structure to network security architecture"
+    }
+  }
+}

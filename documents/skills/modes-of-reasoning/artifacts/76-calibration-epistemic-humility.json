@@ -1,0 +1,95 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/calibration-epistemic-humility@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 76,
+    "name": "calibration-epistemic-humility",
+    "cat": "meta",
+    "core": "Systematically measure how well confidence levels match actual accuracy, then adjust future confidence accordingly. Second-order reasoning: asks 'how good am I at knowing what's true?' rather than 'what is true?'",
+    "out": [
+      "prediction_log: timestamped forecasts with confidence and resolution criteria",
+      "calibration_curve: stated confidence vs actual accuracy plot",
+      "brier_score: accuracy metric (confidence - outcome)^2 averaged; lower is better",
+      "calibration_gap_report: over/underconfidence by confidence band",
+      "adjusted_confidence: revised confidence accounting for measured bias",
+      "domain_accuracy_profile: calibration broken down by topic area"
+    ],
+    "proc": [
+      "log predictions with explicit percentage confidence before outcomes known",
+      "score resolutions: brier component = (confidence - outcome)^2",
+      "compute calibration metrics: brier score and calibration curve by confidence band",
+      "identify systematic biases: over/underconfidence patterns and domain variance",
+      "adjust future confidence: map felt confidence to stated confidence based on measured bias",
+      "iterate and track improvement: compare brier scores across time periods"
+    ],
+    "check": [
+      "predictions logged before outcomes known",
+      "confidence stated as percentage not vague terms",
+      "resolution criteria specified and unambiguous",
+      ">=30 predictions scored for meaningful statistics",
+      "calibration curve computed across confidence bands",
+      "brier score calculated (benchmark: <0.25 beats random)",
+      "systematic biases identified by domain",
+      "adjustment rule articulated for future predictions",
+      "improvement tracked over time"
+    ],
+    "diff": {
+      "meta-reasoning": "meta selects reasoning mode prospectively; calibration scores accuracy retrospectively across many problems",
+      "debiasing": "debiasing applies corrective checks per decision; calibration measures accuracy over many decisions",
+      "bayesian": "bayesian updates beliefs with evidence; calibration scores whether posteriors match frequencies",
+      "reference-class": "reference-class provides base rates for specific forecasts; calibration evaluates all techniques together",
+      "reflective-equilibrium": "reflective equilibrium seeks coherence; calibration compares predictions to outcomes"
+    },
+    "fail": {
+      "mode": "confidence without track record",
+      "signals": [
+        "no prediction log exists",
+        "predictions recorded after outcomes known",
+        "vague unfalsifiable predictions",
+        "same confidence for everything",
+        "never scored wrong"
+      ],
+      "mitigations": [
+        "start prediction log with explicit percentages",
+        "use calibration app or spreadsheet",
+        "pre-commit to scoring all predictions",
+        "translate vague terms to percentages",
+        "require external accountability"
+      ]
+    },
+    "use": [
+      "forecasting teams measuring prediction accuracy",
+      "risk management ensuring confidence matches outcomes",
+      "decision post-mortems scoring past decisions",
+      "expert elicitation calibrating SME confidence",
+      "estimation improvement reducing planning fallacy",
+      "high-stakes domains where overconfidence has severe consequences"
+    ],
+    "rel": [
+      "11-bayesian-probabilistic",
+      "18-reference-class-outside-view",
+      "75-meta-reasoning",
+      "80-debiasing-epistemic-hygiene",
+      "45-decision-theoretic",
+      "77-reflective-equilibrium",
+      "10-statistical-frequentist"
+    ],
+    "ex": {
+      "situation": "team lead assessing calibration on project timeline estimates",
+      "steps": [
+        "logged 40 timeline predictions over 6 months with confidence levels",
+        "scored: 28 shipped on time, 12 missed",
+        "brier score = 0.22; 90% confidence band only 60% accurate",
+        "identified overconfidence at high confidence, worst in new tech projects",
+        "new rule: 90% felt -> state 70%; add 20% buffer for new tech",
+        "next quarter: brier improved to 0.18; 90% band now 75% accurate"
+      ]
+    }
+  }
+}

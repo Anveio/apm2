@@ -1,0 +1,85 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/value-of-information@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 52,
+    "name": "value-of-information",
+    "cat": "decision",
+    "core": "Decide which measurements/experiments reduce uncertainty most per cost to improve decisions. Core question: If I learned X, would I act differently?",
+    "out": [
+      "prioritized inquiry list ranked by decision impact / cost",
+      "EVPI/EVSI numeric bounds",
+      "decision-sensitivity table mapping variables to action changes",
+      "stop-learning threshold",
+      "instrumentation spec for pivotal uncertainty"
+    ],
+    "proc": [
+      "frame decision: state action set and outcome metric",
+      "list key uncertainties that could change optimal action",
+      "assess current beliefs with probability distributions",
+      "compute baseline expected value under current best action",
+      "for each uncertainty: if perfect knowledge changes choice, estimate EVPI; else skip",
+      "estimate cost and EVSI for feasible inquiries",
+      "rank by net EVSI / cost",
+      "stop when top inquiry has negative net EVSI or exceeds budget"
+    ],
+    "check": [
+      "decision clearly stated with explicit action alternatives",
+      "at least one uncertainty identified that could flip decision",
+      "EVPI computed or bounded for each pivotal uncertainty",
+      "inquiry cost estimated (time, money, opportunity)",
+      "stopping condition defined"
+    ],
+    "diff": {
+      "decision-theoretic": "decision-theoretic chooses among actions; VOI chooses among inquiries before acting",
+      "experimental-design": "experimental design answers how to measure X; VOI answers whether to measure X or Y first",
+      "diagnostic": "diagnostic aims to identify cause; VOI aims to improve decision; no action change = zero VOI value",
+      "optimization": "optimization maximizes outcome in fixed model; VOI maximizes value of improving model first"
+    },
+    "fail": {
+      "name": "measuring easy over decision-relevant",
+      "signals": [
+        "inquiry backlog ranked by ease not impact",
+        "no articulated decision the data informs",
+        "reports produced but not cited in action choices",
+        "high precision on non-decision-sensitive variables"
+      ],
+      "mitigations": [
+        "decision-linkage test: require written answer on what decision changes",
+        "sensitivity audit: check if 10x knowledge improvement flips action",
+        "opportunity-cost review: require expected gain > cost with no better alternative",
+        "retrospective decision trace: audit which data actually influenced choices"
+      ]
+    },
+    "use": [
+      "R&D prioritization",
+      "analytics roadmaps",
+      "incident investigation",
+      "test design go/no-go",
+      "due diligence"
+    ],
+    "rel": [
+      "45-decision-theoretic",
+      "69-experimental-design",
+      "41-diagnostic",
+      "11-bayesian-probabilistic",
+      "48-optimization"
+    ],
+    "ex": {
+      "scenario": "Launch Feature A (+$50K expected) or B (+$30K). Uncertainty: A adoption rate 20-40%. Survey cost: $2K.",
+      "steps": [
+        "baseline: launch A (higher EV)",
+        "sensitivity: if adoption <25%, B wins; 30% chance of this",
+        "EVPI: 0.30 * $20K = $6K",
+        "EVSI for survey: ~$3K (50% uncertainty reduction)",
+        "net value: $3K - $2K = +$1K; run survey"
+      ]
+    }
+  }
+}

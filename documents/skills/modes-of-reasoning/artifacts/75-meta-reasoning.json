@@ -1,0 +1,92 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/meta-reasoning@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 75,
+    "name": "meta-reasoning",
+    "cat": "meta",
+    "core": "Second-order reasoning that selects, monitors, and adjusts first-order reasoning processes. Determines which mode to apply, effort allocation, stopping criteria, and quality monitoring. The operating system for all other reasoning modes.",
+    "out": [
+      "problem characterization: type classification (belief/action, cooperative/adversarial)",
+      "mode selection rationale: which mode(s) and why",
+      "time/effort budget: max analysis time with diminishing-returns threshold",
+      "stopping rule: condition triggering 'enough analysis'",
+      "progress checkpoints: scheduled assessment moments",
+      "mode-switch trigger: signals to abandon current approach",
+      "retrospective note: 1-sentence record for future reference"
+    ],
+    "proc": [
+      "characterize problem type: belief vs action, cooperative vs adversarial, certainty vs exploration, time pressure, stakes",
+      "select 2-3 candidate modes using heuristics table, articulate fit rationale for each",
+      "set effort budget proportional to stakes, define stopping rule (confidence threshold, alternatives evaluated)",
+      "execute primary mode with scheduled checkpoints, assess progress at each",
+      "define mode-switch triggers: no progress after 2 checkpoints, problem recharacterization needed, time budget hit",
+      "close loop: note whether mode selection worked for future reference"
+    ],
+    "check": [
+      "problem characterized (belief/action, cooperative/adversarial, certainty/exploration)",
+      ">=2 candidate modes identified with fit rationale",
+      "time budget set proportional to stakes",
+      "stopping rule specified",
+      "mode-switch trigger defined",
+      "checkpoint schedule established",
+      "meta-reasoning <5% of total analysis budget"
+    ],
+    "diff": {
+      "sensemaking": "sensemaking establishes what problem is; meta-reasoning selects how to reason about it",
+      "calibration": "calibration tracks accuracy retrospectively; meta-reasoning selects mode prospectively",
+      "debiasing": "debiasing audits output for errors; meta-reasoning selects which process produces output",
+      "value-of-information": "VoI decides whether to gather more data; meta-reasoning decides how to reason with current data",
+      "heuristic": "heuristics are a specific mode; meta-reasoning decides when to use them",
+      "planning": "planning constructs action sequences; meta-reasoning constructs reasoning step sequences"
+    },
+    "fail": {
+      "name": "meta-infinite regress",
+      "signals": [
+        "mode selection >10% of analysis budget",
+        ">5 candidate modes considered without selection",
+        "researching frameworks instead of applying reasonable mode",
+        "second-guessing mode choice every checkpoint"
+      ],
+      "mitigations": [
+        "time-box strictly: 5% of total budget max",
+        "use default mode ladder: domain default -> satisficing + reference-class",
+        "apply satisficing to mode selection itself",
+        "only switch if mode failing, not merely suboptimal",
+        "never ask 'how should I decide how to reason'"
+      ]
+    },
+    "use": [
+      "high-stakes decisions where mode mismatch costly",
+      "novel problems with no obvious default mode",
+      "multi-phase analysis requiring different modes per stage",
+      "team reasoning alignment before diving in",
+      "resource-constrained decisions",
+      "post-failure analysis of reasoning approach"
+    ],
+    "rel": [
+      {"id": 63, "name": "sensemaking", "role": "establishes framing before mode selection"},
+      {"id": 52, "name": "value-of-information", "role": "input to stopping rules"},
+      {"id": 76, "name": "calibration", "role": "tracks long-run reasoning quality"},
+      {"id": 80, "name": "debiasing", "role": "audits mode outputs for bias"},
+      {"id": 51, "name": "satisficing", "role": "good enough mode choice"},
+      {"id": 53, "name": "heuristic", "role": "fast mode selected under time pressure"},
+      {"id": 47, "name": "planning", "role": "action planning vs thinking planning"},
+      {"id": 77, "name": "reflective-equilibrium", "role": "belief-principle coherence"}
+    ],
+    "ex": {
+      "situation": "Customer reports intermittent login failures, 1 hour to diagnose",
+      "characterization": "belief problem, cooperative, need explanation, high time pressure",
+      "mode_selected": "diagnostic/troubleshooting (structured triage)",
+      "budget": "45 min, stop when root cause identified or top 3 hypotheses ranked",
+      "switch_trigger": "30m no traction -> mechanistic",
+      "outcome": "root cause found at 35m (session cookie race condition)"
+    }
+  }
+}

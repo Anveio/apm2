@@ -1,0 +1,83 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/scientific@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 68,
+    "name": "scientific",
+    "cat": "domain",
+    "core": "Hypothetico-deductive cycle: abduce hypotheses from observations, deduce testable predictions, run experiments with statistical rigor, revise beliefs/theories based on evidence.",
+    "out": [
+      {"a": "hypothesis", "s": "falsifiable claim with observable predictions", "done": "at least one prediction can be tested with available resources"},
+      {"a": "prediction", "s": "if hypothesis true, then observable outcome X under conditions Y", "done": "prediction is specific enough to fail"},
+      {"a": "experiment", "s": "protocol, controls, sample size, statistical test", "done": "power analysis shows test can detect expected effect"},
+      {"a": "result", "s": "data, statistical analysis, confidence intervals, p-values", "done": "analysis pre-registered or exploratory clearly labeled"},
+      {"a": "revised_belief", "s": "updated probability or theory modification", "done": "update magnitude justified by evidence strength"}
+    ],
+    "proc": [
+      "Observe phenomenon: gather initial data, note patterns or anomalies",
+      "Abduce hypotheses: generate candidate explanations that would account for observations",
+      "Deduce predictions: derive specific, falsifiable predictions from each hypothesis",
+      "Design experiment: choose controls, sample size, statistical test; pre-register if possible",
+      "Run experiment: collect data according to protocol, document deviations",
+      "Analyze results: apply pre-specified statistical tests, compute effect sizes and intervals",
+      "Revise beliefs: update credences proportional to evidence strength, modify or reject hypotheses",
+      "Iterate: new observations prompt new hypotheses; refined predictions enable sharper tests"
+    ],
+    "check": [
+      "Hypotheses are falsifiable with specified observations",
+      "Predictions derive logically from hypothesis (not just correlated)",
+      "Experiment has adequate power to detect expected effect",
+      "Analysis plan specified before data collection or exploratory analysis flagged",
+      "Confidence intervals and effect sizes reported alongside p-values",
+      "Belief update proportional to evidence strength"
+    ],
+    "diff": {
+      "abductive": "full cycle integrating generation, prediction, testing, revision vs hypothesis generation only",
+      "statistical-frequentist": "embeds statistical testing within broader inquiry loop vs testing alone",
+      "bayesian-probabilistic": "uses Bayesian update as one component vs pure belief update calculus",
+      "experimental-design": "includes hypothesis and revision phases vs experiment structure only",
+      "engineering-design": "goal is validated theory vs goal is working artifact"
+    },
+    "fail": {
+      "mode": "confirmation bias, underpowered experiments, publication bias",
+      "signals": [
+        "only evidence supporting hypothesis is sought",
+        "sample size chosen for convenience, not power",
+        "negative results discarded or unreported",
+        "post-hoc hypotheses presented as pre-registered"
+      ],
+      "mitigations": [
+        {"m": "pre-register hypotheses and analysis plans", "test": "registration timestamp precedes data collection"},
+        {"m": "power analysis before experiment", "test": "sample size justified by effect size and power target"},
+        {"m": "report all results including nulls", "test": "results section includes non-significant findings"},
+        {"m": "seek disconfirming evidence", "test": "at least one prediction designed to falsify hypothesis"}
+      ]
+    },
+    "use": [
+      "R&D and product experimentation",
+      "A/B testing and growth experiments",
+      "academic and industrial research",
+      "measurement culture and data-driven orgs",
+      "medical and clinical trials"
+    ],
+    "rel": [
+      {"mode": "abductive", "how": "hypothesis generation step is abductive inference"},
+      {"mode": "statistical-frequentist", "how": "experiment analysis uses frequentist tests"},
+      {"mode": "bayesian-probabilistic", "how": "belief revision can use Bayesian updating"},
+      {"mode": "experimental-design", "how": "experiment step applies design principles"},
+      {"mode": "causal-inference", "how": "experiments aim to establish causal claims"}
+    ],
+    "ex": {
+      "confusion": [
+        {"vs": "abductive", "clarify": "abduction generates hypotheses; scientific method also tests and revises them"},
+        {"vs": "experimental-design", "clarify": "experimental design structures tests; scientific method embeds design in full inquiry cycle"}
+      ]
+    }
+  }
+}

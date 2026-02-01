@@ -1,0 +1,76 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/qualitative@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 29,
+    "name": "qualitative",
+    "cat": "causal",
+    "core": "Reason with qualitative states (increasing, decreasing, positive/negative influence) instead of exact numbers. Use sign algebra and monotone constraints for directional predictions when quantitative data is unavailable.",
+    "out": [
+      "directional_predictions",
+      "qualitative_constraints",
+      "sanity_checks",
+      "influence_diagrams"
+    ],
+    "proc": [
+      "Identify variables of interest and their qualitative states (+, -, 0, ?)",
+      "Map influence relations: does X increasing cause Y to increase (+) or decrease (-)?",
+      "Propagate signs through influence graph using sign algebra",
+      "Check for ambiguous paths where influences conflict",
+      "Validate directional predictions against known constraints",
+      "Flag regions where nonlinear thresholds may invalidate sign reasoning"
+    ],
+    "check": [
+      "All variables have defined qualitative states",
+      "Influence signs are justified by domain knowledge",
+      "Conflicting paths explicitly noted as ambiguous",
+      "Threshold assumptions documented",
+      "Predictions stated as directional claims, not magnitudes"
+    ],
+    "diff": {
+      "fermi": "Fermi gives rough numeric estimates; Qualitative reasons about directions without numbers",
+      "systems-thinking": "Systems adds loop closure, delays, and stocks; Qualitative is simpler sign propagation",
+      "causal-inference": "Causal inference quantifies effects rigorously; Qualitative captures direction only"
+    },
+    "fail": {
+      "mode": "Missing nonlinear thresholds where sign reasoning breaks down",
+      "signal": "Prediction fails outside narrow range; 'more X means more Y' only true conditionally",
+      "mit": [
+        "Explicitly state range where monotonicity holds",
+        "Identify saturation or reversal points",
+        "Use Fermi estimates to bound the valid regime"
+      ]
+    },
+    "use": [
+      "Early architecture when numbers unavailable",
+      "Feedback reasoning: does this influence make sense?",
+      "Trend sanity checks before quantitative modeling",
+      "System dynamics exploration without quantification"
+    ],
+    "rel": [
+      {"id": 19, "name": "fermi", "note": "use Fermi for rough numeric estimates"},
+      {"id": 43, "name": "systems-thinking", "note": "upgrade to systems when loops and delays matter"},
+      {"id": 37, "name": "causal-inference", "note": "upgrade when rigorous causal effects needed"}
+    ],
+    "ex": {
+      "problem": "Will adding a cache improve latency?",
+      "variables": [
+        {"name": "cache_size", "state": "+"},
+        {"name": "hit_rate", "state": "+"},
+        {"name": "latency", "state": "-"}
+      ],
+      "influences": [
+        {"from": "cache_size", "to": "hit_rate", "sign": "+"},
+        {"from": "hit_rate", "to": "latency", "sign": "-"}
+      ],
+      "prediction": "Increasing cache size decreases latency (sign: + * - = -)",
+      "caveat": "Only holds until cache exceeds working set; beyond that, hit_rate saturates"
+    }
+  }
+}

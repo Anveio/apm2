@@ -1,0 +1,74 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/diagnostic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 41,
+    "name": "diagnostic",
+    "cat": "causal",
+    "core": "Infer hidden faults or root causes from observed symptoms using fault/causal models combined with uncertainty handling and systematic elimination.",
+    "out": [
+      "ranked list of probable causes with confidence levels",
+      "next-best diagnostic tests to discriminate hypotheses",
+      "triage plans prioritizing investigation steps",
+      "differential diagnoses with supporting/refuting evidence"
+    ],
+    "proc": [
+      "gather symptoms: collect observable anomalies and context",
+      "generate hypotheses: enumerate plausible causes from fault model",
+      "prioritize by prior probability and severity",
+      "design discriminating tests: identify observations that differentiate hypotheses",
+      "update beliefs: revise probabilities based on test results",
+      "iterate until confident diagnosis or escalate with uncertainty bounds"
+    ],
+    "check": [
+      "multiple hypotheses considered before converging",
+      "each hypothesis has explicit supporting and refuting evidence",
+      "test selection justified by discriminative power",
+      "confidence levels stated with reasoning",
+      "escalation criteria defined if diagnosis uncertain"
+    ],
+    "diff": {
+      "abductive-13": "structured fault-model-driven vs general best-explanation inference",
+      "mechanistic-40": "uses mechanism knowledge vs explains mechanism itself",
+      "value-of-information-52": "VoI prioritizes tests, diagnostic consumes that guidance",
+      "counterfactual-39": "identifies actual cause vs explores hypothetical changes"
+    },
+    "fail": {
+      "mode": "premature closure",
+      "signal": "locking onto first plausible cause; ignoring disconfirming evidence; skipping differential",
+      "mitigations": [
+        "list at least 3 hypotheses before investigating deeply",
+        "explicitly note evidence against the leading hypothesis",
+        "ask 'what else could cause these symptoms?'",
+        "require one discriminating test before declaring root cause",
+        "document ruled-out alternatives and why"
+      ]
+    },
+    "use": [
+      "incident response and outage triage",
+      "technical troubleshooting",
+      "quality defect analysis",
+      "medical diagnosis",
+      "customer support escalation"
+    ],
+    "rel": [
+      "abductive-13",
+      "mechanistic-40",
+      "value-of-information-52"
+    ],
+    "ex": {
+      "task": "API latency spike in production",
+      "symptoms": "P99 latency 5x normal; errors stable; CPU normal; memory normal",
+      "hypotheses": ["database slow queries", "network congestion", "upstream dependency degraded", "GC pauses"],
+      "tests": "check DB slow query log; trace sample requests; review dependency dashboards",
+      "result": "DB slow query log shows 3s queries on user table; index missing after migration",
+      "diagnosis": "missing index causing full table scans; ruled out network (traces show DB wait), GC (no pause spikes)"
+    }
+  }
+}

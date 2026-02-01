@@ -1,0 +1,80 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/counterexample-guided@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 8,
+    "name": "counterexample-guided",
+    "cat": "formal",
+    "core": "Refinement loop: propose coarse abstraction, check property, if spurious counterexample found refine abstraction to eliminate it, repeat until property proven or real counterexample found.",
+    "out": [
+      "proof_certificate",
+      "concrete_counterexample_trace",
+      "refinement_log",
+      "abstraction_mapping"
+    ],
+    "proc": [
+      "define_property",
+      "choose_initial_abstraction",
+      "check_abstraction",
+      "simulate_counterexample_on_concrete",
+      "refine_abstraction",
+      "check_termination_bound"
+    ],
+    "check": [
+      "property_machine_checkable",
+      "initial_abstraction_discards_50pct_complexity",
+      "refinement_heuristic_documented",
+      "iteration_cap_and_budget_defined",
+      "each_refinement_strictly_increases_power"
+    ],
+    "diff": {
+      "model_theoretic": "builds_sequence_of_abstractions_vs_single_model",
+      "constraint_sat": "iteratively_refines_encoding_vs_one_shot",
+      "fuzz_then_fix": "systematic_refinement_with_completeness_vs_random",
+      "iterative_deepening": "refines_state_partition_vs_depth_bounds"
+    },
+    "fail": {
+      "mode": "endless_refinement_loops",
+      "signals": [
+        "iteration_exceeds_10x_estimate",
+        "same_abstract_states_re_split",
+        "state_space_grows_faster_than_linear"
+      ],
+      "mitigations": [
+        "predicate_budget",
+        "refinement_size_test",
+        "interpolant_quality_check",
+        "timeout_with_partial_result"
+      ]
+    },
+    "use": [
+      "hw_sw_verification_large_state_space",
+      "security_property_checking",
+      "protocol_verification_unbounded_queues",
+      "cheap_abstraction_check_and_concrete_simulation"
+    ],
+    "rel": [
+      "05-model-theoretic-semantic",
+      "06-constraint-satisfiability",
+      "33-belief-revision",
+      "07-formal-verification-mc"
+    ],
+    "ex": {
+      "goal": "verify_lock_never_acquired_twice_without_release",
+      "steps": [
+        "abstract_to_lock_held_boolean",
+        "check_finds_acquire_acquire_path",
+        "simulate_finds_spurious_x_constraint",
+        "refine_split_on_x_gt_0",
+        "check_no_double_acquire",
+        "output_proof_certificate"
+      ]
+    }
+  }
+}

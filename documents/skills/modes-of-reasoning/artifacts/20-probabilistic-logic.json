@@ -1,0 +1,82 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/probabilistic-logic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 20,
+    "name": "probabilistic-logic",
+    "cat": "probabilistic",
+    "core": "Blend logical structure (relations, rules, quantifiers) with probabilistic uncertainty. Uses probabilistic programming with constraints to reason about structured worlds under uncertainty. More expressive than plain Bayesian models for relational domains.",
+    "out": [
+      {"n": "probabilistic_inferences", "d": "conclusions over structured worlds with uncertainty"},
+      {"n": "uncertain_rule_consequences", "d": "effects of rules with probability weights"},
+      {"n": "relational_predictions", "d": "predictions about relationships with confidence"}
+    ],
+    "proc": [
+      "define logical structure: entities, relations, rules, quantifiers",
+      "assign probabilities to base facts and rules",
+      "propagate uncertainty through logical structure",
+      "compute posterior over structured world states",
+      "validate inferences against known constraints",
+      "extract relational predictions with confidence bounds"
+    ],
+    "check": [
+      "logical structure explicitly defined",
+      "probabilities assigned to base facts",
+      "uncertainty propagated consistently",
+      "inference tractable for domain size",
+      "model validated against known ground truth",
+      "predictions include confidence intervals"
+    ],
+    "diff": {
+      "bayesian": "adds logical structure to probability vs pure distributions",
+      "deductive": "incorporates uncertainty vs binary truth values",
+      "fuzzy-logic": "principled probability vs graded membership functions"
+    },
+    "fail": {
+      "mode": "model_soup",
+      "signals": [
+        "model too expressive to validate",
+        "brittle inference under small changes",
+        "overfitting to training examples",
+        "inference complexity explodes with scale",
+        "unable to explain predictions"
+      ],
+      "mitigations": [
+        "constrain model expressiveness deliberately",
+        "test inference robustness under perturbation",
+        "hold out validation data",
+        "profile inference complexity early",
+        "require explanation traces for predictions"
+      ]
+    },
+    "use": [
+      "knowledge graphs with uncertainty",
+      "uncertain policies",
+      "relational prediction",
+      "combining rules with statistical evidence"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "underlying probability theory"},
+      {"id": 1, "n": "deductive-reasoning", "r": "underlying logical structure"},
+      {"id": 25, "n": "fuzzy-logic", "r": "different approach to graded truth"}
+    ],
+    "ex": {
+      "sit": "Knowledge graph with uncertain entity types and relations. Need to infer missing links.",
+      "steps": [
+        "define entities: Person, Organization; relations: worksFor, locatedIn",
+        "assign priors: P(worksFor(X,Y)|Person(X),Org(Y)) = 0.1",
+        "add rule: worksFor(X,Y) ^ locatedIn(Y,Z) => likelyIn(X,Z) with P=0.8",
+        "observe: worksFor(alice,acme)=0.9, locatedIn(acme,NYC)=0.95",
+        "infer: P(likelyIn(alice,NYC)) = 0.9 * 0.95 * 0.8 = 0.68",
+        "validate: check against known residence data"
+      ],
+      "insight": "logical rules propagate uncertainty while preserving relational structure"
+    }
+  }
+}

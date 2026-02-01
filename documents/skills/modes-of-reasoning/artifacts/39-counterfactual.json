@@ -1,0 +1,79 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/counterfactual@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 39,
+    "name": "counterfactual",
+    "cat": "causal",
+    "core": "Evaluate alternate histories given a causal model to determine what would have happened under different conditions",
+    "out": [
+      "counterfactual_outcomes",
+      "blame_credit_analysis",
+      "individualized_explanations",
+      "scenario_comparisons"
+    ],
+    "proc": [
+      "establish_causal_model_with_variables_and_edges",
+      "identify_intervention_point_and_alternative_value",
+      "fix_intervention_variable_to_counterfactual_value",
+      "propagate_effects_through_causal_graph",
+      "compare_factual_vs_counterfactual_outcomes",
+      "attribute_credit_or_blame_based_on_difference",
+      "document_assumptions_and_model_limitations"
+    ],
+    "check": [
+      "causal_model_explicit_not_implicit",
+      "intervention_well_defined",
+      "downstream_effects_traced",
+      "model_validated_against_known_cases",
+      "uncertainty_quantified",
+      "assumptions_documented"
+    ],
+    "diff": {
+      "causal-inference": "uses_causal_model_to_ask_what_if_not_what_is",
+      "model-based-simulation": "focuses_on_alternate_histories_not_forward_prediction",
+      "historical-investigative": "asks_what_would_have_happened_not_what_did_happen",
+      "statistical": "requires_causal_structure_beyond_observed_correlations"
+    },
+    "fail": {
+      "mode": "confident_counterfactuals_from_weak_models",
+      "desc": "asserting_what_would_have_happened_without_valid_causal_model",
+      "signals": [
+        "no_explicit_causal_model",
+        "confounders_ignored",
+        "model_not_validated",
+        "single_scenario_no_sensitivity_analysis"
+      ],
+      "mit": [
+        "require_explicit_causal_dag",
+        "validate_model_on_observed_interventions",
+        "sensitivity_analysis_on_key_assumptions",
+        "bound_uncertainty_in_counterfactual_claims"
+      ]
+    },
+    "use": [
+      "postmortems",
+      "accountability_analysis",
+      "scenario_evaluation",
+      "personalized_decision_support",
+      "individual_case_explanation"
+    ],
+    "rel": [
+      "causal-inference",
+      "model-based-simulation",
+      "historical-investigative"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_prediction": "counterfactual_asks_past_alternatives_prediction_asks_future",
+        "vs_correlation": "correlation_insufficient_need_causal_model_for_counterfactuals"
+      }
+    }
+  }
+}

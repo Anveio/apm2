@@ -1,0 +1,100 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/bayesian-probabilistic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 11,
+    "name": "bayesian-probabilistic",
+    "cat": "probabilistic",
+    "core": "Represent degrees of belief as probabilities and update them with evidence via Bayes' rule: P(H|E) = P(E|H) * P(H) / P(E). Posterior = (Likelihood * Prior) / Evidence. Normative standard for belief updating under uncertainty.",
+    "out": [
+      {"n": "prior_distribution", "d": "explicit beliefs before new evidence with source"},
+      {"n": "likelihood_model", "d": "P(E|H) for each hypothesis"},
+      {"n": "posterior_distribution", "d": "updated beliefs after incorporating evidence"},
+      {"n": "credible_intervals", "d": "ranges containing specified probability mass"},
+      {"n": "sensitivity_analysis", "d": "how posterior changes with prior/likelihood changes"},
+      {"n": "decision_summary", "d": "point estimates or thresholds for action"}
+    ],
+    "proc": [
+      "specify prior: source (base rates, expert, previous posteriors), range, rationale",
+      "construct likelihood model: P(E|H) for each hypothesis, compare across H",
+      "apply Bayes' rule: P(H|E) proportional to P(E|H) * P(H), normalize",
+      "construct credible intervals: 50%, 90%, 95% ranges",
+      "test sensitivity: vary prior and likelihood, flag if posterior highly sensitive",
+      "extract decision-relevant summary: P(success), expected value, hypothesis ratios",
+      "update iteratively: today's posterior becomes tomorrow's prior"
+    ],
+    "check": [
+      "prior explicitly stated with source",
+      "likelihood model specified for each hypothesis",
+      "posterior computed or estimated",
+      "credible intervals reported",
+      "sensitivity analysis on prior and likelihood",
+      "base rates checked if available",
+      "decision-relevant summary extracted",
+      "confidence appropriate to evidence strength"
+    ],
+    "diff": {
+      "frequentist": "reports P(hypothesis|data) directly vs P(data|hypothesis) over repetitions",
+      "likelihood-based": "adds priors for full posteriors vs compares P(E|H) without priors",
+      "reference-class": "uses base rates as prior input vs provides the prior",
+      "decision-theoretic": "produces posteriors vs consumes them for action choice",
+      "inductive": "formalizes belief updating vs informal pattern generalization"
+    },
+    "fail": {
+      "mode": "base_rate_neglect",
+      "signals": [
+        "high confidence despite rare base rate",
+        "no explicit prior stated",
+        "prior described as uninformative without justification",
+        "posterior tracks likelihood exactly",
+        "dramatic update from single evidence",
+        "confusing P(E|H) with P(H|E)"
+      ],
+      "mitigations": [
+        "state prior before seeing evidence",
+        "anchor priors in base rates via reference-class",
+        "sensitivity analysis under multiple priors",
+        "likelihood ratio sanity check",
+        "separate likelihood statements from posterior claims",
+        "incremental updates, skepticism of large jumps"
+      ]
+    },
+    "use": [
+      "medical diagnosis",
+      "forecasting with base rates",
+      "A/B testing interpretation",
+      "fraud detection",
+      "reliability estimation",
+      "scientific inference",
+      "risk assessment",
+      "sequential learning"
+    ],
+    "rel": [
+      {"id": 10, "n": "statistical-frequentist", "r": "alternative framework, different interpretation"},
+      {"id": 12, "n": "likelihood-based", "r": "comparative evidence without full priors"},
+      {"id": 18, "n": "reference-class", "r": "base rates as prior source"},
+      {"id": 45, "n": "decision-theoretic", "r": "uses posteriors for decisions"},
+      {"id": 20, "n": "probabilistic-logic", "r": "Bayesian + logical structure"},
+      {"id": 76, "n": "calibration", "r": "tracking prediction accuracy"},
+      {"id": 9, "n": "inductive", "r": "informal predecessor"}
+    ],
+    "ex": {
+      "sit": "Rare disease (1% prevalence), test sensitivity 95%, specificity 90%. Patient tests positive.",
+      "steps": [
+        "prior: P(disease) = 0.01 from base rate",
+        "likelihood: P(+|disease)=0.95, P(+|no disease)=0.10",
+        "Bayes: P(disease|+) = (0.95*0.01)/[(0.95*0.01)+(0.10*0.99)] = 0.088",
+        "interpret: only 8.8% chance despite positive test",
+        "sensitivity: if prevalence 10%, posterior would be 51%",
+        "decision: recommend confirmatory test"
+      ],
+      "insight": "low base rate means most positive tests are false positives; P(E|H) is not P(H|E)"
+    }
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/statistical-frequentist@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 10,
+    "name": "statistical-frequentist",
+    "cat": "probabilistic",
+    "core": "Inference about populations from samples using estimators, confidence intervals, hypothesis tests, and error rates. Emphasizes long-run properties of procedures under repeated sampling.",
+    "out": [
+      {"n": "point_estimate", "d": "sample statistic estimating population parameter"},
+      {"n": "confidence_interval", "d": "range with coverage guarantee under repeated sampling"},
+      {"n": "p_value", "d": "probability of data as extreme under null hypothesis"},
+      {"n": "test_decision", "d": "reject/fail-to-reject at specified alpha level"},
+      {"n": "error_rate_bounds", "d": "Type I and Type II error rate guarantees"}
+    ],
+    "proc": [
+      "define population parameter of interest",
+      "specify null and alternative hypotheses",
+      "select test statistic and sampling distribution",
+      "collect sample data following design",
+      "compute point estimate and standard error",
+      "construct confidence interval at chosen level",
+      "calculate test statistic and p-value",
+      "compare to significance threshold, report decision"
+    ],
+    "check": [
+      "sampling assumptions stated and justified",
+      "null hypothesis precisely defined",
+      "test appropriate for data type and design",
+      "sample size adequate for power",
+      "confidence level and alpha consistent",
+      "p-value interpreted as procedure property not belief",
+      "practical significance distinguished from statistical",
+      "multiple comparison correction if needed"
+    ],
+    "diff": {
+      "bayesian": "long-run frequency vs degree of belief; no priors",
+      "inductive": "formal probabilistic framework vs informal generalization",
+      "experimental-design": "analyzes collected data vs plans collection"
+    },
+    "fail": {
+      "mode": "p_value_worship",
+      "signals": [
+        "p<0.05 treated as truth threshold",
+        "non-significant equated with no effect",
+        "confidence interval ignored for p-value",
+        "effect size unreported",
+        "practical significance ignored"
+      ],
+      "mitigations": [
+        "always report effect sizes",
+        "interpret CI width as precision",
+        "pre-register analysis plan",
+        "distinguish statistical from practical significance",
+        "consider power for null results"
+      ]
+    },
+    "use": [
+      "A/B testing",
+      "clinical trials",
+      "quality assurance",
+      "survey sampling",
+      "experimental research",
+      "process control"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian", "r": "alternative framework with priors"},
+      {"id": 9, "n": "inductive", "r": "informal predecessor"},
+      {"id": 69, "n": "experimental-design", "r": "data collection planning"}
+    ],
+    "ex": {
+      "sit": "A/B test: new checkout flow vs control. n=1000 per group. Conversion: 12% vs 10%.",
+      "steps": [
+        "H0: p_new = p_ctrl; H1: p_new > p_ctrl",
+        "z-test for proportions, one-tailed alpha=0.05",
+        "pooled p=0.11, SE=0.014, z=1.43",
+        "p-value=0.076 > 0.05, fail to reject H0",
+        "95% CI for difference: [-0.007, 0.047]"
+      ],
+      "insight": "2pp lift plausible but underpowered to detect; need larger n or accept uncertainty"
+    }
+  }
+}

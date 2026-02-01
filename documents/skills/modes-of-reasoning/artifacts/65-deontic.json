@@ -1,0 +1,71 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/deontic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 65,
+    "name": "deontic",
+    "cat": "domain",
+    "core": "Derive what is permitted (P), obligatory (O), or forbidden (F) from norms; resolve conflicts via priority rules (lex specialis/superior/posterior); identify exceptions and triggers.",
+    "out": [
+      {"type": "norm_inventory", "form": "table: norm-id, source, trigger, operator, action, exceptions", "test": "every norm has one operator and testable trigger"},
+      {"type": "conflict_matrix", "form": "grid of contradictory norm pairs", "test": "non-empty cells have documented resolution"},
+      {"type": "priority_ordering", "form": "ranked norms by authority/specificity/recency", "test": "ordering is total or partitioned with explicit incomparability"},
+      {"type": "compliance_verdict", "form": "PERMITTED/REQUIRED/FORBIDDEN with citing norms", "test": "verdict traces to >=1 norm; conflicts resolved per priority"}
+    ],
+    "proc": [
+      "inventory norms: list source, trigger, operator, action, exceptions",
+      "detect conflicts: check if multiple norms apply with different operators",
+      "apply priority: lex specialis > general, lex superior > lower authority, lex posterior > earlier",
+      "derive verdicts: output surviving deontic status after resolution",
+      "document residual: flag unresolved conflicts as normative gaps for escalation"
+    ],
+    "check": [
+      "every norm has explicit trigger conditions",
+      "O/P/F operator is unambiguous per norm",
+      "exceptions are explicit not implied",
+      "conflict resolution rules declared before analysis",
+      "verdicts cite justifying norms",
+      "residual conflicts flagged not dropped"
+    ],
+    "diff": {
+      "modal": "modal asks possible/necessary (alethic); deontic asks permitted/required (normative)",
+      "legal": "legal applies deontic within institutional constraints; deontic is the formal logic",
+      "moral-ethical": "moral evaluates which norms should exist (meta); deontic derives from given norms (object)",
+      "defeasible": "defeasible handles general exceptions; deontic handles normative exceptions"
+    },
+    "fail": {
+      "mode": "inconsistent norms with no resolution; ignoring priority ordering",
+      "signal": "contradictory operators (O(X) and F(X)) on same action without priority rule",
+      "mit": [
+        "pre-declare priority scheme before analysis",
+        "build conflict matrix after inventorying norms",
+        "require escalation protocol for unresolvable conflicts",
+        "trace every verdict with citation chain"
+      ]
+    },
+    "use": [
+      "compliance analysis",
+      "access control design",
+      "governance frameworks",
+      "contract interpretation",
+      "automated policy engines"
+    ],
+    "rel": [
+      {"id": 64, "name": "modal", "why": "broader modal logic framework"},
+      {"id": 71, "name": "legal", "why": "applied deontic in institutional context"},
+      {"id": 72, "name": "moral-ethical", "why": "meta-level norm evaluation"},
+      {"id": 32, "name": "defeasible", "why": "general exception handling"},
+      {"id": 16, "name": "rule-based", "why": "similar structure, not specifically normative"}
+    ],
+    "ex": {
+      "ctx": "System rules: N1 O(auth) if access-data; N2 P(not-auth) if emergency-responder; N3 F(not-auth) if access-PII",
+      "analysis": "N1 vs N2: lex specialis, P(not-auth) for emergency. N2 vs N3: lex superior (privacy reg), F(not-auth) for PII even in emergency. Gap: emergency responders needing PII flagged for escalation."
+    }
+  }
+}

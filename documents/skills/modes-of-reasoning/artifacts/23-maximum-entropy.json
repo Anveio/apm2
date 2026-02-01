@@ -1,0 +1,85 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/maximum-entropy@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 23,
+    "name": "maximum-entropy",
+    "cat": "probabilistic",
+    "core": "Choose probability distributions that satisfy known constraints while assuming as little else as possible by maximizing entropy. Principled method for constructing least-committal priors and baselines. Does not claim the world is maximally random, only that we should not assume more structure than evidence warrants.",
+    "out": [
+      {"n": "constraint_set", "d": "explicit list of known constraints the distribution must satisfy"},
+      {"n": "max_entropy_distribution", "d": "distribution maximizing entropy subject to constraints"},
+      {"n": "entropy_value", "d": "computed entropy of the resulting distribution"},
+      {"n": "baseline_model", "d": "objective default for comparison or prior use"}
+    ],
+    "proc": [
+      "enumerate known constraints: expectations, moments, marginals, or domain bounds",
+      "formulate entropy maximization: H = -sum(p log p) subject to constraints",
+      "solve for distribution: use Lagrange multipliers or iterative scaling",
+      "verify constraints satisfied: check each constraint holds in solution",
+      "interpret result: use as prior, baseline, or null model",
+      "document assumptions: note what constraints capture and what they omit"
+    ],
+    "check": [
+      "all known constraints explicitly listed",
+      "constraints are accurate and complete for the domain",
+      "entropy maximization correctly applied",
+      "resulting distribution satisfies all constraints",
+      "interpretation does not overstate objectivity",
+      "omitted structure acknowledged"
+    ],
+    "diff": {
+      "bayesian": "provides principled priors vs updates beliefs with evidence",
+      "simplicity-compression": "related parsimony principle but focused on distributions vs descriptions",
+      "imprecise-probability": "single max-ent distribution vs set of distributions when constraints weak",
+      "frequentist": "subjective but principled vs objective long-run frequencies"
+    },
+    "fail": {
+      "mode": "constraint_underspecification",
+      "signals": [
+        "constraints omit known structure",
+        "output treated as objectively true",
+        "sensitivity to constraint formulation ignored",
+        "max-ent used when strong prior knowledge exists",
+        "constraints specified incorrectly"
+      ],
+      "mitigations": [
+        "audit constraints against domain knowledge",
+        "test sensitivity to constraint variations",
+        "compare with alternative distributions",
+        "acknowledge max-ent is conditional on constraints",
+        "use imprecise probability if constraints are weak"
+      ]
+    },
+    "use": [
+      "constructing uninformative priors",
+      "baseline models for comparison",
+      "principled defaults in modeling",
+      "information-theoretic analysis",
+      "natural language processing",
+      "statistical mechanics analogies"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "uses max-ent for prior selection"},
+      {"id": 17, "n": "simplicity-compression", "r": "related parsimony principle"},
+      {"id": 21, "n": "imprecise-probability", "r": "alternative when constraints are weak"}
+    ],
+    "ex": {
+      "sit": "Need prior for dice outcome when only known constraint is mean equals 3.5 (fair die expectation).",
+      "steps": [
+        "constraint: E[X] = 3.5 over outcomes {1,2,3,4,5,6}",
+        "maximize: H = -sum(p_i log p_i) subject to sum(i * p_i) = 3.5, sum(p_i) = 1",
+        "solve: uniform distribution p_i = 1/6 maximizes entropy given constraint",
+        "verify: E[X] = (1+2+3+4+5+6)/6 = 3.5, constraint satisfied",
+        "interpret: uniform is least-committal prior consistent with fair die mean"
+      ],
+      "insight": "max-ent yields uniform when only mean is constrained; additional constraints (variance, mode) would yield different distributions"
+    }
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/search-based-algorithmic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 54,
+    "name": "search-based-algorithmic",
+    "cat": "search",
+    "core": "Systematically explore solution space via tree search, dynamic programming, or graph traversal, guided by heuristics and pruning strategies",
+    "out": [
+      "candidate_solutions",
+      "best_found_solution",
+      "optimality_proof",
+      "explored_search_space",
+      "solution_path"
+    ],
+    "proc": [
+      "define_state_space_representation",
+      "specify_goal_test_predicate",
+      "enumerate_successor_generation",
+      "select_search_strategy",
+      "apply_heuristics_for_guidance",
+      "implement_pruning_rules",
+      "track_explored_states",
+      "extract_solution_path"
+    ],
+    "check": [
+      "state_space_bounded_or_finite",
+      "successor_function_complete",
+      "heuristic_admissible_if_optimality_required",
+      "pruning_preserves_completeness",
+      "duplicate_detection_enabled",
+      "resource_bounds_specified",
+      "termination_guaranteed"
+    ],
+    "diff": {
+      "planning": "planning_is_problem_type_search_is_computational_method",
+      "optimization": "optimization_seeks_best_value_search_explores_structure",
+      "constraint-sat": "constraint_sat_finds_satisfying_assignment_search_is_mechanism"
+    },
+    "fail": {
+      "mode": "combinatorial_explosion_without_structure",
+      "desc": "exponential_blowup_defeats_naive_enumeration",
+      "signals": [
+        "no_heuristic_guidance",
+        "weak_pruning_rules",
+        "exponential_branching_factor",
+        "no_symmetry_breaking",
+        "unbounded_depth"
+      ],
+      "mit": [
+        "design_admissible_heuristics",
+        "add_domain_specific_pruning",
+        "exploit_problem_structure",
+        "use_iterative_deepening",
+        "apply_symmetry_reduction",
+        "cache_subproblem_solutions"
+      ]
+    },
+    "use": [
+      "game_playing_engines",
+      "route_planning_navigation",
+      "automated_theorem_proving",
+      "combinatorial_optimization",
+      "puzzle_solving"
+    ],
+    "rel": [
+      "planning-policy",
+      "optimization",
+      "constraint-satisfiability"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_planning": "search_is_how_planning_is_what",
+        "vs_optimization": "search_explores_discrete_structure_optimization_continuous_landscape",
+        "vs_heuristic": "heuristics_guide_search_not_replace_it"
+      }
+    }
+  }
+}

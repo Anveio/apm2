@@ -1,0 +1,55 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/deductive-reasoning@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 1,
+    "name": "deductive-reasoning",
+    "cat": "formal",
+    "core": "If premises are true and inference rules valid, the conclusion must be true; makes explicit what is implicit in premises.",
+    "out": [
+      "valid entailments",
+      "proofs/derivations",
+      "contradictions/counterexamples (via refutation)"
+    ],
+    "proc": [
+      "identify premises and inference rules",
+      "apply valid logical operations",
+      "derive conclusions preserving truth",
+      "check for contradictions or counterexamples"
+    ],
+    "check": [
+      "premises verified as true?",
+      "inference rules valid?",
+      "no missing premises critical to reality?"
+    ],
+    "diff": {
+      "vs_ampliative": "truth-preserving and monotonic; cannot generate new knowledge beyond what premises contain, unlike induction or abduction"
+    },
+    "fail": {
+      "mode": "garbage-in",
+      "desc": "false or missing premises yield unreliable conclusions despite valid argument structure"
+    },
+    "use": [
+      "spec checking",
+      "compliance logic",
+      "must/shall implications",
+      "formal arguments",
+      "requirements verification"
+    ],
+    "rel": [
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "more structured, emphasizes proof objects"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "solve-by-consistency approach"},
+      {"id": 7, "name": "type-theoretic", "link": "integrated into construction"}
+    ],
+    "ex": {
+      "scenario": "verifying a requirement implies a system behavior",
+      "approach": "formalize premises, apply modus ponens to derive entailed conclusion"
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/reference-class-outside-view@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 18,
+    "name": "reference-class-outside-view",
+    "cat": "ampliative",
+    "core": "Predict by anchoring on base-rate distribution of similar past cases rather than inside-view analysis of unique details. Primary antidote to planning fallacy.",
+    "out": [
+      "reference class definition with inclusion/exclusion criteria",
+      "base rate distribution (mean, median, spread, failure rate)",
+      "similarity assessment (above/at/below average)",
+      "adjustment rationale with direction and magnitude",
+      "final forecast with uncertainty range"
+    ],
+    "proc": [
+      "define reference class: specific enough to be relevant, broad enough for adequate data (aim for 10+ cases)",
+      "gather base rate statistics from actual outcomes (not plans): mean, median, SD, failure rate",
+      "assess similarity: rate case as above/at/below average on key factors",
+      "adjust from base rate with explicit justification; cap at 25% unless strong evidence",
+      "document uncertainty range and conditions that would revise estimate"
+    ],
+    "check": [
+      "reference class defined before seeing data?",
+      "sample size sufficient (10+ cases)?",
+      "using actual outcomes, not planned outcomes?",
+      "adjustments justified with specific reasons?",
+      "total adjustment within 25% unless strongly justified?",
+      "uncertainty range provided, not just point estimate?"
+    ],
+    "diff": {
+      "vs_case_based": "uses statistical distribution of many cases, not individual case details or solutions",
+      "vs_bayesian": "provides the prior (base rate) that Bayesian updating starts from; they are complementary",
+      "vs_analogical": "applies statistical regularities, not structural mappings; more robust to surface-deep similarity mismatch"
+    },
+    "fail": {
+      "mode": "wrong reference class",
+      "desc": "Too broad obscures relevant variation; too narrow lacks data. Signals: class chosen to support desired conclusion, fewer than 10 cases, ignoring structural differences, using planned vs actual outcomes."
+    },
+    "use": [
+      "project timeline estimation",
+      "budget and cost forecasting",
+      "risk and failure rate prediction",
+      "debiasing optimistic inside-view estimates",
+      "portfolio-level planning",
+      "startup success probability",
+      "medical prognosis anchoring"
+    ],
+    "rel": [
+      {"id": 15, "name": "case-based", "link": "retrieves specific cases; reference-class uses aggregate statistics"},
+      {"id": 11, "name": "bayesian-probabilistic", "link": "base rates serve as priors for Bayesian updating"},
+      {"id": 76, "name": "calibration-epistemic-humility", "link": "tracks forecast accuracy over time"},
+      {"id": 9, "name": "inductive", "link": "generalization that produces the base rates used here"}
+    ],
+    "ex": {
+      "scenario": "estimating time to complete backend API rewrite",
+      "approach": "reference class: API rewrites at mid-size companies; base rate: median 9mo, mean 12mo, 30% exceed 18mo; similarity: slightly below average (scope/dependencies offset experience); adjustment: +15% to 14mo; compare: inside-view was 6mo, outside-view is 14mo"
+    }
+  }
+}

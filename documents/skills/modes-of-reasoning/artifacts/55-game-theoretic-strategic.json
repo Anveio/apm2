@@ -1,0 +1,95 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/game-theoretic-strategic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 55,
+    "name": "game-theoretic-strategic",
+    "cat": "strategic",
+    "core": "Analyze situations where your outcome depends on others' choices, and theirs on yours. Core question: What should I do, given that they're optimizing too?",
+    "out": [
+      {"type": "player_map", "valid": "options mutually exclusive and collectively exhaustive"},
+      {"type": "payoff_matrix", "valid": "preferences transitive, covers all outcomes"},
+      {"type": "strategy_profile", "valid": "complete for every information state"},
+      {"type": "equilibrium_analysis", "valid": "no unilateral improvement possible"},
+      {"type": "recommendation", "valid": "accounts for opponent deviations"}
+    ],
+    "proc": [
+      "identify players (self, competitors, regulators, nature)",
+      "list each player's actions exhaustively",
+      "map payoffs per action combination (ordinal if cardinal unknown)",
+      "determine info structure (simultaneous, sequential, repeated, private)",
+      "identify dominant strategies",
+      "find equilibria (pure Nash first, mixed if none)",
+      "stress-test with behavioral deviations",
+      "recommend with failure conditions"
+    ],
+    "check": [
+      "all players identified including nature",
+      "action sets explicit not vague",
+      "payoffs at least ordinal",
+      "info structure stated",
+      "dominant strategies checked",
+      "equilibrium identified or proven absent",
+      "bounded rationality considered",
+      "recommendation includes fails-if clause"
+    ],
+    "diff": {
+      "decision-theoretic": "treats world as passive; game theory treats agents as strategic optimizers",
+      "theory-of-mind": "ToM infers beliefs; game theory derives actions from optimization",
+      "mechanism-design": "MD designs game rules; game theory plays given rules",
+      "negotiation": "uses game theory but adds norms, trust, process",
+      "adversarial": "asks how could fail; game theory asks what will rational opponents do"
+    },
+    "fail": {
+      "mode": "assuming rationality and common knowledge where absent",
+      "signals": [
+        "model predicts X, reality delivers Y",
+        "opponents leave money on table",
+        "equilibrium requires implausible computation",
+        "cultural/emotional factors dominate"
+      ],
+      "mit": [
+        "test behavioral deviations (epsilon-greedy, prospect theory, anchoring)",
+        "use level-k reasoning (L1-L2 typical humans)",
+        "check common-knowledge failures, model as Bayesian game",
+        "validate with historical data",
+        "add robustness buffer for brittle strategies"
+      ]
+    },
+    "use": [
+      "pricing and competition",
+      "negotiation prep (BATNA, ZOPA, credible threats)",
+      "security and adversarial settings",
+      "platform and marketplace strategy",
+      "auctions and bidding",
+      "repeated interactions (reputation, commitment)"
+    ],
+    "rel": [
+      {"id": 45, "name": "decision-theoretic", "note": "single-agent baseline"},
+      {"id": 56, "name": "theory-of-mind", "note": "rich agent belief models"},
+      {"id": 58, "name": "mechanism-design", "note": "design rules vs analyze"},
+      {"id": 57, "name": "negotiation-coalition", "note": "agreement-seeking"},
+      {"id": 79, "name": "adversarial-red-team", "note": "worst-case stress test"},
+      {"id": 49, "name": "robust-worst-case", "note": "when opponents unmodeled"}
+    ],
+    "ex": {
+      "problem": "Two cloud providers deciding whether to cut prices",
+      "players": ["A", "B"],
+      "actions": ["Hold", "Cut"],
+      "payoff_matrix": {
+        "Hold,Hold": [3, 3],
+        "Hold,Cut": [1, 4],
+        "Cut,Hold": [4, 1],
+        "Cut,Cut": [2, 2]
+      },
+      "equilibrium": "Cut,Cut (Prisoner's Dilemma)",
+      "recommendation": "One-shot: Cut. Repeated: signal Hold if reciprocated, retaliate if deviation"
+    }
+  }
+}

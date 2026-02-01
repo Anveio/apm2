@@ -1,0 +1,69 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/modal@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 64,
+    "name": "modal",
+    "cat": "formal",
+    "core": "Reason with necessity (box), possibility (diamond), knowledge (K), and dynamic action (after alpha) operators; distinguish what must be true from what happens to be true; track accessibility relations across possible worlds.",
+    "out": [
+      {"type": "possibility_space", "form": "set of possible worlds with accessibility relations", "test": "relation properties (reflexive, transitive, symmetric) match modal system"},
+      {"type": "knowledge_attribution", "form": "K_agent(phi) with justification", "test": "knowledge satisfies factivity (K(p) implies p)"},
+      {"type": "action_effects", "form": "[alpha]phi or <alpha>phi specifications", "test": "pre/post conditions consistent across world transitions"},
+      {"type": "modality_verdicts", "form": "necessarily(phi)/possibly(phi) with world analysis", "test": "necessity holds in all accessible worlds; possibility in at least one"}
+    ],
+    "proc": [
+      "identify modal operators: classify as alethic (necessary/possible), epistemic (knows/believes), or dynamic (after action)",
+      "define accessibility: specify which worlds are reachable from which (reflexive for T, transitive for S4, equivalence for S5)",
+      "evaluate formulas: check truth at each world relative to accessibility",
+      "derive conclusions: box(phi) iff phi true in all accessible worlds; diamond(phi) iff phi true in some",
+      "validate system: ensure conclusions respect chosen modal axioms (K, T, S4, S5)"
+    ],
+    "check": [
+      "modal system explicitly chosen (K, T, S4, S5, epistemic, dynamic)",
+      "accessibility relation properties documented",
+      "necessity vs contingency distinguished",
+      "possibility not conflated with probability",
+      "knowledge attributions satisfy factivity",
+      "action preconditions verified before dynamic operators"
+    ],
+    "diff": {
+      "deductive": "classical deductive has no modal operators; modal adds necessity/possibility distinctions",
+      "deontic": "deontic uses modal structure for norms (ought/permitted); alethic modal is about truth/necessity",
+      "temporal": "temporal is modal logic specialized for time (always/eventually); general modal is broader",
+      "probabilistic": "probabilistic assigns numeric likelihoods; modal is qualitative (possible vs necessary)"
+    },
+    "fail": {
+      "mode": "conflating possibility with probability; treating contingent truths as necessary",
+      "signal": "claims 'X is possible therefore X is likely' or 'X is true therefore X must be true'",
+      "mit": [
+        "explicitly state modal system before reasoning",
+        "separate possibility (exists accessible world) from probability (measure over worlds)",
+        "test necessity claims by seeking counterexample worlds",
+        "verify accessibility relation matches domain semantics"
+      ]
+    },
+    "use": [
+      "security protocol verification (epistemic: what attacker knows)",
+      "planning under uncertainty (dynamic: action effects)",
+      "specification of system requirements (alethic: necessary properties)",
+      "reasoning about contingencies and counterfactuals"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive", "why": "underlying classical logic foundation"},
+      {"id": 65, "name": "deontic", "why": "modal logic specialized for norms"},
+      {"id": 66, "name": "temporal", "why": "modal logic specialized for time"},
+      {"id": 11, "name": "bayesian-probabilistic", "why": "quantitative alternative to qualitative possibility"}
+    ],
+    "ex": {
+      "ctx": "Security protocol analysis: Agent A sends encrypted message to B. Question: Does attacker E know the plaintext?",
+      "analysis": "Epistemic modal: K_E(plaintext) requires plaintext true in all worlds consistent with E's observations. E observes ciphertext only. Worlds where key differs yield different plaintexts. Since multiple plaintexts consistent with E's observation, not K_E(plaintext). Conclusion: E possibly knows (if guesses key) but not necessarily knows."
+    }
+  }
+}

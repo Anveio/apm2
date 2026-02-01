@@ -1,0 +1,76 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/heuristic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 53,
+    "name": "heuristic",
+    "cat": "search",
+    "core": "Apply simple rules of thumb that often work to make fast decisions. Trade accuracy for speed when speed matters more than precision.",
+    "out": [
+      "quick decisions or inferences",
+      "prioritization shortcuts",
+      "default actions under time pressure",
+      "mental shortcuts for common patterns"
+    ],
+    "proc": [
+      "recognize situation type from surface features",
+      "retrieve applicable rule of thumb from experience",
+      "apply heuristic to generate candidate answer",
+      "check for obvious violations or red flags",
+      "accept result if stakes are low or refine if stakes are high"
+    ],
+    "check": [
+      "heuristic explicitly stated, not implicit",
+      "domain applicability verified",
+      "time or resource constraint justifies shortcut",
+      "fallback to deeper analysis identified for high-stakes cases"
+    ],
+    "diff": {
+      "satisficing": "satisficing accepts first good-enough option; heuristic uses rules to skip evaluation entirely",
+      "fermi": "Fermi decomposes into rough estimates; heuristic applies cached rules without decomposition",
+      "debiasing": "debiasing corrects heuristic errors; heuristic embraces speed over correction"
+    },
+    "fail": {
+      "name": "heuristics become doctrine",
+      "signals": [
+        "rules of thumb treated as universal laws",
+        "no exceptions permitted despite changed context",
+        "heuristic origin forgotten, only rule remembered",
+        "resistance to evidence contradicting the rule"
+      ],
+      "mitigations": [
+        "label heuristics as provisional shortcuts, not truths",
+        "track failure rate and domain boundaries",
+        "schedule periodic review of ossified rules",
+        "pair with calibration checks on high-stakes decisions"
+      ]
+    },
+    "use": [
+      "triage and initial screening",
+      "first-draft generation",
+      "guiding search in large spaces",
+      "high-frequency low-stakes decisions"
+    ],
+    "rel": [
+      "51-satisficing",
+      "19-fermi-order-of-magnitude",
+      "80-debiasing-epistemic-hygiene"
+    ],
+    "ex": {
+      "scenario": "Bug triage: 200 tickets, 2 hours to prioritize. Heuristic: 'customer-reported > internal, crash > cosmetic, recent > old'.",
+      "steps": [
+        "apply three-factor sort without reading details",
+        "top 20 tickets flagged for deep review",
+        "remaining 180 bulk-assigned to backlog",
+        "spot-check 5 random tickets for heuristic failures",
+        "refine heuristic if spot-check shows systematic misses"
+      ]
+    }
+  }
+}

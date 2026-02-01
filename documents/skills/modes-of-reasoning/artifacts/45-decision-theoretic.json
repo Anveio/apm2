@@ -1,0 +1,102 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/decision-theoretic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 45,
+    "name": "decision-theoretic",
+    "cat": "decision",
+    "core": "Combine probability distributions over outcomes with utility functions to choose actions maximizing expected utility: EU(action) = sum P(outcome|action) * U(outcome)",
+    "out": [
+      "decision_matrix",
+      "utility_function",
+      "eu_ranking",
+      "optimal_action",
+      "sensitivity_analysis",
+      "value_of_information"
+    ],
+    "proc": [
+      "enumerate_actions",
+      "enumerate_states_assign_probs",
+      "specify_utility_function",
+      "compute_eu_and_rank",
+      "sensitivity_analysis",
+      "value_of_information",
+      "decide_and_document"
+    ],
+    "check": [
+      "all_actions_enumerated",
+      "states_with_probs_sum_to_1",
+      "utility_function_explicit_with_units",
+      "nonlinear_prefs_tested",
+      "eu_computed_all_actions",
+      "sensitivity_performed",
+      "voi_estimated_if_delayable",
+      "ranking_justified",
+      "utility_mismatch_checked"
+    ],
+    "diff": {
+      "bayesian": "bayesian updates beliefs; decision-theoretic uses beliefs to choose actions",
+      "optimization": "optimization assumes known consequences; decision-theoretic handles uncertainty",
+      "mcda": "mcda keeps tradeoffs explicit; decision-theoretic integrates into single utility",
+      "robust": "robust maximizes minimum utility; decision-theoretic maximizes expected utility",
+      "minimax-regret": "regret minimizes hindsight regret; decision-theoretic is forward-looking",
+      "means-end": "means-end is qualitative; decision-theoretic is quantitative"
+    },
+    "fail": {
+      "mode": "utility_mismatch",
+      "signals": [
+        "discomfort_with_optimal_action",
+        "proxy_diverges_from_goal",
+        "important_outcomes_missing",
+        "borrowed_utility_function",
+        "stakeholder_disagreement",
+        "gaming_emerges"
+      ],
+      "mit": [
+        "elicit_utilities_from_preferences",
+        "list_whats_not_in_utility",
+        "premortem_optimal_choice",
+        "check_proxy_drift",
+        "stakeholder_utility_check",
+        "periodic_utility_review"
+      ]
+    },
+    "use": [
+      "investment_allocation",
+      "medical_treatment_decisions",
+      "product_launch_timing",
+      "hiring_decisions",
+      "pricing_strategies",
+      "insurance_purchasing",
+      "capacity_planning"
+    ],
+    "rel": [
+      "bayesian-probabilistic",
+      "multi-criteria-decision-analysis",
+      "robust-worst-case",
+      "minimax-regret",
+      "means-end-instrumental",
+      "optimization",
+      "planning-policy",
+      "value-of-information",
+      "game-theoretic-strategic"
+    ],
+    "ex": {
+      "situation": "Startup decides: launch with bugs, delay 3mo, or pivot",
+      "actions": ["launch_now", "delay_3mo", "pivot"],
+      "states": [
+        {"name": "market_loves", "p": 0.3},
+        {"name": "market_lukewarm", "p": 0.5},
+        {"name": "market_rejects", "p": 0.2}
+      ],
+      "eu": {"launch_now": 46, "delay_3mo": 51, "pivot": 60},
+      "result": "pivot_highest_eu_but_sensitivity_shows_launch_wins_if_p_loves_rises_to_0.5"
+    }
+  }
+}

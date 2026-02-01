@@ -1,0 +1,87 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/default-typicality@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 31,
+    "name": "default-typicality",
+    "cat": "nonmonotonic",
+    "core": "Apply normally/typically rules that hold unless overridden by more specific information. Categorical inference: default applies or is blocked by exception.",
+    "out": [
+      {"n": "default_rules", "d": "typically X implies Y statements"},
+      {"n": "typical_conclusions", "d": "inferences from applicable defaults"},
+      {"n": "exception_triggers", "d": "conditions blocking specific defaults"},
+      {"n": "specificity_ordering", "d": "which rules override which"},
+      {"n": "default_assumptions", "d": "what holds absent contrary info"}
+    ],
+    "proc": [
+      "identify applicable defaults: list typically/normally rules for domain",
+      "check exception conditions: look for more specific info blocking defaults",
+      "apply specificity ordering: more specific rules override general",
+      "derive typical conclusions: what follows from unblocked defaults",
+      "document assumptions: make explicit what defaults are being relied upon"
+    ],
+    "check": [
+      "defaults explicitly stated as defaults not facts",
+      "exception conditions enumerated",
+      "specificity ordering defined",
+      "blocked defaults identified",
+      "assumptions traceable to source defaults",
+      "conclusions marked as defeasible",
+      "edge cases considered"
+    ],
+    "diff": {
+      "bayesian": "categorical applies/blocked vs numeric probability updates",
+      "non-monotonic": "specific default mechanism vs general framework",
+      "defeasible": "typicality-based vs explicit defeat relations between rules",
+      "belief-revision": "inference-time exceptions vs belief set restructuring"
+    },
+    "fail": {
+      "mode": "default_ossification",
+      "signals": [
+        "defaults treated as universal facts",
+        "exceptions never considered",
+        "origin of defaults forgotten",
+        "no review of default validity",
+        "specificity ordering implicit or missing"
+      ],
+      "mitigations": [
+        "label defaults explicitly in documentation",
+        "periodic default audit",
+        "track exception frequency",
+        "document default provenance",
+        "make specificity ordering explicit"
+      ]
+    },
+    "use": [
+      "ontology design",
+      "rule engine configuration",
+      "SOPs with carve-outs",
+      "configuration management",
+      "policy frameworks",
+      "diagnostic reasoning"
+    ],
+    "rel": [
+      {"id": 30, "n": "non-monotonic", "r": "general framework for defeasible inference"},
+      {"id": 32, "n": "defeasible", "r": "explicit defeat relations"},
+      {"id": 11, "n": "bayesian", "r": "probabilistic alternative to categorical defaults"},
+      {"id": 33, "n": "belief-revision", "r": "restructuring beliefs vs inference-time blocking"}
+    ],
+    "ex": {
+      "sit": "Rule: birds typically fly. Tweety is a bird. Tweety is a penguin. Penguins typically do not fly.",
+      "steps": [
+        "defaults: birds fly, penguins do not fly",
+        "Tweety is bird AND penguin",
+        "penguin more specific than bird (subclass)",
+        "penguin-default blocks bird-default for Tweety",
+        "conclude: Tweety typically does not fly"
+      ],
+      "insight": "more specific rule (penguin) overrides general (bird) without probability calc"
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/model-theoretic-semantic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 5,
+    "name": "model-theoretic-semantic",
+    "cat": "formal",
+    "core": "Reason by constructing/analyzing models that satisfy a theory; determine what is true in all models vs some models.",
+    "out": [
+      "satisfiable/unsatisfiable verdicts",
+      "countermodels",
+      "interpretations",
+      "semantic entailment results"
+    ],
+    "proc": [
+      "formalize the theory or specification",
+      "construct candidate model structures",
+      "check which statements hold in models",
+      "identify countermodels for invalid claims"
+    ],
+    "check": [
+      "model matches intended domain semantics?",
+      "all axioms satisfied in model?",
+      "countermodel genuinely refutes claim?"
+    ],
+    "diff": {
+      "vs_proof_theoretic": "builds worlds where statements hold/fail rather than deriving via rules; focuses on structures making statements true"
+    },
+    "fail": {
+      "mode": "semantic mismatch",
+      "desc": "mathematical model satisfies theory but diverges from real system in important ways"
+    },
+    "use": [
+      "consistency checks",
+      "finding hidden assumptions",
+      "generating counterexamples",
+      "understanding what specifications actually allow"
+    ],
+    "rel": [
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "complementary approach"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "computational model finding"},
+      {"id": 8, "name": "counterexample-guided", "link": "uses countermodels for refinement"}
+    ],
+    "ex": {
+      "scenario": "checking if a security policy is consistent",
+      "approach": "construct a model where all policy rules hold; if none exists, policy is inconsistent"
+    }
+  }
+}

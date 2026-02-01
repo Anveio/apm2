@@ -1,0 +1,57 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/simplicity-compression@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 17,
+    "name": "simplicity-compression",
+    "cat": "ampliative",
+    "core": "Prefer hypotheses that explain data with fewer assumptions or shorter descriptions; balance fit vs complexity via Occam's razor or MDL.",
+    "out": [
+      "bias toward simpler models",
+      "complexity penalties",
+      "regularization choices",
+      "model selection criteria"
+    ],
+    "proc": [
+      "enumerate candidate hypotheses or models",
+      "measure each model's fit to data",
+      "compute complexity penalty for each model",
+      "select model with best fit-complexity trade-off"
+    ],
+    "check": [
+      "complexity metric well-defined?",
+      "fit-complexity balance appropriate for domain?",
+      "simpler model still captures essential structure?",
+      "not oversimplifying genuinely complex phenomena?"
+    ],
+    "diff": {
+      "vs_abductive": "selection principle across hypotheses, not hypothesis generation",
+      "vs_bayesian": "complexity penalties can be encoded as priors but simplicity is the explicit goal"
+    },
+    "fail": {
+      "mode": "oversimplification",
+      "desc": "choosing too simple a model when the world is genuinely complex or nonlinear; sometimes the simplest explanation is too simple"
+    },
+    "use": [
+      "model selection",
+      "avoiding overfitting",
+      "choosing parsimonious policies",
+      "scientific theory choice"
+    ],
+    "rel": [
+      {"id": 13, "name": "abductive", "link": "generates hypotheses to select from"},
+      {"id": 11, "name": "bayesian-probabilistic", "link": "complexity penalties via priors"},
+      {"id": 23, "name": "maximum-entropy", "link": "related parsimony principle"}
+    ],
+    "ex": {
+      "scenario": "choosing between polynomial regression models of degree 2, 5, and 10 for noisy data",
+      "approach": "apply AIC/BIC or MDL; degree-2 model wins despite lower R-squared because complexity penalty outweighs marginal fit improvement"
+    }
+  }
+}

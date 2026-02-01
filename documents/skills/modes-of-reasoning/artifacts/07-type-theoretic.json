@@ -1,0 +1,77 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/type-theoretic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 7,
+    "name": "type-theoretic",
+    "cat": "formal",
+    "core": "Encode invariants in types so the type checker rejects invalid states before runtime. If it compiles, entire error classes are impossible.",
+    "out": [
+      {"type": "type_signature", "verify": "States pre/postconditions and side-effect boundaries"},
+      {"type": "typing_judgment", "verify": "Proves term has claimed type"},
+      {"type": "well_typed_program", "verify": "Compiles without errors; satisfies encoded invariants"},
+      {"type": "api_contract", "verify": "Typed inputs, outputs, and error cases"},
+      {"type": "newtype", "verify": "Distinguishes semantically-different values sharing representation"}
+    ],
+    "proc": [
+      "Identify invariants that must always hold",
+      "Choose encoding depth: simple types, refinement/dependent, or newtypes",
+      "Design type; ask 'Can invalid value inhabit this type?' If yes, tighten",
+      "Implement with checker; compilation failures guide bug discovery",
+      "Review public interfaces; hide internals via opaque/abstract types",
+      "Document escape hatches (unsafe, any, casts) with justification"
+    ],
+    "check": [
+      "Every domain concept has distinct type (no raw string/int in APIs)",
+      "Illegal states unrepresentable (sum types, newtypes, non-empty wrappers)",
+      "Public modules expose opaque/abstract types; internals hidden",
+      "Escape hatches documented with invariant justification",
+      "Compile passes implies invariants hold (no redundant runtime assertions)"
+    ],
+    "diff": {
+      "02-proof-theoretic": "Proof-theoretic: proof object is primary artifact. Type-theoretic: embeds proofs in program types; compiler checks incrementally.",
+      "03-constructive": "Constructive: requires witnesses for existence. Type-theoretic: enforces invariants even without explicit witness extraction.",
+      "06-constraint-sat": "Constraint: finds assignments satisfying constraints. Type-theoretic: prevents ill-formed programs at definition time."
+    },
+    "fail": {
+      "mode": "Fighting type system instead of clarifying spec it encodes",
+      "signals": [
+        "unsafe/any/cast ratio exceeds ~2%",
+        "Compile errors persist after 3 refactoring attempts without spec change",
+        "Team debates 'how to type-check' instead of 'what invariant to enforce'"
+      ],
+      "mit": [
+        {"do": "Write spec first, types second", "test": "Every non-trivial type has one-sentence doc comment stating invariant"},
+        {"do": "Introduce newtypes for domain concepts", "test": "No two domain concepts share same primitive type across module boundaries"},
+        {"do": "Refactor when casts accumulate", "test": "Code review flag for function with >1 explicit cast"},
+        {"do": "Limit type parameter depth to 3", "test": "Linter rule for signature complexity"},
+        {"do": "Use opaque types to hide internals", "test": "Public API contains no raw representation types"}
+      ]
+    },
+    "use": [
+      "API design: types document and enforce contracts without runtime overhead",
+      "Correctness-by-construction: compile-time bugs never reach production",
+      "Safe composition: modules combine freely if types align",
+      "Eliminating bug classes: null-pointer, out-of-bounds, protocol violations become type errors",
+      "Refactoring confidence: type changes propagate required fixes automatically"
+    ],
+    "rel": [
+      {"id": 3, "name": "constructive-intuitionistic", "link": "Curry-Howard correspondence; proofs as programs"},
+      {"id": 2, "name": "mathematical-proof-theoretic", "link": "Types as proofs; proof objects as artifacts"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "Type checking can be viewed as constraint solving"}
+    ],
+    "ex": {
+      "confused_with": [
+        {"mode": "02-proof-theoretic", "distinguish": "Ask: Is primary artifact standalone proof or runnable program? Type-theoretic produces programs whose types carry proofs."},
+        {"mode": "03-constructive", "distinguish": "Ask: Am I required to exhibit computational witness? Constructive demands it; type-theoretic can encode invariants without extracting program from proof."},
+        {"mode": "06-constraint-sat", "distinguish": "Ask: Am I declaring constraints then solving, or defining types then compiling? Constraint solves at runtime/offline; type rejects bad code at compile time."}
+      ]
+    }
+  }
+}

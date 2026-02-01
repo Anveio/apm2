@@ -1,0 +1,92 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/means-end-instrumental@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 44,
+    "name": "means-end-instrumental",
+    "cat": "decision",
+    "core": "From goals, derive actions and subgoals necessary or helpful to achieve them. Answers 'to get X, do Y' by connecting beliefs about the world to choices about action.",
+    "out": [
+      "action_rationales",
+      "subgoals",
+      "dependency_chains",
+      "instrumental_requirements"
+    ],
+    "proc": [
+      "specify_terminal_goal",
+      "identify_necessary_conditions",
+      "decompose_into_subgoals",
+      "map_actions_to_subgoals",
+      "verify_causal_chains",
+      "check_for_side_effects",
+      "prioritize_and_sequence"
+    ],
+    "check": [
+      "terminal_goal_explicit",
+      "subgoals_necessary_for_goal",
+      "actions_causally_linked",
+      "dependencies_acyclic",
+      "means_not_mistaken_for_ends",
+      "side_effects_considered",
+      "resources_sufficient"
+    ],
+    "diff": {
+      "planning-policy": "planning sequences actions over time; means-end derives what actions are needed",
+      "decision-theoretic": "decision-theoretic adds utilities and probabilities; means-end is qualitative",
+      "optimization": "optimization finds best among known options; means-end discovers what options are needed"
+    },
+    "fail": {
+      "mode": "means_become_ends",
+      "signals": [
+        "optimizing_intermediate_steps",
+        "forgetting_original_objective",
+        "process_worship",
+        "metric_fixation",
+        "resistance_to_shortcut"
+      ],
+      "mit": [
+        "regularly_revisit_terminal_goal",
+        "ask_why_for_each_subgoal",
+        "welcome_shortcuts_to_goal",
+        "distinguish_intrinsic_instrumental",
+        "sunset_obsolete_means"
+      ]
+    },
+    "use": [
+      "strategy_decomposition",
+      "okr_development",
+      "operational_planning",
+      "goal_directed_behavior",
+      "requirements_analysis",
+      "project_scoping"
+    ],
+    "rel": [
+      "planning-policy",
+      "decision-theoretic",
+      "optimization",
+      "systems-thinking",
+      "counterfactual"
+    ],
+    "ex": {
+      "situation": "Team wants to reduce customer churn by 20%",
+      "goal": "reduce_churn_20_percent",
+      "subgoals": [
+        "identify_churn_drivers",
+        "improve_onboarding",
+        "increase_feature_adoption",
+        "enhance_support_response"
+      ],
+      "actions": {
+        "identify_churn_drivers": ["analyze_exit_surveys", "cohort_analysis"],
+        "improve_onboarding": ["redesign_first_week_flow", "add_success_milestones"]
+      },
+      "result": "dependency_chain_reveals_onboarding_is_highest_leverage_subgoal"
+    }
+  }
+}

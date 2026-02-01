@@ -1,0 +1,55 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/likelihood-based@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 12,
+    "name": "likelihood-based",
+    "cat": "probabilistic",
+    "core": "Compare how well hypotheses predict observed data via likelihoods, without committing to priors; focuses on what data say about hypotheses rather than full posterior beliefs.",
+    "out": [
+      "likelihood ratios",
+      "relative evidential support rankings",
+      "model comparisons"
+    ],
+    "proc": [
+      "formulate competing hypotheses",
+      "compute likelihood of data under each hypothesis",
+      "calculate likelihood ratios for pairwise comparison",
+      "rank hypotheses by evidential support"
+    ],
+    "check": [
+      "likelihoods correctly computed?",
+      "hypotheses exhaustive for comparison?",
+      "base rates considered where decision-critical?"
+    ],
+    "diff": {
+      "vs_bayesian": "separates data support from belief after priors; sits between Bayesian and frequentist idioms",
+      "vs_abductive": "quantitative likelihood comparison vs qualitative hypothesis selection"
+    },
+    "fail": {
+      "mode": "prior-neglect",
+      "desc": "ignoring base rates/priors when they matter for decisions; likelihood ratios alone don't tell you which hypothesis is more probable"
+    },
+    "use": [
+      "model comparison",
+      "forensic evidence strength",
+      "hypothesis triage",
+      "scientific model selection"
+    ],
+    "rel": [
+      {"id": 11, "name": "bayesian-probabilistic", "link": "adds priors for full posteriors"},
+      {"id": 10, "name": "statistical-frequentist", "link": "different emphasis on long-run frequencies"},
+      {"id": 13, "name": "abductive", "link": "qualitative version of hypothesis comparison"}
+    ],
+    "ex": {
+      "scenario": "comparing two diagnostic hypotheses given patient symptoms",
+      "approach": "compute P(symptoms|disease_A) vs P(symptoms|disease_B), report likelihood ratio as evidence strength"
+    }
+  }
+}

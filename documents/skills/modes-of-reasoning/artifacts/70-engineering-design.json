@@ -1,0 +1,88 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/engineering-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 70,
+    "name": "engineering-design",
+    "cat": "domain",
+    "core": "Iterate from requirements through architecture to validated prototypes, making tradeoffs explicit, encoding constraints formally, and building evidence that the design will survive real-world stresses.",
+    "out": [
+      {"a": "requirements_spec", "s": "numbered list with priority (must/should/may) and acceptance test", "done": "every requirement has verification method"},
+      {"a": "adr", "s": "context, decision, tradeoffs, consequences", "done": "alternatives documented with rejection rationale"},
+      {"a": "interface_contract", "s": "inputs, outputs, preconditions, postconditions, error modes", "done": "machine-checkable or has test harness"},
+      {"a": "tradeoff_matrix", "s": "options x criteria with scores and weights", "done": "stakeholders sign off on weights before scoring"},
+      {"a": "fmea", "s": "component, failure mode, severity, probability, detection, RPN", "done": "top-N RPNs have mitigations"},
+      {"a": "test_plan", "s": "requirement ID, test case, pass/fail criteria, responsible party", "done": "coverage matrix shows every requirement tested"},
+      {"a": "prototype", "s": "executable or physical artifact exercising riskiest assumptions", "done": "key unknowns reduced to acceptable confidence"}
+    ],
+    "proc": [
+      "Elicit requirements: functional (what must system do) and non-functional (latency, cost, safety, maintainability)",
+      "Prioritize: classify must/should/nice-to-have; identify conflicts",
+      "Generate candidate architectures: sketch 2+ structurally different approaches",
+      "Evaluate against constraints: check must-haves satisfaction, margin on should-haves",
+      "Tradeoff analysis: build options x criteria matrix, assign weights, score, document weight rationale",
+      "Select and document: write ADR capturing alternatives and rejection reasons",
+      "Failure mode analysis: enumerate what can go wrong, compute RPN, mitigate top risks",
+      "Prototype riskiest elements: build/simulate highest uncertainty components",
+      "Validate: run tests against requirements, update design if tests fail, repeat until acceptance met"
+    ],
+    "check": [
+      "Every requirement has numbered ID and acceptance test",
+      "At least 2 alternative architectures explicitly considered",
+      "Tradeoff weights agreed with stakeholders before scoring",
+      "Top 5 failure modes have documented mitigations",
+      "Interfaces have explicit contracts (pre/post conditions, error handling)",
+      "Prototype exercised riskiest assumption",
+      "Test coverage matrix shows every must-have verified"
+    ],
+    "diff": {
+      "optimization": "satisfies many constraints vs maximizes single objective",
+      "mcda": "produces buildable artifacts and validates vs produces decision/ranking only",
+      "constraint-satisfiability": "iterates encode-solve-prototype-revise vs solves fixed constraint set once",
+      "systems-thinking": "produces specs and tests vs produces causal loop diagrams",
+      "scientific": "goal is working artifact vs goal is validated theory"
+    },
+    "fail": {
+      "mode": "premature optimization or over-engineering",
+      "signals": [
+        "design addresses failure modes never occurred in similar systems",
+        "requirements grow without prioritization",
+        "no prototype before committing to architecture",
+        "tradeoff matrix has 10+ equally-weighted criteria"
+      ],
+      "mitigations": [
+        {"m": "require evidence for each must-have", "test": "every must-have links to user story, incident, or regulation"},
+        {"m": "time-box architecture exploration", "test": "ADR published by deadline"},
+        {"m": "prototype before committing", "test": "prototype results referenced in ADR"},
+        {"m": "limit tradeoff criteria to 7", "test": "matrix has 7 or fewer columns"},
+        {"m": "failure mode triage by RPN", "test": "FMEA has explicit cutoff with rationale"}
+      ]
+    },
+    "use": [
+      "product development (hardware, software, mixed)",
+      "architecture decisions with long-lived consequences",
+      "safety-critical or reliability-critical systems",
+      "multi-stakeholder projects requiring explicit tradeoff documentation",
+      "projects where build-and-see is too expensive or risky"
+    ],
+    "rel": [
+      {"mode": "constraint-satisfiability", "how": "encode must-haves as constraints; design loop feeds back updates"},
+      {"mode": "mcda", "how": "structured tradeoff matrices are embedded MCDA technique"},
+      {"mode": "robust-worst-case", "how": "safety margins and failure mode analysis draw on worst-case thinking"},
+      {"mode": "optimization", "how": "once structure fixed, parameters may be optimized"},
+      {"mode": "systems-thinking", "how": "understand environment the design must survive"}
+    ],
+    "ex": {
+      "confusion": [
+        {"vs": "optimization", "clarify": "tuning params of fixed structure = optimization; choosing structure to meet all constraints = engineering design"},
+        {"vs": "systems-thinking", "clarify": "systems thinking maps feedback loops; engineering design produces testable specs and buildable artifacts"}
+      ]
+    }
+  }
+}

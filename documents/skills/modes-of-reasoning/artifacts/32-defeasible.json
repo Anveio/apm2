@@ -1,0 +1,85 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/defeasible@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 32,
+    "name": "defeasible",
+    "cat": "nonmonotonic",
+    "core": "Conclusions can be defeated by counterevidence or stronger rules. Tracks priorities and strength relations between competing arguments. More explicit about conflict resolution than plain defaults.",
+    "out": [
+      {"n": "warranted_conclusions", "d": "conclusions surviving all defeat challenges"},
+      {"n": "defeat_relations", "d": "explicit attacks between arguments"},
+      {"n": "priority_ordering", "d": "rule strength/specificity hierarchy"},
+      {"n": "argument_graph", "d": "support and attack structure"},
+      {"n": "undefeated_set", "d": "final defensible positions"}
+    ],
+    "proc": [
+      "identify applicable rules: gather all potentially relevant rules",
+      "construct arguments: chain rules to support conclusions",
+      "map conflicts: find arguments attacking each other",
+      "apply priorities: determine which attacker wins each conflict",
+      "compute extensions: derive warranted conclusions from undefeated arguments"
+    ],
+    "check": [
+      "all relevant rules enumerated",
+      "conflicts explicitly identified",
+      "priority scheme justified",
+      "defeat direction determined for each conflict",
+      "transitive defeats considered",
+      "undefeated conclusions stable under re-evaluation"
+    ],
+    "diff": {
+      "default": "models rule conflicts vs assumes isolated defaults",
+      "argumentation": "priority-driven vs attack/defense dialectics",
+      "belief-revision": "operates on rules vs on propositions",
+      "legal": "general mechanism vs domain-specific application"
+    },
+    "fail": {
+      "mode": "priority_politics",
+      "signals": [
+        "whose rule wins reflects power not relevance",
+        "priorities fixed without justification",
+        "specificity ignored",
+        "conflicting priorities unresolved",
+        "meta-level disputes hidden"
+      ],
+      "mitigations": [
+        "explicit priority rationale",
+        "specificity-based defaults",
+        "separate fact vs rule disagreements",
+        "document priority provenance",
+        "allow priority challenges"
+      ]
+    },
+    "use": [
+      "compliance and policy interpretation",
+      "medical guideline conflicts",
+      "conflicting requirements resolution",
+      "legal reasoning with exceptions",
+      "regulatory overlap handling"
+    ],
+    "rel": [
+      {"id": 31, "n": "default-typicality", "r": "simpler default mechanism"},
+      {"id": 35, "n": "argumentation-theory", "r": "structured attack/defense"},
+      {"id": 71, "n": "legal", "r": "applied defeasible reasoning"},
+      {"id": 33, "n": "belief-revision", "r": "proposition-level updates"}
+    ],
+    "ex": {
+      "sit": "Rules: employees get standard leave; managers get extended leave; senior managers get unlimited leave. Person X is employee, manager, and senior manager.",
+      "steps": [
+        "rules: R1=employee->standard, R2=manager->extended, R3=senior->unlimited",
+        "X triggers all three rules, conclusions conflict",
+        "priority by specificity: senior > manager > employee",
+        "R3 defeats R2 defeats R1",
+        "warranted: X gets unlimited leave"
+      ],
+      "insight": "specificity resolves without ad-hoc exception clauses"
+    }
+  }
+}

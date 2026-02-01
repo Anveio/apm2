@@ -1,0 +1,77 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/constraint-satisfiability@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 6,
+    "name": "constraint-satisfiability",
+    "cat": "formal",
+    "core": "Encode requirements as constraints over variables; ask a solver whether any assignment satisfies all constraints (SAT) or prove none exists (UNSAT).",
+    "out": [
+      {"id": "sat", "form": "variable bindings", "test": "all constraints hold under assignment"},
+      {"id": "unsat", "form": "proof certificate", "test": "no assignment satisfies all constraints"},
+      {"id": "core", "form": "minimal unsat core", "test": "subset is minimal and conflicting"},
+      {"id": "cex", "form": "counterexample", "test": "assignment violates target property"}
+    ],
+    "proc": [
+      {"do": "identify variables (slots, flags, quantities, choices)", "out": "var list", "test": "all assignable elements covered"},
+      {"do": "formalize domains (boolean, int range, enum)", "out": "domain spec", "test": "no impossible values silently excluded"},
+      {"do": "extract constraints from requirements", "out": "constraint set", "test": "each requirement maps to >= 1 constraint"},
+      {"do": "encode implicit constraints (mutex, capacity, ordering)", "out": "augmented set", "test": "background rules explicit"},
+      {"do": "run solver (SAT/SMT/CSP)", "out": "result", "test": "solver terminates"},
+      {"do": "interpret: SAT->validate assignment; UNSAT->extract core", "out": "interpretation", "test": "result traced to requirements"},
+      {"do": "iterate if encoding incomplete", "out": "refined model", "test": "no missing constraints"}
+    ],
+    "check": [
+      "every requirement maps to >= 1 constraint",
+      "variable domains complete",
+      "implicit assumptions made explicit",
+      "SAT result validated on concrete scenario",
+      "UNSAT result traced to minimal core"
+    ],
+    "diff": {
+      "48": "satisfiability: any feasible solution; optimization: best solution with objective",
+      "1": "satisfiability: search solution space; deduction: derive via argument chains",
+      "7": "satisfiability: post-hoc check; type-theoretic: constraints during construction",
+      "5": "satisfiability: find instance; model-theoretic: study meta-properties of satisfiability"
+    },
+    "fail": {
+      "name": "poor encoding (missed constraints)",
+      "detect": [
+        "SAT result fails manual validation",
+        "stakeholders reject 'valid' solutions",
+        "small perturbations yield wildly different solutions"
+      ],
+      "mit": [
+        "requirement traceability matrix with no empty cells",
+        "sanity-check SAT results via independent validator",
+        "adversarial probing: remove constraint, verify known-bad solution",
+        "incremental encoding reviews after each requirement session"
+      ]
+    },
+    "use": [
+      "scheduling: discrete slots + mutex + ordering",
+      "configuration: feature dependencies and incompatibilities",
+      "verification: existential SAT query for property violation",
+      "policy enforcement: grant request without rule violation",
+      "feasibility checks: quick SAT/UNSAT before optimization",
+      "resource allocation: capacity + assignment constraints"
+    ],
+    "rel": [1, 5, 7, 48],
+    "ex": {
+      "prob": "Schedule 3 meetings (A,B,C) into 2 rooms (R1,R2) during 2 slots (T1,T2). A/B cannot overlap. C must be in R1.",
+      "steps": [
+        "vars: room_A,room_B,room_C in {R1,R2}; time_A,time_B,time_C in {T1,T2}",
+        "constraint 1: not(time_A=time_B and room_A=room_B)",
+        "constraint 2: room_C=R1",
+        "run solver"
+      ],
+      "result": "SAT: A@R1/T1, B@R2/T1, C@R1/T2"
+    }
+  }
+}

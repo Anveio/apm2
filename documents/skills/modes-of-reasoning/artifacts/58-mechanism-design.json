@@ -1,0 +1,89 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/mechanism-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 58,
+    "name": "mechanism-design",
+    "cat": "strategic",
+    "core": "Design rules, payoffs, and information structures so self-interested agents' equilibrium behavior produces desired system outcomes. The designer chooses the game; players choose strategies within it.",
+    "out": [
+      {"t": "incentive_map", "v": "agent->actions->payoffs->system_effect"},
+      {"t": "participation_constraint", "v": "expected_utility>=outside_option"},
+      {"t": "truthfulness_proof", "v": "lying_never_improves_payoff"},
+      {"t": "robustness_analysis", "v": "collusion|sybil|info_leak->graceful_degrade"},
+      {"t": "implementation_spec", "v": "rules|timing|payments|disputes"}
+    ],
+    "proc": [
+      "define goal as measurable social-welfare function",
+      "enumerate agent types with private info and actions",
+      "identify individual incentives ignoring others' welfare",
+      "draft mechanism: rules, disclosure, transfers",
+      "verify incentive compatibility via revelation principle",
+      "verify participation constraints",
+      "stress-test: collusion, sybil, timing, info leakage",
+      "iterate or prove impossibility"
+    ],
+    "check": [
+      "goal is measurable system property",
+      "each agent type's incentives modeled",
+      "dominant-strategy or Bayesian IC proven",
+      "participation constraint verified",
+      ">=3 adversarial scenarios tested",
+      "impossibility results consulted",
+      "mechanism explainable to participants"
+    ],
+    "diff": {
+      "game-theoretic": "MD chooses rules; game theory predicts behavior given rules",
+      "negotiation-coalition": "MD designs process before negotiation begins",
+      "systems-thinking": "MD models strategic agents, not just flows",
+      "deontic": "MD asks incentive-compatible, not just permitted",
+      "mcda": "MCDA picks which mechanism; MD designs how it works"
+    },
+    "fail": {
+      "mode": "goodharting",
+      "desc": "metrics become targets and get gamed",
+      "signals": [
+        "metric improves but outcomes worsen",
+        "clustering at thresholds",
+        "unexpected coalitions emerge",
+        "gaming complaints increase"
+      ],
+      "mit": [
+        "measure outcomes not proxies",
+        "use multiple uncorrelated metrics",
+        "build in human review",
+        "rules legible but not fully predictable",
+        "monitor for gaming signals",
+        "iterate mechanism as gaming emerges"
+      ]
+    },
+    "use": [
+      "marketplaces and auctions",
+      "platform governance",
+      "compensation systems",
+      "voting and collective choice",
+      "resource allocation",
+      "protocol design"
+    ],
+    "rel": [
+      {"id": 55, "name": "game-theoretic-strategic", "why": "analyze equilibria within mechanisms"},
+      {"id": 46, "name": "multi-criteria-decision-analysis", "why": "choose among candidate mechanisms"},
+      {"id": 65, "name": "deontic", "why": "normative constraints before incentive analysis"},
+      {"id": 57, "name": "negotiation-coalition", "why": "structured bargaining mechanisms"},
+      {"id": 43, "name": "systems-thinking", "why": "feedback when mechanisms interact with context"},
+      {"id": 79, "name": "adversarial-red-team", "why": "stress-test for gaming"}
+    ],
+    "ex": {
+      "problem": "allocate shared conference room among 5 teams claiming high priority",
+      "mechanism": "second-price auction with weekly-replenishing priority tokens",
+      "ic": "bidding true value is dominant strategy",
+      "robust": "collusion unstable as third team wins cheap"
+    }
+  }
+}

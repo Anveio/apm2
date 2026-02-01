@@ -1,0 +1,55 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/prototype-similarity-based@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 28,
+    "name": "prototype-similarity-based",
+    "cat": "ampliative",
+    "core": "Categorize by similarity to prototypes or exemplars rather than strict necessary-and-sufficient definitions, producing graded membership judgments.",
+    "out": [
+      "graded category judgments",
+      "typicality effects",
+      "family resemblance classifications"
+    ],
+    "proc": [
+      "identify prototypes or exemplars for target categories",
+      "compute similarity between item and prototypes",
+      "assign graded membership based on similarity scores",
+      "handle boundary cases via typicality gradients"
+    ],
+    "check": [
+      "prototypes representative and unbiased?",
+      "similarity metric appropriate for domain?",
+      "category boundaries stable over time?"
+    ],
+    "diff": {
+      "vs_fuzzy_logic": "focuses on similarity geometry to prototypes; fuzzy uses degree membership without exemplars",
+      "vs_case_based": "classifies by similarity; case-based uses exemplars for problem-solving and adaptation"
+    },
+    "fail": {
+      "mode": "prototype-bias",
+      "desc": "hidden bias in prototypes propagates to all classifications; category drift over time"
+    },
+    "use": [
+      "UX taxonomies",
+      "product categorization",
+      "human-facing labeling",
+      "cognitive modeling"
+    ],
+    "rel": [
+      {"id": 25, "name": "fuzzy-logic", "link": "degree membership without prototypes"},
+      {"id": 15, "name": "case-based", "link": "uses exemplars for problem-solving"},
+      {"id": 14, "name": "analogical", "link": "similarity for inference, not just classification"}
+    ],
+    "ex": {
+      "scenario": "categorizing support tickets by similarity to prototype ticket types",
+      "approach": "compute similarity to exemplar tickets for each category, assign graded membership, route based on highest typicality score"
+    }
+  }
+}

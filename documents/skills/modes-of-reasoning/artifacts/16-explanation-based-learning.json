@@ -1,0 +1,58 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/explanation-based-learning@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 16,
+    "name": "explanation-based-learning",
+    "cat": "ampliative",
+    "core": "Use an explanation of why a solution works to generalize a reusable rule or plan; the explanation constrains and justifies the generalization.",
+    "out": [
+      "generalized strategies with explanatory justification",
+      "reusable rules derived from specific examples",
+      "principled generalizations"
+    ],
+    "proc": [
+      "analyze a specific successful solution",
+      "construct explanation of why the solution works",
+      "identify generalizable components in the explanation",
+      "derive reusable rule constrained by the explanation",
+      "validate generalization against deductive reasoning"
+    ],
+    "check": [
+      "explanation deductively sound?",
+      "generalization properly constrained by explanation?",
+      "empirically validated, not just internally elegant?",
+      "avoids overfitting to specific case?"
+    ],
+    "diff": {
+      "vs_inductive": "guided and validated by deductive explanation rather than pure pattern observation",
+      "vs_analogical": "requires explicit explanatory justification for transfer",
+      "vs_case_based": "demands explanatory reasoning, not just case retrieval"
+    },
+    "fail": {
+      "mode": "elegant but wrong explanations",
+      "desc": "explanations that are internally elegant but empirically incorrect; a beautiful theory of why something worked can still be wrong"
+    },
+    "use": [
+      "turning expert solutions into SOPs",
+      "reducing overfitting to anecdotes",
+      "creating reusable patterns from specific successes",
+      "knowledge engineering"
+    ],
+    "rel": [
+      {"id": 9, "name": "inductive", "link": "generalization without requiring explanation"},
+      {"id": 14, "name": "analogical", "link": "transfer without explicit explanation"},
+      {"id": 15, "name": "case-based", "link": "uses cases without requiring explanation"}
+    ],
+    "ex": {
+      "scenario": "an expert debugs a complex production outage caused by cascading timeouts",
+      "approach": "explain why the fix worked (timeout propagation chain); generalize to a reusable circuit-breaker pattern applicable to similar distributed systems"
+    }
+  }
+}

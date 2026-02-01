@@ -1,0 +1,90 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/theory-of-mind@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 56,
+    "name": "theory-of-mind",
+    "cat": "strategic",
+    "core": "Infer beliefs, intentions, and knowledge states of others, including nested beliefs (what they think you think). Core question: What do they believe, want, and know?",
+    "out": [
+      {"type": "belief_model", "valid": "covers relevant propositions, depth specified"},
+      {"type": "intention_map", "valid": "goals inferred from evidence not projection"},
+      {"type": "knowledge_state", "valid": "distinguishes known vs believed vs assumed"},
+      {"type": "behavior_prediction", "valid": "derives from model not stereotype"},
+      {"type": "communication_strategy", "valid": "accounts for audience mental state"}
+    ],
+    "proc": [
+      "identify target agents and their roles",
+      "gather observable evidence (actions, statements, context)",
+      "infer first-order beliefs (what they believe)",
+      "infer second-order beliefs (what they think you believe)",
+      "map intentions and goals from evidence",
+      "identify knowledge asymmetries",
+      "predict behavior from mental model",
+      "design communication or coordination strategy"
+    ],
+    "check": [
+      "model based on evidence not projection",
+      "belief depth explicit (1st, 2nd, nth order)",
+      "uncertainty in inferences acknowledged",
+      "alternative mental models considered",
+      "predictions falsifiable",
+      "cultural and individual differences noted",
+      "overconfidence flags present"
+    ],
+    "diff": {
+      "game-theoretic": "game theory derives actions from optimization; ToM infers beliefs that drive behavior",
+      "negotiation": "negotiation applies ToM; ToM is the underlying inference engine",
+      "rhetorical": "rhetoric persuades based on audience model; ToM builds that model",
+      "adversarial": "adversarial assumes hostile intent; ToM infers actual intent",
+      "causal-inference": "causal explains events; ToM explains agent behavior via mental states"
+    },
+    "fail": {
+      "mode": "mind-reading with overconfidence; projecting own incentives onto others",
+      "signals": [
+        "predictions consistently wrong",
+        "surprised by others' reactions",
+        "assuming shared knowledge that isn't shared",
+        "ignoring cultural or contextual differences",
+        "model unchanged despite contrary evidence"
+      ],
+      "mit": [
+        "seek direct clarification when possible",
+        "maintain multiple hypotheses",
+        "update on observed behavior",
+        "check for projection bias",
+        "consider cultural and individual variation",
+        "express uncertainty in predictions"
+      ]
+    },
+    "use": [
+      "leadership and management",
+      "UX and product design",
+      "teamwork and collaboration",
+      "threat modeling and security",
+      "communication design",
+      "conflict resolution"
+    ],
+    "rel": [
+      {"id": 55, "name": "game-theoretic-strategic", "note": "strategic interaction analysis"},
+      {"id": 57, "name": "negotiation-coalition", "note": "applied ToM for agreements"},
+      {"id": 60, "name": "rhetorical", "note": "persuasion based on audience model"},
+      {"id": 79, "name": "adversarial-red-team", "note": "modeling hostile actors"},
+      {"id": 45, "name": "decision-theoretic", "note": "single-agent baseline"}
+    ],
+    "ex": {
+      "problem": "Team lead notices engineer pushing back on new process",
+      "evidence": ["engineer cites time concerns", "has met past deadlines", "recently assigned to second project"],
+      "first_order": "engineer believes process adds overhead without value",
+      "second_order": "engineer thinks lead doesn't understand their workload",
+      "prediction": "resistance will increase if mandated without discussion",
+      "strategy": "acknowledge workload, explain why process helps, co-design lighter version"
+    }
+  }
+}

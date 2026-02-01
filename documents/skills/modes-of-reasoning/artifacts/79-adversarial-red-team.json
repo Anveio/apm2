@@ -1,0 +1,90 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/adversarial-red-team@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 79,
+    "name": "adversarial-red-team",
+    "cat": "meta",
+    "core": "Systematically attack a system, argument, or plan from an adversary's perspective to discover exploitable weaknesses before deployment. Specify attack paths (sequence of actions), not just concerns.",
+    "out": [
+      "attack_trees: hierarchical decomposition of adversary goal achievement",
+      "exploit_poc: concrete demonstration of exploitability",
+      "failure_catalog: enumerated failures with likelihood and impact",
+      "assumption_hit_list: assumptions that would cause failure if false",
+      "residual_risk_register: unmitigated vulnerabilities with accept/defer rationale"
+    ],
+    "proc": [
+      "scope target and define trust boundary",
+      "enumerate adversary profiles (resources, skills, motivation)",
+      "list attacker objectives per adversary",
+      "generate attack vectors using STRIDE/MITRE ATT&CK taxonomies",
+      "prioritize by likelihood x impact",
+      "attempt exploitation in safe environment",
+      "propose mitigations with residual risk",
+      "report findings with severity and remediation timeline"
+    ],
+    "check": [
+      "defined >=2 distinct adversary profiles",
+      "each finding has concrete attack path",
+      "attempted exploitation of top 3 risks",
+      "mitigations are specific and testable",
+      "challenged own assumptions beyond obvious surface",
+      "residual risk register has explicit accept/defer decisions"
+    ],
+    "diff": {
+      "robust-worst-case": "robust defends with margins; red-team attacks to find insufficient margins",
+      "assurance-case": "assurance argues safety; red-team challenges arguments as adversarial complement",
+      "counterexample-guided": "CEGAR refines abstractions formally; red-team breaks real systems empirically",
+      "game-theoretic": "game theory models equilibrium; red-team exploits any weakness"
+    },
+    "fail": {
+      "name": "cynicism_theater",
+      "desc": "clever-sounding attacks without prioritizing real risk",
+      "signs": [
+        "long lists of unvalidated theoretical vulnerabilities",
+        "attacks requiring implausible adversary capabilities",
+        "no severity differentiation",
+        "unfixable or irrelevant findings"
+      ],
+      "mitigations": [
+        "require exploitation proof with reproducible steps",
+        "explicit adversary model before generating attacks",
+        "risk-rank first 10 findings before expanding",
+        "time-box: 25% generation, 50% validation, 25% reporting",
+        "require concrete testable countermeasures"
+      ]
+    },
+    "use": [
+      "security audits: pentesting, threat modeling, vulnerability assessment",
+      "safety analysis: FMEA, HAZOP, fault-tree",
+      "policy stress-testing: gaming and circumvention",
+      "argument review: logical gaps, weak evidence",
+      "incentive design: exploitation vectors",
+      "pre-mortems: project failure analysis"
+    ],
+    "rel": [
+      {"id": 49, "name": "robust-worst-case", "role": "defensive counterpart"},
+      {"id": 36, "name": "assurance-case", "role": "challenges evidence structure"},
+      {"id": 8, "name": "counterexample-guided", "role": "formal vs empirical"},
+      {"id": 55, "name": "game-theoretic-strategic", "role": "equilibrium vs exploitability"},
+      {"id": 58, "name": "mechanism-design", "role": "adversarial robustness design"}
+    ],
+    "ex": {
+      "target": "employee onboarding system with auto-provisioned cloud access",
+      "adversary": "disgruntled employee with valid credentials, moderate skill",
+      "path": [
+        "submit resignation without informing IT",
+        "use onboarding API to provision elevated service account access",
+        "use service account post-departure to exfiltrate data"
+      ],
+      "finding": "API lacks auth check for elevated access; service accounts not tied to employee lifecycle",
+      "mitigation": "add manager-approval workflow; link service account expiry to termination"
+    }
+  }
+}

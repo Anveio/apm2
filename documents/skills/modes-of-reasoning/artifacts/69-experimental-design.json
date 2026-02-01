@@ -1,0 +1,77 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/experimental-design@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 69,
+    "name": "experimental-design",
+    "cat": "domain",
+    "core": "Choose interventions, measurements, and sampling to identify causal effects reliably. Design determines what conclusions are possible before any data is collected.",
+    "out": [
+      {"a": "experiment_plan", "s": "hypothesis, treatment, control, randomization, timeline", "done": "all threats to validity addressed"},
+      {"a": "power_analysis", "s": "effect size, sample size, alpha, power, justification", "done": "sample sufficient to detect meaningful effect"},
+      {"a": "measurement_strategy", "s": "metrics, instruments, collection cadence, validation", "done": "metrics map to hypothesis constructs"},
+      {"a": "control_design", "s": "control group definition, matching/blocking, confound mitigation", "done": "alternative explanations ruled out"}
+    ],
+    "proc": [
+      "State hypothesis: specify causal claim to test (X causes Y)",
+      "Define treatment and control: operationalize intervention and baseline",
+      "Identify confounds: list factors that could explain outcome besides treatment",
+      "Design randomization: assign units to conditions to break confound correlations",
+      "Choose blocking/stratification: group similar units to reduce variance",
+      "Select metrics: pick measurements that capture true outcome (avoid proxies)",
+      "Run power analysis: compute sample size for desired sensitivity",
+      "Plan instrumentation: ensure reliable, unbiased data collection",
+      "Execute and analyze: run experiment, apply pre-registered analysis"
+    ],
+    "check": [
+      "Hypothesis stated before data collection",
+      "Randomization or quasi-experimental design addresses confounds",
+      "Power analysis shows sample sufficient for target effect size",
+      "Metrics directly measure outcome of interest (not just proxies)",
+      "Analysis plan pre-registered or documented before results",
+      "Control group comparable to treatment group"
+    ],
+    "diff": {
+      "scientific": "designs how to learn vs broader workflow including theory building",
+      "causal-inference": "plans experiment to enable inference vs analyzes data from experiment",
+      "value-of-information": "prioritizes what to learn vs designs how to learn it"
+    },
+    "fail": {
+      "mode": "Goodhart risk: measuring proxies that don't capture real outcome",
+      "signals": [
+        "metric chosen for ease of measurement not validity",
+        "no validation that metric correlates with true outcome",
+        "optimizing metric directly instead of underlying goal"
+      ],
+      "mitigations": [
+        {"m": "validate metrics against ground truth", "test": "metric-outcome correlation documented"},
+        {"m": "use multiple metrics triangulating same construct", "test": "2+ metrics per hypothesis"},
+        {"m": "include qualitative checks for gaming", "test": "review protocol for metric manipulation"}
+      ]
+    },
+    "use": [
+      "A/B testing in products",
+      "causal learning from interventions",
+      "evaluation of policy interventions",
+      "clinical trials",
+      "product feature experiments"
+    ],
+    "rel": [
+      {"mode": "scientific", "how": "experimental design is a component of broader scientific reasoning"},
+      {"mode": "causal-inference", "how": "experiments produce data for causal analysis"},
+      {"mode": "value-of-information", "how": "VOI prioritizes which experiments to run"}
+    ],
+    "ex": {
+      "confusion": [
+        {"vs": "causal-inference", "clarify": "experimental design plans the study; causal inference analyzes the results"},
+        {"vs": "scientific", "clarify": "experimental design focuses on data collection; scientific reasoning includes theory and interpretation"}
+      ]
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/transcendental@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 78,
+    "name": "transcendental",
+    "cat": "meta",
+    "core": "Start from an accepted fact and infer what must be true for it to be possible (Kantian style). Reasons backward from actuality to necessary enabling conditions. If X is possible or actual, what preconditions must hold?",
+    "out": [
+      "necessary preconditions: conditions without which X cannot exist",
+      "architectural must-haves: structural requirements implied by capability",
+      "foundational requirements: base-level constraints enabling higher functions",
+      "presupposition analysis: implicit assumptions revealed by possibility"
+    ],
+    "proc": [
+      "state accepted fact: identify X that is actual or demonstrably possible",
+      "ask enabling question: 'What must be true for X to be possible?'",
+      "derive necessary conditions: identify logically required preconditions",
+      "distinguish necessary from sufficient: avoid conflating 'must have' with 'enough to have'",
+      "check for hidden presuppositions: uncover implicit framework assumptions",
+      "validate against reality: confirm derived conditions match actual world"
+    ],
+    "check": [
+      "starting fact clearly stated and accepted",
+      "enabling question explicitly posed",
+      "each precondition shown necessary (X impossible without it)",
+      "necessary vs sufficient distinction maintained",
+      "framework assumptions surfaced, not hidden",
+      "derived conditions validated against evidence"
+    ],
+    "diff": {
+      "deductive": "deductive derives conclusions from premises; transcendental derives premises from conclusions",
+      "constructive": "constructive builds existence proofs; transcendental uncovers existence requirements",
+      "meta-reasoning": "meta-reasoning selects reasoning modes; transcendental analyzes what makes reasoning possible"
+    },
+    "fail": {
+      "name": "framework projection",
+      "signals": [
+        "treating model requirements as reality requirements",
+        "deriving 'necessary' conditions that alternatives could satisfy",
+        "confusing conceptual necessity with empirical necessity",
+        "assuming only one possible enabling structure"
+      ],
+      "mitigations": [
+        "ask 'necessary for my model or necessary in reality?'",
+        "seek alternative enabling structures",
+        "distinguish logical from empirical necessity",
+        "test derived conditions against counterexamples"
+      ]
+    },
+    "use": [
+      "deep framework design",
+      "conceptual audits",
+      "first-principles constraints",
+      "foundation architecture",
+      "philosophical analysis"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive", "role": "logical derivation from established premises"},
+      {"id": 3, "name": "constructive", "role": "constructive existence proofs"},
+      {"id": 75, "name": "meta-reasoning", "role": "reasoning about reasoning frameworks"}
+    ],
+    "ex": {
+      "situation": "Designing a distributed consensus system",
+      "starting_fact": "Byzantine fault-tolerant consensus is achieved in production systems",
+      "enabling_question": "What must be true for BFT consensus to be possible?",
+      "derived_conditions": [
+        "n >= 3f + 1 nodes (where f is max faulty)",
+        "authenticated communication channels",
+        "partial synchrony or synchrony assumption",
+        "deterministic state machine"
+      ],
+      "outcome": "Architecture requirements derived from possibility conditions, not ad-hoc decisions"
+    }
+  }
+}

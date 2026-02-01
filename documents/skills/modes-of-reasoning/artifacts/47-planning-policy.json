@@ -1,0 +1,84 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/planning-policy@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 47,
+    "name": "planning-policy",
+    "cat": "decision",
+    "core": "Given goal, current state, actions, and dynamics, produce action sequence (plan) or state-to-action mapping (policy) that achieves goal via state-space traversal",
+    "out": [
+      "plan",
+      "policy",
+      "contingency_table",
+      "playbook"
+    ],
+    "proc": [
+      "define_goal_predicate_testable",
+      "enumerate_actions_with_preconditions_effects",
+      "model_dynamics_and_failure_modes",
+      "search_action_sequence_to_goal",
+      "validate_plan_trace_preconditions",
+      "add_contingency_branches",
+      "specify_monitoring_signals"
+    ],
+    "check": [
+      "goal_is_testable_predicate",
+      "actions_have_preconditions_and_effects",
+      "preconditions_satisfied_by_prior_effects",
+      "failure_contingencies_per_step",
+      "observable_checkpoints_defined",
+      "replanning_triggers_specified",
+      "rollback_for_high_risk_steps"
+    ],
+    "diff": {
+      "means-end": "means_end_identifies_subgoals_planning_orders_executable_actions",
+      "decision-theoretic": "decision_theory_single_action_choice_planning_chains_over_time",
+      "optimization": "optimization_finds_best_config_planning_finds_executable_path",
+      "search-based": "search_is_computational_method_planning_is_problem_type"
+    },
+    "fail": {
+      "mode": "ignores_uncertainty_execution_reality",
+      "desc": "no_plan_survives_contact_with_reality",
+      "signals": [
+        "no_contingency_branches",
+        "no_monitoring_observability",
+        "fragile_timing_dependencies",
+        "vague_success_criteria"
+      ],
+      "mit": [
+        "inject_failure_points_with_contingency_branches",
+        "define_observable_checkpoints_per_major_step",
+        "build_replanning_triggers_with_thresholds",
+        "validate_trace_simulation_preconditions",
+        "include_rollback_recovery_actions"
+      ]
+    },
+    "use": [
+      "operations_runbooks",
+      "project_execution_gantt",
+      "incident_response_playbooks",
+      "automation_state_machines",
+      "state_transformation_sequences"
+    ],
+    "rel": [
+      "means-end-instrumental",
+      "decision-theoretic",
+      "optimization",
+      "search-based-algorithmic",
+      "temporal"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_means_end": "goal_hierarchy_vs_executable_action_sequence",
+        "vs_optimization": "static_solution_vs_state_transition_trajectory",
+        "vs_heuristic": "policy_is_complete_state_to_action_map_not_rule_of_thumb"
+      }
+    }
+  }
+}

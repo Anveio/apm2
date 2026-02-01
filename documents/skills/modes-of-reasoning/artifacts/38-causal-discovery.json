@@ -1,0 +1,77 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/causal-discovery@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 38,
+    "name": "causal-discovery",
+    "cat": "causal",
+    "core": "Infer causal graph structure from data and assumptions, ideally with interventions, to learn what causes what",
+    "out": [
+      "candidate_causal_graphs",
+      "equivalence_classes",
+      "hypotheses_for_experimentation",
+      "structural_constraints"
+    ],
+    "proc": [
+      "gather_observational_data_and_domain_knowledge",
+      "state_assumptions_faithfulness_no_hidden_confounding",
+      "apply_constraint_based_or_score_based_discovery_algorithm",
+      "identify_markov_equivalence_class",
+      "incorporate_interventional_data_if_available",
+      "refine_candidate_graphs_with_domain_constraints",
+      "generate_testable_hypotheses_from_structure"
+    ],
+    "check": [
+      "assumptions_explicitly_stated",
+      "equivalence_class_acknowledged",
+      "outputs_treated_as_hypotheses_not_facts",
+      "sample_size_sufficient_for_reliability",
+      "domain_knowledge_incorporated",
+      "validation_experiments_identified"
+    ],
+    "diff": {
+      "causal-inference": "inference_assumes_structure_discovery_learns_it",
+      "abductive": "discovery_focuses_on_causal_structure_abduction_on_general_hypotheses",
+      "statistical": "goes_beyond_correlation_to_infer_directional_causation"
+    },
+    "fail": {
+      "mode": "overtrusting_discovered_structure",
+      "desc": "treating_discovered_graphs_as_ground_truth_without_validating_assumptions",
+      "signals": [
+        "no_assumption_documentation",
+        "equivalence_class_ignored",
+        "no_experimental_validation_planned",
+        "hidden_confounders_dismissed"
+      ],
+      "mit": [
+        "document_faithfulness_and_sufficiency_assumptions",
+        "report_full_equivalence_class",
+        "design_experiments_to_resolve_ambiguity",
+        "sensitivity_analysis_for_hidden_confounding"
+      ]
+    },
+    "use": [
+      "early_stage_domains_unclear_mechanisms",
+      "experiment_prioritization",
+      "hypothesis_generation_causal_structure",
+      "scientific_exploration"
+    ],
+    "rel": [
+      "causal-inference",
+      "abductive",
+      "experimental-design"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_causal_inference": "inference_uses_known_structure_discovery_learns_structure",
+        "vs_correlation": "discovery_infers_direction_and_mediation_not_just_association"
+      }
+    }
+  }
+}

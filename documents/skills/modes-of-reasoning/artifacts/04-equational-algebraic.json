@@ -1,0 +1,57 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/equational-algebraic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 4,
+    "name": "equational-algebraic",
+    "cat": "formal",
+    "core": "Transform expressions using equalities and rewrite rules while preserving meaning; term rewriting rather than logical derivation.",
+    "out": [
+      "equivalent forms",
+      "normal forms",
+      "simplifications",
+      "invariants"
+    ],
+    "proc": [
+      "identify expression to transform",
+      "select applicable rewrite rules",
+      "apply rules preserving equivalence",
+      "reach normal or simplified form",
+      "verify invariants maintained"
+    ],
+    "check": [
+      "rewrite rules sound?",
+      "domain restrictions respected?",
+      "boundary conditions handled?",
+      "equivalence preserved?"
+    ],
+    "diff": {
+      "vs_deductive": "specialized to symbol manipulation; everyday workhorse in math/CS focusing on term rewriting"
+    },
+    "fail": {
+      "mode": "unsound rules",
+      "desc": "implicit domain restrictions like division by zero or overflow; rules that work most of the time fail silently at boundaries"
+    },
+    "use": [
+      "refactoring",
+      "optimization proofs",
+      "dimensional reasoning scaffolds",
+      "invariant manipulation",
+      "algebraic simplification"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive-reasoning", "link": "underlying logical framework"},
+      {"id": 6, "name": "constraint-satisfiability", "link": "can use equational constraints"}
+    ],
+    "ex": {
+      "scenario": "optimizing a mathematical expression",
+      "approach": "apply associativity, commutativity, and distribution rules to simplify while checking domain validity"
+    }
+  }
+}

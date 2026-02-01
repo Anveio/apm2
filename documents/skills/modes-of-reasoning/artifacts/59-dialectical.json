@@ -1,0 +1,83 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/dialectical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 59,
+    "name": "dialectical",
+    "cat": "argumentation",
+    "core": "Advance understanding through structured opposition: surface tensions between thesis and antithesis, refine concepts through conflict, and integrate perspectives into synthesis. Contradiction drives conceptual improvement.",
+    "out": [
+      {"n": "refined_positions", "d": "improved thesis after dialectical process"},
+      {"n": "conceptual_synthesis", "d": "integrated view transcending opposition"},
+      {"n": "clarified_distinctions", "d": "sharpened boundaries between concepts"},
+      {"n": "resolved_tensions", "d": "harmonized previously conflicting ideas"}
+    ],
+    "proc": [
+      "state thesis: articulate initial position clearly",
+      "generate antithesis: identify opposing view or contradiction",
+      "explore tension: examine what each position captures",
+      "synthesize: integrate valid elements into refined position",
+      "iterate: treat synthesis as new thesis if needed"
+    ],
+    "check": [
+      "thesis and antithesis genuinely oppose",
+      "both positions given fair consideration",
+      "tension explicitly articulated",
+      "synthesis preserves valid insights from both",
+      "convergence criteria defined",
+      "resolution advances understanding"
+    ],
+    "diff": {
+      "paraconsistent": "uses tension productively vs tolerates contradictory data",
+      "argumentation-theory": "thesis-antithesis-synthesis vs attack/defense graphs",
+      "reflective-equilibrium": "dialectical opposition vs iterative coherence adjustment",
+      "defeasible": "conceptual refinement vs formal defeat relations"
+    },
+    "fail": {
+      "mode": "endless_debate",
+      "signals": [
+        "no convergence criteria defined",
+        "synthesis never attempted",
+        "positions harden rather than refine",
+        "debate becomes adversarial contest",
+        "conceptual progress absent"
+      ],
+      "mitigations": [
+        "set explicit convergence criteria upfront",
+        "require synthesis attempts at intervals",
+        "track conceptual progress explicitly",
+        "separate idea evaluation from advocacy",
+        "timebox dialectical rounds"
+      ]
+    },
+    "use": [
+      "strategy debates",
+      "assumptions audits",
+      "resolving conceptual confusion",
+      "philosophy and theory development",
+      "design critique"
+    ],
+    "rel": [
+      {"id": 35, "n": "argumentation-theory", "r": "structured debate"},
+      {"id": 34, "n": "paraconsistent", "r": "tolerating contradiction"},
+      {"id": 77, "n": "reflective-equilibrium", "r": "iterative coherence"}
+    ],
+    "ex": {
+      "sit": "Design debate: monolith vs microservices. Thesis: monolith for simplicity. Antithesis: microservices for scalability.",
+      "steps": [
+        "thesis: monolith reduces operational complexity",
+        "antithesis: microservices enable independent scaling",
+        "tension: simplicity vs flexibility trade-off",
+        "synthesis: modular monolith with clear boundaries",
+        "refined: gains modularity without distributed complexity"
+      ],
+      "insight": "dialectical process revealed third option capturing benefits of both"
+    }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/multi-criteria-decision-analysis@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 46,
+    "name": "multi-criteria-decision-analysis",
+    "cat": "decision",
+    "core": "Evaluate alternatives against multiple conflicting objectives using weights, outranking, or Pareto frontiers to make tradeoffs explicit rather than collapsing into single metric.",
+    "out": [
+      "criteria_hierarchy",
+      "weight_vector",
+      "tradeoff_surface",
+      "pareto_efficient_set",
+      "scoring_model",
+      "sensitivity_report"
+    ],
+    "proc": [
+      "identify_alternatives",
+      "define_criteria_hierarchy",
+      "elicit_weights_from_stakeholders",
+      "score_alternatives_per_criterion",
+      "aggregate_scores_or_compute_pareto",
+      "sensitivity_analysis_on_weights",
+      "present_tradeoffs_to_decision_maker"
+    ],
+    "check": [
+      "criteria_cover_all_stakeholder_concerns",
+      "weights_sum_to_one_and_justified",
+      "scoring_scales_consistent",
+      "pareto_frontier_computed_if_incommensurable",
+      "sensitivity_on_weights_performed",
+      "dominated_alternatives_excluded",
+      "weight_sources_documented"
+    ],
+    "diff": {
+      "decision-theoretic": "decision-theoretic collapses to single utility; mcda keeps tradeoffs visible",
+      "optimization": "optimization solves for single objective; mcda surfaces multi-objective frontier",
+      "argumentation-theory": "argumentation deliberates qualitatively; mcda provides quantitative comparisons",
+      "means-end": "means-end links goals to actions; mcda compares across conflicting goals"
+    },
+    "fail": {
+      "mode": "arbitrary_weights",
+      "signals": [
+        "weights_chosen_without_stakeholder_input",
+        "false_precision_in_scores",
+        "political_bias_hidden_in_weights",
+        "criteria_omitted_to_force_outcome",
+        "stakeholder_disagreement_on_weights"
+      ],
+      "mit": [
+        "elicit_weights_via_structured_methods",
+        "document_weight_rationale",
+        "run_sensitivity_on_weight_ranges",
+        "include_all_stakeholders_in_weighting",
+        "use_pareto_when_weights_contested"
+      ]
+    },
+    "use": [
+      "strategic_planning",
+      "procurement_evaluation",
+      "roadmap_prioritization",
+      "governance_decisions",
+      "multi_stakeholder_negotiations",
+      "policy_analysis",
+      "vendor_selection"
+    ],
+    "rel": [
+      "decision-theoretic",
+      "optimization",
+      "argumentation-theory",
+      "robust-worst-case",
+      "game-theoretic-strategic",
+      "value-of-information"
+    ],
+    "ex": {
+      "situation": "Select cloud vendor across cost, security, latency, vendor-lock-in",
+      "criteria": ["cost", "security", "latency", "lock_in_risk"],
+      "weights": [0.3, 0.35, 0.2, 0.15],
+      "alternatives": ["vendor_a", "vendor_b", "vendor_c"],
+      "scores": {
+        "vendor_a": [0.8, 0.9, 0.6, 0.5],
+        "vendor_b": [0.6, 0.7, 0.9, 0.8],
+        "vendor_c": [0.9, 0.6, 0.7, 0.7]
+      },
+      "result": "vendor_a_ranks_highest_but_sensitivity_shows_vendor_b_wins_if_latency_weight_exceeds_0.35"
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/sensemaking-frame-building@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 63,
+    "name": "sensemaking-frame-building",
+    "cat": "domain",
+    "core": "Determine 'what kind of situation is this?' by building frames that organize signals, priorities, and actions under ambiguity. Precedes most other modes by selecting what counts as relevant evidence and what questions to ask.",
+    "out": [
+      "situation frame: named pattern characterizing the situation type",
+      "working hypotheses: 2-3 candidate interpretations ranked by fit",
+      "shared mental model: stakeholder-aligned problem representation",
+      "interpretive structure: lens for filtering signals and prioritizing actions"
+    ],
+    "proc": [
+      "gather signals: list anomalies, constraints, stakeholder concerns, available data",
+      "generate candidate frames: name 2-4 situation types this could be",
+      "test frame fit: for each frame, note what it explains and what it ignores",
+      "select working frame: choose best-fit frame, note key assumptions",
+      "derive implications: what actions, questions, and evidence follow from this frame",
+      "set frame-revision triggers: define signals that would force reframing"
+    ],
+    "check": [
+      ">=2 candidate frames considered before selection",
+      "selected frame explicitly named and characterized",
+      "frame assumptions documented",
+      "frame-revision triggers defined",
+      "downstream actions follow logically from frame",
+      "stakeholders can articulate frame in their own words"
+    ],
+    "diff": {
+      "abductive": "abductive generates hypotheses; sensemaking selects which problem space to hypothesize within",
+      "hermeneutic": "hermeneutic interprets meaning of signals; sensemaking organizes which signals matter",
+      "meta-reasoning": "meta-reasoning selects reasoning mode; sensemaking establishes what problem is before mode selection",
+      "diagnostic": "diagnostic identifies root cause within a frame; sensemaking chooses the frame first"
+    },
+    "fail": {
+      "name": "premature frame lock-in",
+      "signals": [
+        "first frame adopted without considering alternatives",
+        "disconfirming evidence dismissed as noise",
+        "perfect reasoning inside frame yielding wrong answers",
+        "stakeholders using incompatible implicit frames"
+      ],
+      "mitigations": [
+        "require >=2 candidate frames before selection",
+        "name current frame explicitly so it can be questioned",
+        "schedule frame-check at defined intervals",
+        "ask 'what would make us reframe?' before proceeding",
+        "test frame with red team or outsider perspective"
+      ]
+    },
+    "use": [
+      "crisis leadership under novel conditions",
+      "early-stage strategy formulation",
+      "ambiguous competitive landscapes",
+      "novel situations lacking precedent",
+      "problem formulation before solution search",
+      "cross-functional alignment on problem definition"
+    ],
+    "rel": [
+      {"id": 13, "name": "abductive", "role": "generates candidate frames"},
+      {"id": 61, "name": "hermeneutic-interpretive", "role": "interprets signals within frame"},
+      {"id": 75, "name": "meta-reasoning", "role": "selects reasoning approach after framing"}
+    ],
+    "ex": {
+      "situation": "Sales suddenly down 30% in key region, no obvious cause",
+      "frames_considered": ["competitor disruption", "internal execution failure", "market shift", "data artifact"],
+      "selected_frame": "market shift (new regulation changing buyer behavior)",
+      "key_assumption": "regulation impact is structural, not temporary",
+      "revision_trigger": "if competitor analysis shows new entrant, reframe to competitive threat",
+      "outcome": "frame validated; pivoted product positioning to new compliance requirements"
+    }
+  }
+}

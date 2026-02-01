@@ -1,0 +1,78 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/causal-inference@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 37,
+    "name": "causal-inference",
+    "cat": "causal",
+    "core": "Identify causal relations and predict effects of interventions by distinguishing P(Y|X) from P(Y|do(X))",
+    "out": [
+      "causal_effect_estimates",
+      "intervention_predictions",
+      "adjustment_sets",
+      "identifiability_results"
+    ],
+    "proc": [
+      "define_causal_question_and_target_effect",
+      "construct_causal_dag_with_variables_and_edges",
+      "identify_confounders_and_adjustment_sets",
+      "check_identifiability_conditions",
+      "apply_do_calculus_or_back_door_criterion",
+      "estimate_causal_effect_from_data",
+      "validate_assumptions_and_sensitivity"
+    ],
+    "check": [
+      "causal_dag_explicit_and_justified",
+      "confounders_identified",
+      "adjustment_set_valid",
+      "identifiability_verified",
+      "assumptions_documented",
+      "sensitivity_analysis_performed"
+    ],
+    "diff": {
+      "statistical": "distinguishes_intervention_from_observation_not_just_correlation",
+      "counterfactual": "estimates_effects_of_doing_not_alternate_histories",
+      "causal-discovery": "uses_known_structure_not_learning_it",
+      "bayesian": "encodes_causal_structure_beyond_conditional_probabilities"
+    },
+    "fail": {
+      "mode": "hidden_confounders_and_unjustified_assumptions",
+      "desc": "drawing_causal_conclusions_without_valid_causal_model",
+      "signals": [
+        "no_explicit_causal_dag",
+        "confounders_not_addressed",
+        "correlation_treated_as_causation",
+        "adjustment_set_not_justified"
+      ],
+      "mit": [
+        "require_explicit_causal_dag",
+        "identify_and_adjust_for_confounders",
+        "sensitivity_analysis_for_hidden_confounders",
+        "validate_model_with_known_interventions"
+      ]
+    },
+    "use": [
+      "product_impact_analysis",
+      "policy_evaluation",
+      "root_cause_analysis",
+      "treatment_effect_estimation"
+    ],
+    "rel": [
+      "causal-discovery",
+      "counterfactual",
+      "statistical-frequentist"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_correlation": "correlation_shows_association_causation_shows_intervention_effect",
+        "vs_prediction": "prediction_uses_any_signal_causation_requires_structure"
+      }
+    }
+  }
+}

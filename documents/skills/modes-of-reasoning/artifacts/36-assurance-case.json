@@ -1,0 +1,86 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/assurance-case@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 36,
+    "name": "assurance-case",
+    "cat": "argumentation",
+    "core": "CAE tree demonstrating top-level safety/security/reliability claim via decomposition to evidence-backed leaf nodes per GSN/ISO26262/DO-178C",
+    "out": [
+      "safety_case_doc",
+      "evidence_index",
+      "hazard_claim_map",
+      "confidence_assessment",
+      "rebuttal_log"
+    ],
+    "proc": [
+      "define_top_claim_with_boundary_and_context",
+      "identify_hazards_as_branches",
+      "decompose_via_strategies_to_evidenceable_claims",
+      "attach_evidence_with_id_provenance_date",
+      "challenge_each_link_for_support_completeness",
+      "assess_confidence_mark_weak_links",
+      "conduct_adversarial_review",
+      "iterate_until_no_undeveloped_nodes"
+    ],
+    "check": [
+      "top_claim_scoped",
+      "hazards_mapped_to_branches",
+      "leaves_have_traceable_dated_evidence",
+      "no_undeveloped_placeholders",
+      "rebuttal_log_gte_3_entries",
+      "independent_evidence_spot_check",
+      "confidence_gaps_documented"
+    ],
+    "diff": {
+      "argumentation-theory": "requires_traceable_evidence_at_leaves_not_rhetorical_support",
+      "legal": "argues_empirical_system_properties_not_statute_interpretation",
+      "robust-worst-case": "documents_why_guarantees_hold_citing_evidence",
+      "engineering-design": "justifies_post_hoc_that_design_meets_safety_goals",
+      "adversarial-red-team": "target_of_red_teaming_must_survive_scrutiny"
+    },
+    "fail": {
+      "mode": "paper_compliance",
+      "desc": "structure_complete_but_evidence_weak_stale_or_mismatched",
+      "signals": [
+        "undated_evidence_no_artifact_ids",
+        "multiple_claims_share_single_evidence",
+        "uniform_high_confidence_no_gaps",
+        "no_rebuttal_log"
+      ],
+      "mit": [
+        "evidence_freshness_audit_within_policy_window",
+        "independent_evidence_review_3_random_leaves",
+        "adversarial_rebuttal_session_3_attacks_min",
+        "coverage_check_hazard_to_claim",
+        "undeveloped_node_sweep_count_eq_0"
+      ]
+    },
+    "use": [
+      "safety_critical_systems",
+      "security_certification",
+      "ai_ml_governance",
+      "regulatory_submissions",
+      "internal_design_reviews"
+    ],
+    "rel": [
+      "argumentation-theory",
+      "robust-worst-case",
+      "adversarial-red-team",
+      "legal",
+      "engineering-design"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_risk_assessment": "risk_identifies_hazards_assurance_argues_mitigation",
+        "vs_test_plan": "test_defines_what_assurance_consumes_results_as_evidence"
+      }
+    }
+  }
+}

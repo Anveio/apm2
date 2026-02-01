@@ -1,0 +1,80 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/legal@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 71,
+    "name": "legal",
+    "cat": "domain",
+    "core": "Apply rules to facts, interpret texts, reason from precedents using burdens and standards of proof with adversarial argumentation under institutional constraints.",
+    "out": [
+      {"a": "legal_position", "s": "claim, supporting rules, factual basis, burden allocation", "done": "position cites applicable authority and meets burden"},
+      {"a": "compliance_interpretation", "s": "regulation, interpretation, supporting reasoning", "done": "interpretation addresses ambiguity with precedent or canon"},
+      {"a": "precedent_argument", "s": "analogous case, material facts, holding, application", "done": "distinguishes adverse precedent"},
+      {"a": "risk_assessment", "s": "exposure, likelihood, mitigation options", "done": "quantifies exposure range and ranks mitigations"}
+    ],
+    "proc": [
+      "Identify legal question: frame issue precisely, note jurisdiction and applicable body of law",
+      "Gather applicable rules: statutes, regulations, contract terms, precedents",
+      "Analyze facts: map relevant facts to rule elements, note gaps in evidence",
+      "Allocate burden: determine who must prove what and to what standard",
+      "Apply rules to facts: step through elements, cite supporting authority",
+      "Address counterarguments: anticipate opposing interpretation, distinguish adverse precedent",
+      "Assess risk: evaluate likelihood of adverse outcome and exposure magnitude",
+      "Recommend action: propose path that balances legal risk with objectives"
+    ],
+    "check": [
+      "Jurisdiction and choice of law stated",
+      "Applicable rules cited with authority",
+      "Burden of proof explicitly allocated",
+      "Each rule element mapped to facts or identified as gap",
+      "Adverse precedent addressed or distinguished",
+      "Risk quantified or bounded"
+    ],
+    "diff": {
+      "case-based": "legal adds formal burdens, standards of proof, and institutional authority",
+      "defeasible": "legal operates under explicit procedural rules and adversarial structure",
+      "hermeneutic": "legal interpretation constrained by canons and stare decisis",
+      "deontic": "legal norms are institutionally enforced; ethics need not be"
+    },
+    "fail": {
+      "mode": "conflating legal compliance with ethical legitimacy",
+      "signals": [
+        "assumes lawful equals ethical without separate analysis",
+        "ignores jurisdiction or choice-of-law issues",
+        "cites authority without checking current validity",
+        "treats dicta as holding"
+      ],
+      "mitigations": [
+        {"m": "separate legal and ethical analysis", "test": "ethics section present when stakes are high"},
+        {"m": "verify authority is current", "test": "cite check performed, no overruled cases"},
+        {"m": "distinguish holding from dicta", "test": "ratio decidendi identified explicitly"},
+        {"m": "state jurisdiction explicitly", "test": "jurisdiction listed in issue statement"}
+      ]
+    },
+    "use": [
+      "compliance review",
+      "governance and policy drafting",
+      "dispute resolution and litigation strategy",
+      "contract interpretation and negotiation",
+      "regulatory analysis and lobbying"
+    ],
+    "rel": [
+      {"mode": "case-based", "how": "precedent retrieval and analogical matching"},
+      {"mode": "defeasible", "how": "rules with exceptions and rebuttable presumptions"},
+      {"mode": "hermeneutic", "how": "statutory and contractual text interpretation"},
+      {"mode": "deontic", "how": "normative structure of obligations and permissions"}
+    ],
+    "ex": {
+      "confusion": [
+        {"vs": "deontic", "clarify": "deontic logic models obligation abstractly; legal reasoning applies institutionally enforced norms with procedural rules"},
+        {"vs": "case-based", "clarify": "case-based retrieves similar cases; legal reasoning adds stare decisis, burden allocation, and adversarial framing"}
+      ]
+    }
+  }
+}

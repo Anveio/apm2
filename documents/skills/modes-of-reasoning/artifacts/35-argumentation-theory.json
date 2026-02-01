@@ -1,0 +1,88 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/argumentation-theory@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 35,
+    "name": "argumentation-theory",
+    "cat": "argumentation",
+    "core": "Build arguments and counterarguments; compute which claims stand given attack/defense relations. Models dialectical structure of reasoning, evaluating competing reasons rather than just deriving consequences.",
+    "out": [
+      {"n": "accepted_claims", "d": "warranted propositions surviving attacks"},
+      {"n": "rationale_maps", "d": "visual/structured argument graphs"},
+      {"n": "debate_representation", "d": "formal encoding of pro/con structure"},
+      {"n": "attack_relations", "d": "which arguments undermine others"},
+      {"n": "defense_chains", "d": "reinstatement paths for attacked claims"}
+    ],
+    "proc": [
+      "identify claims: enumerate propositions under evaluation",
+      "construct arguments: build support chains for each claim",
+      "map attacks: identify counterarguments and rebuttals",
+      "compute extensions: determine consistent defensible sets",
+      "extract accepted: output warranted claims with justification"
+    ],
+    "check": [
+      "all relevant claims enumerated",
+      "arguments have explicit premises and conclusions",
+      "attack relations correctly identified",
+      "defense/reinstatement considered",
+      "extension semantics applied consistently",
+      "accepted set is conflict-free",
+      "rationale documented for each acceptance"
+    ],
+    "diff": {
+      "defeasible": "evaluates competing reasons vs formal defeat relations",
+      "dialectical": "formal attack/defense vs thesis-antithesis-synthesis",
+      "rhetorical": "logical structure vs persuasion effectiveness",
+      "deductive": "competing reasons vs pure entailment"
+    },
+    "fail": {
+      "mode": "debate_truth_conflation",
+      "signals": [
+        "argument strength equated with correctness",
+        "persuasive claims assumed true",
+        "weak opposition treated as false",
+        "rhetorical skill overweighted",
+        "evidence quality ignored"
+      ],
+      "mitigations": [
+        "separate argument quality from truth",
+        "require independent evidence checks",
+        "evaluate premise truth explicitly",
+        "consider absent counterarguments",
+        "track epistemic vs dialectical status"
+      ]
+    },
+    "use": [
+      "governance decisions",
+      "policy disputes",
+      "legal-style reasoning",
+      "stakeholder conflicts",
+      "decision justification",
+      "ethics review"
+    ],
+    "rel": [
+      {"id": 32, "n": "defeasible", "r": "formal defeat relations"},
+      {"id": 59, "n": "dialectical", "r": "thesis-antithesis-synthesis"},
+      {"id": 60, "n": "rhetorical", "r": "persuasion-oriented"},
+      {"id": 65, "n": "deontic", "r": "normative claims in arguments"},
+      {"id": 36, "n": "assurance-case", "r": "structured safety arguments"}
+    ],
+    "ex": {
+      "sit": "Policy debate: Should we adopt microservices architecture? Pro: scalability, team autonomy. Con: operational complexity, latency.",
+      "steps": [
+        "claims: adopt-microservices, reject-microservices",
+        "pro-args: scalability-benefit, autonomy-benefit",
+        "con-args: complexity-cost, latency-risk",
+        "attacks: complexity-cost attacks scalability if ops team small",
+        "compute: with large ops team, pro-args defensible; adopt warranted"
+      ],
+      "insight": "context (ops team size) determines which arguments survive attacks"
+    }
+  }
+}

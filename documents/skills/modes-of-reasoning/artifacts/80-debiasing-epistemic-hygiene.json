@@ -1,0 +1,103 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/debiasing-epistemic-hygiene@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 80,
+    "name": "debiasing-epistemic-hygiene",
+    "cat": "meta",
+    "core": "Constraint layer applying pre-commitment checks to any reasoning mode output: base-rate anchoring, alternative-hypothesis generation, premortem analysis, disconfirmation search, and bias audit",
+    "out": [
+      "base_rate_anchor",
+      "alternative_hypothesis_list",
+      "premortem_report",
+      "disconfirmation_tests",
+      "cognitive_load_flag",
+      "bias_audit_log",
+      "residual_uncertainty_statement"
+    ],
+    "proc": [
+      "anchor_on_base_rate_before_inside_view",
+      "generate_gte3_alternatives_with_plausibility",
+      "run_premortem_top3_failure_causes",
+      "specify_and_search_disconfirmation_tests",
+      "check_cognitive_load_flag_conditions",
+      "audit_anchoring_availability_confirmation",
+      "document_residual_uncertainty_reducible_vs_irreducible"
+    ],
+    "check": [
+      "base_rate_written_before_analysis_with_source",
+      "gte3_alternatives_with_plausibility_estimates",
+      "premortem_has_gte1_internal_controllable_cause",
+      "disconfirmation_actually_searched_not_hypothetical",
+      "3item_bias_audit_with_pass_fail_rationale",
+      "cognitive_load_flag_set_green_yellow_red",
+      "residual_uncertainty_classified"
+    ],
+    "diff": {
+      "meta-reasoning": "meta_selects_mode_debiasing_audits_mode_output",
+      "calibration-epistemic-humility": "calibration_tracks_long_run_accuracy_debiasing_intervenes_on_single_judgment",
+      "adversarial-red-team": "red_team_simulates_external_adversary_debiasing_audits_own_cognition",
+      "heuristic": "heuristics_are_system1_shortcuts_debiasing_is_system2_audit",
+      "abductive": "abduction_generates_hypotheses_debiasing_prevents_story_bias_in_selection",
+      "bayesian-probabilistic": "bayesian_is_normative_standard_debiasing_catches_departures",
+      "reference-class-outside-view": "reference_class_is_one_technique_in_step1_debiasing_is_broader_discipline"
+    },
+    "fail": {
+      "mode": "ritualized_checklist",
+      "desc": "checklist_completed_without_genuine_consideration_no_conclusions_changed",
+      "signals": [
+        "checklist_copy_pasted_from_previous",
+        "alternatives_are_strawmen",
+        "premortem_lists_only_external_causes",
+        "zero_decisions_reversed_by_checklist",
+        "debiasing_under_5min_for_high_stakes",
+        "disconfirmation_hypothetical_only",
+        "base_rates_estimated_not_sourced"
+      ],
+      "mit": [
+        "require_gte1_judgment_change_per_quarter",
+        "rotate_devils_advocate_role",
+        "blind_elicitation_before_group_discussion",
+        "timebox_10_15min_enforce_before_commitment",
+        "require_evidence_of_disconfirmation_search",
+        "audit_past_debiasing_artifacts_for_accuracy"
+      ]
+    },
+    "use": [
+      "high_stakes_one_shot_decisions",
+      "forecasting_and_estimation",
+      "incident_postmortems",
+      "investment_resource_allocation",
+      "leadership_reviews",
+      "hiring_decisions",
+      "strategic_planning",
+      "hypothesis_selection_post_abduction"
+    ],
+    "rel": [
+      "heuristic",
+      "calibration-epistemic-humility",
+      "adversarial-red-team",
+      "meta-reasoning",
+      "reference-class-outside-view",
+      "abductive",
+      "bayesian-probabilistic",
+      "decision-theoretic",
+      "satisficing",
+      "assurance-case",
+      "reflective-equilibrium"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_calibration": "calibration_tracks_many_judgments_debiasing_audits_single_judgment",
+        "vs_critical_thinking": "critical_thinking_vague_debiasing_targets_named_biases_with_named_procedures",
+        "vs_decision_theoretic": "decision_theory_is_formula_debiasing_is_input_data_quality_check"
+      }
+    }
+  }
+}

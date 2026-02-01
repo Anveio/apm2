@@ -1,0 +1,87 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/qualitative-probability@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 24,
+    "name": "qualitative-probability",
+    "cat": "probabilistic",
+    "core": "Replace numeric probabilities with ordinal 'degree of disbelief' ranks (Spohn-style ranking functions). Update beliefs by shifting ranks rather than computing precise probabilities. Useful when only ordering of plausibility is defensible.",
+    "out": [
+      {"n": "plausibility_ranking", "d": "ordered list of hypotheses from most to least plausible"},
+      {"n": "rank_assignments", "d": "ordinal disbelief ranks for each proposition"},
+      {"n": "belief_dynamics", "d": "how ranks shift with new evidence"},
+      {"n": "comparative_judgments", "d": "A more plausible than B statements"}
+    ],
+    "proc": [
+      "assign initial disbelief ranks to hypotheses (0 = fully believed, higher = less plausible)",
+      "identify new evidence and its impact direction",
+      "shift ranks: conditionalization by setting evidence rank to 0, adjusting others",
+      "derive comparative plausibility ordering from updated ranks",
+      "check consistency: no proposition and its negation both rank 0",
+      "report ranked hypotheses without claiming precise probabilities"
+    ],
+    "check": [
+      "ranks assigned ordinally, not numerically interpreted",
+      "ordering justified by evidence or background knowledge",
+      "rank updates follow conditionalization rules",
+      "no false precision in plausibility claims",
+      "magnitude information noted when relevant but not faked",
+      "comparative statements supported by rank differences"
+    ],
+    "diff": {
+      "bayesian": "ordinal ranks vs numeric probabilities; no precise multiplication",
+      "default-typicality": "graded ranks vs binary typical/atypical",
+      "imprecise-probability": "pure ordering vs interval-valued probabilities",
+      "belief-revision": "ranked entrenchment vs AGM-style contraction/expansion"
+    },
+    "fail": {
+      "mode": "magnitude_loss",
+      "signals": [
+        "decision requires knowing if P=0.01 vs P=0.10",
+        "combining evidence from different domains needs numeric weighting",
+        "rank differences treated as meaningful magnitudes",
+        "critical thresholds exist (e.g., regulatory cutoffs)",
+        "ordinal ranking insufficient for expected value calculation"
+      ],
+      "mitigations": [
+        "flag when magnitude information is decision-relevant",
+        "escalate to Bayesian or imprecise probability if stakes high",
+        "document lost precision explicitly",
+        "use intervals for bounds even without point estimates",
+        "distinguish 'slightly more plausible' from 'vastly more plausible'"
+      ]
+    },
+    "use": [
+      "early-stage hypothesis ranking",
+      "reasoning with weak quantification",
+      "domains lacking precise probability data",
+      "qualitative risk comparison",
+      "preliminary triage before numeric analysis",
+      "expert elicitation of orderings"
+    ],
+    "rel": [
+      {"id": 11, "n": "bayesian-probabilistic", "r": "full numeric probabilities when data supports"},
+      {"id": 31, "n": "default-typicality", "r": "binary rather than ranked plausibility"},
+      {"id": 21, "n": "imprecise-probability", "r": "intervals instead of pure ranks"},
+      {"id": 33, "n": "belief-revision", "r": "related entrenchment ordering approach"}
+    ],
+    "ex": {
+      "sit": "Three competing explanations for system failure: hardware fault, software bug, user error. No failure rate data available.",
+      "steps": [
+        "assign initial ranks: hardware=2, software=1, user=1 (software/user more common historically)",
+        "evidence: logs show no user activity before failure",
+        "update: user error rank shifts to 3 (less plausible given evidence)",
+        "evidence: hardware diagnostics pass",
+        "update: hardware rank shifts to 3",
+        "result: software bug most plausible (rank 1), others rank 3"
+      ],
+      "insight": "reached actionable conclusion (investigate software first) without needing P(bug)=0.73 vs P(hardware)=0.15"
+    }
+  }
+}

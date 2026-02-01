@@ -1,0 +1,88 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/negotiation-coalition@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 57,
+    "name": "negotiation-coalition",
+    "cat": "strategic",
+    "core": "Reason about acceptable agreements and coalition formation under constraints and asymmetric information. Focus on reaching mutually beneficial outcomes, not just predicting equilibria.",
+    "out": [
+      {"type": "offer_set", "valid": "within ZOPA, respects constraints"},
+      {"type": "concession_path", "valid": "monotonic toward agreement zone"},
+      {"type": "coalition_structure", "valid": "stable, no blocking subgroup"},
+      {"type": "pareto_improvement", "valid": "no party worse off"},
+      {"type": "agreement_zone", "valid": "BATNA-bounded for all parties"}
+    ],
+    "proc": [
+      "identify parties and their interests (stated vs underlying)",
+      "determine each party's BATNA (best alternative to negotiated agreement)",
+      "map reservation prices to find ZOPA (zone of possible agreement)",
+      "assess information asymmetries and signaling options",
+      "generate options that expand the pie (integrative bargaining)",
+      "sequence concessions to build trust and momentum",
+      "check coalition stability (no subgroup gains by defecting)",
+      "formalize agreement with enforcement mechanisms"
+    ],
+    "check": [
+      "all stakeholders identified",
+      "BATNAs estimated for each party",
+      "ZOPA exists or proven empty",
+      "interests vs positions distinguished",
+      "value-creating options explored",
+      "coalition stability verified",
+      "long-term relationship impact assessed",
+      "enforcement mechanism specified"
+    ],
+    "diff": {
+      "game-theoretic": "GT predicts outcomes; negotiation seeks agreement through process",
+      "theory-of-mind": "ToM infers beliefs; negotiation uses them to craft acceptable offers",
+      "mechanism-design": "MD designs rules ex ante; negotiation operates within existing rules",
+      "rhetorical": "rhetoric persuades; negotiation trades and compromises"
+    },
+    "fail": {
+      "mode": "winning the negotiation but losing the relationship and long-term incentives",
+      "signals": [
+        "counterparty disengages or retaliates later",
+        "agreement unravels in implementation",
+        "reputation damage in network",
+        "short-term gain, long-term loss pattern"
+      ],
+      "mit": [
+        "explicitly value relationship in payoff function",
+        "stress-test agreement durability",
+        "consider repeated-game dynamics",
+        "build in renegotiation clauses",
+        "verify coalition stability under stress"
+      ]
+    },
+    "use": [
+      "partnerships and joint ventures",
+      "sales and procurement",
+      "cross-team alignment and resource allocation",
+      "contract negotiation",
+      "alliance and coalition formation",
+      "M&A deal structuring"
+    ],
+    "rel": [
+      {"id": 55, "name": "game-theoretic-strategic", "note": "underlying analytical framework"},
+      {"id": 56, "name": "theory-of-mind", "note": "understanding counterparty motives"},
+      {"id": 58, "name": "mechanism-design", "note": "designing negotiation structures"},
+      {"id": 60, "name": "rhetorical", "note": "persuasion and framing tactics"}
+    ],
+    "ex": {
+      "problem": "Two teams need shared infrastructure budget; total available less than combined asks",
+      "parties": ["Team A (needs compute)", "Team B (needs storage)"],
+      "batnas": {"A": "use legacy system", "B": "defer project 6 months"},
+      "zopa": "exists if combined priority spend < budget",
+      "integrative_option": "time-share compute, tiered storage",
+      "coalition_check": "neither team gains by escalating to VP alone",
+      "agreement": "60/40 split with quarterly rebalance clause"
+    }
+  }
+}

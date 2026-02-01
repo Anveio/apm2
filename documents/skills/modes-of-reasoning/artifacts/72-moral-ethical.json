@@ -1,0 +1,69 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/moral-ethical@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 72,
+    "name": "moral-ethical",
+    "cat": "domain",
+    "core": "Reason about right/wrong and value tradeoffs using ethical frameworks (consequentialist, deontological, virtue, contractualist, care ethics); evaluate normative claims that cannot be reduced to facts alone.",
+    "out": [
+      {"type": "value_constraints", "form": "list of bounded permissible actions with ethical justification", "test": "each constraint cites ethical framework and reasoning"},
+      {"type": "ethical_justification", "form": "argument from principles to conclusion", "test": "premises explicit, framework identified, tradeoffs acknowledged"},
+      {"type": "tradeoff_statement", "form": "competing values with weights and resolution rationale", "test": "values named, weights justified, resolution traceable"},
+      {"type": "normative_principles", "form": "ought-statements with scope and exceptions", "test": "scope bounded, exceptions enumerated, not derived from is-alone"}
+    ],
+    "proc": [
+      "identify stakeholders and affected parties",
+      "enumerate relevant values and interests at stake",
+      "select applicable ethical framework(s) for analysis",
+      "apply framework to derive normative conclusions",
+      "surface tradeoffs and document value tensions",
+      "justify resolution with principled constraints"
+    ],
+    "check": [
+      "ought-claims not derived purely from is-facts",
+      "ethical framework explicitly identified",
+      "stakeholder interests enumerated",
+      "tradeoffs surfaced not hidden",
+      "justification traces to principled constraints not preferences",
+      "values laundering detected and flagged"
+    ],
+    "diff": {
+      "deontic": "deontic derives from given norms (formal logic); moral-ethical evaluates which norms should exist (meta-level)",
+      "legal": "legal applies institutional norms; moral-ethical evaluates whether those norms are just",
+      "reflective-equilibrium": "reflective equilibrium balances principles and judgments; moral-ethical is the broader evaluative enterprise"
+    },
+    "fail": {
+      "mode": "values laundering: dressing preferences as ethics without principled constraints",
+      "signal": "ethical claim derived from goal-alignment without independent normative justification",
+      "mit": [
+        "require explicit ethical framework citation",
+        "surface competing values before resolution",
+        "distinguish stakeholder interests from analyst preferences",
+        "test conclusions against multiple ethical frameworks"
+      ]
+    },
+    "use": [
+      "AI governance",
+      "product harm assessment",
+      "trust and safety policy",
+      "people policy",
+      "organizational values alignment"
+    ],
+    "rel": [
+      {"id": 65, "name": "deontic", "why": "formal normative logic for deriving from norms"},
+      {"id": 71, "name": "legal", "why": "institutional norms implementation"},
+      {"id": 77, "name": "reflective-equilibrium", "why": "coherence of principles and judgments"}
+    ],
+    "ex": {
+      "ctx": "Product feature may increase engagement but risks addictive patterns in vulnerable users",
+      "analysis": "Consequentialist: weigh user welfare against business value. Deontological: respect for autonomy requires informed consent. Care ethics: duty to vulnerable populations. Resolution: implement with safeguards (time limits, transparency) as principled constraint, not engagement maximization alone."
+    }
+  }
+}

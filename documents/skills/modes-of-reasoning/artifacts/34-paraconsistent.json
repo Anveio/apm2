@@ -1,0 +1,86 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/paraconsistent@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 34,
+    "name": "paraconsistent",
+    "cat": "nonmonotonic",
+    "core": "Tolerate contradictions without explosion. Classical logic derives everything from A and not-A; paraconsistent logics contain contradictions locally, enabling reasoning to continue in other domains.",
+    "out": [
+      {"n": "contradiction_inventory", "d": "explicit list of conflicting propositions"},
+      {"n": "quarantine_zones", "d": "domains isolated from contradiction propagation"},
+      {"n": "safe_inferences", "d": "conclusions derivable despite inconsistency"},
+      {"n": "conflict_severity", "d": "assessment of which contradictions matter for action"}
+    ],
+    "proc": [
+      "detect contradictions: identify A and not-A pairs in knowledge base",
+      "quarantine: isolate contradictory propositions from unrelated domains",
+      "partition reasoning: separate affected from unaffected inference chains",
+      "continue locally: derive conclusions in consistent subdomains",
+      "flag for resolution: mark contradictions requiring eventual repair"
+    ],
+    "check": [
+      "contradictions explicitly identified",
+      "quarantine boundaries defined",
+      "propagation blocked across boundaries",
+      "local inferences valid within consistent subdomains",
+      "action-critical contradictions flagged",
+      "resolution backlog tracked"
+    ],
+    "diff": {
+      "deductive": "tolerates contradictions vs explodes from them",
+      "belief-revision": "contains contradictions vs repairs them immediately",
+      "argumentation": "isolates conflicts vs structures competing claims",
+      "defeasible": "blocks explosion vs manages defeat relations"
+    },
+    "fail": {
+      "mode": "indefinite_tolerance",
+      "signals": [
+        "contradictions never resolved",
+        "quarantine zones expand indefinitely",
+        "action-critical conflicts ignored",
+        "inconsistency normalized as acceptable",
+        "resolution backlog grows unbounded"
+      ],
+      "mitigations": [
+        "prioritize action-blocking contradictions",
+        "set resolution deadlines",
+        "escalate persistent conflicts",
+        "track quarantine zone growth",
+        "periodic consistency audits"
+      ]
+    },
+    "use": [
+      "merging inconsistent data sources",
+      "messy enterprise data integration",
+      "early incident response triage",
+      "requirements analysis with conflicts",
+      "legacy system migration",
+      "multi-stakeholder input reconciliation"
+    ],
+    "rel": [
+      {"id": 1, "n": "deductive", "r": "explodes on contradiction"},
+      {"id": 33, "n": "belief-revision", "r": "repairs contradictions"},
+      {"id": 35, "n": "argumentation", "r": "structures competing claims"},
+      {"id": 32, "n": "defeasible", "r": "manages defeat relations"},
+      {"id": 75, "n": "meta-reasoning", "r": "when to tolerate vs resolve"}
+    ],
+    "ex": {
+      "sit": "Database merger: Source A says customer X lives in NYC. Source B says customer X lives in LA. Need to process orders now.",
+      "steps": [
+        "detect: address(X, NYC) contradicts address(X, LA)",
+        "quarantine: isolate address domain from order processing",
+        "partition: order validity, payment, inventory unaffected",
+        "continue: process order, flag shipping for manual review",
+        "flag: escalate address conflict for resolution before shipping"
+      ],
+      "insight": "business continues despite data inconsistency; contradiction contained rather than blocking all operations"
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/minimax-regret@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 50,
+    "name": "minimax-regret",
+    "cat": "decision",
+    "core": "Choose action minimizing worst-case regret: the difference between actual outcome and best outcome achievable in hindsight under each scenario",
+    "out": [
+      "regret_matrix",
+      "max_regret_per_action",
+      "minimax_regret_choice",
+      "hedged_strategy",
+      "scenario_sensitivity_map"
+    ],
+    "proc": [
+      "enumerate_actions_and_scenarios",
+      "compute_payoff_matrix",
+      "find_best_payoff_per_scenario",
+      "calculate_regret_as_difference_from_best",
+      "identify_max_regret_per_action",
+      "select_action_with_minimum_max_regret"
+    ],
+    "check": [
+      "scenario_set_covers_plausible_states",
+      "payoff_matrix_complete_and_consistent",
+      "regret_computed_correctly_per_cell",
+      "asymmetric_catastrophic_outcomes_flagged",
+      "compromise_nature_acknowledged"
+    ],
+    "diff": {
+      "robust-worst-case": "optimizes_relative_regret_not_absolute_worst_outcome",
+      "decision-theoretic": "avoids_probability_weighting_uses_regret_metric",
+      "imprecise-probability": "requires_no_probability_model_only_scenario_payoffs"
+    },
+    "fail": {
+      "mode": "catastrophe_blind",
+      "desc": "regret_framing_ignores_asymmetric_catastrophic_outcomes_where_some_losses_are_unrecoverable",
+      "signals": [
+        "scenario_contains_catastrophic_outcome_treated_as_finite_regret",
+        "regret_metric_masks_existential_risk",
+        "compromise_chosen_despite_ruin_in_one_scenario"
+      ],
+      "mit": [
+        "screen_for_catastrophic_outcomes_before_regret_calc",
+        "apply_lexicographic_constraint_safety_first",
+        "combine_with_robust_worst_case_for_tail_risk",
+        "use_bounded_regret_only_above_safety_floor"
+      ]
+    },
+    "use": [
+      "strategy_under_deep_uncertainty",
+      "irreversible_decisions",
+      "portfolio_construction",
+      "technology_choice",
+      "capacity_planning",
+      "vendor_selection"
+    ],
+    "rel": [
+      "robust-worst-case",
+      "decision-theoretic",
+      "imprecise-probability"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_robust_worst_case": "regret_minimizes_relative_shortfall_robust_minimizes_absolute_floor",
+        "vs_expected_utility": "regret_needs_no_probabilities_only_scenario_payoffs",
+        "when_to_prefer": "use_regret_when_probabilities_unknown_and_outcomes_not_catastrophic"
+      }
+    }
+  }
+}

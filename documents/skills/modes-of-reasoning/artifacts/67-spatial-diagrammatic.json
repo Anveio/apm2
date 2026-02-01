@@ -1,0 +1,76 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/spatial-diagrammatic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 67,
+    "name": "spatial-diagrammatic",
+    "cat": "domain",
+    "core": "Reason using geometry, topology, and diagrams. Primitives: containment, adjacency, proximity, flow direction, paths, regions, and boundaries. Exploits visual-spatial representation for inferences that are cumbersome in symbolic form.",
+    "out": [
+      "spatial_inference",
+      "layout_diagram",
+      "flow_argument",
+      "topological_conclusion"
+    ],
+    "proc": [
+      "Define entities and their spatial relationships: containment, adjacency, overlap",
+      "Choose representation: graph, map, Venn, flow chart, or coordinate layout",
+      "Draw or describe diagram with explicit regions and boundaries",
+      "Apply spatial inference rules: transitivity of containment, path existence, reachability",
+      "Derive conclusions from diagram structure: what flows where, what contains what",
+      "Verify diagram faithfully represents constraints; check for hidden assumptions",
+      "Translate spatial conclusions back to domain terms"
+    ],
+    "check": [
+      "All entities placed with explicit spatial relation to others",
+      "Boundaries and regions clearly defined",
+      "Flow directions marked where relevant",
+      "Diagram consistent with stated constraints",
+      "No spatial relationship asserted without justification"
+    ],
+    "diff": {
+      "model-based-simulation": "Simulation runs dynamic models forward; Spatial reasons from static structure and topology",
+      "systems-thinking": "Systems uses loops and delays; Spatial uses containment and adjacency",
+      "qualitative": "Qualitative tracks directional influence; Spatial tracks geometric arrangement"
+    },
+    "fail": {
+      "mode": "Diagram treated as truth without verifying constraint coverage",
+      "signal": "Clean diagram hides missing constraints or messy real-world complexity",
+      "mit": [
+        "List all constraints diagram must satisfy; check each",
+        "Ask what is NOT shown in the diagram",
+        "Cross-check diagram against textual requirements",
+        "Test edge cases: what happens at boundaries?"
+      ]
+    },
+    "use": [
+      "Architecture diagrams: component placement, dependencies",
+      "Supply chain mapping: flow of goods, bottlenecks",
+      "UX design: screen flows, navigation paths",
+      "Robotics: spatial planning, obstacle avoidance",
+      "Network topology: reachability, segmentation"
+    ],
+    "rel": [
+      {"id": 42, "name": "model-based-simulation", "note": "adds dynamics to spatial models"},
+      {"id": 43, "name": "systems-thinking", "note": "often uses diagrams for loop structure"},
+      {"id": 29, "name": "qualitative", "note": "directional without explicit spatial layout"}
+    ],
+    "ex": {
+      "problem": "Can service A reach database D given network segmentation?",
+      "entities": ["Service A", "Service B", "Gateway G", "Database D", "Zone-Public", "Zone-Private"],
+      "relations": [
+        {"type": "containment", "desc": "A in Zone-Public, D in Zone-Private"},
+        {"type": "adjacency", "desc": "Zone-Public adjacent to Gateway G"},
+        {"type": "flow", "desc": "G allows traffic from Zone-Public to Zone-Private on port 5432"}
+      ],
+      "inference": "A -> G -> D path exists; A can reach D through G on port 5432",
+      "constraint_check": "Firewall rules on G must permit; diagram confirmed against config"
+    }
+  }
+}

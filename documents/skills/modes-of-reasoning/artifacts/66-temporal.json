@@ -1,0 +1,68 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/temporal@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 66,
+    "name": "temporal",
+    "cat": "formal",
+    "core": "Reason about ordering, duration, persistence, and change over time. Model when events occur, how long states persist, and what triggers transitions between states.",
+    "out": [
+      {"type": "temporal_constraints", "form": "before/after/during relations between events", "test": "constraints form consistent partial order"},
+      {"type": "timeline", "form": "ordered sequence of states and transitions", "test": "all events placed with no contradictions"},
+      {"type": "persistence_assumptions", "form": "list of what holds until changed", "test": "each assumption has explicit invalidation trigger"},
+      {"type": "change_detection", "form": "state transitions with timestamps and causes", "test": "every change has identified trigger event"}
+    ],
+    "proc": [
+      "identify temporal entities: events, states, intervals, instants",
+      "establish ordering: determine before/after/meets/overlaps relations",
+      "declare persistence: state what holds by default until changed",
+      "model transitions: specify triggers that invalidate persistence",
+      "check consistency: verify no circular or contradictory orderings"
+    ],
+    "check": [
+      "all events have relative or absolute time placement",
+      "persistence assumptions are explicit not implicit",
+      "transition triggers are specified for each state change",
+      "no circular temporal dependencies",
+      "duration estimates have stated precision",
+      "timeline accounts for all known events"
+    ],
+    "diff": {
+      "modal": "modal reasons about possibility/necessity; temporal reasons about when truth holds",
+      "planning-policy": "planning uses temporal to sequence actions; temporal provides the time logic",
+      "historical-investigative": "historical reconstructs past timelines; temporal provides formal framework"
+    },
+    "fail": {
+      "mode": "hidden persistence assumptions; assuming things stay true without explicit justification",
+      "signal": "conclusions rely on unstated 'still true' assumptions; no invalidation conditions",
+      "mit": [
+        "make all persistence assumptions explicit",
+        "require invalidation triggers for each persistent state",
+        "validate timeline consistency before drawing conclusions",
+        "distinguish between 'known to hold' vs 'assumed to hold'"
+      ]
+    },
+    "use": [
+      "scheduling and resource allocation",
+      "planning and workflow design",
+      "forensic timeline reconstruction",
+      "narrative consistency checking",
+      "state management in systems"
+    ],
+    "rel": [
+      {"id": 64, "name": "modal", "why": "temporal as specialized modal logic"},
+      {"id": 47, "name": "planning-policy", "why": "sequencing actions over time"},
+      {"id": 73, "name": "historical-investigative", "why": "reconstructing past timelines"}
+    ],
+    "ex": {
+      "ctx": "Events: A(login 9:00), B(file-access 9:15), C(logout 9:10). Query: could B have occurred?",
+      "analysis": "Temporal constraint: A before C (9:00 < 9:10). B at 9:15 is after C. Persistence: session active from A until C. B requires active session. B at 9:15 violates constraint (after logout). Conclusion: B impossible given timeline."
+    }
+  }
+}

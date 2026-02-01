@@ -1,0 +1,68 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/hermeneutic-interpretive@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 61,
+    "name": "hermeneutic-interpretive",
+    "cat": "domain",
+    "core": "Infer meaning and intent from language, documents, norms, and artifacts using context and interpretive canons; manage ambiguity through contextual understanding rather than formal entailment.",
+    "out": [
+      {"type": "interpretation", "form": "meaning statement with supporting context citations", "test": "interpretation traces to specific textual evidence"},
+      {"type": "reconciled_meaning", "form": "unified reading resolving apparent contradictions", "test": "conflicting passages addressed with explicit rationale"},
+      {"type": "clarified_definition", "form": "term/phrase definition with scope and boundaries", "test": "definition distinguishes intended vs excluded meanings"},
+      {"type": "contextual_understanding", "form": "situational frame explaining why text says what it does", "test": "frame accounts for author, audience, and purpose"}
+    ],
+    "proc": [
+      "identify ambiguous terms, phrases, or passages requiring interpretation",
+      "gather context: author intent, historical setting, audience, document purpose",
+      "apply interpretive canons: plain meaning, contextual, purposive, harmonizing",
+      "reconcile conflicting readings by weighing evidence and coherence",
+      "document interpretation with citations and confidence level"
+    ],
+    "check": [
+      "interpretation cites specific textual evidence",
+      "context sources are identified not assumed",
+      "multiple plausible readings considered before selecting",
+      "author intent vs reader inference distinguished",
+      "cultural/temporal context acknowledged",
+      "confidence level stated for contested interpretations"
+    ],
+    "diff": {
+      "legal": "legal applies formal interpretive rules within institutional authority; hermeneutic is the broader interpretive methodology",
+      "narrative": "narrative constructs meaning through story structure; hermeneutic extracts meaning from existing text",
+      "sensemaking": "sensemaking builds new frames from ambiguous data; hermeneutic interprets within existing frames"
+    },
+    "fail": {
+      "mode": "over-interpretation; reading intent that isn't there; finding meaning author never intended",
+      "signal": "interpretation unsupported by text; context fabricated; single reading asserted without alternatives",
+      "mit": [
+        "require textual citation for every interpretive claim",
+        "list alternative readings before selecting preferred",
+        "distinguish author intent from reader inference explicitly",
+        "flag low-confidence interpretations for validation"
+      ]
+    },
+    "use": [
+      "contract interpretation",
+      "policy document analysis",
+      "requirements clarification",
+      "qualitative feedback synthesis",
+      "cross-cultural communication"
+    ],
+    "rel": [
+      {"id": 71, "name": "legal", "why": "formal interpretation within institutional constraints"},
+      {"id": 62, "name": "narrative-causal-storytelling", "why": "meaning through story structure"},
+      {"id": 63, "name": "sensemaking-frame-building", "why": "building interpretive frames from ambiguity"}
+    ],
+    "ex": {
+      "ctx": "Contract clause: 'Deliverables must be completed in a timely manner.' Dispute over whether 30-day delay is breach.",
+      "analysis": "Plain meaning: 'timely' undefined. Context: industry standard is 14 days; prior dealings allowed 21 days. Purposive: clause protects against unreasonable delay, not perfection. Interpretation: 30 days likely breach given context, but flag for negotiation given ambiguity. Confidence: medium."
+    }
+  }
+}

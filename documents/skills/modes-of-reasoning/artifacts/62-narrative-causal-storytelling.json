@@ -1,0 +1,85 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/narrative-causal-storytelling@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 62,
+    "name": "narrative-causal-storytelling",
+    "cat": "argumentation",
+    "core": "Build coherent time-ordered explanations connecting events, motives, and causes into a story supporting prediction and action. Integrates causal, abductive, and rhetorical constraints into persuasive explanations.",
+    "out": [
+      {"n": "postmortems", "d": "incident analysis with causal chains"},
+      {"n": "strategy_narratives", "d": "coherent accounts of strategic rationale"},
+      {"n": "scenario_stories", "d": "future-oriented causal projections"},
+      {"n": "causal_explanations", "d": "why-chains linking events to outcomes"}
+    ],
+    "proc": [
+      "identify key events: enumerate significant occurrences in sequence",
+      "establish timeline: order events chronologically",
+      "infer motives: attribute intentions to actors",
+      "trace causal links: connect events through cause-effect relations",
+      "synthesize narrative: weave elements into coherent story"
+    ],
+    "check": [
+      "timeline internally consistent",
+      "causal links plausible and supported",
+      "alternative explanations considered",
+      "motives attributed with evidence",
+      "narrative not over-fitted to outcome",
+      "gaps and uncertainties acknowledged"
+    ],
+    "diff": {
+      "abductive": "full narrative arc vs single best explanation",
+      "causal-inference": "story coherence vs statistical validation",
+      "rhetorical": "explanation-focused vs persuasion-focused",
+      "mechanistic": "actor-centric story vs process-centric model"
+    },
+    "fail": {
+      "mode": "over_coherence",
+      "signals": [
+        "story feels too neat or complete",
+        "alternative hypotheses dismissed quickly",
+        "hindsight bias shapes causal attribution",
+        "inconvenient facts omitted",
+        "narrative closure prioritized over accuracy"
+      ],
+      "mitigations": [
+        "explicitly list alternative narratives",
+        "mark confidence levels on causal links",
+        "include unexplained anomalies",
+        "test story against counterfactuals",
+        "seek disconfirming evidence"
+      ]
+    },
+    "use": [
+      "incident reports",
+      "executive communication",
+      "complex causal chain explanation",
+      "teaching and training",
+      "strategic communication"
+    ],
+    "rel": [
+      {"id": 13, "n": "abductive", "r": "generating explanations"},
+      {"id": 37, "n": "causal-inference", "r": "validating causal claims"},
+      {"id": 60, "n": "rhetorical", "r": "persuasive communication"},
+      {"id": 40, "n": "mechanistic", "r": "process-level causation"},
+      {"id": 39, "n": "counterfactual", "r": "testing causal necessity"}
+    ],
+    "ex": {
+      "sit": "Postmortem: Production outage lasted 4 hours. Need to explain what happened and why.",
+      "steps": [
+        "events: deploy at 14:00, alerts at 14:15, rollback at 18:00",
+        "timeline: deploy -> cache miss spike -> DB overload -> cascading failure",
+        "motives: team rushed deploy to meet deadline pressure",
+        "causal links: new code path bypassed cache -> 10x DB load",
+        "narrative: deadline pressure led to skipped load test, revealing cache dependency"
+      ],
+      "insight": "narrative exposes systemic cause (deadline pressure) beyond proximate cause (bad code)"
+    }
+  }
+}

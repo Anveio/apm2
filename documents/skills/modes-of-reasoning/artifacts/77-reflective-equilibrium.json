@@ -1,0 +1,87 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/reflective-equilibrium@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 77,
+    "name": "reflective-equilibrium",
+    "cat": "meta",
+    "core": "Iteratively adjust both abstract principles and concrete case judgments until they cohere. Neither theory nor intuition has automatic priority; both evolve together through mutual revision.",
+    "out": [
+      "coherent_principles: general rules that accommodate considered judgments",
+      "case_decisions: specific judgments consistent with principles",
+      "updated_policies: revised norms reflecting equilibrium",
+      "justified_exceptions: principled reasons for departures",
+      "harmonized_judgments: previously conflicting intuitions reconciled"
+    ],
+    "proc": [
+      "articulate initial principles and intuitive case judgments",
+      "identify tensions between principles and judgments",
+      "consider revising principle to accommodate strong intuition",
+      "consider revising judgment to honor compelling principle",
+      "iterate until no further revisions improve coherence",
+      "document final equilibrium with justification for each adjustment"
+    ],
+    "check": [
+      "principles and judgments stated explicitly before revision",
+      "tensions identified and catalogued",
+      "each revision justified by coherence gain",
+      "difficult cases genuinely addressed not quietly dropped",
+      "final set internally consistent",
+      "trade-offs documented when perfect coherence impossible"
+    ],
+    "diff": {
+      "deductive": "deduction derives conclusions from fixed axioms; reflective equilibrium allows axioms to change",
+      "moral-ethical": "moral reasoning applies normative content; reflective equilibrium is the method for refining that content",
+      "dialectical": "dialectic synthesizes opposing views; reflective equilibrium iterates between theory and cases",
+      "belief-revision": "belief revision updates beliefs given evidence; reflective equilibrium updates principles given judgments and vice versa"
+    },
+    "fail": {
+      "mode": "coherence by case-dropping",
+      "signals": [
+        "hard cases quietly ignored",
+        "principles only tested on easy examples",
+        "intuitions dismissed without principled reason",
+        "equilibrium reached too quickly",
+        "no record of revisions made"
+      ],
+      "mitigations": [
+        "maintain explicit list of difficult cases",
+        "require justification for each excluded case",
+        "seek adversarial cases from others",
+        "document revision history",
+        "revisit equilibrium when new hard cases arise"
+      ]
+    },
+    "use": [
+      "policy design balancing general rules with edge cases",
+      "governance frameworks requiring stakeholder buy-in",
+      "ethics development refining moral principles",
+      "standard setting harmonizing competing requirements",
+      "value-laden decisions requiring principled justification"
+    ],
+    "rel": [
+      "72-moral-ethical",
+      "59-dialectical",
+      "33-belief-revision",
+      "75-meta-reasoning",
+      "76-calibration-epistemic-humility"
+    ],
+    "ex": {
+      "situation": "organization developing data privacy policy",
+      "steps": [
+        "stated principle: minimize data collection",
+        "case judgment: fraud detection needs behavioral data",
+        "tension: principle conflicts with legitimate use case",
+        "revised principle: minimize unnecessary data; define necessary as required for stated service purpose",
+        "tested against more cases: marketing analytics fails; security logging passes",
+        "equilibrium: principle now coherent with considered judgments on 12 test cases"
+      ]
+    }
+  }
+}

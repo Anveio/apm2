@@ -1,0 +1,81 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/robust-worst-case@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 49,
+    "name": "robust-worst-case",
+    "cat": "decision",
+    "core": "Select actions yielding acceptable outcomes under worst plausible conditions via minimax optimization over threat envelope",
+    "out": [
+      "worst_case_bound",
+      "safety_margin",
+      "threat_envelope",
+      "robust_policy",
+      "residual_risk_statement"
+    ],
+    "proc": [
+      "define_threat_envelope_with_credible_bounds",
+      "enumerate_candidate_actions",
+      "evaluate_each_under_simultaneous_worst_case",
+      "select_minimax_action_meeting_threshold",
+      "document_residual_risk_outside_envelope",
+      "set_review_trigger_conditions"
+    ],
+    "check": [
+      "threat_envelope_explicit_with_citations",
+      "worst_case_outcome_computed_not_asserted",
+      "residual_risk_documented",
+      "robustness_cost_vs_expected_value_quantified",
+      "review_trigger_defined"
+    ],
+    "diff": {
+      "decision-theoretic": "optimizes_worst_floor_not_probability_weighted_average",
+      "minimax-regret": "minimizes_absolute_loss_not_relative_regret",
+      "adversarial-red-team": "defends_against_threats_not_generates_attacks",
+      "assurance-case": "selects_policy_while_assurance_documents_safety_claim"
+    },
+    "fail": {
+      "mode": "overconservatism",
+      "desc": "threat_envelope_includes_implausible_scenarios_leaving_value_on_table",
+      "signals": [
+        "envelope_includes_negligible_probability_scenarios",
+        "stakeholders_reject_solution_as_too_costly",
+        "cannot_articulate_credibility_of_worst_case_bound"
+      ],
+      "mit": [
+        "require_credibility_evidence_per_threat",
+        "compute_robustness_tax_vs_expected_value",
+        "use_tiered_envelopes_plausible_vs_extreme",
+        "set_explicit_value_at_risk_budget"
+      ]
+    },
+    "use": [
+      "safety_critical_systems",
+      "security_design",
+      "regulatory_hard_constraints",
+      "tail_risk_control",
+      "sla_guarantees",
+      "adversarial_ml_certified_robustness"
+    ],
+    "rel": [
+      "decision-theoretic",
+      "minimax-regret",
+      "imprecise-probability",
+      "adversarial-red-team",
+      "assurance-case"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_adversarial": "robust_defends_adversarial_generates_attacks_are_complements",
+        "vs_minimax_regret": "robust_optimizes_absolute_outcome_regret_optimizes_relative_distance",
+        "vs_assurance_case": "robust_selects_policy_assurance_documents_why_it_meets_claims"
+      }
+    }
+  }
+}

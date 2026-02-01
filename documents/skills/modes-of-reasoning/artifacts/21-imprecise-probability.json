@@ -1,0 +1,79 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/imprecise-probability@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 21,
+    "name": "imprecise-probability",
+    "cat": "uncertain",
+    "core": "Represent uncertainty with probability ranges when precision is unjustified, separating unknown from unlikely",
+    "out": [
+      "probability_interval",
+      "belief_bounds",
+      "sensitivity_analysis",
+      "robust_conclusion",
+      "decision_under_ambiguity"
+    ],
+    "proc": [
+      "identify_uncertainty_sources_and_available_evidence",
+      "construct_credal_set_or_probability_intervals",
+      "propagate_intervals_through_inference",
+      "identify_robust_conclusions_across_interval",
+      "apply_decision_rule_for_interval_valued_utilities",
+      "report_sensitivity_to_interval_width"
+    ],
+    "check": [
+      "intervals_reflect_genuine_epistemic_state_not_arbitrary_padding",
+      "unknown_distinct_from_low_probability",
+      "decision_rule_specified_for_ambiguous_cases",
+      "sensitivity_analysis_completed",
+      "interval_bounds_justified_by_evidence"
+    ],
+    "diff": {
+      "bayesian-probabilistic": "uses_intervals_not_single_priors_when_evidence_insufficient",
+      "robust-worst-case": "considers_full_interval_not_just_worst_endpoint",
+      "evidential-dempster-shafer": "uses_probability_bounds_vs_belief_plausibility_functions"
+    },
+    "fail": {
+      "mode": "decision_paralysis",
+      "desc": "wide_intervals_prevent_action_without_decision_rule",
+      "signals": [
+        "intervals_too_wide_to_discriminate_options",
+        "no_decision_rule_specified_for_overlapping_intervals",
+        "analysis_stalls_awaiting_unattainable_precision"
+      ],
+      "mit": [
+        "adopt_explicit_decision_rule_maximin_gamma_maximax",
+        "identify_value_of_information_to_narrow_intervals",
+        "use_robust_satisficing_over_interval_maximization",
+        "set_acceptable_ambiguity_threshold_for_action"
+      ]
+    },
+    "use": [
+      "high_stakes_decisions_with_weak_priors",
+      "governance_and_risk_assessment",
+      "robustness_checks_on_probabilistic_models",
+      "deep_uncertainty_scenarios",
+      "expert_disagreement_aggregation"
+    ],
+    "rel": [
+      "bayesian-probabilistic",
+      "robust-worst-case",
+      "evidential-dempster-shafer",
+      "value-of-information",
+      "decision-theoretic"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_bayesian": "imprecise_admits_ignorance_bayesian_requires_point_prior",
+        "vs_robust": "imprecise_considers_full_range_robust_focuses_worst_case",
+        "vs_frequentist": "imprecise_models_epistemic_state_frequentist_models_aleatory"
+      }
+    }
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/many-valued-partial-logics@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 26,
+    "name": "many-valued-partial-logics",
+    "cat": "uncertain",
+    "core": "Use more than two truth values to explicitly represent unknown, undefined, or indeterminate states rather than forcing binary choices",
+    "out": [
+      "multi_valued_truth_assignment",
+      "indeterminacy_tracking",
+      "gap_handling_inference",
+      "partial_knowledge_representation",
+      "null_aware_query_result"
+    ],
+    "proc": [
+      "identify_propositions_lacking_definite_truth_value",
+      "assign_appropriate_third_value_unknown_undefined_null",
+      "propagate_truth_values_using_many_valued_semantics",
+      "distinguish_gaps_from_false_in_inference",
+      "draw_conclusions_respecting_indeterminacy",
+      "report_which_results_depend_on_unknown_values"
+    ],
+    "check": [
+      "unknown_not_conflated_with_false",
+      "undefined_not_conflated_with_unknown",
+      "truth_value_propagation_follows_chosen_logic",
+      "gaps_explicitly_tracked_through_inference",
+      "conclusions_qualified_by_indeterminacy_dependence"
+    ],
+    "diff": {
+      "fuzzy-logic": "discrete_truth_values_vs_continuous_degrees",
+      "paraconsistent": "handles_gaps_vs_contradictions",
+      "default-typicality": "explicit_unknown_vs_assume_true_by_default"
+    },
+    "fail": {
+      "mode": "unknown_false_conflation",
+      "desc": "treating_absence_of_knowledge_as_evidence_of_falsity",
+      "signals": [
+        "closed_world_assumption_applied_inappropriately",
+        "missing_data_treated_as_negative_evidence",
+        "null_comparisons_yield_unexpected_results"
+      ],
+      "mit": [
+        "use_open_world_semantics_where_appropriate",
+        "explicitly_track_unknown_vs_false_throughout",
+        "apply_three_valued_logic_to_null_handling",
+        "document_closed_world_assumptions_when_used"
+      ]
+    },
+    "use": [
+      "databases_with_null_values",
+      "partial_specifications",
+      "incomplete_knowledge_bases",
+      "presupposition_failure_handling",
+      "missingness_aware_reasoning"
+    ],
+    "rel": [
+      "fuzzy-logic",
+      "paraconsistent",
+      "default-typicality",
+      "imprecise-probability",
+      "evidential-dempster-shafer"
+    ],
+    "ex": {
+      "confusion": {
+        "vs_fuzzy": "many_valued_uses_discrete_values_fuzzy_uses_continuous_range",
+        "vs_binary": "many_valued_represents_gaps_binary_forces_choice",
+        "vs_default": "many_valued_preserves_unknown_default_assumes_typical"
+      }
+    }
+  }
+}

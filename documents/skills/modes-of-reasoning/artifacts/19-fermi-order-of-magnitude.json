@@ -1,0 +1,59 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/fermi-order-of-magnitude@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 19,
+    "name": "fermi-order-of-magnitude",
+    "cat": "ampliative",
+    "core": "Rough quantitative estimates via decomposition and bounding; aims for scale correctness rather than precision.",
+    "out": [
+      "back-of-the-envelope estimates",
+      "upper/lower bounds",
+      "sensitivity drivers",
+      "sanity checks"
+    ],
+    "proc": [
+      "decompose unknown quantity into estimable components",
+      "estimate each component with rough bounds",
+      "multiply or combine estimates",
+      "identify dominant terms driving the result",
+      "sanity-check against known reference points"
+    ],
+    "check": [
+      "units consistent throughout?",
+      "all implicit assumptions stated?",
+      "component estimates plausible?",
+      "result within expected order of magnitude?"
+    ],
+    "diff": {
+      "vs_qualitative": "produces numeric estimates, not just directional trends",
+      "vs_reference_class": "decomposes from scratch rather than anchoring to base rates"
+    },
+    "fail": {
+      "mode": "hidden unit/assumption errors",
+      "desc": "unit mistakes or implicit assumptions left untested; errors in component estimates compound multiplicatively"
+    },
+    "use": [
+      "early feasibility assessment",
+      "sanity checks on detailed calculations",
+      "identifying dominant cost or risk terms",
+      "quick prioritization decisions",
+      "interview estimation problems"
+    ],
+    "rel": [
+      {"id": 29, "name": "qualitative", "link": "even coarser directional reasoning"},
+      {"id": 18, "name": "reference-class-outside-view", "link": "anchored to base rates"},
+      {"id": 51, "name": "satisficing", "link": "good-enough decision making"}
+    ],
+    "ex": {
+      "scenario": "estimating annual piano tuner demand in a city",
+      "approach": "decompose: population -> pianos per household -> tunings per year -> time per tuning -> tuners needed; yields order-of-magnitude answer"
+    }
+  }
+}

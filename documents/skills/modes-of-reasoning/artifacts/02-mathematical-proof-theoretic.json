@@ -1,0 +1,54 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/mathematical-proof-theoretic@1",
+    "classification": "PUBLIC",
+    "created_at": "2025-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 2,
+    "name": "mathematical-proof-theoretic",
+    "cat": "formal",
+    "core": "Deduction where the proof object matters: what counts as a proof and how it is constructed. The proof itself is a first-class artifact, not just the conclusion.",
+    "out": [
+      "formal proofs (sometimes machine-checkable)",
+      "proof transformations",
+      "derivability results"
+    ],
+    "proc": [
+      "formalize statement in proof system",
+      "select proof strategy and axioms",
+      "construct derivation step-by-step",
+      "verify proof validity and completeness"
+    ],
+    "check": [
+      "proof syntactically valid in chosen system?",
+      "all axioms and lemmas justified?",
+      "derivation steps sound?"
+    ],
+    "diff": {
+      "vs_everyday_deduction": "more structured; emphasizes derivability and proof structure as primary output"
+    },
+    "fail": {
+      "mode": "spec-mismatch",
+      "desc": "proving the wrong theorem or proving something irrelevant to actual outcomes; proof is correct but disconnected from what matters"
+    },
+    "use": [
+      "formal methods",
+      "theorem proving",
+      "certified reasoning pipelines",
+      "building verified software components"
+    ],
+    "rel": [
+      {"id": 1, "name": "deductive-reasoning", "link": "underlying inference pattern"},
+      {"id": 3, "name": "constructive-intuitionistic", "link": "proofs as algorithms"},
+      {"id": 7, "name": "type-theoretic", "link": "propositions as types"}
+    ],
+    "ex": {
+      "scenario": "verifying a cryptographic protocol",
+      "approach": "construct formal proof of security properties in a proof assistant"
+    }
+  }
+}
