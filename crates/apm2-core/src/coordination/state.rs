@@ -323,7 +323,14 @@ impl fmt::Display for CoordinationError {
     }
 }
 
-impl std::error::Error for CoordinationError {}
+/// Default tick rate for legacy deserialization (1kHz = 1ms per tick).
+///
+/// Used when deserializing legacy JSON where `max_duration_ms` or `elapsed_ms`
+/// were provided without an explicit `tick_rate_hz`. Preserves the semantic
+/// value of the legacy fields (milliseconds).
+const fn default_legacy_tick_rate() -> u64 {
+    1000
+}
 
 /// Budget constraints for a coordination.
 ///
@@ -357,6 +364,12 @@ pub struct CoordinationBudget {
     /// Must match the system's HTF tick rate. Common values:
     /// - `1_000_000` (1MHz): 1 tick = 1 microsecond
     /// - `1_000_000_000` (1GHz): 1 tick = 1 nanosecond
+    ///
+    /// # Backward Compatibility
+    ///
+    /// Defaults to 1kHz (1ms) if missing, to support legacy data where
+    /// `max_duration_ms` was used.
+    #[serde(default = "default_legacy_tick_rate")]
     pub tick_rate_hz: u64,
 
     /// Maximum token consumption (optional).
@@ -466,6 +479,12 @@ pub struct BudgetUsage {
     /// Tick rate in Hz for interpreting `elapsed_ticks`.
     ///
     /// Should match the budget's tick rate and system HTF configuration.
+    ///
+    /// # Backward Compatibility
+    ///
+    /// Defaults to 1kHz (1ms) if missing, to support legacy data where
+    /// `elapsed_ms` was used.
+    #[serde(default = "default_legacy_tick_rate")]
     pub tick_rate_hz: u64,
 
     /// Total tokens consumed across all sessions.
@@ -2429,5 +2448,36 @@ mod tests {
                 current_tick: 500
             })
         ));
+    }
+
+    // =========================================================================
+    // TCK-00242: Legacy JSON Deserialization Tests
+    // =========================================================================
+
+    /// TCK-00242: Verify legacy JSON deserialization works by defaulting
+    /// `tick_rate_hz` to 1000.
+    #[test]
+    fn tck_00242_legacy_json_deserialization() {
+        // Legacy Budget JSON (missing tick_rate_hz)
+        let legacy_budget_json = serde_json::json!({
+            "max_episodes": 10,
+            "max_duration_ms": 60000, // 60 seconds in ms
+            "max_tokens": 1000
+        });
+
+        let budget: CoordinationBudget = serde_json::from_value(legacy_budget_json).unwrap();
+        assert_eq!(budget.max_duration_ticks, 60000);
+        assert_eq!(budget.tick_rate_hz, 1000); // Defaulted to 1kHz
+
+        // Legacy BudgetUsage JSON (missing tick_rate_hz)
+        let legacy_usage_json = serde_json::json!({
+            "consumed_episodes": 5,
+            "elapsed_ms": 30000, // 30 seconds in ms
+            "consumed_tokens": 500
+        });
+
+        let usage: BudgetUsage = serde_json::from_value(legacy_usage_json).unwrap();
+        assert_eq!(usage.elapsed_ticks, 30000);
+        assert_eq!(usage.tick_rate_hz, 1000); // Defaulted to 1kHz
     }
 }

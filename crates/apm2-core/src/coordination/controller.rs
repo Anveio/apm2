@@ -853,13 +853,14 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage
-                .update_elapsed_ticks(
-                    started_at_tick.value(),
-                    current_tick.value(),
-                    current_tick.tick_rate_hz(),
-                )
-                .map_err(|e| match e {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                // The controller must not remain in Running state after a clock anomaly
+                let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
                         ControllerError::InvalidTickRate {
                             expected_hz: expected,
@@ -868,15 +869,25 @@ impl CoordinationController {
                     },
                     CoordinationError::ClockRegression {
                         start_tick,
-                        current_tick,
-                    } => ControllerError::ClockRegression {
-                        start_tick,
-                        current_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        // Transition to Aborted state before returning error
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
                     },
                     _ => ControllerError::Internal {
                         message: format!("unexpected error updating elapsed ticks: {e}"),
                     },
-                })?;
+                };
+                return Err(controller_error);
+            }
         }
 
         // Access tracking by index (handles duplicate work IDs correctly)
@@ -1105,13 +1116,13 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage
-                .update_elapsed_ticks(
-                    started_at_tick.value(),
-                    current_tick.value(),
-                    current_tick.tick_rate_hz(),
-                )
-                .map_err(|e| match e {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
                         ControllerError::InvalidTickRate {
                             expected_hz: expected,
@@ -1120,15 +1131,24 @@ impl CoordinationController {
                     },
                     CoordinationError::ClockRegression {
                         start_tick,
-                        current_tick,
-                    } => ControllerError::ClockRegression {
-                        start_tick,
-                        current_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
                     },
                     _ => ControllerError::Internal {
                         message: format!("unexpected error updating elapsed ticks: {e}"),
                     },
-                })?;
+                };
+                return Err(controller_error);
+            }
         }
 
         // Use placeholder hash (no CAS provided)
@@ -1201,13 +1221,13 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage
-                .update_elapsed_ticks(
-                    started_at_tick.value(),
-                    current_tick.value(),
-                    current_tick.tick_rate_hz(),
-                )
-                .map_err(|e| match e {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                // Auto-abort on clock regression (TCK-00242: fail-closed)
+                let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
                         ControllerError::InvalidTickRate {
                             expected_hz: expected,
@@ -1216,15 +1236,24 @@ impl CoordinationController {
                     },
                     CoordinationError::ClockRegression {
                         start_tick,
-                        current_tick,
-                    } => ControllerError::ClockRegression {
-                        start_tick,
-                        current_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
                     },
                     _ => ControllerError::Internal {
                         message: format!("unexpected error updating elapsed ticks: {e}"),
                     },
-                })?;
+                };
+                return Err(controller_error);
+            }
         }
 
         // Build and store receipt (TCK-00154)
@@ -1307,14 +1336,15 @@ impl CoordinationController {
                 })?;
 
         // Update elapsed time using tick-based tracking (TCK-00242)
+        // Note: For abort(), we don't auto-abort on clock regression since we're
+        // already transitioning to Aborted state. Just map the error.
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage
-                .update_elapsed_ticks(
-                    started_at_tick.value(),
-                    current_tick.value(),
-                    current_tick.tick_rate_hz(),
-                )
-                .map_err(|e| match e {
+            if let Err(e) = self.budget_usage.update_elapsed_ticks(
+                started_at_tick.value(),
+                current_tick.value(),
+                current_tick.tick_rate_hz(),
+            ) {
+                let controller_error = match e {
                     CoordinationError::TickRateMismatch { expected, actual } => {
                         ControllerError::InvalidTickRate {
                             expected_hz: expected,
@@ -1323,15 +1353,25 @@ impl CoordinationController {
                     },
                     CoordinationError::ClockRegression {
                         start_tick,
-                        current_tick,
-                    } => ControllerError::ClockRegression {
-                        start_tick,
-                        current_tick,
+                        current_tick: curr_tick,
+                    } => {
+                        // Even during abort, set the status to Aborted with clock regression reason
+                        self.status = CoordinationStatus::Aborted(AbortReason::Error {
+                            message: format!(
+                                "clock regression detected: current_tick ({curr_tick}) < start_tick ({start_tick})"
+                            ),
+                        });
+                        ControllerError::ClockRegression {
+                            start_tick,
+                            current_tick: curr_tick,
+                        }
                     },
                     _ => ControllerError::Internal {
                         message: format!("unexpected error updating elapsed ticks: {e}"),
                     },
-                })?;
+                };
+                return Err(controller_error);
+            }
         }
 
         let aborted_event = CoordinationAborted::new(
