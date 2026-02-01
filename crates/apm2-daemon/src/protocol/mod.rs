@@ -112,6 +112,10 @@ pub use credentials::PeerCredentials;
 pub use dispatch::{
     // Core dispatcher types
     ConnectionContext,
+    // TCK-00253: Ledger event emitter types
+    LedgerEventEmitter,
+    LedgerEventError,
+    MAX_WORK_CLAIMS,
     // TCK-00253: Policy resolution and work claim types
     PolicyResolution,
     PolicyResolutionError,
@@ -119,8 +123,11 @@ pub use dispatch::{
     PrivilegedDispatcher,
     PrivilegedMessageType,
     PrivilegedResponse,
+    SignedLedgerEvent,
+    StubLedgerEventEmitter,
     StubPolicyResolver,
     StubWorkRegistry,
+    WORK_CLAIMED_DOMAIN_PREFIX,
     WorkClaim,
     WorkRegistry,
     WorkRegistryError,
