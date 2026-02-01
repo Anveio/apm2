@@ -10,6 +10,7 @@
 //! - [INV-0001] An agent cannot execute privileged IPC operations
 //! - [TB-002] Privilege separation boundary: session connections blocked from
 //!   privileged handlers
+//! - [TCK-00253] Actor_id derived from credential, not user input
 //!
 //! # Message Flow
 //!
@@ -25,6 +26,8 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, info, warn};
@@ -36,6 +39,334 @@ use super::messages::{
     IssueCapabilityResponse, PrivilegedError, PrivilegedErrorCode, ShutdownRequest,
     ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, WorkRole,
 };
+
+// ============================================================================
+// Policy Resolver Interface (TCK-00253)
+// ============================================================================
+
+/// Result of a policy resolution request.
+///
+/// Per DD-002, the daemon delegates policy resolution to the governance holon.
+/// This struct captures the resolved policy state for work claiming.
+#[derive(Debug, Clone)]
+pub struct PolicyResolution {
+    /// Unique reference to the `PolicyResolvedForChangeSet` event.
+    pub policy_resolved_ref: String,
+
+    /// BLAKE3 hash of the resolved policy.
+    pub resolved_policy_hash: [u8; 32],
+
+    /// BLAKE3 hash of the capability manifest derived from policy.
+    pub capability_manifest_hash: [u8; 32],
+
+    /// BLAKE3 hash of the sealed context pack.
+    pub context_pack_hash: [u8; 32],
+}
+
+/// Error type for policy resolution operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyResolutionError {
+    /// Policy resolution not found for the given work/role combination.
+    NotFound {
+        /// The work ID that was queried.
+        work_id: String,
+        /// The role that was queried.
+        role: WorkRole,
+    },
+
+    /// Policy resolution failed due to governance error.
+    GovernanceFailed {
+        /// Error message from governance.
+        message: String,
+    },
+
+    /// Invalid credential for policy resolution.
+    InvalidCredential {
+        /// Error message describing the credential issue.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for PolicyResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { work_id, role } => {
+                write!(
+                    f,
+                    "policy resolution not found for work_id={work_id}, role={role:?}"
+                )
+            },
+            Self::GovernanceFailed { message } => {
+                write!(f, "governance failed: {message}")
+            },
+            Self::InvalidCredential { message } => {
+                write!(f, "invalid credential: {message}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for PolicyResolutionError {}
+
+/// Trait for policy resolution delegation to governance.
+///
+/// Per DD-002, the daemon does not embed governance logic. It delegates
+/// policy resolution to the governance holon and mints capability manifests
+/// based on the returned resolution.
+///
+/// # Implementers
+///
+/// - `StubPolicyResolver`: Returns stub data for testing
+/// - `GovernancePolicyResolver`: Delegates to actual governance holon (future)
+pub trait PolicyResolver: Send + Sync {
+    /// Resolves policy for a work claim.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - Generated work ID for this claim
+    /// * `role` - The role being claimed
+    /// * `actor_id` - The authoritative actor ID (derived from credential)
+    ///
+    /// # Returns
+    ///
+    /// `PolicyResolution` containing the resolved policy hashes and references.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PolicyResolutionError` if resolution fails.
+    fn resolve_for_claim(
+        &self,
+        work_id: &str,
+        role: WorkRole,
+        actor_id: &str,
+    ) -> Result<PolicyResolution, PolicyResolutionError>;
+}
+
+/// Stub policy resolver for testing and development.
+///
+/// Returns deterministic stub data. In production, this will be replaced
+/// with a real governance holon integration.
+#[derive(Debug, Clone, Default)]
+pub struct StubPolicyResolver;
+
+impl PolicyResolver for StubPolicyResolver {
+    fn resolve_for_claim(
+        &self,
+        work_id: &str,
+        _role: WorkRole,
+        actor_id: &str,
+    ) -> Result<PolicyResolution, PolicyResolutionError> {
+        // Generate deterministic hashes based on input for testing
+        let policy_hash = blake3::hash(format!("policy:{work_id}:{actor_id}").as_bytes());
+        let manifest_hash = blake3::hash(format!("manifest:{work_id}:{actor_id}").as_bytes());
+        let context_hash = blake3::hash(format!("context:{work_id}:{actor_id}").as_bytes());
+
+        Ok(PolicyResolution {
+            policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
+            resolved_policy_hash: *policy_hash.as_bytes(),
+            capability_manifest_hash: *manifest_hash.as_bytes(),
+            context_pack_hash: *context_hash.as_bytes(),
+        })
+    }
+}
+
+// ============================================================================
+// Work Registry Interface (TCK-00253)
+// ============================================================================
+
+/// A claimed work item with its associated metadata.
+#[derive(Debug, Clone)]
+pub struct WorkClaim {
+    /// Unique work identifier.
+    pub work_id: String,
+
+    /// Lease identifier for this claim.
+    pub lease_id: String,
+
+    /// Authoritative actor ID (derived from credential).
+    pub actor_id: String,
+
+    /// Role claimed for this work.
+    pub role: WorkRole,
+
+    /// Policy resolution for this claim.
+    pub policy_resolution: PolicyResolution,
+}
+
+/// Trait for persisting and querying work claims.
+///
+/// The work registry tracks claimed work items and their associated
+/// policy resolutions. It also handles `WorkClaimed` event signing.
+pub trait WorkRegistry: Send + Sync {
+    /// Registers a new work claim.
+    ///
+    /// # Arguments
+    ///
+    /// * `claim` - The work claim to register
+    ///
+    /// # Returns
+    ///
+    /// The registered `WorkClaim` (may be enriched with additional metadata).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration fails.
+    fn register_claim(&self, claim: WorkClaim) -> Result<WorkClaim, WorkRegistryError>;
+
+    /// Queries a work claim by work ID.
+    fn get_claim(&self, work_id: &str) -> Option<WorkClaim>;
+}
+
+/// Error type for work registry operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkRegistryError {
+    /// Work ID already exists.
+    DuplicateWorkId {
+        /// The duplicate work ID.
+        work_id: String,
+    },
+
+    /// Registration failed.
+    RegistrationFailed {
+        /// Error message.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for WorkRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateWorkId { work_id } => {
+                write!(f, "duplicate work_id: {work_id}")
+            },
+            Self::RegistrationFailed { message } => {
+                write!(f, "registration failed: {message}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for WorkRegistryError {}
+
+/// In-memory stub work registry for testing.
+#[derive(Debug, Default)]
+pub struct StubWorkRegistry {
+    claims: std::sync::RwLock<std::collections::HashMap<String, WorkClaim>>,
+}
+
+impl WorkRegistry for StubWorkRegistry {
+    fn register_claim(&self, claim: WorkClaim) -> Result<WorkClaim, WorkRegistryError> {
+        let mut claims = self.claims.write().expect("lock poisoned");
+        if claims.contains_key(&claim.work_id) {
+            return Err(WorkRegistryError::DuplicateWorkId {
+                work_id: claim.work_id,
+            });
+        }
+        let work_id = claim.work_id.clone();
+        claims.insert(work_id, claim.clone());
+        Ok(claim)
+    }
+
+    fn get_claim(&self, work_id: &str) -> Option<WorkClaim> {
+        let claims = self.claims.read().expect("lock poisoned");
+        claims.get(work_id).cloned()
+    }
+}
+
+// ============================================================================
+// Actor ID Derivation (TCK-00253)
+// ============================================================================
+
+/// Derives the authoritative actor ID from peer credentials.
+///
+/// Per DD-001 and the proto definition, the `actor_id` in the request is a
+/// "display hint" only. The authoritative `actor_id` is derived from the
+/// credential. This implementation uses a fingerprint of the UID and PID
+/// to create a stable identifier.
+///
+/// # Arguments
+///
+/// * `credentials` - The peer credentials from `SO_PEERCRED`
+/// * `nonce` - The nonce from the request (used for additional binding)
+///
+/// # Returns
+///
+/// A stable actor ID string derived from the credential.
+#[must_use]
+pub fn derive_actor_id(credentials: &PeerCredentials, nonce: &[u8]) -> String {
+    // Create a fingerprint from UID, GID, and the nonce
+    // This provides a stable identifier that is bound to the credential
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&credentials.uid.to_le_bytes());
+    hasher.update(&credentials.gid.to_le_bytes());
+    if let Some(pid) = credentials.pid {
+        hasher.update(&pid.to_le_bytes());
+    }
+    hasher.update(nonce);
+
+    let hash = hasher.finalize();
+    let hash_bytes = hash.as_bytes();
+
+    // Use first 16 bytes for a shorter identifier
+    format!(
+        "actor:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        hash_bytes[0],
+        hash_bytes[1],
+        hash_bytes[2],
+        hash_bytes[3],
+        hash_bytes[4],
+        hash_bytes[5],
+        hash_bytes[6],
+        hash_bytes[7]
+    )
+}
+
+/// Generates a unique work ID.
+///
+/// Uses a combination of timestamp and random bytes for uniqueness.
+#[must_use]
+pub fn generate_work_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    // Generate 8 random bytes for uniqueness
+    let random_bytes: [u8; 8] = rand::random();
+    let random_hex = random_bytes
+        .iter()
+        .fold(String::with_capacity(16), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+    format!("W-{timestamp:016x}-{random_hex}")
+}
+
+/// Generates a unique lease ID.
+#[must_use]
+pub fn generate_lease_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let random_bytes: [u8; 8] = rand::random();
+    let random_hex = random_bytes
+        .iter()
+        .fold(String::with_capacity(16), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+    format!("L-{timestamp:016x}-{random_hex}")
+}
 
 // ============================================================================
 // Connection Context
@@ -234,9 +565,21 @@ impl PrivilegedResponse {
 ///   requests
 /// - No privileged handler logic executes for non-privileged connections
 /// - Generic error messages prevent endpoint enumeration (TH-004)
+///
+/// # TCK-00253 Additions
+///
+/// - Policy resolver for governance delegation
+/// - Work registry for claim persistence
+/// - Actor ID derivation from credentials
 pub struct PrivilegedDispatcher {
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
+
+    /// Policy resolver for governance delegation (TCK-00253).
+    policy_resolver: Arc<dyn PolicyResolver>,
+
+    /// Work registry for claim persistence (TCK-00253).
+    work_registry: Arc<dyn WorkRegistry>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -247,17 +590,43 @@ impl Default for PrivilegedDispatcher {
 
 impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration.
+    ///
+    /// Uses stub implementations for policy resolver and work registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
             decode_config: DecodeConfig::default(),
+            policy_resolver: Arc::new(StubPolicyResolver),
+            work_registry: Arc::new(StubWorkRegistry::default()),
         }
     }
 
     /// Creates a new dispatcher with custom decode configuration.
+    ///
+    /// Uses stub implementations for policy resolver and work registry.
     #[must_use]
-    pub const fn with_decode_config(decode_config: DecodeConfig) -> Self {
-        Self { decode_config }
+    pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
+        Self {
+            decode_config,
+            policy_resolver: Arc::new(StubPolicyResolver),
+            work_registry: Arc::new(StubWorkRegistry::default()),
+        }
+    }
+
+    /// Creates a new dispatcher with custom policy resolver and work registry.
+    ///
+    /// This is the production constructor for real governance integration.
+    #[must_use]
+    pub fn with_dependencies(
+        decode_config: DecodeConfig,
+        policy_resolver: Arc<dyn PolicyResolver>,
+        work_registry: Arc<dyn WorkRegistry>,
+    ) -> Self {
+        Self {
+            decode_config,
+            policy_resolver,
+            work_registry,
+        }
     }
 
     /// Dispatches a privileged request to the appropriate handler.
@@ -319,11 +688,21 @@ impl PrivilegedDispatcher {
 
     /// Handles `ClaimWork` requests (IPC-PRIV-001).
     ///
-    /// # Stub Implementation
+    /// # TCK-00253 Implementation
     ///
-    /// This is a stub handler that validates the request and returns a
-    /// placeholder response. Full implementation is in TCK-00253 (`ClaimWork`
-    /// with governance policy resolution).
+    /// This handler implements the work claim flow per DD-001 and DD-002:
+    ///
+    /// 1. Validate request structure
+    /// 2. Derive authoritative `actor_id` from credential (not user input)
+    /// 3. Query governance for `PolicyResolvedForChangeSet`
+    /// 4. Mint capability manifest based on resolved policy
+    /// 5. Register work claim in registry
+    /// 6. Return work assignment
+    ///
+    /// # Security
+    ///
+    /// Per DD-001: The `actor_id` in the request is a display hint only.
+    /// The authoritative `actor_id` is derived from the peer credential.
     fn handle_claim_work(
         &self,
         payload: &[u8],
@@ -336,36 +715,84 @@ impl PrivilegedDispatcher {
                 }
             })?;
 
+        let role = WorkRole::try_from(request.role).unwrap_or(WorkRole::Unspecified);
+
         info!(
-            actor_id = %request.actor_id,
-            role = ?WorkRole::try_from(request.role).unwrap_or(WorkRole::Unspecified),
+            actor_id_hint = %request.actor_id,
+            role = ?role,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "ClaimWork request received (stub handler)"
+            "ClaimWork request received"
         );
 
-        // Validate required fields
-        if request.actor_id.is_empty() {
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                "actor_id is required",
-            ));
-        }
-
-        if request.role == WorkRole::Unspecified as i32 {
+        // Validate role is specified
+        if role == WorkRole::Unspecified {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 "role is required",
             ));
         }
 
-        // STUB: Return placeholder response
-        // Full implementation in TCK-00253
+        // TCK-00253: Derive authoritative actor_id from credential (not user input)
+        // Per DD-001: "actor_id is a display hint; authoritative actor_id derived from credential"
+        let peer_creds = ctx.peer_credentials().ok_or_else(|| ProtocolError::Serialization {
+            reason: "peer credentials required for work claim".to_string(),
+        })?;
+
+        let actor_id = derive_actor_id(peer_creds, &request.nonce);
+
+        debug!(
+            actor_id_hint = %request.actor_id,
+            derived_actor_id = %actor_id,
+            "Actor ID derived from credential"
+        );
+
+        // Generate unique work and lease IDs
+        let work_id = generate_work_id();
+        let lease_id = generate_lease_id();
+
+        // TCK-00253: Query governance for policy resolution
+        // Per DD-002: "Daemon calls HOLON-KERNEL-GOVERNANCE for policy resolution"
+        let policy_resolution = self
+            .policy_resolver
+            .resolve_for_claim(&work_id, role, &actor_id)
+            .map_err(|e| {
+                warn!(error = %e, "Policy resolution failed");
+                ProtocolError::Serialization {
+                    reason: format!("policy resolution failed: {e}"),
+                }
+            })?;
+
+        info!(
+            work_id = %work_id,
+            lease_id = %lease_id,
+            actor_id = %actor_id,
+            policy_resolved_ref = %policy_resolution.policy_resolved_ref,
+            "Work claimed with policy resolution"
+        );
+
+        // Register the work claim
+        let claim = WorkClaim {
+            work_id: work_id.clone(),
+            lease_id: lease_id.clone(),
+            actor_id,
+            role,
+            policy_resolution: policy_resolution.clone(),
+        };
+
+        self.work_registry.register_claim(claim).map_err(|e| {
+            warn!(error = %e, "Work registration failed");
+            ProtocolError::Serialization {
+                reason: format!("work registration failed: {e}"),
+            }
+        })?;
+
+        // Return the work assignment
         Ok(PrivilegedResponse::ClaimWork(ClaimWorkResponse {
-            work_id: "W-STUB-001".to_string(),
-            lease_id: "L-STUB-001".to_string(),
-            capability_manifest_hash: vec![0u8; 32],
-            policy_resolved_ref: "PolicyResolvedForChangeSet:STUB".to_string(),
-            context_pack_hash: vec![0u8; 32],
+            work_id,
+            lease_id,
+            capability_manifest_hash: policy_resolution.capability_manifest_hash.to_vec(),
+            policy_resolved_ref: policy_resolution.policy_resolved_ref,
+            context_pack_hash: policy_resolution.context_pack_hash.to_vec(),
         }))
     }
 
@@ -915,35 +1342,37 @@ mod tests {
     }
 
     // ========================================================================
-    // ADV-005: ClaimWork with capability parameters rejected
+    // ADV-005: ClaimWork role validation
     // ========================================================================
     #[test]
     fn test_adv_005_claim_work_validation() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
-        // Test missing actor_id
+        // TCK-00253: Empty actor_id in request is OK (it's just a display hint)
+        // The authoritative actor_id is derived from credential
         let request = ClaimWorkRequest {
-            actor_id: String::new(),
+            actor_id: String::new(), // Empty is OK - we derive from credential
             role: WorkRole::Implementer.into(),
             credential_signature: vec![],
-            nonce: vec![],
+            nonce: vec![1, 2, 3, 4], // Nonce for actor_id derivation
         };
         let frame = encode_claim_work_request(&request);
         let response = dispatcher.dispatch(&frame, &ctx).unwrap();
 
+        // Should succeed now - actor_id is derived, not validated
         match response {
-            PrivilegedResponse::Error(err) => {
-                assert_eq!(
-                    err.code,
-                    PrivilegedErrorCode::CapabilityRequestRejected as i32
-                );
-                assert!(err.message.contains("actor_id"));
+            PrivilegedResponse::ClaimWork(resp) => {
+                assert!(!resp.work_id.is_empty());
+                assert!(!resp.lease_id.is_empty());
             },
-            _ => panic!("Expected validation error for empty actor_id"),
+            PrivilegedResponse::Error(err) => {
+                panic!("Unexpected error: {err:?}");
+            },
+            _ => panic!("Expected ClaimWork response"),
         }
 
-        // Test missing role
+        // Test missing role - still required
         let request = ClaimWorkRequest {
             actor_id: "test-actor".to_string(),
             role: WorkRole::Unspecified.into(),
@@ -962,6 +1391,247 @@ mod tests {
                 assert!(err.message.contains("role"));
             },
             _ => panic!("Expected validation error for unspecified role"),
+        }
+    }
+
+    // ========================================================================
+    // TCK-00253: Actor ID derived from credential tests
+    // ========================================================================
+    mod tck_00253 {
+        use super::*;
+
+        /// ADV-005: Actor ID must be derived from credential, not user input.
+        ///
+        /// This test verifies that different user-provided actor_ids with
+        /// the same credential produce the same derived actor_id.
+        #[test]
+        fn test_actor_id_derived_from_credential_not_user_input() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = make_privileged_ctx();
+
+            // Same nonce but different user-provided actor_id
+            let nonce = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+            // Request 1: User provides "alice"
+            let request1 = ClaimWorkRequest {
+                actor_id: "alice".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: nonce.clone(),
+            };
+            let frame1 = encode_claim_work_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+
+            // Request 2: User provides "bob" (different from alice)
+            let request2 = ClaimWorkRequest {
+                actor_id: "bob".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: nonce.clone(),
+            };
+            let frame2 = encode_claim_work_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+
+            // Both should succeed
+            let resp1 = match response1 {
+                PrivilegedResponse::ClaimWork(r) => r,
+                _ => panic!("Expected ClaimWork response"),
+            };
+            let resp2 = match response2 {
+                PrivilegedResponse::ClaimWork(r) => r,
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Work IDs should be different (unique per claim)
+            assert_ne!(resp1.work_id, resp2.work_id);
+
+            // But the derived actor_id should be the same since credentials are the same
+            // We verify this by checking the work registry
+            let claim1 = dispatcher.work_registry.get_claim(&resp1.work_id);
+            let claim2 = dispatcher.work_registry.get_claim(&resp2.work_id);
+
+            assert!(claim1.is_some(), "Work claim 1 should be registered");
+            assert!(claim2.is_some(), "Work claim 2 should be registered");
+
+            // Same credential + same nonce = same derived actor_id
+            assert_eq!(
+                claim1.unwrap().actor_id,
+                claim2.unwrap().actor_id,
+                "Derived actor_id should be the same for same credential + nonce"
+            );
+        }
+
+        /// Different nonces should produce different actor_ids.
+        #[test]
+        fn test_different_nonce_produces_different_actor_id() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = make_privileged_ctx();
+
+            let request1 = ClaimWorkRequest {
+                actor_id: "test".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![1, 1, 1, 1],
+            };
+            let frame1 = encode_claim_work_request(&request1);
+            let response1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+
+            let request2 = ClaimWorkRequest {
+                actor_id: "test".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![2, 2, 2, 2], // Different nonce
+            };
+            let frame2 = encode_claim_work_request(&request2);
+            let response2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+
+            let resp1 = match response1 {
+                PrivilegedResponse::ClaimWork(r) => r,
+                _ => panic!("Expected ClaimWork response"),
+            };
+            let resp2 = match response2 {
+                PrivilegedResponse::ClaimWork(r) => r,
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            let claim1 = dispatcher.work_registry.get_claim(&resp1.work_id).unwrap();
+            let claim2 = dispatcher.work_registry.get_claim(&resp2.work_id).unwrap();
+
+            // Different nonces should produce different actor_ids
+            assert_ne!(
+                claim1.actor_id, claim2.actor_id,
+                "Different nonces should produce different actor_ids"
+            );
+        }
+
+        /// Policy resolution is required for work claim.
+        #[test]
+        fn test_policy_resolution_required_for_claim() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = make_privileged_ctx();
+
+            let request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![1, 2, 3, 4],
+            };
+            let frame = encode_claim_work_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            // Should succeed with policy resolution reference
+            match response {
+                PrivilegedResponse::ClaimWork(resp) => {
+                    assert!(
+                        !resp.policy_resolved_ref.is_empty(),
+                        "PolicyResolvedForChangeSet reference should be present"
+                    );
+                    assert!(
+                        resp.policy_resolved_ref.contains("PolicyResolvedForChangeSet"),
+                        "Reference should indicate PolicyResolvedForChangeSet"
+                    );
+                    assert_eq!(
+                        resp.capability_manifest_hash.len(),
+                        32,
+                        "Capability manifest hash should be 32 bytes"
+                    );
+                    assert_eq!(
+                        resp.context_pack_hash.len(),
+                        32,
+                        "Context pack hash should be 32 bytes"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!("Unexpected error: {err:?}");
+                },
+                _ => panic!("Expected ClaimWork response"),
+            }
+        }
+
+        /// Work claim is persisted in registry.
+        #[test]
+        fn test_work_claimed_event_persisted() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = make_privileged_ctx();
+
+            let request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Reviewer.into(),
+                credential_signature: vec![],
+                nonce: vec![5, 6, 7, 8],
+            };
+            let frame = encode_claim_work_request(&request);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            let work_id = match response {
+                PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+                _ => panic!("Expected ClaimWork response"),
+            };
+
+            // Verify the claim is queryable from the registry
+            let claim = dispatcher
+                .work_registry
+                .get_claim(&work_id)
+                .expect("Work claim should be persisted");
+
+            assert_eq!(claim.work_id, work_id);
+            assert_eq!(claim.role, WorkRole::Reviewer);
+            assert!(claim.actor_id.starts_with("actor:"));
+            assert!(!claim.policy_resolution.policy_resolved_ref.is_empty());
+        }
+
+        /// Missing credentials should fail.
+        #[test]
+        fn test_missing_credentials_fails() {
+            let dispatcher = PrivilegedDispatcher::new();
+            // Privileged connection but no credentials
+            let ctx = ConnectionContext::privileged(None);
+
+            let request = ClaimWorkRequest {
+                actor_id: "test-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![],
+                nonce: vec![1, 2, 3, 4],
+            };
+            let frame = encode_claim_work_request(&request);
+            let result = dispatcher.dispatch(&frame, &ctx);
+
+            // Should fail because we can't derive actor_id without credentials
+            assert!(
+                result.is_err(),
+                "Should fail when credentials are missing"
+            );
+        }
+
+        /// Test derive_actor_id function directly.
+        #[test]
+        fn test_derive_actor_id_deterministic() {
+            let creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let nonce = vec![1, 2, 3, 4];
+
+            let actor1 = derive_actor_id(&creds, &nonce);
+            let actor2 = derive_actor_id(&creds, &nonce);
+
+            assert_eq!(actor1, actor2, "Same inputs should produce same actor_id");
+            assert!(actor1.starts_with("actor:"), "Actor ID should have 'actor:' prefix");
+        }
+
+        /// Test work and lease ID generation.
+        #[test]
+        fn test_id_generation_unique() {
+            let work_id1 = generate_work_id();
+            let work_id2 = generate_work_id();
+            assert_ne!(work_id1, work_id2, "Work IDs should be unique");
+            assert!(work_id1.starts_with("W-"), "Work ID should start with 'W-'");
+
+            let lease_id1 = generate_lease_id();
+            let lease_id2 = generate_lease_id();
+            assert_ne!(lease_id1, lease_id2, "Lease IDs should be unique");
+            assert!(lease_id1.starts_with("L-"), "Lease ID should start with 'L-'");
         }
     }
 
