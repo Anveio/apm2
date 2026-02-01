@@ -31,11 +31,12 @@ rfc_rollout_and_ops:
       - id: "ROL-HEF-0003"
         name: "Phase 1C - Session-limited subscriptions"
         steps:
-          - "Enable session.sock subscriptions limited to own episode/work scope."
+          - "Enable session.sock subscriptions limited to capability-manifest allowlists (episode/work/gate scopes)."
           - "Require capability manifest opt-in for any broader patterns."
         guardrails:
           - "Session token validation enforced before ACL evaluation."
           - "Per-connection resource caps enforced."
+          - "Enable-by-default is blocked until GATE-HEF-PROJECTION-ONLY passes (TCK-00309 complete)."
         rollback_steps:
           - "Disable session subscriptions; keep operator subscriptions."
         evidence_ids:

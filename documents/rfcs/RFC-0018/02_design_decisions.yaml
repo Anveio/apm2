@@ -288,11 +288,12 @@ rfc_design_decisions:
     - id: "DD-HEF-0004"
       title: "Default-deny subscription ACLs and daemon-only publish"
       statement: |
-        Operator connections may subscribe broadly; session connections are
-        restricted to their own episode.<episode_id>.{lifecycle,tool,io} and work.<work_id>.events
-        topics by default. Capability manifests may further restrict (never
-        broaden) session subscriptions. Sessions never publish pulse topics;
-        daemon-only publish from outbox after ledger commit.
+        Operator connections may subscribe broadly. Session connections are
+        deny-by-default: sessions may subscribe only to topics explicitly
+        enumerated in the session capability manifest/lease (episode_id/work_id/gate_id
+        scopes). Capability manifests may grant only within policy (never broaden
+        beyond policy). Sessions never publish pulse topics; daemon-only publish
+        from outbox after ledger commit.
       context: |
         Pulse traffic crosses the IPC boundary and must preserve RFC-0017 trust
         boundaries and SoD. Enforcement points: SubscribePulse handling in
@@ -364,8 +365,11 @@ rfc_design_decisions:
         Pulse emission order is: CAS persist -> ledger commit -> outbox enqueue
         -> pulse publish. Outbox storage and fanout live in the daemon; apm2-core
         exposes only a post-commit notification interface and must not depend on
-        daemon types. Ordering is authoritative by LedgerTime (cursor/seq); expiry
-        and backoff windows use MonotonicTicks; HLC is advisory only; wall time is
+        daemon types. Ledger append MUST NOT block on pulse fanout. Post-commit
+        notifications are best-effort and MUST NOT fail the commit. Outbox enqueue
+        occurs after durable commit; fanout is decoupled from the commit path.
+        Ordering is authoritative by LedgerTime (cursor/seq); expiry and backoff
+        windows use MonotonicTicks; HLC is advisory only; wall time is
         observational.
       context: |
         Pulses must never outrun authoritative truth and must respect HTF.

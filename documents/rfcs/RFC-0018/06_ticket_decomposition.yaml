@@ -68,7 +68,7 @@ rfc_ticket_decomposition:
       files_to_create:
         - "crates/apm2-daemon/src/protocol/pulse_acl.rs (ACL evaluation)"
       acceptance_criteria:
-        - "Session subscriptions are limited to own episode/work topics by default."
+        - "Session subscriptions are deny-by-default; only capability-manifest allowlisted topics are accepted."
         - "Operator subscriptions can access full topic taxonomy."
       evidence_ids:
         - "EVID-HEF-0002"
@@ -83,12 +83,14 @@ rfc_ticket_decomposition:
       summary: |
         Enforce caps at daemon boundary: max subscriptions per connection,
         max patterns, max pulses/sec, max queue depth, and max bytes in-flight.
-        Implement drop policy with ordered priority (episode.<id>.io first).
+        Implement drop policy with ordered priority (episode.<episode_id>.io first).
       files_to_modify:
         - "crates/apm2-daemon/src/protocol/ (quota + queue enforcement)"
       files_to_create: []
       acceptance_criteria:
         - "Oversubscription triggers RESOURCE_LIMIT without daemon crash."
+        - "Caps enforced: max_subscriptions_per_connection=16; max_patterns_per_subscription=16; max_total_patterns_per_connection=64."
+        - "Caps enforced: max_pulses_per_sec_per_subscriber=100; max_burst_pulses_per_subscriber=200; max_queue_depth_per_subscriber=256; max_bytes_in_flight_per_subscriber=1048576; max_pulse_payload_bytes=2048."
       evidence_ids:
         - "EVID-HEF-0007"
 
@@ -115,6 +117,7 @@ rfc_ticket_decomposition:
       acceptance_criteria:
         - "Pulse is emitted only after ledger append succeeds."
         - "apm2-core has no daemon dependency; outbox state is daemon-owned."
+        - "Post-commit hook never fails the ledger append; fanout is decoupled."
       evidence_ids:
         - "EVID-HEF-0006"
 
@@ -227,14 +230,18 @@ rfc_ticket_decomposition:
       risk_tier: "T2"
       summary: |
         Disable direct gh api /statuses writes for FAC-adjacent signals in xtask,
-        or route them through daemon projection-only logic. Ensure HEF rollout
-        does not depend on GitHub as a truth source.
+        or route them through daemon projection-only logic. This ticket MUST
+        begin with a repo search for direct GitHub status writes and update the
+        touched file set accordingly. Phase 1 must fail-closed (disable direct
+        writes) until projection routing exists.
       files_to_modify:
         - "xtask/src/tasks/aat.rs (remove or gate direct status writes)"
         - "xtask/src/tasks/push.rs (remove or gate direct status writes)"
         - "xtask/src/tasks/review.rs (remove or gate direct status writes)"
+        - "xtask/src/tasks/security_review_exec.rs (remove or gate direct status writes)"
       files_to_create: []
       acceptance_criteria:
-        - "FAC-adjacent status updates are emitted only via daemon projection logic or disabled."
+        - "Direct GitHub status writes for FAC-adjacent signals are disabled by default."
+        - "If daemon projection routing exists, all status writes are routed through it."
       evidence_ids:
         - "EVID-HEF-0001"

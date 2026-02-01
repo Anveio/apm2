@@ -17,6 +17,10 @@ rfc_governance_and_gates:
       required_evidence_categories:
         - "INTEGRATION_TEST_RESULTS"
         - "SECURITY_SCAN_RESULTS"
+    - gate_id: "GATE-HEF-PROJECTION-ONLY"
+      authority_role: "AUTH_SECURITY"
+      required_evidence_categories:
+        - "SECURITY_SCAN_RESULTS"
   gate_reviews:
     - gate_id: "GATE-RFC-ARCHITECTURE"
       status: "PENDING"
@@ -34,6 +38,9 @@ rfc_governance_and_gates:
         - "EVID-HEF-0005"
         - "EVID-HEF-0006"
         - "EVID-HEF-0007"
+    - gate_id: "GATE-HEF-PROJECTION-ONLY"
+      status: "PENDING"
+      evidence_ids: []
   waivers:
     - id: "WVR-0001"
       scope:

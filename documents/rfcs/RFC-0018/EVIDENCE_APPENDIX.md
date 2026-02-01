@@ -49,9 +49,11 @@ Line ranges are from `nl -ba` output.
 - xtask AAT sets GitHub status checks via gh api:
   `xtask/src/tasks/aat.rs:172-207`.
 - xtask push creates pending GitHub status checks:
-  `xtask/src/tasks/push.rs:239-365`.
+  `xtask/src/tasks/push.rs:353-390`.
 - xtask review updates GitHub status checks:
   `xtask/src/tasks/review.rs:351-369`.
+- xtask security review exec updates GitHub status checks:
+  `xtask/src/tasks/security_review_exec.rs:382-398`.
 
 ## Ledger event emission status
 - StubLedgerEventEmitter is in-memory and intended for testing, not persistence:

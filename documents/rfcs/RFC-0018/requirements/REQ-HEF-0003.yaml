@@ -6,10 +6,12 @@ rfc_requirement:
   title: "Default-deny ACLs and daemon-only publish"
   statement: |
     Pulse subscriptions must be denied by default. operator.sock may subscribe
-    broadly; session.sock is restricted to its own work/episode scope. Sessions
-    never publish pulse topics; daemon-only publish from outbox.
+    broadly; session.sock may subscribe only to topics explicitly allowlisted in
+    the session capability manifest/lease (episode_id/work_id/gate_id scopes).
+    Sessions never publish pulse topics; daemon-only publish from outbox.
   acceptance_criteria:
-    - "Session attempts to subscribe to privileged topics are denied."
+    - "Session subscriptions are denied unless the topic is explicitly allowlisted in the capability manifest/lease."
+    - "Sessions cannot subscribe to arbitrary work_id/gate_id scopes outside their allowlist."
     - "Session attempts to publish pulses are denied."
     - "Operator subscriptions honor ACLs and capability restrictions."
   evidence:

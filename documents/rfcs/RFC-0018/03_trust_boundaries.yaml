@@ -22,7 +22,7 @@ rfc_trust_boundaries:
         - "PulseEvent -> filtered delivery to subscriber"
       authn_authz:
         authn: "Session connections must present a valid session_token before subscription; operator connections rely on socket privilege."
-        authz: "Default-deny ACLs by socket type and capability manifest; daemon-only publish."
+        authz: "Default-deny ACLs; session subscriptions require explicit allowlist in capability manifest/lease; daemon-only publish."
       risks:
         - "Unauthorized subscription to privileged topics"
         - "Pulse-driven authority escalation"

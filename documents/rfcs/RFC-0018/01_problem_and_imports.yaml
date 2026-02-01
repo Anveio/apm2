@@ -38,8 +38,9 @@ rfc_problem_and_imports:
         (crates/apm2-daemon/src/projection/mod.rs:4-21).
       - xtask commands directly write GitHub status checks via gh api, which is a
         bypass surface that HEF must not treat as authoritative
-        (xtask/src/tasks/aat.rs:172-207, xtask/src/tasks/push.rs:239-365,
-        xtask/src/tasks/review.rs:351-369).
+        (xtask/src/tasks/aat.rs:172-207, xtask/src/tasks/push.rs:353-390,
+        xtask/src/tasks/review.rs:351-369,
+        xtask/src/tasks/security_review_exec.rs:382-398).
 
       Dependencies:
       - RFC-0017 DD-009 hard cutover (ProtocolServer-only control plane) is a

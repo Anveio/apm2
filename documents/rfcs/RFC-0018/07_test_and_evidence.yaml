@@ -17,6 +17,13 @@ rfc_test_and_evidence:
         framework: "cargo test"
         evidence_ids:
           - "EVID-HEF-0004"
+      - id: "UT-HEF-0003"
+        name: "Topic grammar audit (no placeholder patterns)"
+        scope: "Reject work..events, gate..., episode.. patterns in RFC-0018"
+        coverage_target: "100%"
+        framework: "bash"
+        evidence_ids:
+          - "EVID-HEF-0008"
     integration:
       - id: "IT-HEF-0001"
         name: "Subscription ACL enforcement"
@@ -32,7 +39,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0006"
       - id: "IT-HEF-0003"
         name: "Backpressure + drop policy"
-        scope: "Queue caps, subscription explosion handling, rate-limit enforcement, drop ordering"
+        scope: "Queue caps (Phase-1 numeric values), subscription explosion handling, rate-limit enforcement, drop ordering"
         test_environment: "Local daemon under load"
         evidence_ids:
           - "EVID-HEF-0007"
@@ -97,4 +104,6 @@ rfc_test_and_evidence:
           artifact_ref: "evidence_artifacts/EVID-HEF-0006.yaml#rfc_evidence_artifact"
         - artifact_id: "EVID-HEF-0007"
           artifact_ref: "evidence_artifacts/EVID-HEF-0007.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0008"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0008.yaml#rfc_evidence_artifact"
       imports: []

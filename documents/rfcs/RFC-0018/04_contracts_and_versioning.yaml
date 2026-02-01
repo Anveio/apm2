@@ -107,6 +107,7 @@ rfc_contracts_and_versioning:
   subscribe_semantics:
     - "SubscribePulseRequest is accepted only after handshake and privilege checks."
     - "Session subscriptions require valid session_token before ACL evaluation."
+    - "Session subscriptions are deny-by-default; only capability-manifest allowlisted topics are accepted."
     - "since_ledger_cursor is a resume hint; correctness requires ledger catch-up."
     - "Pulse replay buffer is optional and non-authoritative; absence is allowed."
     - "Clients must treat pulses as hints and verify via ledger/CAS."
