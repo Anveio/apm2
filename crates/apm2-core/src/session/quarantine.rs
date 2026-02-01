@@ -55,7 +55,8 @@ pub const CONTEXT_TICKS_REMAINING: &str = "ticks_remaining_calculation";
 ///
 /// # Response
 ///
-/// Per `03_trust_boundaries.yaml`, the default response to `CLOCK_REGRESSION` is:
+/// Per `03_trust_boundaries.yaml`, the default response to `CLOCK_REGRESSION`
+/// is:
 /// - Fail-closed for high-risk operations
 /// - Quarantine the affected node
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
