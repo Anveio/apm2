@@ -2846,7 +2846,10 @@ mod tests {
 
         // Multiple wildcards
         assert!(shell_pattern_matches("*cargo*", "run cargo build"));
-        assert!(shell_pattern_matches("git * * -m *", "git commit -a -m test"));
+        assert!(shell_pattern_matches(
+            "git * * -m *",
+            "git commit -a -m test"
+        ));
     }
 
     #[test]

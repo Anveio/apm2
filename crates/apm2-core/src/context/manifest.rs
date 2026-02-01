@@ -349,7 +349,10 @@ impl ToolClassExt for ToolClass {
 /// assert!(shell_pattern_matches("cargo *", "cargo test --release"));
 ///
 /// // Suffix match
-/// assert!(shell_pattern_matches("* --release", "cargo build --release"));
+/// assert!(shell_pattern_matches(
+///     "* --release",
+///     "cargo build --release"
+/// ));
 ///
 /// // Contains match
 /// assert!(shell_pattern_matches("*build*", "cargo build --release"));
@@ -3118,7 +3121,10 @@ pub mod tests {
             .try_build();
 
         assert!(
-            matches!(result, Err(ManifestError::WriteAllowlistPathTraversal { .. })),
+            matches!(
+                result,
+                Err(ManifestError::WriteAllowlistPathTraversal { .. })
+            ),
             "Expected WriteAllowlistPathTraversal, got {result:?}"
         );
     }
@@ -3139,9 +3145,7 @@ pub mod tests {
 
     #[test]
     fn tck_00254_write_allowlist_path_too_long() {
-        let long_path = std::path::PathBuf::from(
-            "/".to_string() + &"x".repeat(MAX_PATH_LENGTH),
-        );
+        let long_path = std::path::PathBuf::from("/".to_string() + &"x".repeat(MAX_PATH_LENGTH));
 
         let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
             .write_allowlist(vec![long_path])
