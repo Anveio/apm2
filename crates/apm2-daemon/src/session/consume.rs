@@ -119,6 +119,32 @@ pub enum ConsumeSessionError {
         /// The manifest ID.
         manifest_id: String,
     },
+
+    /// Write path not allowed in manifest.
+    ///
+    /// Per TCK-00254, write operations are validated against the manifest's
+    /// `write_allowlist`. This error is returned when the write path is not
+    /// in the allowlist (fail-closed semantics).
+    #[error("write path '{path}' not in manifest allowlist for '{manifest_id}'")]
+    WritePathNotAllowed {
+        /// The path that was denied.
+        path: String,
+        /// The manifest ID.
+        manifest_id: String,
+    },
+
+    /// Shell command not allowed in manifest.
+    ///
+    /// Per TCK-00254, shell execution requests are validated against the
+    /// manifest's `shell_allowlist`. This error is returned when the command
+    /// does not match any allowed pattern (fail-closed semantics).
+    #[error("shell command '{command}' not in manifest allowlist for '{manifest_id}'")]
+    ShellCommandNotAllowed {
+        /// The command that was denied.
+        command: String,
+        /// The manifest ID.
+        manifest_id: String,
+    },
 }
 
 // =============================================================================
@@ -452,25 +478,64 @@ pub fn validate_tool_request(
         });
     }
 
-    // Extract path from FileRead for path validation
-    let path = match tool {
-        tool_request::Tool::FileRead(read) => &read.path,
-        _ => return Ok(()), // Not a FileRead, skip path validation
-    };
-
-    // Create firewall and validate
-    let firewall = DefaultContextFirewall::new(manifest, mode);
-    match firewall.validate_read(path, None) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            // SECURITY: Truncate path BEFORE creating the error to prevent
-            // local DoS via oversized paths in error variants.
-            Err(ConsumeSessionError::ContextMiss {
-                path: ContextRefinementRequest::truncate_path_str(path),
-                manifest_id: manifest.manifest_id.clone(),
-                reason: e.to_string(),
-            })
+    // Validate based on tool type
+    match tool {
+        tool_request::Tool::FileRead(read) => {
+            // Validate path against manifest entries
+            let firewall = DefaultContextFirewall::new(manifest, mode);
+            match firewall.validate_read(&read.path, None) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    // SECURITY: Truncate path BEFORE creating the error to prevent
+                    // local DoS via oversized paths in error variants.
+                    Err(ConsumeSessionError::ContextMiss {
+                        path: ContextRefinementRequest::truncate_path_str(&read.path),
+                        manifest_id: manifest.manifest_id.clone(),
+                        reason: e.to_string(),
+                    })
+                },
+            }
         },
+        tool_request::Tool::FileWrite(write) => {
+            // TCK-00254: Validate write path against write_allowlist (fail-closed)
+            let path = std::path::Path::new(&write.path);
+            if !manifest.is_write_path_allowed(path) {
+                return Err(ConsumeSessionError::WritePathNotAllowed {
+                    path: ContextRefinementRequest::truncate_path_str(&write.path),
+                    manifest_id: manifest.manifest_id.clone(),
+                });
+            }
+            Ok(())
+        },
+        tool_request::Tool::FileEdit(edit) => {
+            // TCK-00254: Validate edit path against write_allowlist (fail-closed)
+            let path = std::path::Path::new(&edit.path);
+            if !manifest.is_write_path_allowed(path) {
+                return Err(ConsumeSessionError::WritePathNotAllowed {
+                    path: ContextRefinementRequest::truncate_path_str(&edit.path),
+                    manifest_id: manifest.manifest_id.clone(),
+                });
+            }
+            Ok(())
+        },
+        tool_request::Tool::ShellExec(exec) => {
+            // TCK-00254: Validate shell command against shell_allowlist (fail-closed)
+            if !manifest.is_shell_command_allowed(&exec.command) {
+                // SECURITY: Truncate command to prevent oversized error variants
+                let truncated_command = if exec.command.len() > 256 {
+                    format!("{}...", &exec.command[..256])
+                } else {
+                    exec.command.clone()
+                };
+                return Err(ConsumeSessionError::ShellCommandNotAllowed {
+                    command: truncated_command,
+                    manifest_id: manifest.manifest_id.clone(),
+                });
+            }
+            Ok(())
+        },
+        // Other tool types don't require additional path/command validation
+        _ => Ok(()),
     }
 }
 
@@ -515,8 +580,10 @@ mod tests {
                     .access_level(AccessLevel::Read)
                     .build(),
             )
-            // TCK-00254: Include tool_allowlist for test compatibility
+            // TCK-00254: Include allowlists for test compatibility
             .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute])
+            // Allow "ls" command for shell execution tests
+            .shell_allowlist(vec!["ls".to_string()])
             .build()
     }
 

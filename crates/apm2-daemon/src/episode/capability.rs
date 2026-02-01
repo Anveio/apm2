@@ -947,50 +947,65 @@ impl CapabilityManifest {
     /// Matches a shell command against a pattern with simple glob support.
     ///
     /// Supports `*` as a wildcard that matches any sequence of characters.
+    ///
+    /// # Implementation
+    ///
+    /// Uses streaming iteration over pattern parts to avoid heap allocations
+    /// in the hot path (SEC-DOS-MDL-0001). This is critical since this method
+    /// is called for every tool request against every pattern in the shell
+    /// allowlist (up to `MAX_SHELL_ALLOWLIST` patterns).
     fn shell_pattern_matches(pattern: &str, command: &str) -> bool {
-        // Split pattern by '*' and check if command contains all parts in order
-        let parts: Vec<&str> = pattern.split('*').collect();
-
-        if parts.is_empty() {
-            return true;
-        }
-
-        if parts.len() == 1 {
-            // No wildcards - exact match required
+        // Check for wildcards first - if none, exact match required
+        if !pattern.contains('*') {
             return pattern == command;
         }
 
+        // Streaming iterator over pattern parts (zero allocations)
+        let mut parts = pattern.split('*');
         let mut remaining = command;
 
-        // Check first part (must be at start unless pattern starts with *)
-        if !pattern.starts_with('*') {
-            if let Some(stripped) = remaining.strip_prefix(parts[0]) {
-                remaining = stripped;
-            } else {
-                return false;
+        // Handle first part: must be at start unless pattern starts with '*'
+        if let Some(first) = parts.next() {
+            if !first.is_empty() {
+                // Pattern doesn't start with '*', so first part must be prefix
+                if let Some(stripped) = remaining.strip_prefix(first) {
+                    remaining = stripped;
+                } else {
+                    return false;
+                }
             }
         }
 
-        // Check middle parts (can be anywhere)
-        for part in &parts[1..parts.len() - 1] {
-            if part.is_empty() {
-                continue;
+        // Handle middle and last parts
+        // We peek ahead to distinguish middle parts from the last part
+        let mut prev_part: Option<&str> = None;
+        for part in parts {
+            // Process the previous part as a middle part (can be anywhere)
+            if let Some(p) = prev_part {
+                if !p.is_empty() {
+                    if let Some(pos) = remaining.find(p) {
+                        remaining = &remaining[pos + p.len()..];
+                    } else {
+                        return false;
+                    }
+                }
             }
-            if let Some(pos) = remaining.find(part) {
-                remaining = &remaining[pos + part.len()..];
-            } else {
-                return false;
-            }
+            prev_part = Some(part);
         }
 
-        // Check last part (must be at end unless pattern ends with *)
-        let last_part = parts[parts.len() - 1];
-        if !pattern.ends_with('*') {
-            if !remaining.ends_with(last_part) {
-                return false;
+        // Process the last part: must be at end unless pattern ends with '*'
+        if let Some(last_part) = prev_part {
+            if !pattern.ends_with('*') && !last_part.is_empty() {
+                // Pattern doesn't end with '*', so last part must be suffix
+                if !remaining.ends_with(last_part) {
+                    return false;
+                }
+            } else if !last_part.is_empty() {
+                // Pattern ends with '*', so last part just needs to exist
+                if !remaining.contains(last_part) {
+                    return false;
+                }
             }
-        } else if !last_part.is_empty() && !remaining.contains(last_part) {
-            return false;
         }
 
         true
@@ -1061,8 +1076,10 @@ impl CapabilityManifest {
         }
 
         // TCK-00254: Check write allowlist for Write operations (fail-closed)
-        // If write_allowlist is configured, the path MUST be present for validation.
-        if request.tool_class == ToolClass::Write && !self.write_allowlist.is_empty() {
+        // SECURITY (SEC-SCP-FAC-0020): Always enforce write allowlist check for Write
+        // operations. If the allowlist is empty, is_write_path_allowed returns false,
+        // correctly implementing fail-closed semantics per DD-004.
+        if request.tool_class == ToolClass::Write {
             match &request.path {
                 Some(path) => {
                     if !self.is_write_path_allowed(path) {
@@ -1074,7 +1091,7 @@ impl CapabilityManifest {
                     }
                 },
                 None => {
-                    // SECURITY: Fail-closed - missing path when allowlist is configured
+                    // SECURITY: Fail-closed - Write requests must provide a path
                     return CapabilityDecision::Deny {
                         reason: DenyReason::WritePathRequired,
                     };
@@ -1083,9 +1100,10 @@ impl CapabilityManifest {
         }
 
         // TCK-00254: Check shell allowlist for Execute operations (fail-closed)
-        // If shell_allowlist is configured, the shell_command MUST be present for
-        // validation.
-        if request.tool_class == ToolClass::Execute && !self.shell_allowlist.is_empty() {
+        // SECURITY (SEC-SCP-FAC-0020): Always enforce shell allowlist check for Execute
+        // operations. If the allowlist is empty, is_shell_command_allowed returns
+        // false, correctly implementing fail-closed semantics per DD-004.
+        if request.tool_class == ToolClass::Execute {
             match &request.shell_command {
                 Some(command) => {
                     if !self.is_shell_command_allowed(command) {
@@ -1097,7 +1115,7 @@ impl CapabilityManifest {
                     }
                 },
                 None => {
-                    // SECURITY: Fail-closed - missing shell_command when allowlist is configured
+                    // SECURITY: Fail-closed - Execute requests must provide a shell_command
                     return CapabilityDecision::Deny {
                         reason: DenyReason::ShellCommandRequired,
                     };
@@ -1401,7 +1419,19 @@ impl CapabilityManifestBuilder {
     /// # Errors
     ///
     /// Returns an error if validation fails.
-    pub fn build(self) -> Result<CapabilityManifest, CapabilityError> {
+    ///
+    /// # Implementation
+    ///
+    /// Allowlists are sorted during construction to ensure `PartialEq`
+    /// consistency with `canonical_bytes()`. This prevents bugs in caching
+    /// or deduplication where logically identical manifests would compare
+    /// as different due to insertion order.
+    pub fn build(mut self) -> Result<CapabilityManifest, CapabilityError> {
+        // Sort allowlists for PartialEq consistency with canonical_bytes()
+        self.tool_allowlist.sort_by_key(|t| t.value());
+        self.write_allowlist.sort();
+        self.shell_allowlist.sort();
+
         let manifest = CapabilityManifest {
             manifest_id: self.manifest_id,
             capabilities: self.capabilities,
@@ -2114,20 +2144,31 @@ mod tests {
             scope: CapabilityScope::allow_all(),
             risk_tier_required: RiskTier::Tier3,
         };
-        let manifest = make_manifest(vec![cap]);
 
-        // Tier 1 should be denied
-        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier1);
+        // Create manifest with shell_allowlist to allow the test command
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .capability(cap)
+            .tool_allowlist(vec![ToolClass::Execute])
+            .shell_allowlist(vec!["test-cmd".to_string()])
+            .build()
+            .unwrap();
+
+        // Tier 1 should be denied (insufficient risk tier)
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier1).with_shell_command("test-cmd");
         let decision = manifest.validate_request(&request);
         assert!(decision.is_denied());
 
         // Tier 3 should be allowed
-        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier3);
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier3).with_shell_command("test-cmd");
         let decision = manifest.validate_request(&request);
         assert!(decision.is_allowed());
 
         // Tier 4 should also be allowed (higher than required)
-        let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier4);
+        let request =
+            ToolRequest::new(ToolClass::Execute, RiskTier::Tier4).with_shell_command("test-cmd");
         let decision = manifest.validate_request(&request);
         assert!(decision.is_allowed());
     }
@@ -2987,7 +3028,8 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_without_shell_command_when_no_allowlist_is_allowed() {
+    fn test_execute_without_shell_command_when_no_allowlist_is_denied() {
+        // SEC-SCP-FAC-0020: Empty shell_allowlist means fail-closed
         // Create execute capability WITHOUT shell_allowlist
         let exec_cap = Capability {
             capability_id: "exec-cap".to_string(),
@@ -2999,17 +3041,23 @@ mod tests {
         let manifest = CapabilityManifest::builder("test")
             .delegator("delegator")
             .tool_allowlist(vec![ToolClass::Execute])
-            // No shell_allowlist configured - empty
+            // No shell_allowlist configured - empty means fail-closed
             .capability(exec_cap)
             .build()
             .unwrap();
 
-        // Execute request WITHOUT shell_command should be ALLOWED
-        // (no allowlist means no validation required)
+        // Execute request WITHOUT shell_command should be DENIED
+        // (empty allowlist means nothing is allowed - fail-closed per DD-004)
         let request = ToolRequest::new(ToolClass::Execute, RiskTier::Tier0);
         let decision = manifest.validate_request(&request);
 
-        assert!(decision.is_allowed());
+        assert!(decision.is_denied());
+        assert!(matches!(
+            decision,
+            CapabilityDecision::Deny {
+                reason: DenyReason::ShellCommandRequired
+            }
+        ));
     }
 
     #[test]
@@ -3045,7 +3093,8 @@ mod tests {
     }
 
     #[test]
-    fn test_write_without_path_when_no_allowlist_is_allowed() {
+    fn test_write_without_path_when_no_allowlist_is_denied() {
+        // SEC-SCP-FAC-0020: Empty write_allowlist means fail-closed
         // Create write capability WITHOUT write_allowlist
         let write_cap = Capability {
             capability_id: "write-cap".to_string(),
@@ -3057,16 +3106,22 @@ mod tests {
         let manifest = CapabilityManifest::builder("test")
             .delegator("delegator")
             .tool_allowlist(vec![ToolClass::Write])
-            // No write_allowlist configured - empty
+            // No write_allowlist configured - empty means fail-closed
             .capability(write_cap)
             .build()
             .unwrap();
 
-        // Write request WITHOUT path should be ALLOWED
-        // (no allowlist means no validation required)
+        // Write request WITHOUT path should be DENIED
+        // (empty allowlist means nothing is allowed - fail-closed per DD-004)
         let request = ToolRequest::new(ToolClass::Write, RiskTier::Tier0);
         let decision = manifest.validate_request(&request);
 
-        assert!(decision.is_allowed());
+        assert!(decision.is_denied());
+        assert!(matches!(
+            decision,
+            CapabilityDecision::Deny {
+                reason: DenyReason::WritePathRequired
+            }
+        ));
     }
 }

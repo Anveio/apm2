@@ -16,37 +16,13 @@
 //! - AD-TOOL-002: Capability manifests as sealed references
 //! - REQ-TOOL-001: Tool access control requirements
 
-// Re-export the canonical ToolClass from apm2-core to eliminate type
-// duplication. Per Code Quality Review [MAJOR]: ToolClass was previously
-// duplicated between apm2-core and apm2-daemon. The canonical definition now
-// lives in apm2-core.
-pub use apm2_core::context::{MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN, ToolClass};
-use prost::Message;
-
-/// Internal protobuf representation for `ToolClass`.
-#[derive(Clone, PartialEq, Message)]
-struct ToolClassProto {
-    #[prost(uint32, optional, tag = "1")]
-    value: Option<u32>,
-}
-
-/// Extension trait for `ToolClass` to provide canonical serialization.
-///
-/// Per AD-VERIFY-001, this provides deterministic serialization
-/// for use in digests and signatures.
-pub trait ToolClassExt {
-    /// Returns the canonical bytes for this tool class.
-    fn canonical_bytes(&self) -> Vec<u8>;
-}
-
-impl ToolClassExt for ToolClass {
-    fn canonical_bytes(&self) -> Vec<u8> {
-        let proto = ToolClassProto {
-            value: Some(u32::from(self.value())),
-        };
-        proto.encode_to_vec()
-    }
-}
+// Re-export the canonical ToolClass and ToolClassExt from apm2-core to
+// eliminate type duplication. Per Code Quality Review [MINOR]: ToolClass
+// canonicalization logic was previously fragmented between crates. The
+// canonical definition now lives in apm2-core (TCK-00254).
+pub use apm2_core::context::{
+    MAX_TOOL_ALLOWLIST, MAX_TOOL_CLASS_NAME_LEN, ToolClass, ToolClassExt,
+};
 
 #[cfg(test)]
 mod tests {

@@ -101,6 +101,14 @@ pub const MAX_PATH_COMPONENTS: usize = 256;
 /// Per CTR-1303, bounded collections prevent `DoS`.
 pub const MAX_TOOL_ALLOWLIST: usize = 100;
 
+/// Maximum number of paths in the write allowlist.
+/// Per CTR-1303, bounded collections prevent `DoS`.
+pub const MAX_WRITE_ALLOWLIST: usize = 1000;
+
+/// Maximum number of patterns in the shell allowlist.
+/// Per CTR-1303, bounded collections prevent `DoS`.
+pub const MAX_SHELL_ALLOWLIST: usize = 500;
+
 /// Maximum string length for tool class names during parsing.
 pub const MAX_TOOL_CLASS_NAME_LEN: usize = 64;
 
@@ -271,6 +279,36 @@ impl ToolClass {
 impl std::fmt::Display for ToolClass {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+// =============================================================================
+// ToolClassExt - Canonical Serialization
+// =============================================================================
+
+/// Internal protobuf representation for `ToolClass`.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ToolClassProto {
+    #[prost(uint32, optional, tag = "1")]
+    value: Option<u32>,
+}
+
+/// Extension trait for `ToolClass` to provide canonical serialization.
+///
+/// Per AD-VERIFY-001, this provides deterministic serialization
+/// for use in digests and signatures.
+pub trait ToolClassExt {
+    /// Returns the canonical bytes for this tool class.
+    fn canonical_bytes(&self) -> Vec<u8>;
+}
+
+impl ToolClassExt for ToolClass {
+    fn canonical_bytes(&self) -> Vec<u8> {
+        use prost::Message;
+        let proto = ToolClassProto {
+            value: Some(u32::from(self.value())),
+        };
+        proto.encode_to_vec()
     }
 }
 
@@ -660,6 +698,22 @@ pub struct ContextPackManifest {
     #[serde(default)]
     pub tool_allowlist: Vec<ToolClass>,
 
+    /// Allowlist of filesystem paths that can be written to.
+    ///
+    /// Per TCK-00254 and REQ-DCP-0002, write operations are validated against
+    /// this allowlist. Paths should be absolute and normalized. Empty means
+    /// no writes allowed (fail-closed).
+    #[serde(default)]
+    pub write_allowlist: Vec<std::path::PathBuf>,
+
+    /// Allowlist of shell command patterns that can be executed.
+    ///
+    /// Per TCK-00254 and REQ-DCP-0002, shell execution requests are validated
+    /// against this allowlist. Patterns may use glob syntax. Empty means no
+    /// shell allowed (fail-closed).
+    #[serde(default)]
+    pub shell_allowlist: Vec<String>,
+
     /// Index for O(1) path lookups.
     /// Maps normalized path to index in entries vector.
     #[serde(skip)]
@@ -674,6 +728,8 @@ impl PartialEq for ContextPackManifest {
             && self.profile_id == other.profile_id
             && self.entries == other.entries
             && self.tool_allowlist == other.tool_allowlist
+            && self.write_allowlist == other.write_allowlist
+            && self.shell_allowlist == other.shell_allowlist
     }
 }
 
@@ -692,10 +748,110 @@ impl ContextPackManifest {
         &self.entries
     }
 
+    /// Checks if the given path is in the write allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// The path must be a prefix match: `/workspace` allows `/workspace/foo`.
+    #[must_use]
+    pub fn is_write_path_allowed(&self, path: &std::path::Path) -> bool {
+        if self.write_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        // Check if the path starts with any allowed path
+        self.write_allowlist
+            .iter()
+            .any(|allowed| path.starts_with(allowed))
+    }
+
+    /// Checks if the given shell command matches a pattern in the shell
+    /// allowlist.
+    ///
+    /// Per TCK-00254, returns `false` if the allowlist is empty (fail-closed).
+    /// Patterns use simple glob matching with `*` as wildcard.
+    #[must_use]
+    pub fn is_shell_command_allowed(&self, command: &str) -> bool {
+        if self.shell_allowlist.is_empty() {
+            // Fail-closed: empty allowlist means nothing is allowed
+            return false;
+        }
+
+        // Check if the command matches any allowed pattern
+        self.shell_allowlist
+            .iter()
+            .any(|pattern| Self::shell_pattern_matches(pattern, command))
+    }
+
+    /// Matches a shell command against a pattern with simple glob support.
+    ///
+    /// Supports `*` as a wildcard that matches any sequence of characters.
+    ///
+    /// # Implementation
+    ///
+    /// Uses streaming iteration over pattern parts to avoid heap allocations
+    /// in the hot path (SEC-DOS-MDL-0001).
+    fn shell_pattern_matches(pattern: &str, command: &str) -> bool {
+        // Check for wildcards first - if none, exact match required
+        if !pattern.contains('*') {
+            return pattern == command;
+        }
+
+        // Streaming iterator over pattern parts (zero allocations)
+        let mut parts = pattern.split('*');
+        let mut remaining = command;
+
+        // Handle first part: must be at start unless pattern starts with '*'
+        if let Some(first) = parts.next() {
+            if !first.is_empty() {
+                // Pattern doesn't start with '*', so first part must be prefix
+                if let Some(stripped) = remaining.strip_prefix(first) {
+                    remaining = stripped;
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        // Handle middle and last parts
+        // We peek ahead to distinguish middle parts from the last part
+        let mut prev_part: Option<&str> = None;
+        for part in parts {
+            // Process the previous part as a middle part (can be anywhere)
+            if let Some(p) = prev_part {
+                if !p.is_empty() {
+                    if let Some(pos) = remaining.find(p) {
+                        remaining = &remaining[pos + p.len()..];
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            prev_part = Some(part);
+        }
+
+        // Process the last part: must be at end unless pattern ends with '*'
+        if let Some(last_part) = prev_part {
+            if !pattern.ends_with('*') && !last_part.is_empty() {
+                // Pattern doesn't end with '*', so last part must be suffix
+                if !remaining.ends_with(last_part) {
+                    return false;
+                }
+            } else if !last_part.is_empty() {
+                // Pattern ends with '*', so last part just needs to exist
+                if !remaining.contains(last_part) {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
     /// Computes the manifest hash from the manifest fields.
     ///
     /// The hash is computed over the canonical representation of all fields
-    /// except the hash itself. Per TCK-00254, `tool_allowlist` is sorted for
+    /// except the hash itself. Per TCK-00254, all allowlists are sorted for
     /// deterministic ordering.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
@@ -704,6 +860,8 @@ impl ContextPackManifest {
         profile_id: &str,
         entries: &[ManifestEntry],
         tool_allowlist: &[ToolClass],
+        write_allowlist: &[std::path::PathBuf],
+        shell_allowlist: &[String],
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
 
@@ -744,6 +902,28 @@ impl ContextPackManifest {
         hasher.update(&(sorted_tools.len() as u32).to_be_bytes());
         for tool_value in &sorted_tools {
             hasher.update(&[*tool_value]);
+        }
+
+        // Write allowlist (TCK-00254) - sorted for determinism
+        let mut sorted_write_paths: Vec<String> = write_allowlist
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        sorted_write_paths.sort();
+        hasher.update(&(sorted_write_paths.len() as u32).to_be_bytes());
+        for path in &sorted_write_paths {
+            hasher.update(&(path.len() as u32).to_be_bytes());
+            hasher.update(path.as_bytes());
+        }
+
+        // Shell allowlist (TCK-00254) - sorted for determinism
+        let mut sorted_shell_patterns: Vec<&str> =
+            shell_allowlist.iter().map(String::as_str).collect();
+        sorted_shell_patterns.sort();
+        hasher.update(&(sorted_shell_patterns.len() as u32).to_be_bytes());
+        for pattern in &sorted_shell_patterns {
+            hasher.update(&(pattern.len() as u32).to_be_bytes());
+            hasher.update(pattern.as_bytes());
         }
 
         *hasher.finalize().as_bytes()
@@ -1042,6 +1222,8 @@ impl ContextPackManifest {
             &self.profile_id,
             &self.entries,
             &self.tool_allowlist,
+            &self.write_allowlist,
+            &self.shell_allowlist,
         );
 
         // Use constant-time comparison for security
@@ -1207,6 +1389,8 @@ pub struct ContextPackManifestBuilder {
     profile_id: String,
     entries: Vec<ManifestEntry>,
     tool_allowlist: Vec<ToolClass>,
+    write_allowlist: Vec<std::path::PathBuf>,
+    shell_allowlist: Vec<String>,
 }
 
 impl ContextPackManifestBuilder {
@@ -1218,6 +1402,8 @@ impl ContextPackManifestBuilder {
             profile_id: profile_id.into(),
             entries: Vec::new(),
             tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         }
     }
 
@@ -1248,6 +1434,39 @@ impl ContextPackManifestBuilder {
     #[must_use]
     pub fn allow_tool(mut self, tool: ToolClass) -> Self {
         self.tool_allowlist.push(tool);
+        self
+    }
+
+    /// Sets the write allowlist.
+    ///
+    /// Per TCK-00254, only writes to paths in this allowlist are permitted.
+    #[must_use]
+    pub fn write_allowlist(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.write_allowlist = paths;
+        self
+    }
+
+    /// Adds a path to the write allowlist.
+    #[must_use]
+    pub fn allow_write_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.write_allowlist.push(path.into());
+        self
+    }
+
+    /// Sets the shell allowlist.
+    ///
+    /// Per TCK-00254, only shell commands matching patterns in this allowlist
+    /// can be executed.
+    #[must_use]
+    pub fn shell_allowlist(mut self, patterns: Vec<String>) -> Self {
+        self.shell_allowlist = patterns;
+        self
+    }
+
+    /// Adds a shell pattern to the allowlist.
+    #[must_use]
+    pub fn allow_shell_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.shell_allowlist.push(pattern.into());
         self
     }
 
@@ -1313,6 +1532,31 @@ impl ContextPackManifestBuilder {
             });
         }
 
+        // Validate write_allowlist size (TCK-00254)
+        if self.write_allowlist.len() > MAX_WRITE_ALLOWLIST {
+            return Err(ManifestError::CollectionTooLarge {
+                field: "write_allowlist",
+                actual: self.write_allowlist.len(),
+                max: MAX_WRITE_ALLOWLIST,
+            });
+        }
+
+        // Validate shell_allowlist size (TCK-00254)
+        if self.shell_allowlist.len() > MAX_SHELL_ALLOWLIST {
+            return Err(ManifestError::CollectionTooLarge {
+                field: "shell_allowlist",
+                actual: self.shell_allowlist.len(),
+                max: MAX_SHELL_ALLOWLIST,
+            });
+        }
+
+        // Sort allowlists for PartialEq consistency with compute_manifest_hash()
+        // This ensures logically identical manifests compare equal regardless of
+        // insertion order, preventing bugs in caching or deduplication.
+        self.tool_allowlist.sort_by_key(|t| t.value());
+        self.write_allowlist.sort();
+        self.shell_allowlist.sort();
+
         // Track paths and stable_ids for duplicate detection using HashSet for O(N)
         let mut seen_paths: HashSet<String> = HashSet::with_capacity(self.entries.len());
         let mut seen_stable_ids: HashSet<&str> = HashSet::new();
@@ -1372,12 +1616,14 @@ impl ContextPackManifestBuilder {
         // Build path index for O(1) lookups
         let path_index = ContextPackManifest::build_path_index(&self.entries);
 
-        // Compute manifest hash (includes tool_allowlist per TCK-00254)
+        // Compute manifest hash (includes all allowlists per TCK-00254)
         let manifest_hash = ContextPackManifest::compute_manifest_hash(
             &self.manifest_id,
             &self.profile_id,
             &self.entries,
             &self.tool_allowlist,
+            &self.write_allowlist,
+            &self.shell_allowlist,
         );
 
         Ok(ContextPackManifest {
@@ -1386,6 +1632,8 @@ impl ContextPackManifestBuilder {
             profile_id: self.profile_id,
             entries: self.entries,
             tool_allowlist: self.tool_allowlist,
+            write_allowlist: self.write_allowlist,
+            shell_allowlist: self.shell_allowlist,
             path_index,
         })
     }
