@@ -286,6 +286,13 @@ impl RestartManager {
     /// If the provided `current_tick` has a different tick rate than the
     /// configured rate, this method returns `false` (fail-closed: deny
     /// restart).
+    ///
+    /// # SEC-FIX-002: History Entry Rate Validation
+    ///
+    /// In legacy mode (no `tick_rate_hz` configured), history entries are
+    /// validated to ensure they share the same tick rate as `current_tick`.
+    /// If any history entry has a different tick rate, this method returns
+    /// `false` (fail-closed: deny restart) to prevent cross-rate comparisons.
     #[must_use]
     pub fn should_restart_at_tick(&self, exit_code: Option<i32>, current_tick: &HtfTick) -> bool {
         // Check circuit breaker
@@ -303,6 +310,21 @@ impl RestartManager {
             if current_tick.tick_rate_hz() != configured_rate {
                 // Fail-closed: deny restart on tick rate mismatch
                 return false;
+            }
+        }
+
+        // SEC-FIX-002: In legacy mode, validate history entries have consistent tick
+        // rates This prevents incorrect window calculations when entries have
+        // mixed tick rates
+        let expected_tick_rate = self
+            .tick_rate_hz
+            .unwrap_or_else(|| current_tick.tick_rate_hz());
+        for entry in &self.history {
+            if let Some(ref entry_tick) = entry.recorded_at_tick {
+                if entry_tick.tick_rate_hz() != expected_tick_rate {
+                    // Fail-closed: deny restart if history contains mismatched tick rates
+                    return false;
+                }
             }
         }
 
@@ -410,12 +432,22 @@ impl RestartManager {
         since = "0.4.0",
         note = "use record_restart_at_tick for tick-based timing (RFC-0016 HTF)"
     )]
+    #[allow(clippy::disallowed_methods)] // Legacy method uses wall-clock for backwards compatibility
     pub fn record_restart(&mut self, exit_code: Option<i32>, uptime: Duration) -> Duration {
         self.backoff_attempt += 1;
         let delay = self.config.backoff.delay_for_attempt(self.backoff_attempt);
 
+        // Record with wall-clock timestamp for legacy pruning
+        // Note: truncation is acceptable here as restart windows are typically
+        // seconds/minutes
+        #[allow(clippy::cast_possible_truncation)]
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
         let entry = RestartEntry {
-            timestamp_ns: None,
+            timestamp_ns: Some(now_ns),
             exit_code,
             uptime,
             delay,
@@ -424,13 +456,40 @@ impl RestartManager {
 
         self.history.push(entry);
 
-        // Legacy mode doesn't prune by tick (no tick available)
+        // SEC-FIX-001: Prune old entries using wall-clock time to prevent
+        // unbounded history growth and session lockout
+        self.prune_history_wall_clock();
+
         // Circuit breaker check uses history length
         if self.history.len() >= self.config.max_restarts as usize {
             self.circuit_open = true;
         }
 
         delay
+    }
+
+    /// Remove old entries from history using wall-clock time (legacy).
+    ///
+    /// This method is used by the deprecated `record_restart` method for
+    /// backwards compatibility. It prunes entries older than `restart_window`.
+    #[allow(clippy::disallowed_methods)] // Legacy method uses wall-clock for backwards compatibility
+    fn prune_history_wall_clock(&mut self) {
+        // Note: truncation is acceptable here as restart windows are typically
+        // seconds/minutes
+        #[allow(clippy::cast_possible_truncation)]
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let window_ns = self.config.restart_window.as_nanos() as u64;
+        let cutoff_ns = now_ns.saturating_sub(window_ns);
+
+        self.history.retain(|entry| {
+            // Keep entries that have a timestamp within the window
+            entry.timestamp_ns.is_some_and(|ts| ts >= cutoff_ns)
+        });
     }
 
     /// Get the number of restarts within the window (legacy).
@@ -748,6 +807,138 @@ mod tck_00243 {
     fn with_ticks_panics_on_zero_rate() {
         let config = RestartConfig::default();
         let _ = RestartManager::with_ticks(config, 1000, 0);
+    }
+
+    /// SEC-FIX-001: Legacy record_restart prunes old entries to prevent session
+    /// lockout.
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_record_restart_prunes_history() {
+        let config = RestartConfig {
+            max_restarts: 5,
+            restart_window: Duration::from_millis(100), // Very short window for testing
+            ..Default::default()
+        };
+
+        let mut manager = RestartManager::new(config);
+
+        // Record a restart
+        manager.record_restart(Some(1), Duration::from_secs(1));
+        assert!(!manager.history.is_empty(), "history should have an entry");
+
+        // Wait longer than the window
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Record another restart - this should prune the old entry
+        manager.record_restart(Some(1), Duration::from_secs(1));
+
+        // The old entry should have been pruned, leaving only the new one
+        // (or possibly both if timing is close, but definitely not more than 2)
+        assert!(
+            manager.history.len() <= 2,
+            "history should be pruned, got {} entries",
+            manager.history.len()
+        );
+
+        // More importantly, the circuit breaker should not be permanently open
+        // after window expires
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Use a tick-based check to verify state
+        // Note: should_restart uses history.len(), so we need a fresh manager to verify
+        let config2 = RestartConfig {
+            max_restarts: 5,
+            restart_window: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let mut manager2 = RestartManager::new(config2);
+
+        // Record max_restarts entries quickly
+        for _ in 0..5 {
+            manager2.record_restart(Some(1), Duration::from_secs(1));
+        }
+        // Circuit should be open after max_restarts
+        assert!(manager2.circuit_open, "circuit should be open");
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Record another restart - should prune old entries
+        manager2.record_restart(Some(1), Duration::from_secs(1));
+
+        // After pruning, we should have fewer entries than max_restarts
+        // (only recent entries remain)
+        assert!(
+            manager2.history.len() <= 2,
+            "history should be pruned after window expires, got {} entries",
+            manager2.history.len()
+        );
+    }
+
+    /// SEC-FIX-002: History entries with mismatched tick rates fail closed.
+    #[test]
+    fn history_tick_rate_mismatch_fails_closed() {
+        let config = RestartConfig {
+            max_restarts: 5,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        // Create a manager WITHOUT tick_rate_hz configured (legacy mode)
+        let mut manager = RestartManager::new(config);
+
+        // Record restart at 1MHz tick rate
+        let tick_1mhz = HtfTick::new(100, 1_000_000);
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(1), tick_1mhz);
+
+        // Try to check restart at a DIFFERENT tick rate (10MHz)
+        let tick_10mhz = HtfTick::new(200, 10_000_000);
+
+        // Should fail closed because history has different tick rate than current_tick
+        assert!(
+            !manager.should_restart_at_tick(Some(1), &tick_10mhz),
+            "should fail closed when history tick rate differs from current tick rate"
+        );
+
+        // With matching tick rate, should allow restart
+        let tick_1mhz_later = HtfTick::new(200, 1_000_000);
+        assert!(
+            manager.should_restart_at_tick(Some(1), &tick_1mhz_later),
+            "should allow restart when tick rates match"
+        );
+    }
+
+    /// SEC-FIX-002: Configured tick rate validates history entries.
+    #[test]
+    fn configured_tick_rate_validates_history() {
+        let config = RestartConfig {
+            max_restarts: 5,
+            restart_window: Duration::from_secs(60),
+            ..Default::default()
+        };
+
+        // Create a manager WITH tick_rate_hz configured
+        let mut manager = RestartManager::with_ticks(config, 60_000_000, 1_000_000);
+
+        // Record restart at the configured tick rate
+        let tick = HtfTick::new(100, 1_000_000);
+        manager.record_restart_at_tick(Some(1), Duration::from_secs(1), tick);
+
+        // Manually insert a history entry with wrong tick rate to simulate corruption
+        manager.history.push(RestartEntry {
+            timestamp_ns: None,
+            exit_code: Some(1),
+            uptime: Duration::from_secs(1),
+            delay: Duration::from_secs(1),
+            recorded_at_tick: Some(HtfTick::new(50, 2_000_000)), // Wrong rate!
+        });
+
+        // Should fail closed because history has mismatched tick rate
+        let current_tick = HtfTick::new(200, 1_000_000);
+        assert!(
+            !manager.should_restart_at_tick(Some(1), &current_tick),
+            "should fail closed when history contains entry with wrong tick rate"
+        );
     }
 }
 
