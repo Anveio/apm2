@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::crash::{CrashEvent, CrashType};
 use super::entropy::EntropyTrackerSummary;
-use super::quarantine::{QuarantineEvaluation, QuarantineManager};
+use super::quarantine::{ClockRegressionDefect, QuarantineEvaluation, QuarantineManager};
 use crate::htf::HtfTick;
 use crate::restart::{BackoffConfig, RestartConfig, RestartManager};
 
@@ -76,9 +76,26 @@ impl RestartCoordinator {
     }
 
     /// Returns the current restart count within the window.
+    ///
+    /// **DEPRECATED**: Use [`RestartCoordinator::restart_count_at_tick`] for
+    /// tick-based timing (RFC-0016 HTF).
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use restart_count_at_tick for tick-based timing (RFC-0016 HTF)"
+    )]
     pub fn restart_count(&self) -> usize {
         self.restart_manager.restart_count()
+    }
+
+    /// Returns the current restart count within the tick-based window
+    /// (RFC-0016 HTF compliant).
+    ///
+    /// This is the preferred method for getting restart counts. Tick-based
+    /// timing is immune to wall-clock manipulation.
+    #[must_use]
+    pub fn restart_count_at_tick(&self, current_tick: &HtfTick) -> usize {
+        self.restart_manager.restart_count_at_tick(current_tick)
     }
 
     /// Returns whether the circuit breaker is open.
@@ -89,11 +106,18 @@ impl RestartCoordinator {
 
     /// Determines whether a crashed session should be restarted.
     ///
+    /// **DEPRECATED**: Use [`RestartCoordinator::should_restart_at_tick`] for
+    /// tick-based timing (RFC-0016 HTF).
+    ///
     /// Takes into account:
     /// - The crash type (some crashes shouldn't trigger restart)
     /// - The entropy budget (exhausted budget means no restart)
     /// - The restart manager's circuit breaker and limits
     #[must_use]
+    #[deprecated(
+        since = "0.4.0",
+        note = "use should_restart_at_tick for tick-based timing (RFC-0016 HTF)"
+    )]
     pub fn should_restart(
         &self,
         crash_event: &CrashEvent,
@@ -156,12 +180,118 @@ impl RestartCoordinator {
         }
     }
 
+    /// Determines whether a crashed session should be restarted using
+    /// tick-based timing (RFC-0016 HTF compliant).
+    ///
+    /// This is the preferred method for making restart decisions. Tick-based
+    /// timing is immune to wall-clock manipulation.
+    ///
+    /// Takes into account:
+    /// - The crash type (some crashes shouldn't trigger restart)
+    /// - The entropy budget (exhausted budget means no restart)
+    /// - The restart manager's circuit breaker and limits
+    ///
+    /// # Arguments
+    ///
+    /// * `crash_event` - The crash event details
+    /// * `entropy_summary` - Optional entropy tracker summary
+    /// * `current_tick` - The current monotonic tick
+    #[must_use]
+    pub fn should_restart_at_tick(
+        &self,
+        crash_event: &CrashEvent,
+        entropy_summary: Option<&EntropyTrackerSummary>,
+        current_tick: &HtfTick,
+    ) -> RestartDecision {
+        // Check crash type first
+        if !crash_event.crash_type.is_restartable() {
+            return match &crash_event.crash_type {
+                CrashType::CleanExit => RestartDecision::Terminate {
+                    reason: TerminateReason::CleanExit,
+                },
+                CrashType::EntropyExceeded => RestartDecision::Terminate {
+                    reason: TerminateReason::EntropyExhausted,
+                },
+                CrashType::Signal { signal, .. } => RestartDecision::Terminate {
+                    reason: TerminateReason::NonRestartableSignal(*signal),
+                },
+                _ => RestartDecision::Terminate {
+                    reason: TerminateReason::RestartLimitExceeded,
+                },
+            };
+        }
+
+        // Check entropy budget
+        if let Some(summary) = entropy_summary {
+            if summary.is_exceeded {
+                return RestartDecision::Terminate {
+                    reason: TerminateReason::EntropyExhausted,
+                };
+            }
+        }
+
+        // Check circuit breaker
+        if self.restart_manager.is_circuit_open() {
+            return RestartDecision::Terminate {
+                reason: TerminateReason::CircuitBreakerOpen,
+            };
+        }
+
+        // Check restart count limit using tick-based window
+        let exit_code = crash_event.crash_type.exit_code();
+        if !self
+            .restart_manager
+            .should_restart_at_tick(exit_code, current_tick)
+        {
+            return RestartDecision::Terminate {
+                reason: TerminateReason::RestartLimitExceeded,
+            };
+        }
+
+        // Calculate delay based on attempt number
+        let attempt_number = crash_event.restart_count + 1;
+        let delay = self
+            .restart_manager
+            .config()
+            .backoff
+            .delay_for_attempt(attempt_number);
+
+        RestartDecision::Restart {
+            delay,
+            resume_cursor: crash_event.last_ledger_cursor,
+            attempt_number,
+        }
+    }
+
     /// Records a restart and returns the backoff delay.
     ///
+    /// **DEPRECATED**: Use [`RestartCoordinator::record_restart_at_tick`] for
+    /// tick-based timing (RFC-0016 HTF).
+    ///
     /// This should be called when a restart is actually performed.
+    #[deprecated(
+        since = "0.4.0",
+        note = "use record_restart_at_tick for tick-based timing (RFC-0016 HTF)"
+    )]
     pub fn record_restart(&mut self, uptime: Duration) -> Duration {
         let exit_code = None; // We don't track specific exit code at this level
         self.restart_manager.record_restart(exit_code, uptime)
+    }
+
+    /// Records a restart at the given tick and returns the backoff delay
+    /// (RFC-0016 HTF compliant).
+    ///
+    /// This is the preferred method for recording restarts. Tick-based timing
+    /// is immune to wall-clock manipulation.
+    ///
+    /// # Arguments
+    ///
+    /// * `uptime` - How long the session ran before crashing
+    /// * `current_tick` - The current monotonic tick
+    pub fn record_restart_at_tick(&mut self, uptime: Duration, current_tick: HtfTick) -> Duration {
+        let exit_code = None; // We don't track specific exit code at this level
+        self.restart_manager
+            .record_restart_at_tick(exit_code, uptime, current_tick)
     }
 
     /// Records a successful run (uptime exceeded minimum).
@@ -184,6 +314,37 @@ impl RestartCoordinator {
             BackoffConfig::Exponential { .. } => "EXPONENTIAL",
             BackoffConfig::Linear { .. } => "LINEAR",
         }
+    }
+
+    /// Checks if a quarantine has expired, returning a defect on tick rate
+    /// mismatch (RFC-0016 HTF, DD-HTF-0001).
+    ///
+    /// This method wraps
+    /// [`QuarantineManager::check_quarantine_expired_at_tick`] to provide
+    /// quarantine expiry checks with proper defect emission for
+    /// observability.
+    ///
+    /// # SEC-HTF-003: Tick Rate Validation (FAIL-CLOSED)
+    ///
+    /// If tick rates differ between `current_tick` and `quarantine_until_tick`,
+    /// returns `(false, Some(defect))` where:
+    /// - `false` = quarantine NOT expired (fail-closed behavior)
+    /// - `defect` = `ClockRegressionDefect` for emission to ledger/logs
+    ///
+    /// # Arguments
+    ///
+    /// * `quarantine_until_tick` - Tick when quarantine expires
+    /// * `current_tick` - Current tick
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(is_expired, Option<ClockRegressionDefect>)`.
+    #[must_use]
+    pub fn check_quarantine_expired_at_tick(
+        quarantine_until_tick: &HtfTick,
+        current_tick: &HtfTick,
+    ) -> (bool, Option<ClockRegressionDefect>) {
+        QuarantineManager::check_quarantine_expired_at_tick(quarantine_until_tick, current_tick)
     }
 
     /// Determines whether a crashed session should be restarted, with
@@ -1222,5 +1383,196 @@ mod tests {
         // Tick values should be identical regardless of wall time
         assert_eq!(tick1, tick2);
         assert_eq!(tick1.unwrap().value(), 1060); // current_tick + 60
+    }
+
+    // ========================================================================
+    // Tick-based RestartCoordinator Methods (TCK-00243 Security Fixes)
+    // ========================================================================
+
+    #[test]
+    fn tck_00243_should_restart_at_tick_allows_restart() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+        let entropy = make_entropy_summary(false);
+        let current_tick = HtfTick::new(1000, 1_000_000);
+
+        let decision = coordinator.should_restart_at_tick(&crash, Some(&entropy), &current_tick);
+
+        assert!(decision.is_restart());
+        if let RestartDecision::Restart {
+            attempt_number,
+            resume_cursor,
+            ..
+        } = decision
+        {
+            assert_eq!(attempt_number, 1);
+            assert_eq!(resume_cursor, 42);
+        }
+    }
+
+    #[test]
+    fn tck_00243_should_restart_at_tick_denies_clean_exit() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let crash = make_crash_event(CrashType::CleanExit, 0);
+        let current_tick = HtfTick::new(1000, 1_000_000);
+
+        let decision = coordinator.should_restart_at_tick(&crash, None, &current_tick);
+
+        assert!(decision.is_terminate());
+        if let RestartDecision::Terminate { reason } = decision {
+            assert_eq!(reason, TerminateReason::CleanExit);
+        }
+    }
+
+    #[test]
+    fn tck_00243_should_restart_at_tick_denies_entropy_exceeded() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+        let entropy = make_entropy_summary(true); // Exceeded
+        let current_tick = HtfTick::new(1000, 1_000_000);
+
+        let decision = coordinator.should_restart_at_tick(&crash, Some(&entropy), &current_tick);
+
+        assert!(decision.is_terminate());
+        if let RestartDecision::Terminate { reason } = decision {
+            assert_eq!(reason, TerminateReason::EntropyExhausted);
+        }
+    }
+
+    #[test]
+    fn tck_00243_should_restart_at_tick_uses_tick_based_window() {
+        use crate::restart::RestartConfig;
+
+        let config = RestartConfig {
+            max_restarts: 2,
+            ..Default::default()
+        };
+        let mut coordinator = RestartCoordinator::new("session-1", "work-1", config);
+        let crash = make_crash_event(CrashType::ErrorExit { exit_code: 1 }, 0);
+        let tick1 = HtfTick::new(1000, 1_000_000);
+        let tick2 = HtfTick::new(2000, 1_000_000);
+
+        // Record 2 restarts using tick-based method
+        coordinator.record_restart_at_tick(Duration::from_secs(1), tick1);
+        coordinator.record_restart_at_tick(Duration::from_secs(1), tick2);
+
+        // Circuit should be open now
+        assert!(coordinator.is_circuit_open());
+
+        let current_tick = HtfTick::new(3000, 1_000_000);
+        let decision = coordinator.should_restart_at_tick(&crash, None, &current_tick);
+
+        assert!(decision.is_terminate());
+        if let RestartDecision::Terminate { reason } = decision {
+            assert_eq!(reason, TerminateReason::CircuitBreakerOpen);
+        }
+    }
+
+    #[test]
+    fn tck_00243_record_restart_at_tick_returns_delay() {
+        let mut coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let current_tick = HtfTick::new(1000, 1_000_000);
+
+        let delay = coordinator.record_restart_at_tick(Duration::from_secs(5), current_tick);
+
+        // Default exponential backoff: first attempt should be 1 second
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tck_00243_restart_count_at_tick_returns_correct_count() {
+        let mut coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let tick1 = HtfTick::new(1000, 1_000_000);
+        let tick2 = HtfTick::new(2000, 1_000_000);
+
+        assert_eq!(coordinator.restart_count_at_tick(&tick1), 0);
+
+        coordinator.record_restart_at_tick(Duration::from_secs(1), tick1);
+        assert_eq!(coordinator.restart_count_at_tick(&tick2), 1);
+
+        coordinator.record_restart_at_tick(Duration::from_secs(1), tick2);
+        let tick3 = HtfTick::new(3000, 1_000_000);
+        assert_eq!(coordinator.restart_count_at_tick(&tick3), 2);
+    }
+
+    #[test]
+    fn tck_00243_check_quarantine_expired_at_tick_no_defect() {
+        let quarantine_until = HtfTick::new(2000, 1_000_000);
+        let current_tick = HtfTick::new(1500, 1_000_000);
+
+        let (is_expired, defect) =
+            RestartCoordinator::check_quarantine_expired_at_tick(&quarantine_until, &current_tick);
+
+        assert!(!is_expired);
+        assert!(defect.is_none());
+    }
+
+    #[test]
+    fn tck_00243_check_quarantine_expired_at_tick_expired() {
+        let quarantine_until = HtfTick::new(2000, 1_000_000);
+        let current_tick = HtfTick::new(2500, 1_000_000);
+
+        let (is_expired, defect) =
+            RestartCoordinator::check_quarantine_expired_at_tick(&quarantine_until, &current_tick);
+
+        assert!(is_expired);
+        assert!(defect.is_none());
+    }
+
+    #[test]
+    fn tck_00243_check_quarantine_expired_at_tick_rate_mismatch_emits_defect() {
+        let quarantine_until = HtfTick::new(2000, 1_000_000); // 1MHz
+        let current_tick = HtfTick::new(1500, 10_000_000); // 10MHz (mismatch!)
+
+        let (is_expired, defect) =
+            RestartCoordinator::check_quarantine_expired_at_tick(&quarantine_until, &current_tick);
+
+        // Fail-closed: quarantine should NOT be expired
+        assert!(!is_expired);
+
+        // Defect should be present
+        assert!(defect.is_some());
+        let defect = defect.unwrap();
+        assert_eq!(defect.code, "CLOCK_REGRESSION");
+        assert_eq!(defect.current_tick_rate_hz, 10_000_000);
+        assert_eq!(defect.expected_tick_rate_hz, 1_000_000);
+        assert!(defect.fail_closed_applied);
+    }
+
+    #[test]
+    fn tck_00243_should_restart_at_tick_denies_non_restartable_signal() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let crash = make_crash_event(
+            CrashType::Signal {
+                signal: libc::SIGSEGV,
+                signal_name: "SIGSEGV".to_string(),
+            },
+            0,
+        );
+        let current_tick = HtfTick::new(1000, 1_000_000);
+
+        let decision = coordinator.should_restart_at_tick(&crash, None, &current_tick);
+
+        assert!(decision.is_terminate());
+        if let RestartDecision::Terminate { reason } = decision {
+            assert_eq!(reason, TerminateReason::NonRestartableSignal(libc::SIGSEGV));
+        }
+    }
+
+    #[test]
+    fn tck_00243_should_restart_at_tick_allows_restartable_signal() {
+        let coordinator = RestartCoordinator::with_defaults("session-1", "work-1");
+        let crash = make_crash_event(
+            CrashType::Signal {
+                signal: libc::SIGTERM,
+                signal_name: "SIGTERM".to_string(),
+            },
+            0,
+        );
+        let current_tick = HtfTick::new(1000, 1_000_000);
+
+        let decision = coordinator.should_restart_at_tick(&crash, None, &current_tick);
+
+        assert!(decision.is_restart());
     }
 }
