@@ -1231,7 +1231,9 @@ impl LeaseValidator for StubLeaseValidator {
                 })
             },
             |entry| {
-                if entry.work_id == work_id {
+                let work_id_matches = entry.work_id.len() == work_id.len()
+                    && bool::from(entry.work_id.as_bytes().ct_eq(work_id.as_bytes()));
+                if work_id_matches {
                     Ok(())
                 } else {
                     Err(LeaseValidationError::WorkIdMismatch {
