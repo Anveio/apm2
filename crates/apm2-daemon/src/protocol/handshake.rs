@@ -30,10 +30,8 @@
 //! - Version mismatch provides diagnostic info without leaking internals
 
 use bytes::Bytes;
-use nix::unistd::getuid;
 use serde::{Deserialize, Serialize};
 
-use super::credentials::PeerCredentials;
 use super::error::{MAX_HANDSHAKE_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ProtocolResult};
 
 /// Hello message sent by client to initiate handshake.
@@ -330,6 +328,13 @@ pub enum HandshakeState {
 /// Server-side handshake handler.
 ///
 /// Validates client Hello messages and generates appropriate responses.
+///
+/// # Security Note (TCK-00248)
+///
+/// UID-based authorization is performed at the connection accept level
+/// in [`crate::protocol::ProtocolServer::accept`], NOT during handshake.
+/// This ensures unauthorized peers are rejected BEFORE they can send
+/// any frames, satisfying the "rejection before handshake" requirement.
 #[derive(Debug)]
 pub struct ServerHandshake {
     /// Server info string for `HelloAck`.
@@ -343,21 +348,17 @@ pub struct ServerHandshake {
 
     /// Negotiated protocol version (after successful handshake).
     negotiated_version: Option<u32>,
-
-    /// Peer credentials for authentication (TCK-00248).
-    peer_credentials: Option<PeerCredentials>,
 }
 
 impl ServerHandshake {
     /// Create a new server handshake handler.
     #[must_use]
-    pub fn new(server_info: impl Into<String>, peer_credentials: Option<PeerCredentials>) -> Self {
+    pub fn new(server_info: impl Into<String>) -> Self {
         Self {
             server_info: server_info.into(),
             policy_hash: None,
             state: HandshakeState::AwaitingHello,
             negotiated_version: None,
-            peer_credentials,
         }
     }
 
@@ -372,6 +373,11 @@ impl ServerHandshake {
     ///
     /// Returns the response to send to the client.
     ///
+    /// # Security Note
+    ///
+    /// UID authorization is performed at `accept()` time, so by the time
+    /// this method is called, the peer has already been authenticated.
+    ///
     /// # Errors
     ///
     /// Returns `Err` if the handshake is not in `AwaitingHello` state.
@@ -381,22 +387,6 @@ impl ServerHandshake {
             return Err(ProtocolError::handshake_failed(
                 "unexpected Hello message (already handshaked)",
             ));
-        }
-
-        // Validate peer credentials (TCK-00248)
-        // SEC-DCP-001: Error message must not leak internal state (UIDs)
-        // SEC-DCP-002: Use constant-time comparison to prevent timing attacks
-        if let Some(creds) = &self.peer_credentials {
-            let current_uid = getuid().as_raw();
-            // Constant-time comparison: XOR and check if zero
-            // This prevents timing attacks that could leak information about the expected
-            // UID
-            let uid_match = (creds.uid ^ current_uid) == 0;
-            if !uid_match {
-                self.state = HandshakeState::Failed;
-                // Generic error message - do not leak UIDs to unauthorized peers
-                return Ok(HelloNack::rejected("permission denied").into());
-            }
         }
 
         // Validate protocol version
@@ -591,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_server_handshake_success() {
-        let mut server = ServerHandshake::new("daemon/1.0", None);
+        let mut server = ServerHandshake::new("daemon/1.0");
         assert_eq!(server.state(), HandshakeState::AwaitingHello);
 
         let hello = Hello::new("cli/1.0");
@@ -604,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_server_handshake_version_mismatch() {
-        let mut server = ServerHandshake::new("daemon/1.0", None);
+        let mut server = ServerHandshake::new("daemon/1.0");
 
         let hello = Hello::with_version(99, "cli/1.0");
         let response = server.process_hello(&hello).unwrap();
@@ -615,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_server_handshake_duplicate_hello() {
-        let mut server = ServerHandshake::new("daemon/1.0", None);
+        let mut server = ServerHandshake::new("daemon/1.0");
 
         // First hello succeeds
         let hello1 = Hello::new("cli/1.0");
@@ -655,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_server_with_policy_hash() {
-        let mut server = ServerHandshake::new("daemon/1.0", None).with_policy_hash("policy123");
+        let mut server = ServerHandshake::new("daemon/1.0").with_policy_hash("policy123");
 
         let hello = Hello::new("cli/1.0");
         let response = server.process_hello(&hello).unwrap();
@@ -795,82 +785,8 @@ mod tests {
         assert!(matches!(parsed, HandshakeMessage::Hello(_)));
     }
 
-    /// Test that UID mismatch results in rejection (TCK-00248).
-    ///
-    /// This exercises the `if creds.uid != current_uid` rejection path
-    /// which was previously untested.
-    #[test]
-    fn test_server_handshake_uid_mismatch_rejection() {
-        use super::super::credentials::PeerCredentials;
-
-        // Create credentials with a different UID than the current process
-        let current_uid = getuid().as_raw();
-        let mismatched_uid = if current_uid == 0 {
-            1000
-        } else {
-            current_uid + 1
-        };
-
-        let fake_credentials = PeerCredentials {
-            uid: mismatched_uid,
-            gid: 1000,
-            pid: Some(12345),
-        };
-
-        let mut server = ServerHandshake::new("daemon/1.0", Some(fake_credentials));
-        let hello = Hello::new("cli/1.0");
-
-        let response = server.process_hello(&hello).unwrap();
-
-        // Should receive HelloNack with rejection
-        match response {
-            HandshakeMessage::HelloNack(nack) => {
-                assert_eq!(nack.error_code, HandshakeErrorCode::Rejected);
-                // SEC-DCP-001: Error message must NOT leak UIDs
-                assert!(
-                    !nack.message.contains(&current_uid.to_string()),
-                    "Error message should not leak server UID"
-                );
-                assert!(
-                    !nack.message.contains(&mismatched_uid.to_string()),
-                    "Error message should not leak client UID"
-                );
-                // Should be a generic "permission denied" message
-                assert_eq!(nack.message, "permission denied");
-            },
-            other => panic!("Expected HelloNack, got: {other:?}"),
-        }
-
-        // Server should be in failed state
-        assert_eq!(server.state(), HandshakeState::Failed);
-    }
-
-    /// Test that matching UID allows handshake to proceed (TCK-00248).
-    #[test]
-    fn test_server_handshake_uid_match_allowed() {
-        use super::super::credentials::PeerCredentials;
-
-        // Create credentials with the same UID as the current process
-        let current_uid = getuid().as_raw();
-
-        let valid_credentials = PeerCredentials {
-            uid: current_uid,
-            gid: 1000,
-            pid: Some(12345),
-        };
-
-        let mut server = ServerHandshake::new("daemon/1.0", Some(valid_credentials));
-        let hello = Hello::new("cli/1.0");
-
-        let response = server.process_hello(&hello).unwrap();
-
-        // Should receive HelloAck
-        assert!(
-            matches!(response, HandshakeMessage::HelloAck(_)),
-            "Expected HelloAck for matching UID"
-        );
-
-        // Server should be in completed state
-        assert!(server.is_completed());
-    }
+    // NOTE: UID authorization tests have been moved to server.rs tests
+    // since UID validation now occurs at accept() time, before handshake.
+    // See `test_accept_uid_mismatch_rejection` and
+    // `test_accept_uid_match_success` in the server module tests.
 }

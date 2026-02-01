@@ -5,18 +5,23 @@
 //! - Frame encoding/decoding over the wire
 //! - Handshake protocol completion
 //! - Connection lifecycle management
-//! - UID-based authentication (TCK-00248)
+//! - UID-based authentication at accept time (TCK-00248)
+//!
+//! # Security Note (TCK-00248)
+//!
+//! UID validation is performed at `accept()` time, before the handshake.
+//! Since both client and server run as the same user in tests, integration
+//! tests verify the authorization succeeds. Unit tests in `server.rs` verify
+//! that the constant-time comparison and error handling work correctly.
 
 use std::time::Duration;
 
 use apm2_daemon::protocol::{
-    ClientHandshake, HandshakeMessage, Hello, PROTOCOL_VERSION, PeerCredentials, ProtocolServer,
-    ServerConfig, ServerHandshake, connect, parse_handshake_message, parse_hello,
-    serialize_handshake_message,
+    ClientHandshake, HandshakeMessage, Hello, PROTOCOL_VERSION, ProtocolServer, ServerConfig,
+    ServerHandshake, connect, parse_handshake_message, parse_hello, serialize_handshake_message,
 };
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use nix::unistd::getuid;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -68,7 +73,7 @@ async fn test_full_handshake_protocol() {
     // Spawn server that handles handshake
     let server_handle = tokio::spawn(async move {
         let (mut conn, _permit) = server.accept().await.unwrap();
-        let mut handshake = ServerHandshake::new("test-daemon/1.0", None);
+        let mut handshake = ServerHandshake::new("test-daemon/1.0");
 
         // Receive Hello from client using secure parsing (enforces 64KB limit)
         let frame = conn.framed().next().await.unwrap().unwrap();
@@ -131,7 +136,7 @@ async fn test_handshake_version_mismatch() {
     // Spawn server
     let server_handle = tokio::spawn(async move {
         let (mut conn, _permit) = server.accept().await.unwrap();
-        let mut handshake = ServerHandshake::new("test-daemon/1.0", None);
+        let mut handshake = ServerHandshake::new("test-daemon/1.0");
 
         // Use secure parsing (enforces 64KB limit)
         let frame = conn.framed().next().await.unwrap().unwrap();
@@ -330,152 +335,96 @@ async fn test_connection_limit_enforcement() {
     assert!(inner.unwrap().is_ok(), "Third accept should succeed");
 }
 
-/// Test that UID mismatch results in handshake rejection (TCK-00248).
+/// Test that same-UID connections are accepted (TCK-00248).
 ///
-/// This integration test exercises the rejection path when peer credentials
-/// indicate a UID that doesn't match the server's UID. Uses mock credentials
-/// since we can't easily change the process UID in tests.
+/// This integration test verifies that when client and server run as the same
+/// user (which is always the case in tests), the connection is accepted and
+/// handshake succeeds.
 ///
-/// SEC-DCP-003: This test verifies security controls are enforced, not
-/// bypassed.
+/// # Security Note (TCK-00248)
+///
+/// UID validation now happens at `accept()` time (before handshake), using
+/// constant-time comparison via `subtle::ConstantTimeEq`. Since we can't
+/// easily change the process UID in tests, this test verifies the success
+/// path. Unit tests in `server.rs` verify the rejection path using mocked
+/// credentials.
 #[tokio::test]
-async fn test_handshake_uid_mismatch_rejection() {
+async fn test_accept_validates_uid_at_connection_time() {
     let tmp = TempDir::new().unwrap();
-    let socket_path = test_socket_path(&tmp, "uid_mismatch");
+    let socket_path = test_socket_path(&tmp, "uid_validation");
 
     let config = ServerConfig::new(&socket_path).with_server_info("test-daemon/1.0");
     let server = ProtocolServer::bind(config).unwrap();
 
-    // Spawn server that simulates a UID mismatch by using mock credentials
+    // Spawn server that accepts and verifies peer credentials are populated
     let server_handle = tokio::spawn(async move {
-        let (mut conn, _permit) = server.accept().await.unwrap();
+        let (conn, _permit) = server.accept().await.unwrap();
 
-        // Create mock credentials with a different UID than the server's
-        // This simulates a client connecting with unauthorized credentials
-        let current_uid = getuid().as_raw();
-        let unauthorized_uid = if current_uid == 0 {
-            1000
-        } else {
-            current_uid + 1
-        };
+        // Verify that peer credentials were extracted
+        let creds = conn
+            .peer_credentials()
+            .expect("Peer credentials should be present");
 
-        let mock_credentials = PeerCredentials {
-            uid: unauthorized_uid,
-            gid: 1000,
-            pid: Some(12345),
-        };
+        // Verify credentials match current process (same user in tests)
+        let current_uid = nix::unistd::getuid().as_raw();
+        assert_eq!(
+            creds.uid, current_uid,
+            "Peer UID should match current process UID"
+        );
 
-        // Create handshake with the mock (unauthorized) credentials
-        let mut handshake = ServerHandshake::new("test-daemon/1.0", Some(mock_credentials));
+        // PID should be present on Linux
+        assert!(creds.pid.is_some(), "Peer PID should be present");
 
-        // Receive Hello from client
-        let frame = conn.framed().next().await.unwrap().unwrap();
-        let hello = parse_hello(&frame).expect("failed to parse Hello");
-
-        // Process should return a rejection due to UID mismatch
-        let response = handshake.process_hello(&hello).unwrap();
-        let response_bytes = serialize_handshake_message(&response).unwrap();
-        conn.framed().send(response_bytes).await.unwrap();
-
-        // Verify the response is a rejection
-        match response {
-            HandshakeMessage::HelloNack(nack) => {
-                // SEC-DCP-001: Error message must NOT leak UIDs
-                assert!(
-                    !nack.message.contains(&current_uid.to_string()),
-                    "Error message leaked server UID"
-                );
-                assert!(
-                    !nack.message.contains(&unauthorized_uid.to_string()),
-                    "Error message leaked client UID"
-                );
-                assert_eq!(
-                    nack.message, "permission denied",
-                    "Expected generic error message"
-                );
-            },
-            _ => panic!("Expected HelloNack for UID mismatch"),
-        }
-
-        // Handshake should have failed
-        assert!(!handshake.is_completed());
+        conn
     });
 
-    // Client side - attempts connection
-    let mut client_conn = connect(&socket_path).await.unwrap();
-    let mut client_handshake = ClientHandshake::new("test-cli/1.0");
+    // Connect as client
+    let client = connect(&socket_path).await.unwrap();
 
-    // Send Hello
-    let hello = client_handshake.create_hello();
-    let hello_msg = HandshakeMessage::Hello(hello);
-    let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
-    client_conn.framed().send(hello_bytes).await.unwrap();
-
-    // Receive rejection
-    let response_frame = client_conn.framed().next().await.unwrap().unwrap();
-    let response = parse_handshake_message(&response_frame).expect("failed to parse response");
-
-    // Client should receive HelloNack
-    assert!(
-        matches!(response, HandshakeMessage::HelloNack(_)),
-        "Expected HelloNack for unauthorized client"
-    );
-
-    // Process the response - should fail
-    let result = client_handshake.process_response(response);
-    assert!(result.is_err(), "Client handshake should fail");
-    assert!(!client_handshake.is_completed());
-
-    // Wait for server to complete
-    timeout(Duration::from_secs(1), server_handle)
+    // Verify server accepted the connection (UID matched)
+    let _server_conn = timeout(Duration::from_secs(1), server_handle)
         .await
-        .expect("server timed out")
-        .expect("server task panicked");
+        .expect("server accept timed out")
+        .expect("server accept failed");
+
+    // Client connection exists
+    drop(client);
 }
 
-/// Test that matching UID allows handshake to succeed (TCK-00248).
+/// Test full handshake succeeds after UID validation at accept (TCK-00248).
 ///
-/// This integration test verifies that when peer credentials match the server's
-/// UID, the handshake proceeds successfully.
+/// This verifies that the handshake works correctly after UID authorization
+/// has already been performed at the `accept()` stage.
 #[tokio::test]
-async fn test_handshake_uid_match_success() {
+async fn test_handshake_after_uid_validation() {
     let tmp = TempDir::new().unwrap();
-    let socket_path = test_socket_path(&tmp, "uid_match");
+    let socket_path = test_socket_path(&tmp, "uid_handshake");
 
     let config = ServerConfig::new(&socket_path).with_server_info("test-daemon/1.0");
     let server = ProtocolServer::bind(config).unwrap();
 
-    // Spawn server with matching UID credentials
+    // Spawn server
     let server_handle = tokio::spawn(async move {
+        // accept() performs UID validation before returning
         let (mut conn, _permit) = server.accept().await.unwrap();
 
-        // Use the actual current UID (simulating authorized connection)
-        let current_uid = getuid().as_raw();
+        // Verify peer credentials are present (UID validated at accept)
+        assert!(
+            conn.peer_credentials().is_some(),
+            "Credentials should be present after accept"
+        );
 
-        let valid_credentials = PeerCredentials {
-            uid: current_uid,
-            gid: 1000,
-            pid: Some(12345),
-        };
+        // Handshake no longer needs to validate UID - already done at accept()
+        let mut handshake = ServerHandshake::new("test-daemon/1.0");
 
-        let mut handshake = ServerHandshake::new("test-daemon/1.0", Some(valid_credentials));
-
-        // Receive Hello from client
         let frame = conn.framed().next().await.unwrap().unwrap();
         let hello = parse_hello(&frame).expect("failed to parse Hello");
 
-        // Process should succeed with matching UID
         let response = handshake.process_hello(&hello).unwrap();
         let response_bytes = serialize_handshake_message(&response).unwrap();
         conn.framed().send(response_bytes).await.unwrap();
 
-        // Verify success
-        assert!(
-            matches!(response, HandshakeMessage::HelloAck(_)),
-            "Expected HelloAck for matching UID"
-        );
         assert!(handshake.is_completed());
-
         handshake.negotiated_version()
     });
 
@@ -483,22 +432,18 @@ async fn test_handshake_uid_match_success() {
     let mut client_conn = connect(&socket_path).await.unwrap();
     let mut client_handshake = ClientHandshake::new("test-cli/1.0");
 
-    // Send Hello
     let hello = client_handshake.create_hello();
     let hello_msg = HandshakeMessage::Hello(hello);
     let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
     client_conn.framed().send(hello_bytes).await.unwrap();
 
-    // Receive response
     let response_frame = client_conn.framed().next().await.unwrap().unwrap();
     let response = parse_handshake_message(&response_frame).expect("failed to parse response");
     client_handshake.process_response(response).unwrap();
 
-    // Client should have completed handshake successfully
     assert!(client_handshake.is_completed());
     assert_eq!(client_handshake.server_info(), Some("test-daemon/1.0"));
 
-    // Verify server completed
     let server_version = timeout(Duration::from_secs(1), server_handle)
         .await
         .expect("server timed out")
