@@ -1371,7 +1371,7 @@ mod tests {
     // =========================================================================
 
     /// SEC-FAC-001: Verify bounded deserialization rejects oversized
-    /// work_outcomes.
+    /// `work_outcomes`.
     ///
     /// Attackers may craft malicious JSON with excessive array sizes to
     /// cause memory exhaustion. The bounded deserializer MUST reject
@@ -1424,9 +1424,9 @@ mod tests {
     }
 
     /// SEC-FAC-001: Verify bounded deserialization rejects oversized
-    /// session_ids.
+    /// `session_ids`.
     ///
-    /// Attackers may craft malicious JSON with excessive session_ids to
+    /// Attackers may craft malicious JSON with excessive `session_ids` to
     /// cause memory exhaustion. The bounded deserializer MUST reject
     /// arrays exceeding `MAX_SESSION_IDS_PER_OUTCOME`.
     #[test]
@@ -1453,8 +1453,8 @@ mod tests {
         );
     }
 
-    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
-    /// in CoordinationReceipt.
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `CoordinationReceipt`.
     ///
     /// Attackers may inject unexpected fields to probe for vulnerabilities
     /// or exploit lenient parsing. The `deny_unknown_fields` attribute
@@ -1493,8 +1493,8 @@ mod tests {
         );
     }
 
-    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
-    /// in WorkOutcomeEntry.
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `WorkOutcomeEntry`.
     #[test]
     fn sec_fac_002_deny_unknown_fields_work_outcome() {
         let json = serde_json::json!({
@@ -1513,8 +1513,8 @@ mod tests {
         );
     }
 
-    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
-    /// in BudgetUsageOutput.
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `BudgetUsageOutput`.
     #[test]
     fn sec_fac_002_deny_unknown_fields_budget_usage() {
         let json = serde_json::json!({
@@ -1522,7 +1522,7 @@ mod tests {
             "elapsed_ticks": 0,
             "elapsed_ms": 0,
             "consumed_tokens": 0,
-            "hidden_budget": 999999,
+            "hidden_budget": 999_999,
         });
 
         let result: Result<BudgetUsageOutput, _> = serde_json::from_value(json);
@@ -1533,8 +1533,8 @@ mod tests {
         );
     }
 
-    /// SEC-FAC-002: Verify deny_unknown_fields rejects unexpected fields
-    /// in BudgetCeilingOutput.
+    /// SEC-FAC-002: Verify `deny_unknown_fields` rejects unexpected fields
+    /// in `BudgetCeilingOutput`.
     #[test]
     fn sec_fac_002_deny_unknown_fields_budget_ceiling() {
         let json = serde_json::json!({
@@ -1582,8 +1582,8 @@ mod tests {
                 "max_tokens": null
             },
             "stop_condition": "WORK_COMPLETED",
-            "started_at": 1704067200000000000_u64,
-            "completed_at": 1704067205000000000_u64,
+            "started_at": 1_704_067_200_000_000_000_u64,
+            "completed_at": 1_704_067_205_000_000_000_u64,
             "total_sessions": 2,
             "successful_sessions": 2,
             "failed_sessions": 0,
