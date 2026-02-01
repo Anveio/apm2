@@ -97,6 +97,95 @@ pub const MAX_PATH_LENGTH: usize = 4096;
 /// Prevents Vec allocation spikes from paths with many segments.
 pub const MAX_PATH_COMPONENTS: usize = 256;
 
+/// Maximum number of tool classes in the tool allowlist.
+/// Per CTR-1303, bounded collections prevent `DoS`.
+pub const MAX_TOOL_ALLOWLIST: usize = 100;
+
+// =============================================================================
+// Tool Class Enum (TCK-00254)
+//
+// Per REQ-DCP-0002, the context pack manifest includes a tool allowlist.
+// This enum mirrors the one in apm2-daemon for consistency.
+// =============================================================================
+
+/// Tool class for capability categorization in context pack manifests.
+///
+/// Per TCK-00254, this defines the coarse-grained categories of tool
+/// operations that can be allowed in a context pack.
+///
+/// # Discriminant Stability
+///
+/// Explicit discriminant values maintain semver compatibility. New variants
+/// must use new values; existing values must not change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum ToolClass {
+    /// Read operations: file reads, directory listings, git status.
+    #[default]
+    Read      = 0,
+
+    /// Write operations: file writes, file edits, file deletions.
+    Write     = 1,
+
+    /// Execute operations: shell commands, process spawning.
+    Execute   = 2,
+
+    /// Network operations: HTTP requests, socket connections.
+    Network   = 3,
+
+    /// Git operations: commits, pushes, branch operations.
+    Git       = 4,
+
+    /// Inference operations: LLM API calls.
+    Inference = 5,
+
+    /// Artifact operations: CAS publish/fetch.
+    Artifact  = 6,
+}
+
+impl ToolClass {
+    /// Returns the numeric value of this tool class.
+    #[must_use]
+    pub const fn value(&self) -> u8 {
+        *self as u8
+    }
+
+    /// Parses a tool class from a u8 value.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the value does not correspond to a known tool class.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Read),
+            1 => Some(Self::Write),
+            2 => Some(Self::Execute),
+            3 => Some(Self::Network),
+            4 => Some(Self::Git),
+            5 => Some(Self::Inference),
+            6 => Some(Self::Artifact),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ToolClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Read => "Read",
+            Self::Write => "Write",
+            Self::Execute => "Execute",
+            Self::Network => "Network",
+            Self::Git => "Git",
+            Self::Inference => "Inference",
+            Self::Artifact => "Artifact",
+        };
+        write!(f, "{name}")
+    }
+}
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -459,6 +548,7 @@ impl ManifestEntryBuilder {
 ///   time)
 /// - `profile_id`: Profile that generated this manifest
 /// - `entries`: List of allowed file entries
+/// - `tool_allowlist`: List of allowed tool classes (TCK-00254)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextPackManifest {
@@ -475,6 +565,13 @@ pub struct ContextPackManifest {
     /// List of allowed file entries.
     entries: Vec<ManifestEntry>,
 
+    /// Allowlist of tool classes that can be invoked.
+    ///
+    /// Per TCK-00254 and REQ-DCP-0002, tool requests are validated against
+    /// this allowlist. Empty means no tools allowed (fail-closed).
+    #[serde(default)]
+    pub tool_allowlist: Vec<ToolClass>,
+
     /// Index for O(1) path lookups.
     /// Maps normalized path to index in entries vector.
     #[serde(skip)]
@@ -488,6 +585,7 @@ impl PartialEq for ContextPackManifest {
             && self.manifest_hash == other.manifest_hash
             && self.profile_id == other.profile_id
             && self.entries == other.entries
+            && self.tool_allowlist == other.tool_allowlist
     }
 }
 
@@ -509,13 +607,15 @@ impl ContextPackManifest {
     /// Computes the manifest hash from the manifest fields.
     ///
     /// The hash is computed over the canonical representation of all fields
-    /// except the hash itself.
+    /// except the hash itself. Per TCK-00254, `tool_allowlist` is sorted for
+    /// deterministic ordering.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     fn compute_manifest_hash(
         manifest_id: &str,
         profile_id: &str,
         entries: &[ManifestEntry],
+        tool_allowlist: &[ToolClass],
     ) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
 
@@ -548,6 +648,14 @@ impl ContextPackManifest {
 
             // access_level
             hasher.update(&[entry.access_level as u8]);
+        }
+
+        // Tool allowlist (TCK-00254) - sorted for determinism
+        let mut sorted_tools: Vec<u8> = tool_allowlist.iter().map(ToolClass::value).collect();
+        sorted_tools.sort_unstable();
+        hasher.update(&(sorted_tools.len() as u32).to_be_bytes());
+        for tool_value in &sorted_tools {
+            hasher.update(&[*tool_value]);
         }
 
         *hasher.finalize().as_bytes()
@@ -841,8 +949,12 @@ impl ContextPackManifest {
     /// Returns [`ManifestError::InvalidData`] if the computed hash does not
     /// match the stored hash.
     pub fn verify_self_consistency(&self) -> Result<(), ManifestError> {
-        let computed_hash =
-            Self::compute_manifest_hash(&self.manifest_id, &self.profile_id, &self.entries);
+        let computed_hash = Self::compute_manifest_hash(
+            &self.manifest_id,
+            &self.profile_id,
+            &self.entries,
+            &self.tool_allowlist,
+        );
 
         // Use constant-time comparison for security
         if !bool::from(computed_hash.ct_eq(&self.manifest_hash)) {
@@ -1006,6 +1118,7 @@ pub struct ContextPackManifestBuilder {
     manifest_id: String,
     profile_id: String,
     entries: Vec<ManifestEntry>,
+    tool_allowlist: Vec<ToolClass>,
 }
 
 impl ContextPackManifestBuilder {
@@ -1016,6 +1129,7 @@ impl ContextPackManifestBuilder {
             manifest_id: manifest_id.into(),
             profile_id: profile_id.into(),
             entries: Vec::new(),
+            tool_allowlist: Vec::new(),
         }
     }
 
@@ -1030,6 +1144,22 @@ impl ContextPackManifestBuilder {
     #[must_use]
     pub fn entries(mut self, entries: Vec<ManifestEntry>) -> Self {
         self.entries = entries;
+        self
+    }
+
+    /// Sets the tool allowlist.
+    ///
+    /// Per TCK-00254, only tools in this allowlist can be invoked.
+    #[must_use]
+    pub fn tool_allowlist(mut self, tools: Vec<ToolClass>) -> Self {
+        self.tool_allowlist = tools;
+        self
+    }
+
+    /// Adds a tool class to the allowlist.
+    #[must_use]
+    pub fn allow_tool(mut self, tool: ToolClass) -> Self {
+        self.tool_allowlist.push(tool);
         self
     }
 
@@ -1077,12 +1207,21 @@ impl ContextPackManifestBuilder {
             });
         }
 
-        // Validate collection size
+        // Validate collection sizes (CTR-1303: bounded collections)
         if self.entries.len() > MAX_ENTRIES {
             return Err(ManifestError::CollectionTooLarge {
                 field: "entries",
                 actual: self.entries.len(),
                 max: MAX_ENTRIES,
+            });
+        }
+
+        // Validate tool_allowlist size (TCK-00254)
+        if self.tool_allowlist.len() > MAX_TOOL_ALLOWLIST {
+            return Err(ManifestError::CollectionTooLarge {
+                field: "tool_allowlist",
+                actual: self.tool_allowlist.len(),
+                max: MAX_TOOL_ALLOWLIST,
             });
         }
 
@@ -1145,11 +1284,12 @@ impl ContextPackManifestBuilder {
         // Build path index for O(1) lookups
         let path_index = ContextPackManifest::build_path_index(&self.entries);
 
-        // Compute manifest hash
+        // Compute manifest hash (includes tool_allowlist per TCK-00254)
         let manifest_hash = ContextPackManifest::compute_manifest_hash(
             &self.manifest_id,
             &self.profile_id,
             &self.entries,
+            &self.tool_allowlist,
         );
 
         Ok(ContextPackManifest {
@@ -1157,6 +1297,7 @@ impl ContextPackManifestBuilder {
             manifest_hash,
             profile_id: self.profile_id,
             entries: self.entries,
+            tool_allowlist: self.tool_allowlist,
             path_index,
         })
     }
@@ -2099,6 +2240,144 @@ pub mod tests {
     }
 
     // =========================================================================
+    // TCK-00254: Tool Allowlist Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_with_tool_allowlist() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .build();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Write));
+    }
+
+    #[test]
+    fn test_manifest_builder_allow_tool() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .allow_tool(ToolClass::Read)
+            .allow_tool(ToolClass::Execute)
+            .build();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Execute));
+    }
+
+    #[test]
+    fn test_manifest_tool_allowlist_too_large() {
+        let tools: Vec<ToolClass> = (0..=MAX_TOOL_ALLOWLIST).map(|_| ToolClass::Read).collect();
+
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(tools)
+            .try_build();
+
+        assert!(matches!(
+            result,
+            Err(ManifestError::CollectionTooLarge { field, actual, max })
+            if field == "tool_allowlist" && actual == MAX_TOOL_ALLOWLIST + 1 && max == MAX_TOOL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_hash_includes_tool_allowlist() {
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read])
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Write])
+            .build();
+
+        // Different tool allowlists should produce different hashes
+        assert_ne!(manifest1.manifest_hash(), manifest2.manifest_hash());
+    }
+
+    #[test]
+    fn test_manifest_hash_tool_allowlist_order_determinism() {
+        // Same tools in different order should produce same hash (sorted before
+        // hashing)
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Execute, ToolClass::Read, ToolClass::Write])
+            .build();
+
+        assert_eq!(
+            manifest1.manifest_hash(),
+            manifest2.manifest_hash(),
+            "manifest hash should be deterministic regardless of tool_allowlist order"
+        );
+    }
+
+    #[test]
+    fn test_manifest_empty_tool_allowlist_valid() {
+        // Empty tool_allowlist should be valid (fail-closed semantics)
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001").build();
+
+        assert!(manifest.tool_allowlist.is_empty());
+        assert!(manifest.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_with_tool_allowlist() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        // Deserialize back
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        recovered.rebuild_index();
+
+        assert_eq!(manifest.tool_allowlist, recovered.tool_allowlist);
+        assert_eq!(manifest.manifest_hash(), recovered.manifest_hash());
+        assert!(recovered.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_tool_class_from_u8() {
+        assert_eq!(ToolClass::from_u8(0), Some(ToolClass::Read));
+        assert_eq!(ToolClass::from_u8(1), Some(ToolClass::Write));
+        assert_eq!(ToolClass::from_u8(2), Some(ToolClass::Execute));
+        assert_eq!(ToolClass::from_u8(3), Some(ToolClass::Network));
+        assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
+        assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
+        assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
+        assert_eq!(ToolClass::from_u8(7), None);
+        assert_eq!(ToolClass::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_tool_class_value() {
+        assert_eq!(ToolClass::Read.value(), 0);
+        assert_eq!(ToolClass::Write.value(), 1);
+        assert_eq!(ToolClass::Execute.value(), 2);
+        assert_eq!(ToolClass::Network.value(), 3);
+        assert_eq!(ToolClass::Git.value(), 4);
+        assert_eq!(ToolClass::Inference.value(), 5);
+        assert_eq!(ToolClass::Artifact.value(), 6);
+    }
+
+    #[test]
+    fn test_tool_class_display() {
+        assert_eq!(format!("{}", ToolClass::Read), "Read");
+        assert_eq!(format!("{}", ToolClass::Write), "Write");
+        assert_eq!(format!("{}", ToolClass::Execute), "Execute");
+    }
+
+    // =========================================================================
     // TCK-00255: Sealing Tests
     // =========================================================================
 
@@ -2369,5 +2648,143 @@ pub mod tests {
         assert_eq!(manifest1.entries()[0].path(), "/aaa/file.rs");
         assert_eq!(manifest1.entries()[1].path(), "/bbb/file.rs");
         assert_eq!(manifest1.entries()[2].path(), "/ccc/file.rs");
+    }
+
+    // =========================================================================
+    // TCK-00254: Tool Allowlist Tests
+    // =========================================================================
+
+    #[test]
+    fn test_manifest_with_tool_allowlist() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .build();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Write));
+    }
+
+    #[test]
+    fn test_manifest_builder_allow_tool() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .allow_tool(ToolClass::Read)
+            .allow_tool(ToolClass::Execute)
+            .build();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Execute));
+    }
+
+    #[test]
+    fn test_manifest_tool_allowlist_too_large() {
+        let tools: Vec<ToolClass> = (0..=MAX_TOOL_ALLOWLIST).map(|_| ToolClass::Read).collect();
+
+        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(tools)
+            .try_build();
+
+        assert!(matches!(
+            result,
+            Err(ManifestError::CollectionTooLarge { field, actual, max })
+            if field == "tool_allowlist" && actual == MAX_TOOL_ALLOWLIST + 1 && max == MAX_TOOL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_hash_includes_tool_allowlist() {
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read])
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Write])
+            .build();
+
+        // Different tool allowlists should produce different hashes
+        assert_ne!(manifest1.manifest_hash(), manifest2.manifest_hash());
+    }
+
+    #[test]
+    fn test_manifest_hash_tool_allowlist_order_determinism() {
+        // Same tools in different order should produce same hash (sorted before
+        // hashing)
+        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .build();
+
+        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Execute, ToolClass::Read, ToolClass::Write])
+            .build();
+
+        assert_eq!(
+            manifest1.manifest_hash(),
+            manifest2.manifest_hash(),
+            "manifest hash should be deterministic regardless of tool_allowlist order"
+        );
+    }
+
+    #[test]
+    fn test_manifest_empty_tool_allowlist_valid() {
+        // Empty tool_allowlist should be valid (fail-closed semantics)
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001").build();
+
+        assert!(manifest.tool_allowlist.is_empty());
+        assert!(manifest.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_with_tool_allowlist() {
+        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .add_entry(
+                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
+                    .access_level(AccessLevel::Read)
+                    .build(),
+            )
+            .build();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        // Deserialize back
+        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
+        recovered.rebuild_index();
+
+        assert_eq!(manifest.tool_allowlist, recovered.tool_allowlist);
+        assert_eq!(manifest.manifest_hash(), recovered.manifest_hash());
+        assert!(recovered.verify_self_consistency().is_ok());
+    }
+
+    #[test]
+    fn test_tool_class_from_u8() {
+        assert_eq!(ToolClass::from_u8(0), Some(ToolClass::Read));
+        assert_eq!(ToolClass::from_u8(1), Some(ToolClass::Write));
+        assert_eq!(ToolClass::from_u8(2), Some(ToolClass::Execute));
+        assert_eq!(ToolClass::from_u8(3), Some(ToolClass::Network));
+        assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
+        assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
+        assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
+        assert_eq!(ToolClass::from_u8(7), None);
+        assert_eq!(ToolClass::from_u8(255), None);
+    }
+
+    #[test]
+    fn test_tool_class_value() {
+        assert_eq!(ToolClass::Read.value(), 0);
+        assert_eq!(ToolClass::Write.value(), 1);
+        assert_eq!(ToolClass::Execute.value(), 2);
+        assert_eq!(ToolClass::Network.value(), 3);
+        assert_eq!(ToolClass::Git.value(), 4);
+        assert_eq!(ToolClass::Inference.value(), 5);
+        assert_eq!(ToolClass::Artifact.value(), 6);
+    }
+
+    #[test]
+    fn test_tool_class_display() {
+        assert_eq!(format!("{}", ToolClass::Read), "Read");
+        assert_eq!(format!("{}", ToolClass::Write), "Write");
+        assert_eq!(format!("{}", ToolClass::Execute), "Execute");
     }
 }

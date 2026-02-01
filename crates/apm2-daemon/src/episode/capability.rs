@@ -37,7 +37,7 @@
 //! - CTR-1303: Bounded collections with MAX_* constants
 //! - HOLONIC-BOUNDARY-001: Deterministic time via clock injection
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -46,6 +46,24 @@ use serde::{Deserialize, Serialize};
 use super::envelope::RiskTier;
 use super::scope::{CapabilityScope, ScopeError};
 use super::tool_class::ToolClass;
+
+// =============================================================================
+// Allowlist Resource Limits (TCK-00254)
+//
+// Per CTR-1303, all Vec fields must have bounded sizes to prevent DoS.
+// =============================================================================
+
+/// Maximum number of tool classes in the tool allowlist.
+pub const MAX_TOOL_ALLOWLIST: usize = 100;
+
+/// Maximum number of paths in the write allowlist.
+pub const MAX_WRITE_ALLOWLIST: usize = 1000;
+
+/// Maximum number of shell patterns in the shell allowlist.
+pub const MAX_SHELL_ALLOWLIST: usize = 500;
+
+/// Maximum length of a shell pattern.
+pub const MAX_SHELL_PATTERN_LEN: usize = 1024;
 
 // =============================================================================
 // Clock Abstraction
@@ -168,6 +186,46 @@ pub enum CapabilityError {
         /// Name of the empty field.
         field: &'static str,
     },
+
+    /// Tool allowlist exceeds maximum size.
+    TooManyToolAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Write allowlist exceeds maximum size.
+    TooManyWriteAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Shell allowlist exceeds maximum size.
+    TooManyShellAllowlistEntries {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Shell pattern exceeds maximum length.
+    ShellPatternTooLong {
+        /// Actual length in bytes.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Path in write allowlist exceeds maximum length.
+    WriteAllowlistPathTooLong {
+        /// Actual length in bytes.
+        len: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for CapabilityError {
@@ -196,6 +254,21 @@ impl std::fmt::Display for CapabilityError {
             },
             Self::EmptyField { field } => {
                 write!(f, "required field is empty: {field}")
+            },
+            Self::TooManyToolAllowlistEntries { count, max } => {
+                write!(f, "too many tool allowlist entries: {count} (max {max})")
+            },
+            Self::TooManyWriteAllowlistEntries { count, max } => {
+                write!(f, "too many write allowlist entries: {count} (max {max})")
+            },
+            Self::TooManyShellAllowlistEntries { count, max } => {
+                write!(f, "too many shell allowlist entries: {count} (max {max})")
+            },
+            Self::ShellPatternTooLong { len, max } => {
+                write!(f, "shell pattern too long: {len} bytes (max {max})")
+            },
+            Self::WriteAllowlistPathTooLong { len, max } => {
+                write!(f, "write allowlist path too long: {len} bytes (max {max})")
             },
         }
     }
@@ -502,6 +575,13 @@ impl CapabilityBuilder {
 /// - Is referenced by hash in the episode envelope
 /// - Expires at a specified time (optional)
 ///
+/// # TCK-00254 Extensions
+///
+/// Per RFC-0017, the manifest includes allowlists for tool mediation:
+/// - `tool_allowlist`: Allowed tool classes
+/// - `write_allowlist`: Allowed filesystem write paths
+/// - `shell_allowlist`: Allowed shell command patterns
+///
 /// # Security
 ///
 /// Uses `deny_unknown_fields` to prevent field injection attacks when
@@ -524,6 +604,27 @@ pub struct CapabilityManifest {
     /// When this manifest expires (Unix timestamp in seconds).
     /// Zero means no expiration.
     pub expires_at: u64,
+
+    /// Allowlist of tool classes that can be invoked.
+    ///
+    /// Per REQ-DCP-0002, tool requests are validated against this allowlist
+    /// at the daemon layer. Empty means no tools allowed (fail-closed).
+    #[serde(default)]
+    pub tool_allowlist: Vec<ToolClass>,
+
+    /// Allowlist of filesystem paths that can be written to.
+    ///
+    /// Per REQ-DCP-0002, write operations are validated against this allowlist.
+    /// Paths should be absolute and normalized. Empty means no writes allowed.
+    #[serde(default)]
+    pub write_allowlist: Vec<PathBuf>,
+
+    /// Allowlist of shell command patterns that can be executed.
+    ///
+    /// Per REQ-DCP-0002, shell execution requests are validated against this
+    /// allowlist. Patterns may use glob syntax. Empty means no shell allowed.
+    #[serde(default)]
+    pub shell_allowlist: Vec<String>,
 }
 
 impl CapabilityManifest {
@@ -578,6 +679,49 @@ impl CapabilityManifest {
             if !seen_ids.insert(&cap.capability_id) {
                 return Err(CapabilityError::DuplicateCapabilityId {
                     id: cap.capability_id.clone(),
+                });
+            }
+        }
+
+        // Validate allowlists (TCK-00254: CTR-1303 bounded collections)
+        if self.tool_allowlist.len() > MAX_TOOL_ALLOWLIST {
+            return Err(CapabilityError::TooManyToolAllowlistEntries {
+                count: self.tool_allowlist.len(),
+                max: MAX_TOOL_ALLOWLIST,
+            });
+        }
+
+        if self.write_allowlist.len() > MAX_WRITE_ALLOWLIST {
+            return Err(CapabilityError::TooManyWriteAllowlistEntries {
+                count: self.write_allowlist.len(),
+                max: MAX_WRITE_ALLOWLIST,
+            });
+        }
+
+        // Validate write allowlist path lengths
+        for path in &self.write_allowlist {
+            let path_len = path.as_os_str().len();
+            if path_len > super::scope::MAX_PATH_LEN {
+                return Err(CapabilityError::WriteAllowlistPathTooLong {
+                    len: path_len,
+                    max: super::scope::MAX_PATH_LEN,
+                });
+            }
+        }
+
+        if self.shell_allowlist.len() > MAX_SHELL_ALLOWLIST {
+            return Err(CapabilityError::TooManyShellAllowlistEntries {
+                count: self.shell_allowlist.len(),
+                max: MAX_SHELL_ALLOWLIST,
+            });
+        }
+
+        // Validate shell pattern lengths
+        for pattern in &self.shell_allowlist {
+            if pattern.len() > MAX_SHELL_PATTERN_LEN {
+                return Err(CapabilityError::ShellPatternTooLong {
+                    len: pattern.len(),
+                    max: MAX_SHELL_PATTERN_LEN,
                 });
             }
         }
@@ -884,17 +1028,47 @@ struct CapabilityManifestProto {
     created_at: Option<u64>,
     #[prost(uint64, optional, tag = "5")]
     expires_at: Option<u64>,
+    /// Sorted tool class values for deterministic serialization.
+    #[prost(uint32, repeated, tag = "6")]
+    tool_allowlist: Vec<u32>,
+    /// Sorted write paths for deterministic serialization.
+    #[prost(string, repeated, tag = "7")]
+    write_allowlist: Vec<String>,
+    /// Sorted shell patterns for deterministic serialization.
+    #[prost(string, repeated, tag = "8")]
+    shell_allowlist: Vec<String>,
 }
 
 impl CapabilityManifest {
     /// Returns the canonical bytes for this manifest.
     ///
-    /// Per AD-VERIFY-001, capabilities are sorted by ID for determinism.
+    /// Per AD-VERIFY-001, capabilities and allowlists are sorted for
+    /// determinism.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         // Sort capabilities by ID for deterministic ordering
         let mut sorted_caps: Vec<_> = self.capabilities.iter().collect();
         sorted_caps.sort_by(|a, b| a.capability_id.cmp(&b.capability_id));
+
+        // Sort tool allowlist by value for determinism
+        let mut sorted_tools: Vec<u32> = self
+            .tool_allowlist
+            .iter()
+            .map(|t| u32::from(t.value()))
+            .collect();
+        sorted_tools.sort_unstable();
+
+        // Sort write allowlist paths for determinism
+        let mut sorted_write_paths: Vec<String> = self
+            .write_allowlist
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        sorted_write_paths.sort();
+
+        // Sort shell allowlist for determinism
+        let mut sorted_shell_patterns: Vec<String> = self.shell_allowlist.clone();
+        sorted_shell_patterns.sort();
 
         let proto = CapabilityManifestProto {
             manifest_id: self.manifest_id.clone(),
@@ -902,6 +1076,9 @@ impl CapabilityManifest {
             delegator_id: self.delegator_id.clone(),
             created_at: Some(self.created_at),
             expires_at: Some(self.expires_at),
+            tool_allowlist: sorted_tools,
+            write_allowlist: sorted_write_paths,
+            shell_allowlist: sorted_shell_patterns,
         };
         proto.encode_to_vec()
     }
@@ -915,6 +1092,9 @@ pub struct CapabilityManifestBuilder {
     delegator_id: String,
     created_at: u64,
     expires_at: u64,
+    tool_allowlist: Vec<ToolClass>,
+    write_allowlist: Vec<PathBuf>,
+    shell_allowlist: Vec<String>,
 }
 
 impl CapabilityManifestBuilder {
@@ -932,6 +1112,9 @@ impl CapabilityManifestBuilder {
             delegator_id: String::new(),
             created_at: now,
             expires_at: 0,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         }
     }
 
@@ -981,6 +1164,55 @@ impl CapabilityManifestBuilder {
         self
     }
 
+    /// Sets the tool allowlist.
+    ///
+    /// Per REQ-DCP-0002, only tools in this allowlist can be invoked.
+    #[must_use]
+    pub fn tool_allowlist(mut self, tools: Vec<ToolClass>) -> Self {
+        self.tool_allowlist = tools;
+        self
+    }
+
+    /// Adds a tool class to the allowlist.
+    #[must_use]
+    pub fn allow_tool(mut self, tool: ToolClass) -> Self {
+        self.tool_allowlist.push(tool);
+        self
+    }
+
+    /// Sets the write path allowlist.
+    ///
+    /// Per REQ-DCP-0002, only paths in this allowlist can be written to.
+    #[must_use]
+    pub fn write_allowlist(mut self, paths: Vec<PathBuf>) -> Self {
+        self.write_allowlist = paths;
+        self
+    }
+
+    /// Adds a path to the write allowlist.
+    #[must_use]
+    pub fn allow_write_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.write_allowlist.push(path.into());
+        self
+    }
+
+    /// Sets the shell pattern allowlist.
+    ///
+    /// Per REQ-DCP-0002, only commands matching patterns in this allowlist
+    /// can be executed.
+    #[must_use]
+    pub fn shell_allowlist(mut self, patterns: Vec<String>) -> Self {
+        self.shell_allowlist = patterns;
+        self
+    }
+
+    /// Adds a shell pattern to the allowlist.
+    #[must_use]
+    pub fn allow_shell_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.shell_allowlist.push(pattern.into());
+        self
+    }
+
     /// Builds the manifest.
     ///
     /// # Errors
@@ -993,6 +1225,9 @@ impl CapabilityManifestBuilder {
             delegator_id: self.delegator_id,
             created_at: self.created_at,
             expires_at: self.expires_at,
+            tool_allowlist: self.tool_allowlist,
+            write_allowlist: self.write_allowlist,
+            shell_allowlist: self.shell_allowlist,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -1593,6 +1828,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 0,
             expires_at: 1, // Expired in 1970
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0);
@@ -1615,6 +1853,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         let manifest2 = CapabilityManifest {
@@ -1626,6 +1867,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Different order should produce same canonical bytes
@@ -1736,6 +1980,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000, // Expires at timestamp 2000
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Clock is before expiration
@@ -1757,6 +2004,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000, // Expires at timestamp 2000
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Clock is after expiration
@@ -1778,6 +2028,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 0, // No expiration
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Should never expire regardless of clock
@@ -1799,6 +2052,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Should succeed with clock before expiration
@@ -1829,6 +2085,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 1000,
             expires_at: 2000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         let request = ToolRequest::new(ToolClass::Read, RiskTier::Tier0)
@@ -1874,6 +2133,9 @@ mod tests {
             delegator_id: "delegator".to_string(),
             created_at: 0,
             expires_at: 1000,
+            tool_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            shell_allowlist: Vec::new(),
         };
 
         // Verify behavior is deterministic with fixed clock
@@ -1905,5 +2167,261 @@ mod tests {
             assert!(!manifest.is_expired_with_clock(&at_expiry));
             assert!(manifest.is_expired_with_clock(&after_expiry));
         }
+    }
+
+    // ==========================================================================
+    // TCK-00254: Allowlist Tests
+    //
+    // Per REQ-DCP-0002, these tests verify the tool, write, and shell
+    // allowlists for capability manifests.
+    // ==========================================================================
+
+    #[test]
+    fn test_manifest_with_tool_allowlist() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
+        assert!(manifest.tool_allowlist.contains(&ToolClass::Write));
+    }
+
+    #[test]
+    fn test_manifest_with_write_allowlist() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .write_allowlist(vec![
+                PathBuf::from("/workspace/src"),
+                PathBuf::from("/workspace/target"),
+            ])
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.write_allowlist.len(), 2);
+        assert!(
+            manifest
+                .write_allowlist
+                .contains(&PathBuf::from("/workspace/src"))
+        );
+    }
+
+    #[test]
+    fn test_manifest_with_shell_allowlist() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .shell_allowlist(vec!["cargo *".to_string(), "git status".to_string()])
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.shell_allowlist.len(), 2);
+        assert!(manifest.shell_allowlist.contains(&"cargo *".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_builder_allow_methods() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .allow_tool(ToolClass::Read)
+            .allow_tool(ToolClass::Execute)
+            .allow_write_path("/workspace")
+            .allow_shell_pattern("npm *")
+            .build()
+            .unwrap();
+
+        assert_eq!(manifest.tool_allowlist.len(), 2);
+        assert_eq!(manifest.write_allowlist.len(), 1);
+        assert_eq!(manifest.shell_allowlist.len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_tool_allowlist_too_large() {
+        let tools: Vec<ToolClass> = (0..=MAX_TOOL_ALLOWLIST).map(|_| ToolClass::Read).collect();
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .tool_allowlist(tools)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::TooManyToolAllowlistEntries { count, max })
+            if count == MAX_TOOL_ALLOWLIST + 1 && max == MAX_TOOL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_write_allowlist_too_large() {
+        let paths: Vec<PathBuf> = (0..=MAX_WRITE_ALLOWLIST)
+            .map(|i| PathBuf::from(format!("/path/{i}")))
+            .collect();
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(paths)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::TooManyWriteAllowlistEntries { count, max })
+            if count == MAX_WRITE_ALLOWLIST + 1 && max == MAX_WRITE_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_shell_allowlist_too_large() {
+        let patterns: Vec<String> = (0..=MAX_SHELL_ALLOWLIST)
+            .map(|i| format!("cmd{i}"))
+            .collect();
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .shell_allowlist(patterns)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::TooManyShellAllowlistEntries { count, max })
+            if count == MAX_SHELL_ALLOWLIST + 1 && max == MAX_SHELL_ALLOWLIST
+        ));
+    }
+
+    #[test]
+    fn test_manifest_shell_pattern_too_long() {
+        let long_pattern = "x".repeat(MAX_SHELL_PATTERN_LEN + 1);
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .shell_allowlist(vec![long_pattern])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::ShellPatternTooLong { len, max })
+            if len == MAX_SHELL_PATTERN_LEN + 1 && max == MAX_SHELL_PATTERN_LEN
+        ));
+    }
+
+    #[test]
+    fn test_manifest_write_path_too_long() {
+        let long_path =
+            PathBuf::from("/".to_string() + &"x".repeat(super::super::scope::MAX_PATH_LEN));
+
+        let result = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .write_allowlist(vec![long_path])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(CapabilityError::WriteAllowlistPathTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn test_canonical_bytes_includes_allowlists() {
+        let manifest1 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read])
+            .build()
+            .unwrap();
+
+        let manifest2 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Write])
+            .build()
+            .unwrap();
+
+        // Different tool allowlists should produce different hashes
+        assert_ne!(manifest1.canonical_bytes(), manifest2.canonical_bytes());
+        assert_ne!(manifest1.digest(), manifest2.digest());
+    }
+
+    #[test]
+    fn test_canonical_bytes_allowlist_order_determinism() {
+        // Same allowlist items in different orders should produce same hash
+        let manifest1 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .write_allowlist(vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/c"),
+            ])
+            .shell_allowlist(vec!["z".to_string(), "a".to_string(), "m".to_string()])
+            .build()
+            .unwrap();
+
+        let manifest2 = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Execute, ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![
+                PathBuf::from("/c"),
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+            ])
+            .shell_allowlist(vec!["m".to_string(), "z".to_string(), "a".to_string()])
+            .build()
+            .unwrap();
+
+        // Same content in different order should produce same hash (sorted before
+        // hashing)
+        assert_eq!(
+            manifest1.canonical_bytes(),
+            manifest2.canonical_bytes(),
+            "canonical bytes should be deterministic regardless of allowlist order"
+        );
+        assert_eq!(
+            manifest1.digest(),
+            manifest2.digest(),
+            "digest should be deterministic regardless of allowlist order"
+        );
+    }
+
+    #[test]
+    fn test_manifest_with_empty_allowlists_valid() {
+        // Empty allowlists should be valid (fail-closed semantics)
+        let manifest = CapabilityManifest::builder("test")
+            .delegator("delegator")
+            .build()
+            .unwrap();
+
+        assert!(manifest.tool_allowlist.is_empty());
+        assert!(manifest.write_allowlist.is_empty());
+        assert!(manifest.shell_allowlist.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_serde_roundtrip_with_allowlists() {
+        let manifest = CapabilityManifest::builder("test-manifest")
+            .delegator("test-delegator")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo *".to_string()])
+            .build()
+            .unwrap();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&manifest).unwrap();
+
+        // Deserialize back
+        let recovered: CapabilityManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(manifest.tool_allowlist, recovered.tool_allowlist);
+        assert_eq!(manifest.write_allowlist, recovered.write_allowlist);
+        assert_eq!(manifest.shell_allowlist, recovered.shell_allowlist);
+        assert_eq!(manifest.digest(), recovered.digest());
     }
 }

@@ -153,11 +153,12 @@ pub use broker::{
 pub use budget::{EpisodeBudget, EpisodeBudgetBuilder};
 // Re-export tool execution types (TCK-00165)
 pub use budget_tracker::{BudgetExhaustedError, BudgetSnapshot, BudgetTracker};
-// Re-export capability types (TCK-00163)
+// Re-export capability types (TCK-00163, TCK-00254)
 pub use capability::{
     Capability, CapabilityBuilder, CapabilityDecision, CapabilityError, CapabilityManifest,
     CapabilityManifestBuilder, CapabilityValidator, DenyReason, MAX_ACTOR_ID_LEN, MAX_CAPABILITIES,
-    MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, ToolRequest,
+    MAX_CAPABILITY_ID_LEN, MAX_MANIFEST_ID_LEN, MAX_SHELL_ALLOWLIST, MAX_SHELL_PATTERN_LEN,
+    MAX_TOOL_ALLOWLIST, MAX_WRITE_ALLOWLIST, ToolRequest,
 };
 // Re-export Claude Code adapter types (TCK-00173)
 pub use claude_code::{

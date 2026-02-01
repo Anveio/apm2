@@ -83,5 +83,6 @@ mod manifest;
 
 pub use manifest::{
     AccessLevel, ContextPackManifest, ContextPackManifestBuilder, MAX_ENTRIES, MAX_PATH_COMPONENTS,
-    MAX_PATH_LENGTH, ManifestEntry, ManifestEntryBuilder, ManifestError, normalize_path,
+    MAX_PATH_LENGTH, MAX_TOOL_ALLOWLIST, ManifestEntry, ManifestEntryBuilder, ManifestError,
+    ToolClass, normalize_path,
 };
