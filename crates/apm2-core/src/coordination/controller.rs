@@ -3741,8 +3741,8 @@ mod tests {
 
     /// TCK-00242: Controller auto-aborts on clock regression.
     ///
-    /// When `update_elapsed_ticks` detects a clock regression (current_tick <
-    /// start_tick), the controller must automatically transition to Aborted
+    /// When `update_elapsed_ticks` detects a clock regression (`current_tick` <
+    /// `start_tick`), the controller must automatically transition to Aborted
     /// state (fail-closed).
     #[test]
     fn tck_00242_auto_abort_on_clock_regression() {
@@ -3785,10 +3785,11 @@ mod tests {
         ));
     }
 
-    /// TCK-00242: Controller auto-aborts on clock regression during complete().
+    /// TCK-00242: Controller auto-aborts on clock regression during
+    /// `complete()`.
     ///
     /// The fail-closed behavior applies to all methods that call
-    /// update_elapsed_ticks.
+    /// `update_elapsed_ticks`.
     #[test]
     fn tck_00242_auto_abort_on_clock_regression_during_complete() {
         let config = test_config(vec!["work-1".to_string()]);
