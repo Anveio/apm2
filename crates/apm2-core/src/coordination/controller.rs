@@ -118,8 +118,8 @@ use super::events::{
 };
 use super::evidence::{ReceiptBuilder, WorkOutcome};
 use super::state::{
-    AbortReason, BudgetUsage, CoordinationBudget, CoordinationStatus, MAX_WORK_QUEUE_SIZE,
-    SessionOutcome, StopCondition, WorkItemOutcome,
+    AbortReason, BudgetUsage, CoordinationBudget, CoordinationError, CoordinationStatus,
+    MAX_WORK_QUEUE_SIZE, SessionOutcome, StopCondition, WorkItemOutcome,
 };
 use crate::crypto::Hash;
 use crate::evidence::ContentAddressedStore;
@@ -853,11 +853,30 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage.update_elapsed_ticks(
-                started_at_tick.value(),
-                current_tick.value(),
-                current_tick.tick_rate_hz(),
-            );
+            self.budget_usage
+                .update_elapsed_ticks(
+                    started_at_tick.value(),
+                    current_tick.value(),
+                    current_tick.tick_rate_hz(),
+                )
+                .map_err(|e| match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    } => ControllerError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                })?;
         }
 
         // Access tracking by index (handles duplicate work IDs correctly)
@@ -1086,11 +1105,30 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage.update_elapsed_ticks(
-                started_at_tick.value(),
-                current_tick.value(),
-                current_tick.tick_rate_hz(),
-            );
+            self.budget_usage
+                .update_elapsed_ticks(
+                    started_at_tick.value(),
+                    current_tick.value(),
+                    current_tick.tick_rate_hz(),
+                )
+                .map_err(|e| match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    } => ControllerError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                })?;
         }
 
         // Use placeholder hash (no CAS provided)
@@ -1163,11 +1201,30 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage.update_elapsed_ticks(
-                started_at_tick.value(),
-                current_tick.value(),
-                current_tick.tick_rate_hz(),
-            );
+            self.budget_usage
+                .update_elapsed_ticks(
+                    started_at_tick.value(),
+                    current_tick.value(),
+                    current_tick.tick_rate_hz(),
+                )
+                .map_err(|e| match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    } => ControllerError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                })?;
         }
 
         // Build and store receipt (TCK-00154)
@@ -1251,11 +1308,30 @@ impl CoordinationController {
 
         // Update elapsed time using tick-based tracking (TCK-00242)
         if let Some(started_at_tick) = self.started_at_tick {
-            self.budget_usage.update_elapsed_ticks(
-                started_at_tick.value(),
-                current_tick.value(),
-                current_tick.tick_rate_hz(),
-            );
+            self.budget_usage
+                .update_elapsed_ticks(
+                    started_at_tick.value(),
+                    current_tick.value(),
+                    current_tick.tick_rate_hz(),
+                )
+                .map_err(|e| match e {
+                    CoordinationError::TickRateMismatch { expected, actual } => {
+                        ControllerError::InvalidTickRate {
+                            expected_hz: expected,
+                            actual_hz: actual,
+                        }
+                    },
+                    CoordinationError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    } => ControllerError::ClockRegression {
+                        start_tick,
+                        current_tick,
+                    },
+                    _ => ControllerError::Internal {
+                        message: format!("unexpected error updating elapsed ticks: {e}"),
+                    },
+                })?;
         }
 
         let aborted_event = CoordinationAborted::new(
@@ -2256,7 +2332,8 @@ mod tests {
         // Budget is 1000 ticks, started at tick 1000, so tick 2001 exceeds it
         controller
             .budget_usage
-            .update_elapsed_ticks(1000, 2001, TEST_TICK_RATE_HZ);
+            .update_elapsed_ticks(1000, 2001, TEST_TICK_RATE_HZ)
+            .unwrap();
 
         // Check stop condition - should return BudgetExhausted(Duration)
         let stop = controller.check_stop_condition();
@@ -2453,7 +2530,8 @@ mod tests {
         // Budget is 1000 ticks, started at tick 1000, so tick 2001 exceeds it
         controller
             .budget_usage
-            .update_elapsed_ticks(1000, 2001, TEST_TICK_RATE_HZ);
+            .update_elapsed_ticks(1000, 2001, TEST_TICK_RATE_HZ)
+            .unwrap();
 
         // All three budgets are now exhausted, check priority
         // Duration should take priority

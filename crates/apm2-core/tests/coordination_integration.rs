@@ -882,7 +882,7 @@ fn tck_00155_receipt_canonical_encoding_golden_vector() {
     let canonical = receipt.canonical_bytes();
 
     // Verify magic bytes (versioning)
-    assert_eq!(&canonical[0..4], b"CRv1", "Magic bytes should be CRv1");
+    assert_eq!(&canonical[0..4], b"CRv2", "Magic bytes should be CRv2");
 
     // Verify determinism: same receipt always produces same bytes
     let canonical2 = receipt.canonical_bytes();

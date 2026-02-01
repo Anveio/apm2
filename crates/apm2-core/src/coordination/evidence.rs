@@ -361,7 +361,8 @@ impl CoordinationReceipt {
         let mut buf = Vec::with_capacity(1024);
 
         // Magic bytes for versioning (allows future format changes)
-        buf.extend_from_slice(b"CRv1");
+        // CRv2: TCK-00242 - replaced elapsed_ms/max_duration_ms with tick-based fields
+        buf.extend_from_slice(b"CRv2");
 
         // Coordination ID
         write_length_prefixed_string(&mut buf, &self.coordination_id);

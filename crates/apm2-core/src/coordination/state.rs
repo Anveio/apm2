@@ -268,6 +268,28 @@ pub enum CoordinationError {
         /// Description of which budget field is invalid.
         field: &'static str,
     },
+    /// Tick rate mismatch during budget tracking.
+    ///
+    /// Once a `BudgetUsage` is initialized with a tick rate, all subsequent
+    /// updates must use the same rate to ensure `elapsed_ticks` semantics
+    /// remain valid.
+    TickRateMismatch {
+        /// The tick rate that was previously set.
+        expected: u64,
+        /// The tick rate that was attempted.
+        actual: u64,
+    },
+    /// Clock regression detected during elapsed time update.
+    ///
+    /// The current tick value is less than the start tick, indicating a
+    /// clock regression or discontinuity. Per fail-closed policy, this
+    /// error must be handled rather than silently ignored.
+    ClockRegression {
+        /// The tick value when coordination started.
+        start_tick: u64,
+        /// The current tick value that is less than start.
+        current_tick: u64,
+    },
 }
 
 impl fmt::Display for CoordinationError {
@@ -280,6 +302,21 @@ impl fmt::Display for CoordinationError {
                 write!(
                     f,
                     "budget field '{field}' must be a positive (non-zero) value"
+                )
+            },
+            Self::TickRateMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "tick rate mismatch: initialized with {expected} Hz, attempted update with {actual} Hz"
+                )
+            },
+            Self::ClockRegression {
+                start_tick,
+                current_tick,
+            } => {
+                write!(
+                    f,
+                    "clock regression detected: current tick {current_tick} < start tick {start_tick}"
                 )
             },
         }
@@ -307,7 +344,12 @@ pub struct CoordinationBudget {
     ///
     /// Ticks are node-local monotonic units; the interpretation depends on
     /// `tick_rate_hz`. This field replaces the wall-clock based
-    /// `max_duration_ticks` for replay stability.
+    /// `max_duration_ms` for replay stability.
+    ///
+    /// # Backward Compatibility
+    ///
+    /// The alias `max_duration_ms` is supported for deserializing legacy data.
+    #[serde(alias = "max_duration_ms")]
     pub max_duration_ticks: u64,
 
     /// Tick rate in Hz (ticks per second) for interpreting duration.
@@ -414,6 +456,11 @@ pub struct BudgetUsage {
     ///
     /// Ticks are node-local monotonic units. This replaces `elapsed_ms`
     /// for replay stability per TCK-00242.
+    ///
+    /// # Backward Compatibility
+    ///
+    /// The alias `elapsed_ms` is supported for deserializing legacy data.
+    #[serde(alias = "elapsed_ms")]
     pub elapsed_ticks: u64,
 
     /// Tick rate in Hz for interpreting `elapsed_ticks`.
@@ -578,27 +625,45 @@ impl BudgetUsage {
     /// * `current_tick` - The current tick value
     /// * `tick_rate_hz` - The tick rate in Hz
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `tick_rate_hz` differs from the previously set rate (when
-    /// `self.tick_rate_hz > 0`). This prevents temporal confusion where
-    /// `elapsed_ticks` would become semantically invalid due to rate changes.
+    /// Returns [`CoordinationError::TickRateMismatch`] if `tick_rate_hz`
+    /// differs from the previously set rate (when `self.tick_rate_hz > 0`).
+    /// This prevents temporal confusion where `elapsed_ticks` would become
+    /// semantically invalid due to rate changes.
     ///
-    /// If `current_tick < start_tick`, elapsed saturates to 0 (defensive
-    /// handling per RSK-2504).
-    pub fn update_elapsed_ticks(&mut self, start_tick: u64, current_tick: u64, tick_rate_hz: u64) {
+    /// Returns [`CoordinationError::ClockRegression`] if `current_tick <
+    /// start_tick`, indicating a clock regression or discontinuity. Per
+    /// fail-closed policy, callers must handle this error explicitly rather
+    /// than silently continuing.
+    pub const fn update_elapsed_ticks(
+        &mut self,
+        start_tick: u64,
+        current_tick: u64,
+        tick_rate_hz: u64,
+    ) -> Result<(), CoordinationError> {
         // Enforce rate immutability once initialized (TCK-00242)
         // A rate of 0 indicates uninitialized state (from Default or new())
-        assert!(
-            self.tick_rate_hz == 0 || self.tick_rate_hz == tick_rate_hz,
-            "BudgetUsage tick rate mismatch: initialized with {} Hz, attempted update with {} Hz. \
-             Tick rate must remain constant throughout coordination to ensure elapsed_ticks semantics.",
-            self.tick_rate_hz,
-            tick_rate_hz
-        );
+        if self.tick_rate_hz != 0 && self.tick_rate_hz != tick_rate_hz {
+            return Err(CoordinationError::TickRateMismatch {
+                expected: self.tick_rate_hz,
+                actual: tick_rate_hz,
+            });
+        }
 
-        self.elapsed_ticks = current_tick.saturating_sub(start_tick);
+        // Detect clock regression (fail-closed per TCK-00242)
+        // Instead of saturating to 0 which allows indefinite coordination,
+        // we fail explicitly to prevent security bypass.
+        if current_tick < start_tick {
+            return Err(CoordinationError::ClockRegression {
+                start_tick,
+                current_tick,
+            });
+        }
+
+        self.elapsed_ticks = current_tick - start_tick;
         self.tick_rate_hz = tick_rate_hz;
+        Ok(())
     }
 
     /// Returns the remaining episodes before budget exhaustion.
@@ -2287,7 +2352,7 @@ mod tests {
         assert_eq!(usage.tick_rate_hz, 0);
 
         // First assignment should work
-        usage.update_elapsed_ticks(0, 1000, 1_000_000);
+        usage.update_elapsed_ticks(0, 1000, 1_000_000).unwrap();
 
         assert_eq!(usage.elapsed_ticks, 1000);
         assert_eq!(usage.tick_rate_hz, 1_000_000);
@@ -2301,28 +2366,34 @@ mod tests {
         let mut usage = BudgetUsage::with_tick_rate(1_000_000);
 
         // First update
-        usage.update_elapsed_ticks(0, 1000, 1_000_000);
+        usage.update_elapsed_ticks(0, 1000, 1_000_000).unwrap();
         assert_eq!(usage.elapsed_ticks, 1000);
 
         // Second update with same rate should work
-        usage.update_elapsed_ticks(0, 2000, 1_000_000);
+        usage.update_elapsed_ticks(0, 2000, 1_000_000).unwrap();
         assert_eq!(usage.elapsed_ticks, 2000);
     }
 
-    /// TCK-00242: `BudgetUsage` panics on tick rate mismatch.
+    /// TCK-00242: `BudgetUsage` returns error on tick rate mismatch.
     ///
     /// Once initialized with a non-zero rate, attempting to use a different
-    /// rate should panic to prevent temporal confusion.
+    /// rate should return an error to prevent temporal confusion.
     #[test]
-    #[should_panic(expected = "BudgetUsage tick rate mismatch")]
-    fn tck_00242_budget_usage_panics_on_rate_mismatch() {
+    fn tck_00242_budget_usage_errors_on_rate_mismatch() {
         let mut usage = BudgetUsage::with_tick_rate(1_000_000);
 
         // First update with correct rate
-        usage.update_elapsed_ticks(0, 1000, 1_000_000);
+        usage.update_elapsed_ticks(0, 1000, 1_000_000).unwrap();
 
-        // Second update with different rate should panic
-        usage.update_elapsed_ticks(0, 2000, 1_000_000_000);
+        // Second update with different rate should return error
+        let result = usage.update_elapsed_ticks(0, 2000, 1_000_000_000);
+        assert!(matches!(
+            result,
+            Err(CoordinationError::TickRateMismatch {
+                expected: 1_000_000,
+                actual: 1_000_000_000
+            })
+        ));
     }
 
     /// TCK-00242: `BudgetUsage` from Default still allows rate assignment.
@@ -2335,9 +2406,28 @@ mod tests {
         assert_eq!(usage.tick_rate_hz, 0);
 
         // Should be able to set rate
-        usage.update_elapsed_ticks(100, 500, 1_000_000);
+        usage.update_elapsed_ticks(100, 500, 1_000_000).unwrap();
 
         assert_eq!(usage.elapsed_ticks, 400);
         assert_eq!(usage.tick_rate_hz, 1_000_000);
+    }
+
+    /// TCK-00242: `BudgetUsage` detects clock regression.
+    ///
+    /// When `current_tick` < `start_tick`, the method should return an error
+    /// rather than silently saturating to 0.
+    #[test]
+    fn tck_00242_budget_usage_detects_clock_regression() {
+        let mut usage = BudgetUsage::new();
+
+        // Clock regression: current tick is before start tick
+        let result = usage.update_elapsed_ticks(1000, 500, 1_000_000);
+        assert!(matches!(
+            result,
+            Err(CoordinationError::ClockRegression {
+                start_tick: 1000,
+                current_tick: 500
+            })
+        ));
     }
 }
