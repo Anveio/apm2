@@ -173,31 +173,54 @@ impl SessionReducer {
                     (*expires_at_tick, *tick_rate_hz)
                 {
                     // Tick-based quarantine: use tick comparison (RFC-0016 HTF)
-                    // We don't have current tick from event, so use wall-clock as approximation
-                    // for the current tick based on timestamp and tick rate
                     //
-                    // SEC-HTF-003: If we had a proper current_tick from the event's
-                    // time_envelope_ref, we would use check_quarantine_expired_at_tick
-                    // to get defect emission. For now, we use wall-clock as a fallback.
-                    //
-                    // TODO(TCK-00247): Resolve time_envelope_ref to get actual current tick
-                    let expires_at_tick = HtfTick::new(expires_tick, rate_hz);
-                    let approx_current_tick =
-                        Self::approximate_tick_from_timestamp(timestamp, rate_hz);
+                    // SEC-HTF-003: The current tick MUST come from the event's
+                    // time_envelope_ref, NOT from wall-clock approximation.
+                    // If time_envelope_ref is missing, use fail-closed behavior.
+                    let expires_at_htf_tick = HtfTick::new(expires_tick, rate_hz);
 
-                    let (expired, _defect) = QuarantineManager::check_quarantine_expired_at_tick(
-                        &expires_at_tick,
-                        &approx_current_tick,
+                    // SEC-HTF-003: Fail-closed behavior - if time_envelope_ref is
+                    // missing on a tick-based quarantine, deny the restart.
+                    // We cannot securely verify expiry without authoritative tick.
+                    if event.time_envelope_ref.is_none() {
+                        return Err(SessionError::MissingTimeEnvelopeRef { session_id });
+                    }
+
+                    // For now, since we don't have CAS access to resolve the
+                    // time_envelope_ref to get the actual tick value, we use
+                    // the tick embedded in the event's timestamp as a fallback.
+                    // This is a temporary measure until the daemon clock service
+                    // (TCK-00240) is fully integrated to stamp envelopes at
+                    // runtime boundaries.
+                    //
+                    // NOTE: In production, the time_envelope_ref would be resolved
+                    // to get the authoritative current tick from the HTF envelope.
+                    let current_tick = Self::approximate_tick_from_timestamp(timestamp, rate_hz);
+
+                    // DD-HTF-0001: Use check_quarantine_expired_at_tick to properly
+                    // handle defect emission on tick rate mismatch.
+                    let (expired, defect) = QuarantineManager::check_quarantine_expired_at_tick(
+                        &expires_at_htf_tick,
+                        &current_tick,
                     );
-                    // Note: _defect would be emitted to ledger in production code
+
+                    // DD-HTF-0001: If a clock regression defect is detected,
+                    // return an error containing the defect information.
+                    if let Some(clock_defect) = defect {
+                        return Err(SessionError::ClockRegressionDetected {
+                            session_id,
+                            current_tick_rate_hz: clock_defect.current_tick_rate_hz,
+                            expected_tick_rate_hz: clock_defect.expected_tick_rate_hz,
+                        });
+                    }
 
                     let remaining = if expired {
                         Some(0)
                     } else {
                         Some(
-                            expires_at_tick
+                            expires_at_htf_tick
                                 .value()
-                                .saturating_sub(approx_current_tick.value()),
+                                .saturating_sub(current_tick.value()),
                         )
                     };
                     (expired, remaining)
@@ -609,6 +632,46 @@ pub mod helpers {
             // HTF time envelope reference (RFC-0016): not yet populated by this helper.
             // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
             time_envelope_ref: None,
+        };
+        let event = SessionEvent {
+            event: Some(session_event::Event::Started(started)),
+        };
+        event.encode_to_vec()
+    }
+
+    /// Creates a `SessionStarted` event payload for a restarted session with
+    /// a time envelope reference (RFC-0016 HTF compliant).
+    ///
+    /// This is the preferred helper for tests that verify tick-based quarantine
+    /// expiry, as it includes the `time_envelope_ref` required for proper HTF
+    /// time authority validation.
+    #[must_use]
+    #[expect(clippy::too_many_arguments)]
+    pub fn session_started_payload_with_htf(
+        session_id: &str,
+        actor_id: &str,
+        adapter_type: &str,
+        work_id: &str,
+        lease_id: &str,
+        entropy_budget: u64,
+        resume_cursor: u64,
+        restart_attempt: u32,
+        time_envelope_hash: [u8; 32],
+    ) -> Vec<u8> {
+        use crate::events::TimeEnvelopeRef;
+
+        let started = SessionStarted {
+            session_id: session_id.to_string(),
+            actor_id: actor_id.to_string(),
+            adapter_type: adapter_type.to_string(),
+            work_id: work_id.to_string(),
+            lease_id: lease_id.to_string(),
+            entropy_budget,
+            resume_cursor,
+            restart_attempt,
+            time_envelope_ref: Some(TimeEnvelopeRef {
+                hash: time_envelope_hash.to_vec(),
+            }),
         };
         let event = SessionEvent {
             event: Some(session_event::Event::Started(started)),
@@ -2169,15 +2232,17 @@ mod unit_tests {
         reducer.apply(&quar_event, &ctx).unwrap();
 
         // Try to restart at 5 seconds (tick ~5, before expires_at_tick=10)
-        let restart_payload = helpers::session_started_payload_with_restart(
+        // SEC-HTF-003: Must include time_envelope_ref for tick-based quarantine
+        let restart_payload = helpers::session_started_payload_with_htf(
             "session-1",
             "actor-1",
             "claude-code",
             "work-1",
             "lease-1",
             1000,
-            100, // resume_cursor
-            1,   // restart_attempt
+            100,        // resume_cursor
+            1,          // restart_attempt
+            [0x42; 32], // time_envelope_ref hash (dummy for test)
         );
         let mut restart_event = create_event("session.started", "session-1", restart_payload);
         restart_event.timestamp_ns = 5_000_000_000; // ~5 ticks, before 10
@@ -2230,15 +2295,17 @@ mod unit_tests {
         reducer.apply(&quar_event, &ctx).unwrap();
 
         // Restart at 15 seconds (tick ~15, after expires_at_tick=10)
-        let restart_payload = helpers::session_started_payload_with_restart(
+        // SEC-HTF-003: Must include time_envelope_ref for tick-based quarantine
+        let restart_payload = helpers::session_started_payload_with_htf(
             "session-1",
             "actor-1",
             "claude-code",
             "work-1",
             "lease-1",
             1000,
-            100, // resume_cursor
-            1,   // restart_attempt
+            100,        // resume_cursor
+            1,          // restart_attempt
+            [0x42; 32], // time_envelope_ref hash (dummy for test)
         );
         let mut restart_event = create_event("session.started", "session-1", restart_payload);
         restart_event.timestamp_ns = 15_000_000_000; // ~15 ticks, after 10
@@ -2250,6 +2317,62 @@ mod unit_tests {
             "Should allow restart after tick-based quarantine expires: {result:?}"
         );
         assert!(reducer.state().get("session-1").unwrap().is_active());
+    }
+
+    /// TCK-00243: SEC-HTF-003 Tests that restart is rejected when
+    /// time_envelope_ref is missing for tick-based quarantine (fail-closed).
+    #[test]
+    fn tck_00243_missing_time_envelope_ref_fails_closed() {
+        let mut reducer = SessionReducer::new();
+        let ctx = ReducerContext::new(1);
+
+        // Start session
+        let start_payload = helpers::session_started_payload(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+        );
+        let mut start_event = create_event("session.started", "session-1", start_payload);
+        start_event.timestamp_ns = 1_000_000_000;
+        reducer.apply(&start_event, &ctx).unwrap();
+
+        // Quarantine with tick-based timing (1Hz)
+        let quar_payload = helpers::session_quarantined_payload_with_ticks(
+            "session-1",
+            "crash_loop",
+            10_000_000_000, // wall-clock expires (observational)
+            2,              // issued_at_tick
+            10,             // expires_at_tick
+            1,              // tick_rate_hz (1Hz)
+        );
+        let mut quar_event = create_event("session.quarantined", "session-1", quar_payload);
+        quar_event.timestamp_ns = 2_000_000_000;
+        reducer.apply(&quar_event, &ctx).unwrap();
+
+        // Try to restart WITHOUT time_envelope_ref (using legacy helper)
+        // SEC-HTF-003: This should be rejected with fail-closed behavior
+        let restart_payload = helpers::session_started_payload_with_restart(
+            "session-1",
+            "actor-1",
+            "claude-code",
+            "work-1",
+            "lease-1",
+            1000,
+            100, // resume_cursor
+            1,   // restart_attempt
+        );
+        let mut restart_event = create_event("session.started", "session-1", restart_payload);
+        restart_event.timestamp_ns = 15_000_000_000; // Even after expiry time
+        let result = reducer.apply(&restart_event, &ctx);
+
+        // Should reject with MissingTimeEnvelopeRef (fail-closed)
+        assert!(
+            matches!(result, Err(SessionError::MissingTimeEnvelopeRef { .. })),
+            "Should reject restart without time_envelope_ref for tick-based quarantine: {result:?}"
+        );
     }
 
     /// TCK-00243: Tests that terminated sessions can still be restarted

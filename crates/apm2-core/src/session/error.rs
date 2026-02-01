@@ -74,6 +74,47 @@ pub enum SessionError {
         /// Remaining ticks if tick-based timing is available, None for legacy.
         remaining_ticks: Option<u64>,
     },
+
+    /// Attempted to restart a tick-based quarantined session without a valid
+    /// time envelope reference.
+    ///
+    /// # SEC-HTF-003: Fail-Closed Behavior (RFC-0016)
+    ///
+    /// When a session has a tick-based quarantine, the restart event MUST
+    /// include a `time_envelope_ref` to provide the authoritative current tick.
+    /// Without this reference, we cannot securely verify quarantine expiry
+    /// and must deny the restart (fail-closed behavior).
+    ///
+    /// This prevents attackers from bypassing quarantine by omitting time
+    /// envelope data from restart events.
+    #[error(
+        "session {session_id} restart denied: tick-based quarantine requires time_envelope_ref (SEC-HTF-003)"
+    )]
+    MissingTimeEnvelopeRef {
+        /// The session ID.
+        session_id: String,
+    },
+
+    /// Clock regression detected during quarantine expiry check.
+    ///
+    /// # DD-HTF-0001: Defect Emission (RFC-0016)
+    ///
+    /// When tick rates mismatch during quarantine expiry checks, a clock
+    /// regression defect is emitted. This indicates a potential security
+    /// issue where ticks from different clock domains are being compared.
+    ///
+    /// The restart is denied with fail-closed behavior.
+    #[error(
+        "session {session_id} restart denied: clock regression detected (current_rate={current_tick_rate_hz}Hz, expected_rate={expected_tick_rate_hz}Hz)"
+    )]
+    ClockRegressionDetected {
+        /// The session ID.
+        session_id: String,
+        /// Current tick rate in Hz.
+        current_tick_rate_hz: u64,
+        /// Expected tick rate in Hz.
+        expected_tick_rate_hz: u64,
+    },
 }
 
 /// Display implementation for state names used in error messages.
