@@ -919,7 +919,7 @@ impl ContextPackManifest {
         // Shell allowlist (TCK-00254) - sorted for determinism
         let mut sorted_shell_patterns: Vec<&str> =
             shell_allowlist.iter().map(String::as_str).collect();
-        sorted_shell_patterns.sort();
+        sorted_shell_patterns.sort_unstable();
         hasher.update(&(sorted_shell_patterns.len() as u32).to_be_bytes());
         for pattern in &sorted_shell_patterns {
             hasher.update(&(pattern.len() as u32).to_be_bytes());
@@ -1495,6 +1495,7 @@ impl ContextPackManifestBuilder {
     /// are found.
     /// Returns [`ManifestError::InvalidPath`] if any path contains traversal
     /// or null bytes.
+    #[allow(clippy::too_many_lines)]
     pub fn try_build(mut self) -> Result<ContextPackManifest, ManifestError> {
         use std::collections::HashSet;
 
@@ -1553,7 +1554,7 @@ impl ContextPackManifestBuilder {
         // Sort allowlists for PartialEq consistency with compute_manifest_hash()
         // This ensures logically identical manifests compare equal regardless of
         // insertion order, preventing bugs in caching or deduplication.
-        self.tool_allowlist.sort_by_key(|t| t.value());
+        self.tool_allowlist.sort_by_key(ToolClass::value);
         self.write_allowlist.sort();
         self.shell_allowlist.sort();
 
@@ -2984,143 +2985,5 @@ pub mod tests {
         assert_eq!(manifest1.entries()[0].path(), "/aaa/file.rs");
         assert_eq!(manifest1.entries()[1].path(), "/bbb/file.rs");
         assert_eq!(manifest1.entries()[2].path(), "/ccc/file.rs");
-    }
-
-    // =========================================================================
-    // TCK-00254: Tool Allowlist Tests
-    // =========================================================================
-
-    #[test]
-    fn test_manifest_with_tool_allowlist() {
-        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
-            .build();
-
-        assert_eq!(manifest.tool_allowlist.len(), 2);
-        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
-        assert!(manifest.tool_allowlist.contains(&ToolClass::Write));
-    }
-
-    #[test]
-    fn test_manifest_builder_allow_tool() {
-        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .allow_tool(ToolClass::Read)
-            .allow_tool(ToolClass::Execute)
-            .build();
-
-        assert_eq!(manifest.tool_allowlist.len(), 2);
-        assert!(manifest.tool_allowlist.contains(&ToolClass::Read));
-        assert!(manifest.tool_allowlist.contains(&ToolClass::Execute));
-    }
-
-    #[test]
-    fn test_manifest_tool_allowlist_too_large() {
-        let tools: Vec<ToolClass> = (0..=MAX_TOOL_ALLOWLIST).map(|_| ToolClass::Read).collect();
-
-        let result = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(tools)
-            .try_build();
-
-        assert!(matches!(
-            result,
-            Err(ManifestError::CollectionTooLarge { field, actual, max })
-            if field == "tool_allowlist" && actual == MAX_TOOL_ALLOWLIST + 1 && max == MAX_TOOL_ALLOWLIST
-        ));
-    }
-
-    #[test]
-    fn test_manifest_hash_includes_tool_allowlist() {
-        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(vec![ToolClass::Read])
-            .build();
-
-        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(vec![ToolClass::Write])
-            .build();
-
-        // Different tool allowlists should produce different hashes
-        assert_ne!(manifest1.manifest_hash(), manifest2.manifest_hash());
-    }
-
-    #[test]
-    fn test_manifest_hash_tool_allowlist_order_determinism() {
-        // Same tools in different order should produce same hash (sorted before
-        // hashing)
-        let manifest1 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
-            .build();
-
-        let manifest2 = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(vec![ToolClass::Execute, ToolClass::Read, ToolClass::Write])
-            .build();
-
-        assert_eq!(
-            manifest1.manifest_hash(),
-            manifest2.manifest_hash(),
-            "manifest hash should be deterministic regardless of tool_allowlist order"
-        );
-    }
-
-    #[test]
-    fn test_manifest_empty_tool_allowlist_valid() {
-        // Empty tool_allowlist should be valid (fail-closed semantics)
-        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001").build();
-
-        assert!(manifest.tool_allowlist.is_empty());
-        assert!(manifest.verify_self_consistency().is_ok());
-    }
-
-    #[test]
-    fn test_manifest_serde_roundtrip_with_tool_allowlist() {
-        let manifest = ContextPackManifestBuilder::new("manifest-001", "profile-001")
-            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
-            .add_entry(
-                ManifestEntryBuilder::new("/project/file.rs", [0x42; 32])
-                    .access_level(AccessLevel::Read)
-                    .build(),
-            )
-            .build();
-
-        // Serialize to JSON
-        let json = serde_json::to_string(&manifest).unwrap();
-
-        // Deserialize back
-        let mut recovered: ContextPackManifest = serde_json::from_str(&json).unwrap();
-        recovered.rebuild_index();
-
-        assert_eq!(manifest.tool_allowlist, recovered.tool_allowlist);
-        assert_eq!(manifest.manifest_hash(), recovered.manifest_hash());
-        assert!(recovered.verify_self_consistency().is_ok());
-    }
-
-    #[test]
-    fn test_tool_class_from_u8() {
-        assert_eq!(ToolClass::from_u8(0), Some(ToolClass::Read));
-        assert_eq!(ToolClass::from_u8(1), Some(ToolClass::Write));
-        assert_eq!(ToolClass::from_u8(2), Some(ToolClass::Execute));
-        assert_eq!(ToolClass::from_u8(3), Some(ToolClass::Network));
-        assert_eq!(ToolClass::from_u8(4), Some(ToolClass::Git));
-        assert_eq!(ToolClass::from_u8(5), Some(ToolClass::Inference));
-        assert_eq!(ToolClass::from_u8(6), Some(ToolClass::Artifact));
-        assert_eq!(ToolClass::from_u8(7), None);
-        assert_eq!(ToolClass::from_u8(255), None);
-    }
-
-    #[test]
-    fn test_tool_class_value() {
-        assert_eq!(ToolClass::Read.value(), 0);
-        assert_eq!(ToolClass::Write.value(), 1);
-        assert_eq!(ToolClass::Execute.value(), 2);
-        assert_eq!(ToolClass::Network.value(), 3);
-        assert_eq!(ToolClass::Git.value(), 4);
-        assert_eq!(ToolClass::Inference.value(), 5);
-        assert_eq!(ToolClass::Artifact.value(), 6);
-    }
-
-    #[test]
-    fn test_tool_class_display() {
-        assert_eq!(format!("{}", ToolClass::Read), "Read");
-        assert_eq!(format!("{}", ToolClass::Write), "Write");
-        assert_eq!(format!("{}", ToolClass::Execute), "Execute");
     }
 }

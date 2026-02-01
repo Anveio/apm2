@@ -1428,7 +1428,7 @@ impl CapabilityManifestBuilder {
     /// as different due to insertion order.
     pub fn build(mut self) -> Result<CapabilityManifest, CapabilityError> {
         // Sort allowlists for PartialEq consistency with canonical_bytes()
-        self.tool_allowlist.sort_by_key(|t| t.value());
+        self.tool_allowlist.sort_by_key(ToolClass::value);
         self.write_allowlist.sort();
         self.shell_allowlist.sort();
 
