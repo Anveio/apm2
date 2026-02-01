@@ -30,6 +30,8 @@
 //! - [`messages`]: Protocol buffer message types ([`messages::Receipt`],
 //!   [`messages::TelemetryFrame`], etc.)
 //! - [`server`]: UDS server ([`ProtocolServer`], [`Connection`])
+//! - [`session_token`]: Per-connection session tokens ([`SessionToken`],
+//!   [`TokenMinter`]) for authenticating session-scoped requests (TCK-00250)
 //!
 //! # Wire Format
 //!
@@ -93,6 +95,7 @@ pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
 pub mod server;
+pub mod session_token;
 
 // Re-export commonly used types at module level
 pub use credentials::PeerCredentials;
@@ -111,3 +114,4 @@ pub use messages::{
 pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
 };
+pub use session_token::{SessionToken, SessionTokenError, TokenMinter};
