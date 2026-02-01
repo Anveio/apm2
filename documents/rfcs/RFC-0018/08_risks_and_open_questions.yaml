@@ -38,6 +38,15 @@ rfc_risks_and_open_questions:
         - "TCK-00309 removes or routes direct GitHub status writes through daemon projection logic."
       evidence_ids:
         - "EVID-HEF-0001"
+    - id: "RSK-HEF-0005"
+      statement: "FAC v0 autonomy preconditions (ChangeSetBundle, ReviewReceipt, ReviewBlocked) may be missing, forcing GitHub reads or stalling reviews."
+      impact: "Reviewer liveness fails or authority leaks to external projections."
+      likelihood: "HIGH"
+      mitigations:
+        - "TCK-00310..TCK-00313 implement FAC v0 preconditions and tests."
+        - "GATE-HEF-FAC-V0 blocks enable-by-default until evidence exists."
+      evidence_ids:
+        - "EVID-HEF-0012"
   open_questions:
     - id: "Q-HEF-0001"
       question: "Should episode_id be added to existing Session/Tool kernel events, or should new Episode* events be added?"

@@ -68,3 +68,17 @@ Line ranges are from `nl -ba` output.
 - Ledger API exposes append/read/head but no outbox/pulse publisher surface:
   `crates/apm2-core/src/ledger/storage.rs:412-518`,
   `crates/apm2-core/src/ledger/storage.rs:719-736`. Ticket: `TCK-00304`.
+
+## FAC v0 autonomy gaps
+- KernelEvent payload list does not include ChangeSetPublished, ReviewReceiptRecorded,
+  or ReviewBlockedRecorded events: `proto/kernel_events.proto:73-93`. Tickets: `TCK-00310`, `TCK-00311`, `TCK-00312`.
+- EvidenceEvent only includes EvidencePublished and GateReceiptGenerated:
+  `proto/kernel_events.proto:436-466`. Tickets: `TCK-00312`.
+- PolicyResolvedForChangeSet includes changeset_digest but no CAS diff/bundle reference:
+  `proto/kernel_events.proto:726-744`. Ticket: `TCK-00310`.
+- ChangeSet risk-tier input tracks file paths/counts only (no file contents):
+  `crates/apm2-core/src/fac/risk_tier.rs:292-313`. Ticket: `TCK-00310`.
+- Episode PinnedSnapshot provides repo/lockfile/policy hashes (not a diff bundle):
+  `crates/apm2-daemon/src/episode/snapshot.rs:88-104`. Ticket: `TCK-00311`.
+- ProjectionReceipt struct exists in daemon projection module (projection-only artifact):
+  `crates/apm2-daemon/src/projection/projection_receipt.rs:200-238`.

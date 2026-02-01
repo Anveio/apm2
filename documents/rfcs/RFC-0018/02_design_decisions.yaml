@@ -172,6 +172,126 @@ rfc_design_decisions:
           - "Add defect event type to kernel_events.proto"
           - "Ledger emission path for DefectRecord"
 
+      - category: "fac_v0"
+        topic_pattern: "N/A (non-pulse: ChangeSetBundleV1)"
+        trigger_events:
+          - "ChangeSetPublished (ledger event)"
+        required_pointers:
+          - "changeset_digest"
+          - "changeset_bundle_hash (CAS)"
+        preconditions_status: "NEW_WORK_REQUIRED"
+        evidence:
+          - "proto/kernel_events.proto:73-93"
+          - "proto/kernel_events.proto:726-744"
+        new_work_required:
+          - "Define ChangeSetPublished event in kernel_events.proto"
+          - "Define ChangeSetBundleV1 CAS schema + canonicalization"
+
+      - category: "fac_v0"
+        topic_pattern: "N/A (non-pulse: ReviewReceipt)"
+        trigger_events:
+          - "ReviewReceiptRecorded (ledger event)"
+        required_pointers:
+          - "review_receipt_id"
+          - "changeset_digest"
+          - "review_artifact_bundle_hash (CAS)"
+        preconditions_status: "NEW_WORK_REQUIRED"
+        evidence:
+          - "proto/kernel_events.proto:73-93"
+          - "proto/kernel_events.proto:436-466"
+        new_work_required:
+          - "Define ReviewReceiptRecorded event in kernel_events.proto"
+          - "Define ReviewArtifactBundleV1 CAS schema + canonicalization"
+
+      - category: "fac_v0"
+        topic_pattern: "N/A (non-pulse: ReviewBlocked)"
+        trigger_events:
+          - "ReviewBlockedRecorded (ledger event)"
+        required_pointers:
+          - "review_blocked_id"
+          - "changeset_digest"
+          - "blocked_reason_code"
+          - "blocked_log_hash (CAS)"
+        preconditions_status: "NEW_WORK_REQUIRED"
+        evidence:
+          - "proto/kernel_events.proto:73-93"
+        new_work_required:
+          - "Define ReviewBlockedRecorded event in kernel_events.proto"
+          - "Define blocked reason codes + CAS log bundle"
+
+  fac_v0_autonomy_preconditions:
+    description: |
+      FAC v0 autonomy requires internal diff observability, reviewer viability,
+      and explicit blocked semantics without GitHub reads. Preconditions below
+      are truth-plane anchored (ledger + CAS) and must exist before FAC v0 is
+      considered autonomous.
+    table:
+      - id: "FAC-V0-001"
+        name: "ChangeSetBundleV1 + changeset_digest binding"
+        required_artifacts:
+          - "ChangeSetBundleV1 stored in CAS (canonical diff + manifest)"
+          - "changeset_digest computed from canonical bundle bytes"
+        ledger_anchor:
+          - "ChangeSetPublished ledger event referencing changeset_digest + cas_ref"
+        preconditions_status: "PARTIAL"
+        evidence:
+          - "proto/kernel_events.proto:726-744"
+          - "crates/apm2-core/src/fac/risk_tier.rs:292-313"
+        new_work_required:
+          - "Define ChangeSetBundleV1 schema + canonicalization rules"
+          - "Add ChangeSetPublished event to kernel_events.proto"
+          - "Emit ledger event with CAS hash + digest binding"
+
+      - id: "FAC-V0-002"
+        name: "Workspace snapshot/apply semantics"
+        required_artifacts:
+          - "WorkspaceSnapshotV1 (CAS) or equivalent episode-local snapshot"
+          - "Deterministic patch apply + failure capture"
+        ledger_anchor:
+          - "ReviewBlockedRecorded on apply failure"
+        preconditions_status: "PARTIAL"
+        evidence:
+          - "crates/apm2-daemon/src/episode/snapshot.rs:88-104"
+        new_work_required:
+          - "Define WorkspaceSnapshotV1 or patch-apply receipt schema"
+          - "Emit ReviewBlockedRecorded with CAS logs on apply failure"
+
+      - id: "FAC-V0-003"
+        name: "ReviewReceipt (ledger anchored)"
+        required_artifacts:
+          - "ReviewArtifactBundleV1 in CAS (review text + tool logs)"
+        ledger_anchor:
+          - "ReviewReceiptRecorded ledger event referencing CAS hash"
+        preconditions_status: "NEW_WORK_REQUIRED"
+        evidence:
+          - "proto/kernel_events.proto:73-93"
+          - "proto/kernel_events.proto:436-466"
+        new_work_required:
+          - "Define ReviewReceiptRecorded event in kernel_events.proto"
+          - "Define ReviewArtifactBundleV1 schema + canonicalization"
+
+      - id: "FAC-V0-004"
+        name: "ReviewBlocked (explicit liveness failures)"
+        required_artifacts:
+          - "ReviewBlocked CAS bundle with reason_code + logs"
+        ledger_anchor:
+          - "ReviewBlockedRecorded ledger event referencing CAS hash"
+        preconditions_status: "NEW_WORK_REQUIRED"
+        evidence:
+          - "proto/kernel_events.proto:73-93"
+        new_work_required:
+          - "Define ReviewBlockedRecorded event + reason codes"
+
+      - id: "FAC-V0-005"
+        name: "ProjectionReceipt (optional)"
+        required_artifacts:
+          - "ProjectionReceipt signed by adapter (projection module)"
+        ledger_anchor:
+          - "Optional; projection-only artifact"
+        preconditions_status: "EXISTS"
+        evidence:
+          - "crates/apm2-daemon/src/projection/projection_receipt.rs:200-238"
+
   resource_governance:
     limits:
       max_subscriptions_per_connection: 16
@@ -431,3 +551,94 @@ rfc_design_decisions:
         - "REQ-HEF-0008"
       evidence_ids:
         - "EVID-HEF-0001"
+
+    - id: "DD-HEF-0010"
+      title: "Canonical ChangeSetBundle + changeset_digest binding"
+      statement: |
+        All review decisions MUST bind to a canonical ChangeSetBundleV1 stored in
+        CAS. The changeset_digest is computed from canonical bundle bytes and is
+        anchored by a ledger event before any review or gate decision.
+      context: |
+        FAC v0 autonomy requires reviewers to see the exact diff without GitHub
+        reads. Canonicalization prevents mismatched diffs and TOCTOU attacks.
+      alternatives:
+        - id: "ALT-HEF-0010-A"
+          name: "Use GitHub diff as source of truth"
+          pros: ["Already available"]
+          cons: ["Violates projection-only posture; external TOCTOU risk"]
+          security_tradeoffs: ["External spoofing and divergence risk"]
+          operability_tradeoffs: ["Depends on network availability"]
+      chosen_rationale: "Keeps diff observability internal and verifiable."
+      impacted_requirement_ids:
+        - "REQ-HEF-0009"
+      evidence_ids:
+        - "EVID-HEF-0009"
+
+    - id: "DD-HEF-0011"
+      title: "Reviewer episode contract (minimal tools, CAS logging, no GitHub truth)"
+      statement: |
+        Reviewer episodes MUST receive a workspace snapshot/apply input derived
+        from ChangeSetBundleV1, run a minimal approved tool set, and emit review
+        artifacts/logs into CAS. Reviewer decisions never depend on GitHub reads.
+      context: |
+        Autonomy requires reviewers to operate entirely inside Forge with
+        deterministic inputs and evidence-carrying outputs.
+      alternatives:
+        - id: "ALT-HEF-0011-A"
+          name: "Allow reviewers to fetch diffs from GitHub"
+          pros: ["Less internal tooling"]
+          cons: ["Breaks projection-only; leaks authority"]
+          security_tradeoffs: ["External manipulation risk"]
+          operability_tradeoffs: ["Network dependency"]
+      chosen_rationale: "Keeps reviewer inputs and outputs within CAS/ledger."
+      impacted_requirement_ids:
+        - "REQ-HEF-0010"
+      evidence_ids:
+        - "EVID-HEF-0010"
+        - "EVID-HEF-0011"
+
+    - id: "DD-HEF-0012"
+      title: "ReviewBlocked semantics (explicit liveness failures)"
+      statement: |
+        ReviewBlocked is a first-class, ledger-anchored outcome with explicit
+        reason codes and CAS logs. Retries are bounded by HTF windows; blocked
+        outcomes must be surfaced as durable receipts.
+      context: |
+        Liveness requires reviewers to fail loudly and reproducibly when inputs
+        are missing or invalid.
+      alternatives:
+        - id: "ALT-HEF-0012-A"
+          name: "Silent retry without receipts"
+          pros: ["Simpler"]
+          cons: ["Hides liveness failures; stalls FAC"]
+          security_tradeoffs: ["Opaque failure modes"]
+          operability_tradeoffs: ["Hard to debug"]
+      chosen_rationale: "Explicit blocked receipts preserve liveness and auditability."
+      impacted_requirement_ids:
+        - "REQ-HEF-0011"
+      evidence_ids:
+        - "EVID-HEF-0010"
+
+    - id: "DD-HEF-0013"
+      title: "FAC v0 autonomy is gated by end-to-end evidence"
+      statement: |
+        HEF enable-by-default is blocked until FAC v0 autonomy evidence exists:
+        ChangeSetBundle -> reviewer episode -> ReviewReceipt -> GateReceipt ->
+        projection, with no GitHub reads for truth.
+      context: |
+        Without end-to-end evidence, HEF risks becoming a side channel rather
+        than an accelerator for autonomous FAC.
+      alternatives:
+        - id: "ALT-HEF-0013-A"
+          name: "Enable HEF without FAC v0 evidence"
+          pros: ["Faster rollout"]
+          cons: ["No autonomy guarantee; potential authority confusion"]
+          security_tradeoffs: ["Unvalidated control loop behavior"]
+          operability_tradeoffs: ["Unclear readiness"]
+      chosen_rationale: "Ensures HEF accelerates FAC only when autonomy is proven."
+      impacted_requirement_ids:
+        - "REQ-HEF-0009"
+        - "REQ-HEF-0010"
+        - "REQ-HEF-0011"
+      evidence_ids:
+        - "EVID-HEF-0012"

@@ -20,6 +20,38 @@ rfc_contracts_and_versioning:
           description: "Add PulseEnvelopeV1, PulseSubscribeRequest/Response, PulseUnsubscribeRequest/Response, PulseEvent."
       evidence_ids:
         - "EVID-HEF-0003"
+    - id: "CTR-HEF-FAC-0001"
+      name: "ChangeSetBundleV1 (CAS artifact)"
+      type: "ARTIFACT"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "0.1.0"
+        compatibility_rules:
+          - "Bundle encoding is canonical; field order is deterministic."
+          - "changeset_digest is derived from canonical bundle bytes."
+      schemas:
+        - id: "SCH-HEF-FAC-0001"
+          path: "schemas/apm2/changeset_bundle_v1.yaml"
+          format: "JSON_SCHEMA"
+          description: "NEW WORK REQUIRED: canonical ChangeSetBundleV1 schema."
+      evidence_ids:
+        - "EVID-HEF-0009"
+    - id: "CTR-HEF-FAC-0002"
+      name: "ReviewArtifactBundleV1 (CAS artifact)"
+      type: "ARTIFACT"
+      versioning:
+        scheme: "SEMVER"
+        current_version: "0.1.0"
+        compatibility_rules:
+          - "Bundle encoding is canonical; field order is deterministic."
+          - "Review receipts reference bundle hash; bundle is immutable."
+      schemas:
+        - id: "SCH-HEF-FAC-0002"
+          path: "schemas/apm2/review_artifact_bundle_v1.yaml"
+          format: "JSON_SCHEMA"
+          description: "NEW WORK REQUIRED: canonical ReviewArtifactBundleV1 schema."
+      evidence_ids:
+        - "EVID-HEF-0011"
   outputs:
     artifacts_produced:
       - "PulseEvent frames delivered over ProtocolServer"
@@ -103,6 +135,52 @@ rfc_contracts_and_versioning:
         description: "Server-to-client notification containing PulseEnvelopeV1."
         fields:
           - "PulseEnvelopeV1 envelope"
+
+  fac_v0_artifact_formats:
+    changeset_bundle_v1:
+      status: "NEW_WORK_REQUIRED"
+      schema_path: "schemas/apm2/changeset_bundle_v1.yaml"
+      required_fields:
+        - "changeset_id (opaque)"
+        - "base_selector (resolved commit/tree id)"
+        - "changeset_digest (32 bytes)"
+        - "diff_format (e.g., unified diff; canonical)"
+        - "diff_bytes (CAS content hash)"
+        - "file_manifest (sorted, stable)"
+      canonicalization_rules:
+        - "file_manifest sorted lexicographically by path"
+        - "diff_bytes hashed after canonical newline normalization"
+        - "all strings ASCII or UTF-8 normalized; length-bounded"
+      notes:
+        - "Bundle must be CAS-hosted; pulses only carry hashes."
+    review_artifact_bundle_v1:
+      status: "NEW_WORK_REQUIRED"
+      schema_path: "schemas/apm2/review_artifact_bundle_v1.yaml"
+      required_fields:
+        - "review_id"
+        - "changeset_digest"
+        - "review_text_hash (CAS)"
+        - "tool_log_hashes (CAS)"
+        - "time_envelope_ref (CAS)"
+      canonicalization_rules:
+        - "log hashes sorted by tool_name + seq"
+        - "review_text stored as immutable CAS artifact"
+      notes:
+        - "Review receipts reference this bundle hash; no GitHub reads."
+    review_blocked_v1:
+      status: "NEW_WORK_REQUIRED"
+      schema_path: "schemas/apm2/review_blocked_v1.yaml"
+      required_fields:
+        - "blocked_id"
+        - "changeset_digest"
+        - "reason_code"
+        - "blocked_log_hash (CAS)"
+        - "time_envelope_ref (CAS)"
+      canonicalization_rules:
+        - "reason_code from fixed enum"
+        - "logs stored in CAS; hash references only"
+      notes:
+        - "Ledger event ReviewBlockedRecorded references this bundle hash."
 
   subscribe_semantics:
     - "SubscribePulseRequest is accepted only after handshake and privilege checks."

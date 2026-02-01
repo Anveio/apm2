@@ -21,6 +21,20 @@ rfc_problem_and_imports:
       - Kernel event schema defines WorkEvent, ToolEvent, SessionEvent,
         GateReceipt, and PolicyResolvedForChangeSet payloads
         (proto/kernel_events.proto:96-239,243-282,723-791).
+      - KernelEvent payload list does not include ChangeSetPublished,
+        ReviewReceiptRecorded, or ReviewBlockedRecorded events
+        (proto/kernel_events.proto:73-93).
+      - EvidenceEvent only includes EvidencePublished and GateReceiptGenerated
+        (proto/kernel_events.proto:436-466).
+      - PolicyResolvedForChangeSet anchors changeset_digest but does not include
+        any CAS reference to a diff bundle
+        (proto/kernel_events.proto:726-744).
+      - ChangeSet risk-tier input tracks file paths and counts only; no diff
+        contents are represented
+        (crates/apm2-core/src/fac/risk_tier.rs:292-313).
+      - Episode PinnedSnapshot captures repo/lockfile/policy hashes but is not a
+        review receipt or diff bundle
+        (crates/apm2-daemon/src/episode/snapshot.rs:88-104).
       - ProtocolServer uses length-prefixed binary framing (max frame size
         16 MiB) with dual sockets (operator.sock/session.sock) and privilege
         separation (crates/apm2-daemon/src/protocol/mod.rs:38-48,
@@ -74,6 +88,12 @@ rfc_problem_and_imports:
           requirement_ref: "requirements/REQ-HEF-0007.yaml#rfc_requirement"
         - requirement_id: "REQ-HEF-0008"
           requirement_ref: "requirements/REQ-HEF-0008.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0009"
+          requirement_ref: "requirements/REQ-HEF-0009.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0010"
+          requirement_ref: "requirements/REQ-HEF-0010.yaml#rfc_requirement"
+        - requirement_id: "REQ-HEF-0011"
+          requirement_ref: "requirements/REQ-HEF-0011.yaml#rfc_requirement"
       rationale: |
         HEF Phase 1 introduces pulse-plane contracts, ACLs, resource governance,
         and disclosure rules that are not explicit PRD requirements and must be

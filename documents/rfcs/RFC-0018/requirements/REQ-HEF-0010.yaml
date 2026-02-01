@@ -1,0 +1,20 @@
+rfc_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-HEF-0010"
+  type: "FUNCTIONAL"
+  title: "Reviewer viability (workspace snapshot/apply + minimal tools)"
+  statement: |
+    Reviewer episodes must receive a workspace snapshot/apply input derived from
+    ChangeSetBundleV1, execute a minimal approved tool set, and store review
+    outputs/logs in CAS with ledger-anchored receipts.
+  acceptance_criteria:
+    - "Workspace snapshot/apply succeeds for valid bundles; failures emit ReviewBlocked with CAS logs."
+    - "Reviewer tool execution logs are stored in CAS and referenced by ReviewReceipt."
+  evidence:
+    evidence_ids:
+      - "EVID-HEF-0010"
+      - "EVID-HEF-0011"
+      - "EVID-HEF-0012"
+    inherited_from_prd: false
+    notes: []

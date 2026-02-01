@@ -1,0 +1,19 @@
+rfc_requirement:
+  schema_version: "2026-01-23"
+  template_version: "2026-01-23"
+  id: "REQ-HEF-0011"
+  type: "RELIABILITY"
+  title: "ReviewBlocked liveness semantics"
+  statement: |
+    ReviewBlocked must be a ledger-anchored outcome with explicit reason codes
+    and CAS logs. Retries are bounded by HTF windows; blocked outcomes are
+    durable receipts for liveness failures.
+  acceptance_criteria:
+    - "ReviewBlockedRecorded is emitted for apply/tool failures with reason_code and CAS log hash."
+    - "Retries are bounded by MonotonicTicks windows; blocked outcomes persist in ledger."
+  evidence:
+    evidence_ids:
+      - "EVID-HEF-0010"
+      - "EVID-HEF-0012"
+    inherited_from_prd: false
+    notes: []

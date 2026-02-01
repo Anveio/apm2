@@ -5,7 +5,7 @@ rfc_ticket_decomposition:
   notes: |
     Ticket decomposition for HEF Phase 1. Ordering establishes:
     1) protocol schema, 2) topic grammar + ACLs, 3) outbox + publisher,
-    4) truth-plane trigger coverage, 5) red-team validation.
+    4) truth-plane trigger coverage, 5) FAC v0 preconditions, 6) red-team validation.
 
   tickets:
     - ticket_id: "TCK-00300"
@@ -245,3 +245,99 @@ rfc_ticket_decomposition:
         - "If daemon projection routing exists, all status writes are routed through it."
       evidence_ids:
         - "EVID-HEF-0001"
+
+    - ticket_id: "TCK-00310"
+      group: "FAC v0 Preconditions"
+      title: "FAC v0 NEW WORK REQUIRED: ChangeSetBundleV1 + ChangeSetPublished event"
+      requirement_ids:
+        - "REQ-HEF-0009"
+      depends_on: []
+      risk_tier: "T3"
+      summary: |
+        Define ChangeSetBundleV1 CAS schema and canonicalization. Add a
+        ChangeSetPublished ledger event that anchors changeset_digest and CAS
+        hash before any review begins.
+      files_to_modify:
+        - "proto/kernel_events.proto (add ChangeSetPublished event type)"
+        - "crates/apm2-core/src/ledger/ (emit ChangeSetPublished)"
+      files_to_create:
+        - "schemas/apm2/changeset_bundle_v1.yaml (ChangeSetBundleV1 schema)"
+        - "crates/apm2-core/src/fac/changeset_bundle.rs (bundle canonicalization)"
+      acceptance_criteria:
+        - "ChangeSetBundleV1 canonicalization is defined and deterministic."
+        - "Ledger event ChangeSetPublished references changeset_digest + CAS hash."
+      evidence_ids:
+        - "EVID-HEF-0009"
+
+    - ticket_id: "TCK-00311"
+      group: "FAC v0 Preconditions"
+      title: "FAC v0 NEW WORK REQUIRED: Workspace snapshot/apply + ReviewBlocked"
+      requirement_ids:
+        - "REQ-HEF-0010"
+        - "REQ-HEF-0011"
+      depends_on:
+        - "TCK-00310"
+      risk_tier: "T3"
+      summary: |
+        Implement reviewer workspace snapshot/apply semantics from
+        ChangeSetBundleV1. On apply/tool failure, emit ReviewBlockedRecorded with
+        reason_code and CAS log references.
+      files_to_modify:
+        - "proto/kernel_events.proto (add ReviewBlockedRecorded event type)"
+        - "crates/apm2-daemon/src/episode/ (apply snapshot + emit ReviewBlocked)"
+      files_to_create:
+        - "schemas/apm2/review_blocked_v1.yaml (reason codes + CAS log bundle)"
+      acceptance_criteria:
+        - "Workspace apply failure emits ReviewBlockedRecorded with CAS logs."
+        - "Retries bounded by HTF windows; blocked outcome is durable."
+      evidence_ids:
+        - "EVID-HEF-0010"
+
+    - ticket_id: "TCK-00312"
+      group: "FAC v0 Preconditions"
+      title: "FAC v0 NEW WORK REQUIRED: ReviewReceipt artifacts + ledger event"
+      requirement_ids:
+        - "REQ-HEF-0010"
+      depends_on:
+        - "TCK-00310"
+      risk_tier: "T3"
+      summary: |
+        Store reviewer outputs (review text + tool logs) in CAS and anchor via a
+        ReviewReceiptRecorded ledger event. Review receipts must bind to
+        changeset_digest and ReviewArtifactBundleV1.
+      files_to_modify:
+        - "proto/kernel_events.proto (add ReviewReceiptRecorded event type)"
+        - "crates/apm2-core/src/evidence/ (review receipt validation)"
+        - "crates/apm2-daemon/src/episode/ (emit ReviewReceiptRecorded)"
+      files_to_create:
+        - "schemas/apm2/review_artifact_bundle_v1.yaml (ReviewArtifactBundleV1 schema)"
+      acceptance_criteria:
+        - "ReviewReceiptRecorded references ReviewArtifactBundleV1 CAS hash."
+        - "ReviewReceipt binds changeset_digest + time_envelope_ref."
+      evidence_ids:
+        - "EVID-HEF-0011"
+
+    - ticket_id: "TCK-00313"
+      group: "FAC v0 Preconditions"
+      title: "FAC v0: End-to-end autonomous run harness"
+      requirement_ids:
+        - "REQ-HEF-0009"
+        - "REQ-HEF-0010"
+        - "REQ-HEF-0011"
+      depends_on:
+        - "TCK-00310"
+        - "TCK-00311"
+        - "TCK-00312"
+      risk_tier: "T3"
+      summary: |
+        Build an end-to-end FAC v0 harness that drives ChangeSetPublished ->
+        reviewer episodes -> ReviewReceipt -> GateReceipt -> projection, with
+        no GitHub reads for truth.
+      files_to_modify:
+        - "crates/apm2-daemon/tests/ (FAC v0 integration tests)"
+      files_to_create:
+        - "crates/apm2-daemon/tests/hef_fac_v0_e2e.rs"
+      acceptance_criteria:
+        - "EVID-HEF-0012 produced; GATE-HEF-FAC-V0 passes."
+      evidence_ids:
+        - "EVID-HEF-0012"

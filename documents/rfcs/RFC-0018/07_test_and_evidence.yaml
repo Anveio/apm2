@@ -19,7 +19,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0004"
       - id: "UT-HEF-0003"
         name: "Topic grammar audit (no placeholder patterns)"
-        scope: "Reject work..events, gate..., episode.. patterns in RFC-0018"
+        scope: "Reject placeholder topic patterns (double-dot/ellipsis) in RFC-0018"
         coverage_target: "100%"
         framework: "bash"
         evidence_ids:
@@ -67,6 +67,30 @@ rfc_test_and_evidence:
         test_environment: "Local daemon + pulse client"
         evidence_ids:
           - "EVID-HEF-0005"
+      - id: "IT-HEF-FAC-0001"
+        name: "FAC v0 diff observability (ChangeSetBundle)"
+        scope: "ChangeSetBundle available + diff render without GitHub reads"
+        test_environment: "Local daemon + reviewer episode"
+        evidence_ids:
+          - "EVID-HEF-0009"
+      - id: "IT-HEF-FAC-0002"
+        name: "FAC v0 workspace snapshot/apply + ReviewBlocked"
+        scope: "Snapshot/apply success path + blocked receipt on failure"
+        test_environment: "Local daemon + reviewer episode"
+        evidence_ids:
+          - "EVID-HEF-0010"
+      - id: "IT-HEF-FAC-0003"
+        name: "FAC v0 reviewer minimal tools + CAS logs"
+        scope: "Reviewer tools run; logs stored in CAS; ReviewReceipt references hashes"
+        test_environment: "Local daemon + reviewer episode"
+        evidence_ids:
+          - "EVID-HEF-0011"
+      - id: "IT-HEF-FAC-0004"
+        name: "FAC v0 autonomous run (end-to-end)"
+        scope: "ChangeSetPublished -> reviewer episodes -> ReviewReceipt -> GateReceipt -> projection; no GitHub reads for truth"
+        test_environment: "Local daemon + fac harness"
+        evidence_ids:
+          - "EVID-HEF-0012"
     fuzz:
       - id: "FZ-HEF-0001"
         name: "Pulse frame fuzzing"
@@ -106,4 +130,12 @@ rfc_test_and_evidence:
           artifact_ref: "evidence_artifacts/EVID-HEF-0007.yaml#rfc_evidence_artifact"
         - artifact_id: "EVID-HEF-0008"
           artifact_ref: "evidence_artifacts/EVID-HEF-0008.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0009"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0009.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0010"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0010.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0011"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0011.yaml#rfc_evidence_artifact"
+        - artifact_id: "EVID-HEF-0012"
+          artifact_ref: "evidence_artifacts/EVID-HEF-0012.yaml#rfc_evidence_artifact"
       imports: []
