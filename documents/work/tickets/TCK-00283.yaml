@@ -1,6 +1,8 @@
 acceptance_criteria:
   - criterion: Legacy socket path absent or refused
-    verification: ADV-012 cannot connect to daemon.sock
+    verification: ADV-012 fails against legacy single-socket path derived from old config/defaults
+  - criterion: No unexpected .sock files exist
+    verification: ADV-012 enumerates IPC dir and finds only operator.sock/session.sock
   - criterion: JSON downgrade attempts fail
     verification: ADV-012 shows JSON frames rejected before handlers
 implementation:

@@ -9,7 +9,7 @@ rfc_ticket_decomposition:
     All tickets trace to PRD-0010 requirements and leverage existing CCP components.
     Amendment A-001 (DD-009) cancels CLI migration + telemetry-gated xtask deprecation
     tickets (TCK-00270..TCK-00277) and adds a new Amendment Follow-ups group
-    (TCK-00279..TCK-00284) focused on hard cutover enforcement.
+    (TCK-00279..TCK-00285) focused on hard cutover enforcement and xtask removal.
 
   planned_ticket_structure:
     groups:
@@ -160,12 +160,21 @@ rfc_ticket_decomposition:
             scope: "Adversarial downgrade test and evidence"
           - title: "xtask bypass closure"
             scope: "Remove direct external projection writes or hard-fail"
+      - group_id: GRP-011
+        name: "xtask Removal (Post-Bypass)"
+        phase: PHASE-5
+        requirements_covered:
+          - REQ-0014
+        estimated_tickets:
+          - title: "Remove xtask crate after bypass closure"
+            scope: "Delete xtask crate and remove workspace references"
 
   dependencies_overview:
     critical_path:
       - "GRP-001 (IPC Foundation) -> GRP-002 (Work Orchestration)"
       - "GRP-001 -> GRP-005 (Event Signing)"
       - "GRP-001 -> GRP-010 (Hard Cutover Enforcement)"
+      - "GRP-010 -> GRP-011 (xtask removal after bypass closure)"
       - "GRP-002 -> GRP-003 (Episode Spawn)"
       - "GRP-003 -> GRP-004 (Tool Mediation)"
       - "GRP-003 -> GRP-006 (Session Lifecycle)"
@@ -1783,13 +1792,15 @@ rfc_ticket_decomposition:
       implementation_steps:
         - step: 1
           action: "Add ADV-012 test harness"
-          details: "Probe legacy socket and send JSON frames to ProtocolServer sockets."
+          details: "Probe legacy socket (derived from old config/defaults), enumerate .sock files, send JSON frames to ProtocolServer sockets."
         - step: 2
           action: "Record evidence"
           details: "Emit evidence artifacts per PRD-0010 evidence standards."
       acceptance_criteria:
         - criterion: "Legacy socket path absent/refuses connection"
-          verification: "ADV-012 fails to connect to legacy socket"
+          verification: "ADV-012 fails against legacy single-socket path derived from old config/defaults"
+        - criterion: "No unexpected .sock files exist"
+          verification: "ADV-012 enumerates IPC dir and finds only operator.sock/session.sock"
         - criterion: "ProtocolServer rejects JSON frames before handlers"
           verification: "ADV-012 fails downgrade attempts"
       test_requirements:
@@ -1826,3 +1837,39 @@ rfc_ticket_decomposition:
         - test_id: UT-XTASK-014
           description: "xtask external write paths removed"
           verification_command: "cargo test -p xtask"
+
+    - ticket_id: TCK-00285
+      title: "Remove xtask crate after bypass closure"
+      group_id: GRP-011
+      phase: PHASE-5
+      requirement_ids:
+        - REQ-0014
+      depends_on:
+        - TCK-00284
+      files_to_modify:
+        - path: "Cargo.toml"
+          changes: "Remove xtask from workspace members."
+        - path: ".cargo/config.toml"
+          changes: "Remove xtask aliases if present."
+      files_to_delete:
+        - path: "xtask/"
+          reason: "xtask crate removal after bypass closure."
+      implementation_steps:
+        - step: 1
+          action: "Verify bypass closure complete"
+          details: "TCK-00284 acceptance criteria satisfied."
+        - step: 2
+          action: "Remove xtask crate"
+          details: "Delete xtask/ and remove workspace references."
+        - step: 3
+          action: "Update documentation"
+          details: "Remove xtask references from docs and onboarding."
+      acceptance_criteria:
+        - criterion: "xtask crate removed from repository"
+          verification: "xtask/ directory no longer exists"
+        - criterion: "Workspace builds without xtask"
+          verification: "cargo build --workspace succeeds without xtask member"
+      test_requirements:
+        - test_id: CI-XTASK-REMOVAL-001
+          description: "Workspace builds after xtask removal"
+          verification_command: "cargo build --workspace"

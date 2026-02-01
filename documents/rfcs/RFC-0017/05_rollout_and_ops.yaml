@@ -185,7 +185,7 @@ rfc_rollout_and_ops:
         duration_estimate: "1 release cycle"
 
       - milestone: "Phase 5 complete"
-        action: "Remove xtask crate"
+        action: "Remove xtask crate (post-bypass closure, TCK-00285)"
         gate: "Replacement workflows validated; no telemetry gate"
 
     divergence_policy: |

@@ -4,7 +4,7 @@ acceptance_criteria:
   - criterion: Legacy JSON IPC startup removed
     verification: No ipc_server::run invocation in default build
   - criterion: Legacy socket path is absent
-    verification: ADV-012 cannot connect to daemon.sock
+    verification: ADV-012 fails against legacy single-socket path derived from old config/defaults
 implementation:
   code_examples: []
   files_to_create: []
