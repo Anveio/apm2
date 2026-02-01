@@ -599,18 +599,23 @@ pub const MAX_WORK_CLAIMS: usize = 10_000;
 /// This registry enforces a maximum of [`MAX_WORK_CLAIMS`] entries to prevent
 /// memory exhaustion. When the limit is reached, the oldest entry (by insertion
 /// order) is evicted to make room for the new claim.
+///
+/// # Performance
+///
+/// Uses `VecDeque` for O(1) eviction via `pop_front()` instead of
+/// `Vec::remove(0)` which is O(n).
 #[derive(Debug)]
 pub struct StubWorkRegistry {
     /// Claims stored with insertion order for LRU eviction.
-    /// The `Vec` maintains insertion order; oldest entries are at the front.
-    claims: std::sync::RwLock<(Vec<String>, std::collections::HashMap<String, WorkClaim>)>,
+    /// Uses `VecDeque` for O(1) eviction of oldest entries.
+    claims: std::sync::RwLock<(VecDeque<String>, std::collections::HashMap<String, WorkClaim>)>,
 }
 
 impl Default for StubWorkRegistry {
     fn default() -> Self {
         Self {
             claims: std::sync::RwLock::new((
-                Vec::with_capacity(MAX_WORK_CLAIMS.min(1000)), // Pre-allocate reasonably
+                VecDeque::with_capacity(MAX_WORK_CLAIMS.min(1000)), // Pre-allocate reasonably
                 std::collections::HashMap::with_capacity(MAX_WORK_CLAIMS.min(1000)),
             )),
         }
@@ -628,10 +633,9 @@ impl WorkRegistry for StubWorkRegistry {
             });
         }
 
-        // CTR-1303: Evict oldest entry if at capacity
+        // CTR-1303: Evict oldest entry if at capacity (O(1) via pop_front)
         while claims.len() >= MAX_WORK_CLAIMS {
-            if let Some(oldest_key) = order.first().cloned() {
-                order.remove(0);
+            if let Some(oldest_key) = order.pop_front() {
                 claims.remove(&oldest_key);
                 debug!(
                     evicted_work_id = %oldest_key,
@@ -643,7 +647,7 @@ impl WorkRegistry for StubWorkRegistry {
         }
 
         let work_id = claim.work_id.clone();
-        order.push(work_id.clone());
+        order.push_back(work_id.clone());
         claims.insert(work_id, claim.clone());
         Ok(claim)
     }
@@ -921,7 +925,13 @@ pub const MAX_SESSIONS: usize = 10_000;
 ///
 /// Per TCK-00256, the session state is persisted when `SpawnEpisode` succeeds
 /// to enable subsequent session-scoped IPC calls.
-#[derive(Debug, Clone)]
+///
+/// # Security Note
+///
+/// The `Debug` impl manually redacts `lease_id` to prevent accidental leakage
+/// in debug logs. The `lease_id` is a security-sensitive credential that should
+/// not appear in logs or error messages.
+#[derive(Clone)]
 pub struct SessionState {
     /// Unique session identifier.
     pub session_id: String,
@@ -932,11 +942,28 @@ pub struct SessionState {
     /// Ephemeral handle for IPC communication.
     pub ephemeral_handle: String,
     /// Lease ID authorizing this session.
+    ///
+    /// **SECURITY**: This field is redacted in Debug output to prevent
+    /// credential leakage in logs.
     pub lease_id: String,
     /// Policy resolution reference.
     pub policy_resolved_ref: String,
     /// Episode ID in the runtime (if created).
     pub episode_id: Option<String>,
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("session_id", &self.session_id)
+            .field("work_id", &self.work_id)
+            .field("role", &self.role)
+            .field("ephemeral_handle", &self.ephemeral_handle)
+            .field("lease_id", &"[REDACTED]")
+            .field("policy_resolved_ref", &self.policy_resolved_ref)
+            .field("episode_id", &self.episode_id)
+            .finish()
+    }
 }
 
 /// Trait for persisting and querying session state.
