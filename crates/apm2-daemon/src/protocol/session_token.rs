@@ -67,6 +67,10 @@ const MAX_SESSION_ID_LENGTH: usize = 256;
 /// tokens (CTR-1303).
 const MAX_LEASE_ID_LENGTH: usize = 256;
 
+/// Expected length of the hex-encoded MAC string.
+/// HMAC-SHA256 produces 32 bytes = 64 hex characters.
+const EXPECTED_MAC_HEX_LENGTH: usize = MAC_LENGTH * 2;
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -173,8 +177,8 @@ pub struct SessionToken {
     /// Token expiration in nanoseconds since Unix epoch.
     pub expires_at_ns: u64,
 
-    /// HMAC-SHA256 over the token data (domain prefix, `session_id`, `lease_id`,
-    /// `spawn_time_ns`, `expires_at_ns`).
+    /// HMAC-SHA256 over the token data (domain prefix, `session_id`,
+    /// `lease_id`, `spawn_time_ns`, `expires_at_ns`).
     ///
     /// Hex-encoded for JSON serialization.
     pub mac: String,
@@ -327,15 +331,52 @@ impl TokenMinter {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `session_id` or `lease_id` exceeds maximum length (CTR-1303)
+    /// - MAC hex string has wrong length (CTR-1303: check before allocation)
     /// - The token has expired
     /// - The MAC is invalid (tampering detected)
     ///
     /// # Security
     ///
+    /// - Input bounds validated BEFORE any allocation (SEC-CTRL-FAC-001)
+    /// - Length invariants enforced in validation path, not just minting
     /// - MAC verification uses constant-time comparison (CTR-WH001)
     /// - Expiration is checked before returning success
     pub fn validate(&self, token: &SessionToken, now: SystemTime) -> Result<(), SessionTokenError> {
-        // Check expiration first (fail fast)
+        // =================================================================
+        // PHASE 1: Input bounds validation (before any allocation)
+        // SEC-CTRL-FAC-001: Reject oversized inputs before resource use
+        // =================================================================
+
+        // Validate session_id length (CTR-1303)
+        if token.session_id.len() > MAX_SESSION_ID_LENGTH {
+            return Err(SessionTokenError::SessionIdTooLong {
+                len: token.session_id.len(),
+                max: MAX_SESSION_ID_LENGTH,
+            });
+        }
+
+        // Validate lease_id length (CTR-1303)
+        if token.lease_id.len() > MAX_LEASE_ID_LENGTH {
+            return Err(SessionTokenError::LeaseIdTooLong {
+                len: token.lease_id.len(),
+                max: MAX_LEASE_ID_LENGTH,
+            });
+        }
+
+        // Validate MAC hex length BEFORE calling hex::decode (SEC-CTRL-FAC-001)
+        if token.mac.len() != EXPECTED_MAC_HEX_LENGTH {
+            return Err(SessionTokenError::InvalidFormat(format!(
+                "invalid MAC hex length: {} chars, expected {} chars",
+                token.mac.len(),
+                EXPECTED_MAC_HEX_LENGTH
+            )));
+        }
+
+        // =================================================================
+        // PHASE 2: Expiration check (fail fast on expired tokens)
+        // =================================================================
+
         let now_ns = system_time_to_nanos(now)?;
 
         if token.expires_at_ns <= now_ns {
@@ -345,17 +386,13 @@ impl TokenMinter {
             });
         }
 
-        // Decode the provided MAC
+        // =================================================================
+        // PHASE 3: MAC verification (constant-time comparison)
+        // =================================================================
+
+        // Now safe to decode: length already validated, allocation is bounded
         let provided_mac = hex::decode(&token.mac)
             .map_err(|e| SessionTokenError::InvalidFormat(format!("invalid MAC hex: {e}")))?;
-
-        if provided_mac.len() != MAC_LENGTH {
-            return Err(SessionTokenError::InvalidFormat(format!(
-                "invalid MAC length: {} bytes, expected {} bytes",
-                provided_mac.len(),
-                MAC_LENGTH
-            )));
-        }
 
         // Compute expected MAC
         let expected_mac = self.compute_mac(
@@ -726,5 +763,181 @@ mod tests {
         // After expiration
         let after = test_spawn_time() + Duration::from_secs(7200);
         assert!(token.is_expired(after));
+    }
+
+    // =========================================================================
+    // SEC-FIND-001 / SEC-FIND-002 Regression Tests (DoS Protection)
+    // These tests verify that validation rejects oversized inputs BEFORE
+    // performing any allocation or computation.
+    // =========================================================================
+
+    /// SEC-FIND-001: Verify MAC hex length validated BEFORE `hex::decode`
+    /// allocation.
+    ///
+    /// Attack vector: Attacker supplies token with large `mac` string (e.g.,
+    /// 1MB). Expected: Rejected immediately based on string length, no
+    /// allocation occurs.
+    #[test]
+    fn test_validate_rejects_oversized_mac_before_allocation() {
+        let minter = test_minter();
+        let mut token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // Simulate attacker supplying a very large MAC string (65536 chars)
+        // This should be rejected BEFORE hex::decode is called
+        token.mac = "a".repeat(65536);
+
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        let result = minter.validate(&token, now);
+
+        // Should fail with InvalidFormat, not InvalidMac (which would mean we
+        // allocated and computed the MAC before checking length)
+        assert!(
+            matches!(result, Err(SessionTokenError::InvalidFormat(msg)) if msg.contains("hex length"))
+        );
+    }
+
+    /// SEC-FIND-001: Verify short MAC hex rejected before allocation.
+    #[test]
+    fn test_validate_rejects_short_mac_hex_before_decode() {
+        let minter = test_minter();
+        let mut token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // MAC that's too short (should be 64 hex chars, we provide 16)
+        token.mac = "a".repeat(16);
+
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        let result = minter.validate(&token, now);
+
+        assert!(
+            matches!(result, Err(SessionTokenError::InvalidFormat(msg)) if msg.contains("hex length"))
+        );
+    }
+
+    /// SEC-FIND-002: Verify oversized `session_id` rejected in validation path.
+    ///
+    /// Attack vector: Attacker crafts token with valid MAC but oversized
+    /// `session_id`. Expected: Rejected based on `session_id` length before
+    /// HMAC computation.
+    #[test]
+    fn test_validate_rejects_oversized_session_id() {
+        let minter = test_minter();
+        let mut token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // Replace session_id with oversized value (bypassing mint validation)
+        token.session_id = "x".repeat(MAX_SESSION_ID_LENGTH + 1);
+
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        let result = minter.validate(&token, now);
+
+        assert!(matches!(
+            result,
+            Err(SessionTokenError::SessionIdTooLong { .. })
+        ));
+    }
+
+    /// SEC-FIND-002: Verify oversized `lease_id` rejected in validation path.
+    #[test]
+    fn test_validate_rejects_oversized_lease_id() {
+        let minter = test_minter();
+        let mut token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // Replace lease_id with oversized value (bypassing mint validation)
+        token.lease_id = "x".repeat(MAX_LEASE_ID_LENGTH + 1);
+
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        let result = minter.validate(&token, now);
+
+        assert!(matches!(
+            result,
+            Err(SessionTokenError::LeaseIdTooLong { .. })
+        ));
+    }
+
+    /// SEC-FIND-001/002: Verify validation order - bounds checked before
+    /// expiration.
+    ///
+    /// This ensures denial-of-service protection takes priority: we don't even
+    /// check expiration if bounds are violated, preventing any unnecessary
+    /// computation.
+    #[test]
+    fn test_validate_checks_bounds_before_expiration() {
+        let minter = test_minter();
+        let mut token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // Make token expired AND have oversized session_id
+        token.session_id = "x".repeat(MAX_SESSION_ID_LENGTH + 1);
+
+        // Use a time after expiration
+        let now = test_spawn_time() + Duration::from_secs(7200);
+        let result = minter.validate(&token, now);
+
+        // Should fail with SessionIdTooLong, NOT Expired
+        // This proves bounds are checked before expiration
+        assert!(matches!(
+            result,
+            Err(SessionTokenError::SessionIdTooLong { .. })
+        ));
+    }
+
+    /// SEC-FIND-001: Verify MAC length check before expiration check.
+    #[test]
+    fn test_validate_checks_mac_length_before_expiration() {
+        let minter = test_minter();
+        let mut token = minter
+            .mint("session-001", "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        // Make token expired AND have invalid MAC length
+        token.mac = "abcd".to_string();
+
+        // Use a time after expiration
+        let now = test_spawn_time() + Duration::from_secs(7200);
+        let result = minter.validate(&token, now);
+
+        // Should fail with InvalidFormat, NOT Expired
+        assert!(matches!(result, Err(SessionTokenError::InvalidFormat(_))));
+    }
+
+    /// Boundary test: `session_id` at exactly `MAX_SESSION_ID_LENGTH` should
+    /// pass.
+    #[test]
+    fn test_validate_accepts_max_length_session_id() {
+        let minter = test_minter();
+        let max_len_id = "x".repeat(MAX_SESSION_ID_LENGTH);
+
+        let token = minter
+            .mint(&max_len_id, "lease-001", test_spawn_time(), test_ttl())
+            .unwrap();
+
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        let result = minter.validate(&token, now);
+
+        assert!(result.is_ok());
+    }
+
+    /// Boundary test: `lease_id` at exactly `MAX_LEASE_ID_LENGTH` should pass.
+    #[test]
+    fn test_validate_accepts_max_length_lease_id() {
+        let minter = test_minter();
+        let max_len_id = "x".repeat(MAX_LEASE_ID_LENGTH);
+
+        let token = minter
+            .mint("session-001", &max_len_id, test_spawn_time(), test_ttl())
+            .unwrap();
+
+        let now = test_spawn_time() + Duration::from_secs(1800);
+        let result = minter.validate(&token, now);
+
+        assert!(result.is_ok());
     }
 }
