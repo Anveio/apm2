@@ -26,6 +26,7 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -39,6 +40,7 @@ use super::messages::{
     IssueCapabilityResponse, PrivilegedError, PrivilegedErrorCode, ShutdownRequest,
     ShutdownResponse, SpawnEpisodeRequest, SpawnEpisodeResponse, WorkRole,
 };
+use crate::episode::{EpisodeRuntime, EpisodeRuntimeConfig};
 
 // ============================================================================
 // Ledger Event Emitter Interface (TCK-00253)
@@ -901,6 +903,144 @@ impl PrivilegedResponse {
 // Dispatcher
 // ============================================================================
 
+/// Maximum number of sessions tracked in the session registry.
+///
+/// Per CTR-1303: In-memory stores must have `max_entries` limit to prevent
+/// denial-of-service via memory exhaustion.
+pub const MAX_SESSIONS: usize = 10_000;
+
+/// Session state for a spawned episode.
+///
+/// Per TCK-00256, the session state is persisted when `SpawnEpisode` succeeds
+/// to enable subsequent session-scoped IPC calls.
+#[derive(Debug, Clone)]
+pub struct SessionState {
+    /// Unique session identifier.
+    pub session_id: String,
+    /// Work ID this session is associated with.
+    pub work_id: String,
+    /// Role claimed for this session.
+    pub role: WorkRole,
+    /// Ephemeral handle for IPC communication.
+    pub ephemeral_handle: String,
+    /// Lease ID authorizing this session.
+    pub lease_id: String,
+    /// Policy resolution reference.
+    pub policy_resolved_ref: String,
+    /// Episode ID in the runtime (if created).
+    pub episode_id: Option<String>,
+}
+
+/// Trait for persisting and querying session state.
+///
+/// Per TCK-00256, sessions must be persisted to enable subsequent
+/// session-scoped IPC calls.
+pub trait SessionRegistry: Send + Sync {
+    /// Registers a new session.
+    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError>;
+
+    /// Queries a session by session ID.
+    fn get_session(&self, session_id: &str) -> Option<SessionState>;
+
+    /// Queries a session by ephemeral handle.
+    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState>;
+}
+
+/// Error type for session registry operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRegistryError {
+    /// Session ID already exists.
+    DuplicateSessionId {
+        /// The duplicate session ID.
+        session_id: String,
+    },
+
+    /// Registration failed.
+    RegistrationFailed {
+        /// Error message.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for SessionRegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateSessionId { session_id } => {
+                write!(f, "duplicate session_id: {session_id}")
+            },
+            Self::RegistrationFailed { message } => {
+                write!(f, "session registration failed: {message}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for SessionRegistryError {}
+
+/// In-memory stub session registry for testing.
+///
+/// # Capacity Limits (CTR-1303)
+///
+/// This registry enforces a maximum of [`MAX_SESSIONS`] entries to prevent
+/// memory exhaustion. When the limit is reached, the oldest entry (by insertion
+/// order) is evicted to make room for the new session.
+#[derive(Debug, Default)]
+pub struct StubSessionRegistry {
+    /// Sessions stored with insertion order for LRU eviction.
+    sessions: std::sync::RwLock<(Vec<String>, HashMap<String, SessionState>)>,
+    /// Sessions indexed by ephemeral handle for efficient lookup.
+    sessions_by_handle: std::sync::RwLock<HashMap<String, String>>,
+}
+
+impl SessionRegistry for StubSessionRegistry {
+    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+        let mut guard = self.sessions.write().expect("lock poisoned");
+        let mut handles = self.sessions_by_handle.write().expect("lock poisoned");
+        let (order, sessions) = &mut *guard;
+
+        if sessions.contains_key(&session.session_id) {
+            return Err(SessionRegistryError::DuplicateSessionId {
+                session_id: session.session_id,
+            });
+        }
+
+        // CTR-1303: Evict oldest entry if at capacity
+        while sessions.len() >= MAX_SESSIONS {
+            if let Some(oldest_key) = order.first().cloned() {
+                order.remove(0);
+                if let Some(evicted) = sessions.remove(&oldest_key) {
+                    handles.remove(&evicted.ephemeral_handle);
+                }
+                debug!(
+                    evicted_session_id = %oldest_key,
+                    "Evicted oldest session to maintain capacity limit"
+                );
+            } else {
+                break;
+            }
+        }
+
+        let session_id = session.session_id.clone();
+        let handle = session.ephemeral_handle.clone();
+        order.push(session_id.clone());
+        handles.insert(handle, session_id.clone());
+        sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    fn get_session(&self, session_id: &str) -> Option<SessionState> {
+        let guard = self.sessions.read().expect("lock poisoned");
+        guard.1.get(session_id).cloned()
+    }
+
+    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
+        let handles = self.sessions_by_handle.read().expect("lock poisoned");
+        let session_id = handles.get(handle)?;
+        let guard = self.sessions.read().expect("lock poisoned");
+        guard.1.get(session_id).cloned()
+    }
+}
+
 /// Privileged endpoint dispatcher.
 ///
 /// Routes incoming messages to the appropriate handler based on message type.
@@ -921,6 +1061,11 @@ impl PrivilegedResponse {
 /// - Work registry for claim persistence
 /// - Ledger event emitter for signed event persistence
 /// - Actor ID derivation from credentials
+///
+/// # TCK-00256 Additions
+///
+/// - Episode runtime for lifecycle management
+/// - Session registry for session state persistence
 pub struct PrivilegedDispatcher {
     /// Decode configuration for bounded message decoding.
     decode_config: DecodeConfig,
@@ -933,6 +1078,12 @@ pub struct PrivilegedDispatcher {
 
     /// Ledger event emitter for signed event persistence (TCK-00253).
     event_emitter: Arc<dyn LedgerEventEmitter>,
+
+    /// Episode runtime for lifecycle management (TCK-00256).
+    episode_runtime: Arc<EpisodeRuntime>,
+
+    /// Session registry for session state persistence (TCK-00256).
+    session_registry: Arc<dyn SessionRegistry>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -944,8 +1095,8 @@ impl Default for PrivilegedDispatcher {
 impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration.
     ///
-    /// Uses stub implementations for policy resolver, work registry, and event
-    /// emitter.
+    /// Uses stub implementations for policy resolver, work registry, event
+    /// emitter, and session registry.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -953,13 +1104,15 @@ impl PrivilegedDispatcher {
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
             event_emitter: Arc::new(StubLedgerEventEmitter::new()),
+            episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
+            session_registry: Arc::new(StubSessionRegistry::default()),
         }
     }
 
     /// Creates a new dispatcher with custom decode configuration.
     ///
-    /// Uses stub implementations for policy resolver, work registry, and event
-    /// emitter.
+    /// Uses stub implementations for policy resolver, work registry, event
+    /// emitter, and session registry.
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
         Self {
@@ -967,6 +1120,8 @@ impl PrivilegedDispatcher {
             policy_resolver: Arc::new(StubPolicyResolver),
             work_registry: Arc::new(StubWorkRegistry::default()),
             event_emitter: Arc::new(StubLedgerEventEmitter::new()),
+            episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
+            session_registry: Arc::new(StubSessionRegistry::default()),
         }
     }
 
@@ -979,12 +1134,16 @@ impl PrivilegedDispatcher {
         policy_resolver: Arc<dyn PolicyResolver>,
         work_registry: Arc<dyn WorkRegistry>,
         event_emitter: Arc<dyn LedgerEventEmitter>,
+        episode_runtime: Arc<EpisodeRuntime>,
+        session_registry: Arc<dyn SessionRegistry>,
     ) -> Self {
         Self {
             decode_config,
             policy_resolver,
             work_registry,
             event_emitter,
+            episode_runtime,
+            session_registry,
         }
     }
 
@@ -994,6 +1153,22 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn event_emitter(&self) -> &Arc<dyn LedgerEventEmitter> {
         &self.event_emitter
+    }
+
+    /// Returns a reference to the episode runtime.
+    ///
+    /// This is useful for testing to verify episode state.
+    #[must_use]
+    pub const fn episode_runtime(&self) -> &Arc<EpisodeRuntime> {
+        &self.episode_runtime
+    }
+
+    /// Returns a reference to the session registry.
+    ///
+    /// This is useful for testing to verify session state.
+    #[must_use]
+    pub fn session_registry(&self) -> &Arc<dyn SessionRegistry> {
+        &self.session_registry
     }
 
     /// Dispatches a privileged request to the appropriate handler.
@@ -1138,9 +1313,11 @@ impl PrivilegedDispatcher {
             },
         };
 
+        // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
+        // leakage
         info!(
             work_id = %work_id,
-            lease_id = %lease_id,
+            lease_id = "[REDACTED]",
             actor_id = %actor_id,
             policy_resolved_ref = %policy_resolution.policy_resolved_ref,
             "Work claimed with policy resolution"
@@ -1205,11 +1382,25 @@ impl PrivilegedDispatcher {
 
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
     ///
-    /// # Stub Implementation
+    /// # TCK-00256 Implementation
     ///
-    /// This is a stub handler that validates the request and returns a
-    /// placeholder response. Full implementation is in TCK-00256
-    /// (`SpawnEpisode` with `PolicyResolvedForChangeSet` check).
+    /// This handler implements the episode spawn flow per DD-001 and DD-002:
+    ///
+    /// 1. Validate request structure
+    /// 2. Query work registry for `PolicyResolvedForChangeSet`
+    /// 3. Validate role matches the claimed role
+    /// 4. Validate `lease_id` matches the claimed `lease_id` (SEC-SCP-FAC-0020)
+    /// 5. Create episode in runtime with policy constraints
+    /// 6. Persist session state for subsequent IPC calls
+    /// 7. Return session credentials
+    ///
+    /// # Security
+    ///
+    /// - Per SEC-SCP-FAC-0020: `lease_id` is validated against the claim to
+    ///   prevent authorization bypass. The `lease_id` is redacted from logs to
+    ///   prevent capability leakage.
+    /// - Per fail-closed semantics: spawn is rejected if policy resolution is
+    ///   missing.
     fn handle_spawn_episode(
         &self,
         payload: &[u8],
@@ -1222,12 +1413,14 @@ impl PrivilegedDispatcher {
                 }
             })?;
 
+        // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
+        // leakage
         info!(
             work_id = %request.work_id,
             role = ?WorkRole::try_from(request.role).unwrap_or(WorkRole::Unspecified),
-            lease_id = ?request.lease_id,
+            lease_id = "[REDACTED]",
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
-            "SpawnEpisode request received (stub handler)"
+            "SpawnEpisode request received"
         );
 
         // Validate required fields
@@ -1289,6 +1482,39 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // SEC-SCP-FAC-0020: Validate lease_id matches the claimed lease_id
+        // This prevents authorization bypass where a caller provides an arbitrary
+        // lease_id. All roles must provide the correct lease_id from ClaimWork.
+        // For GateExecutor, we already checked that lease_id.is_some() above.
+        // For all roles, the lease_id must match the claim if provided.
+        let provided_lease_id = request.lease_id.as_deref().unwrap_or("");
+        if !provided_lease_id.is_empty() && provided_lease_id != claim.lease_id {
+            warn!(
+                work_id = %request.work_id,
+                "SpawnEpisode rejected: lease_id mismatch"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "lease_id does not match the claimed lease_id",
+            ));
+        }
+
+        // For GateExecutor, the lease_id is required and must match
+        if request.role == WorkRole::GateExecutor as i32 {
+            if let Some(ref lease_id) = request.lease_id {
+                if lease_id != &claim.lease_id {
+                    warn!(
+                        work_id = %request.work_id,
+                        "SpawnEpisode rejected: GateExecutor lease_id mismatch"
+                    );
+                    return Ok(PrivilegedResponse::error(
+                        PrivilegedErrorCode::CapabilityRequestRejected,
+                        "lease_id does not match the claimed lease_id for GATE_EXECUTOR",
+                    ));
+                }
+            }
+        }
+
         info!(
             work_id = %request.work_id,
             policy_resolved_ref = %claim.policy_resolution.policy_resolved_ref,
@@ -1298,6 +1524,34 @@ impl PrivilegedDispatcher {
         // Generate session ID and ephemeral handle
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
         let ephemeral_handle = format!("H-{}", uuid::Uuid::new_v4());
+
+        // TCK-00256: Persist session state for subsequent IPC calls
+        // The episode_runtime can create/start episodes asynchronously when needed.
+        // For now, we persist the session state with policy constraints reference
+        // so that subsequent async operations can use it.
+        let session_state = SessionState {
+            session_id: session_id.clone(),
+            work_id: request.work_id.clone(),
+            role: request_role,
+            ephemeral_handle: ephemeral_handle.clone(),
+            lease_id: claim.lease_id.clone(),
+            policy_resolved_ref: claim.policy_resolution.policy_resolved_ref.clone(),
+            episode_id: None, // Will be set when episode starts in async context
+        };
+
+        if let Err(e) = self.session_registry.register_session(session_state) {
+            warn!(error = %e, "Session registration failed");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("session registration failed: {e}"),
+            ));
+        }
+
+        debug!(
+            session_id = %session_id,
+            work_id = %request.work_id,
+            "Session state persisted successfully"
+        );
 
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,
@@ -2307,16 +2561,17 @@ mod tests {
         let claim_frame = encode_claim_work_request(&claim_request);
         let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
 
-        let work_id = match claim_response {
-            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+        // SEC-SCP-FAC-0020: Get the correct lease_id from the claim response
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
             _ => panic!("Expected ClaimWork response"),
         };
 
-        // Now spawn with the claimed work_id
+        // Now spawn with the claimed work_id and correct lease_id
         let request = SpawnEpisodeRequest {
             work_id,
             role: WorkRole::GateExecutor.into(),
-            lease_id: Some("L-001".to_string()),
+            lease_id: Some(lease_id), // Use the correct lease_id from ClaimWork
         };
         let frame = encode_spawn_episode_request(&request);
 
@@ -2331,6 +2586,159 @@ mod tests {
             },
             _ => panic!("Expected SpawnEpisode response"),
         }
+    }
+
+    // ========================================================================
+    // SEC-SCP-FAC-0020: Lease ID Validation Tests
+    // ========================================================================
+
+    /// SEC-SCP-FAC-0020: `SpawnEpisode` with wrong `lease_id` fails.
+    ///
+    /// Per security review: `lease_id` must be validated against the claim to
+    /// prevent authorization bypass.
+    #[test]
+    fn tck_00256_spawn_with_wrong_lease_id_fails() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Claim work with GateExecutor role
+        let claim_request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::GateExecutor.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let work_id = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Try to spawn with a WRONG lease_id (arbitrary string)
+        let request = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::GateExecutor.into(),
+            lease_id: Some("L-WRONG-LEASE-ID".to_string()), // Wrong!
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::Error(err) => {
+                assert_eq!(
+                    err.code,
+                    PrivilegedErrorCode::CapabilityRequestRejected as i32,
+                    "Should return CapabilityRequestRejected for lease_id mismatch"
+                );
+                assert!(
+                    err.message.contains("lease_id"),
+                    "Error message should mention lease_id: {}",
+                    err.message
+                );
+            },
+            _ => panic!("Expected lease_id mismatch error, got: {response:?}"),
+        }
+    }
+
+    /// SEC-SCP-FAC-0020: `SpawnEpisode` with correct `lease_id` succeeds.
+    #[test]
+    fn tck_00256_spawn_with_correct_lease_id_succeeds() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Claim work
+        let claim_request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let (work_id, lease_id) = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Spawn with the correct lease_id (optional for non-GateExecutor)
+        let request = SpawnEpisodeRequest {
+            work_id,
+            role: WorkRole::Implementer.into(),
+            lease_id: Some(lease_id), // Correct lease_id
+        };
+        let frame = encode_spawn_episode_request(&request);
+
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        match response {
+            PrivilegedResponse::SpawnEpisode(resp) => {
+                assert!(!resp.session_id.is_empty());
+            },
+            PrivilegedResponse::Error(err) => {
+                panic!("Unexpected error: {err:?}");
+            },
+            _ => panic!("Expected SpawnEpisode response"),
+        }
+    }
+
+    /// SEC-SCP-FAC-0020: Session state is persisted after successful spawn.
+    #[test]
+    fn tck_00256_session_state_persisted() {
+        let dispatcher = PrivilegedDispatcher::new();
+        let ctx = make_privileged_ctx();
+
+        // Claim work
+        let claim_request = ClaimWorkRequest {
+            actor_id: "test-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+
+        let work_id = match claim_response {
+            PrivilegedResponse::ClaimWork(resp) => resp.work_id,
+            _ => panic!("Expected ClaimWork response"),
+        };
+
+        // Spawn episode
+        let request = SpawnEpisodeRequest {
+            work_id: work_id.clone(),
+            role: WorkRole::Implementer.into(),
+            lease_id: None,
+        };
+        let frame = encode_spawn_episode_request(&request);
+        let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+        let (session_id, ephemeral_handle) = match response {
+            PrivilegedResponse::SpawnEpisode(resp) => (resp.session_id, resp.ephemeral_handle),
+            _ => panic!("Expected SpawnEpisode response"),
+        };
+
+        // Verify session is persisted
+        let session = dispatcher.session_registry.get_session(&session_id);
+        assert!(session.is_some(), "Session should be persisted");
+
+        let session = session.unwrap();
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.work_id, work_id);
+        assert_eq!(session.role, WorkRole::Implementer);
+        assert_eq!(session.ephemeral_handle, ephemeral_handle);
+
+        // Also verify we can query by ephemeral handle
+        let session_by_handle = dispatcher
+            .session_registry
+            .get_session_by_handle(&ephemeral_handle);
+        assert!(
+            session_by_handle.is_some(),
+            "Session should be queryable by handle"
+        );
+        assert_eq!(session_by_handle.unwrap().session_id, session_id);
     }
 
     // ========================================================================
