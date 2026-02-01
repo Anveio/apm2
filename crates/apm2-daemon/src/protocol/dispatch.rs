@@ -263,13 +263,25 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // CTR-1303: Persist to bounded in-memory store with LRU eviction
         {
             let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
             let (order, events) = &mut *guard;
 
-            // Evict oldest entries if at capacity
+            // Evict oldest entries if at capacity, also pruning events_by_work_id index
             while events.len() >= MAX_LEDGER_EVENTS {
                 if let Some(oldest_key) = order.first().cloned() {
                     order.remove(0);
-                    events.remove(&oldest_key);
+                    // Remove from events and prune the events_by_work_id index
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        // Remove from work_id index
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            // Remove the entry entirely if no events remain for this work_id
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
                     debug!(
                         evicted_event_id = %oldest_key,
                         "Evicted oldest ledger event to maintain capacity limit"
@@ -281,9 +293,6 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
             order.push(event_id.clone());
             events.insert(event_id.clone(), signed_event.clone());
-        }
-        {
-            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
             events_by_work
                 .entry(claim.work_id.clone())
                 .or_default()
