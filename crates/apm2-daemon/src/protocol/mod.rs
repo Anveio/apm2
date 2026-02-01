@@ -98,6 +98,8 @@ pub mod handshake;
 pub mod messages;
 pub mod server;
 pub mod session_token;
+/// Dual-socket manager for privilege separation (TCK-00249).
+pub mod socket_manager;
 
 // Re-export commonly used types at module level
 pub use credentials::PeerCredentials;
@@ -140,3 +142,7 @@ pub use server::{
     Connection, ConnectionPermit, ProtocolServer, ServerConfig, connect, default_socket_path,
 };
 pub use session_token::{SessionToken, SessionTokenError, TokenMinter};
+pub use socket_manager::{
+    SocketManager, SocketManagerConfig, SocketType, default_operator_socket_path,
+    default_session_socket_path,
+};

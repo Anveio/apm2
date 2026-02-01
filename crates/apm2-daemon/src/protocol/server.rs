@@ -398,6 +398,19 @@ pub struct ConnectionPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+impl ConnectionPermit {
+    /// Create a new connection permit.
+    ///
+    /// This is used by [`SocketManager`] to create permits for connections
+    /// accepted from the dual-socket topology.
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub const fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self { _permit: permit }
+    }
+}
+
 /// A framed connection to a client.
 ///
 /// Wraps a Unix stream with the frame codec for length-prefixed messaging.
@@ -428,6 +441,22 @@ impl Connection {
             ),
             peer_credentials,
         }
+    }
+
+    /// Create a new connection from a Unix stream with credentials.
+    ///
+    /// This is used by [`SocketManager`] to create connections for the
+    /// dual-socket topology after credentials have been validated.
+    ///
+    /// Initializes with [`MAX_HANDSHAKE_FRAME_SIZE`] limit.
+    ///
+    /// [`SocketManager`]: super::socket_manager::SocketManager
+    #[must_use]
+    pub fn new_with_credentials(
+        stream: UnixStream,
+        peer_credentials: Option<PeerCredentials>,
+    ) -> Self {
+        Self::new(stream, peer_credentials)
     }
 
     /// Returns the peer credentials associated with this connection.
