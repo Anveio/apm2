@@ -3738,4 +3738,85 @@ mod tests {
 
         assert!(controller.is_terminal());
     }
+
+    /// TCK-00242: Controller auto-aborts on clock regression.
+    ///
+    /// When `update_elapsed_ticks` detects a clock regression (current_tick <
+    /// start_tick), the controller must automatically transition to Aborted
+    /// state (fail-closed).
+    #[test]
+    fn tck_00242_auto_abort_on_clock_regression() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Start at tick 2000
+        controller.start(tick(2000), 1_000_000_000).unwrap();
+
+        let spawn = controller
+            .prepare_session_spawn("work-1", 100, 2_000_000_000)
+            .unwrap();
+
+        // Try to record termination with a tick BEFORE the start tick (regression)
+        let regressed_tick = tick(1000); // 1000 < 2000
+
+        let result = controller.record_session_termination(
+            &spawn.session_id,
+            "work-1",
+            SessionOutcome::Success,
+            1000,
+            regressed_tick,
+            3_000_000_000,
+        );
+
+        // Should return ClockRegression error
+        assert!(matches!(
+            result,
+            Err(ControllerError::ClockRegression {
+                start_tick: 2000,
+                current_tick: 1000,
+            })
+        ));
+
+        // Controller should now be in terminal (Aborted) state
+        assert!(controller.is_terminal());
+        assert!(matches!(
+            controller.status(),
+            CoordinationStatus::Aborted(AbortReason::Error { .. })
+        ));
+    }
+
+    /// TCK-00242: Controller auto-aborts on clock regression during complete().
+    ///
+    /// The fail-closed behavior applies to all methods that call
+    /// update_elapsed_ticks.
+    #[test]
+    fn tck_00242_auto_abort_on_clock_regression_during_complete() {
+        let config = test_config(vec!["work-1".to_string()]);
+        let mut controller = CoordinationController::new(config);
+
+        // Start at tick 2000
+        controller.start(tick(2000), 1_000_000_000).unwrap();
+
+        // Try to complete with a tick BEFORE the start tick (regression)
+        let regressed_tick = tick(1500); // 1500 < 2000
+
+        let result =
+            controller.complete(StopCondition::WorkCompleted, regressed_tick, 2_000_000_000);
+
+        // Should return ClockRegression error
+        assert!(matches!(
+            result,
+            Err(ControllerError::ClockRegression {
+                start_tick: 2000,
+                current_tick: 1500,
+            })
+        ));
+
+        // Controller should now be in terminal (Aborted) state
+        assert!(controller.is_terminal());
+        assert!(matches!(
+            controller.status(),
+            CoordinationStatus::Aborted(AbortReason::Error { .. })
+        ));
+    }
 }
