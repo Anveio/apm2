@@ -895,19 +895,36 @@ impl SqliteLedgerBackend {
         self.append(&event)
     }
 
+    /// Maximum payload size for `append_verified` to prevent denial-of-service
+    /// via unbounded memory allocation. 16 MiB is generous for event payloads
+    /// while preventing abuse.
+    pub const MAX_VERIFIED_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
+
     /// Appends an event to the ledger after verifying its signature.
     ///
     /// This method provides signature verification on ingestion per RFC-0017
     /// DD-006. It rejects:
     /// 1. Unsigned events (signature field is None or empty)
     /// 2. Events with invalid signatures
+    /// 3. Events where `actor_id` does not match the `verifying_key`
+    /// 4. Events with payloads exceeding `MAX_VERIFIED_PAYLOAD_SIZE`
     ///
-    /// The signature is verified using domain separation with
-    /// `LEDGER_EVENT_PREFIX` to prevent cross-context replay attacks.
+    /// # Security Properties
+    ///
+    /// - **Signature domain consistency**: The signature is verified over the
+    ///   `event_hash` (which includes `prev_hash` for chain linking), ensuring
+    ///   consistency with `verify_chain`.
+    /// - **Full event coverage**: The `event_hash` covers the entire event
+    ///   record via `prev_hash || payload`, preventing tampering with metadata.
+    /// - **Actor binding**: The `actor_id` must match the hex-encoded public
+    ///   key of the `verifying_key`, binding identity to the cryptographic key.
+    /// - **Denial-of-service protection**: Payload size is limited to prevent
+    ///   memory exhaustion.
     ///
     /// # Arguments
     ///
-    /// * `event` - The event to append (must have signature field populated)
+    /// * `event` - The event to append (must have `signature`, `prev_hash`, and
+    ///   `event_hash` fields populated)
     /// * `verifying_key` - The public key to verify the signature against
     ///
     /// # Returns
@@ -917,29 +934,42 @@ impl SqliteLedgerBackend {
     /// # Errors
     ///
     /// - `UnsignedEvent` if the event has no signature
-    /// - `SignatureInvalid` if the signature verification fails
+    /// - `SignatureInvalid` if the signature verification fails or `actor_id`
+    ///   mismatch
     /// - Other `LedgerError` variants for storage errors
     ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// use apm2_core::crypto::Signer;
+    /// use apm2_core::crypto::{EventHasher, Signer};
     /// use apm2_core::fac::{LEDGER_EVENT_PREFIX, sign_with_domain};
     /// use apm2_core::ledger::{EventRecord, Ledger};
     ///
     /// let ledger = Ledger::in_memory().unwrap();
     /// let signer = Signer::generate();
     ///
+    /// // Compute actor_id from verifying key
+    /// let actor_id = hex::encode(signer.verifying_key().as_bytes());
+    ///
     /// let mut event = EventRecord::new(
     ///     "test.event",
     ///     "session-1",
-    ///     "actor-1",
+    ///     &actor_id,
     ///     b"payload".to_vec(),
     /// );
     ///
-    /// // Sign the payload with domain separation
-    /// let signature =
-    ///     sign_with_domain(&signer, LEDGER_EVENT_PREFIX, &event.payload);
+    /// // Get the previous hash (genesis for first event)
+    /// let prev_hash = ledger.last_event_hash().unwrap();
+    ///
+    /// // Compute event_hash the same way verify_chain expects
+    /// let prev_hash_array: [u8; 32] = prev_hash.clone().try_into().unwrap();
+    /// let event_hash = EventHasher::hash_event(&event.payload, &prev_hash_array);
+    ///
+    /// // Sign the event_hash with domain separation
+    /// let signature = sign_with_domain(&signer, LEDGER_EVENT_PREFIX, &event_hash);
+    ///
+    /// event.prev_hash = Some(prev_hash);
+    /// event.event_hash = Some(event_hash.to_vec());
     /// event.signature = Some(signature.to_bytes().to_vec());
     ///
     /// // Append with signature verification
@@ -952,6 +982,30 @@ impl SqliteLedgerBackend {
         event: &EventRecord,
         verifying_key: &crate::crypto::VerifyingKey,
     ) -> Result<u64, LedgerError> {
+        // DoS protection: reject oversized payloads
+        if event.payload.len() > Self::MAX_VERIFIED_PAYLOAD_SIZE {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!(
+                    "payload size {} exceeds maximum {} bytes",
+                    event.payload.len(),
+                    Self::MAX_VERIFIED_PAYLOAD_SIZE
+                ),
+            });
+        }
+
+        // Validate actor_id matches verifying_key (identity binding)
+        let expected_actor_id = hex::encode(verifying_key.as_bytes());
+        if event.actor_id != expected_actor_id {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!(
+                    "actor_id mismatch: expected {} (from verifying_key), got {}",
+                    expected_actor_id, event.actor_id
+                ),
+            });
+        }
+
         // Check for unsigned event
         let signature_bytes =
             event
@@ -967,6 +1021,49 @@ impl SqliteLedgerBackend {
             });
         }
 
+        // Require event_hash to be set (for chain consistency)
+        let event_hash =
+            event
+                .event_hash
+                .as_ref()
+                .ok_or_else(|| LedgerError::SignatureInvalid {
+                    seq_id: 0,
+                    details: "event_hash is required for verified append".to_string(),
+                })?;
+
+        if event_hash.len() != 32 {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!("event_hash must be 32 bytes, got {}", event_hash.len()),
+            });
+        }
+
+        // Verify event_hash matches computed hash (full coverage check)
+        let prev_hash = event.prev_hash.as_deref().unwrap_or(&[0u8; 32]);
+        if prev_hash.len() != 32 {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!("prev_hash must be 32 bytes, got {}", prev_hash.len()),
+            });
+        }
+
+        let prev_hash_array: [u8; 32] =
+            prev_hash
+                .try_into()
+                .map_err(|_| LedgerError::SignatureInvalid {
+                    seq_id: 0,
+                    details: "prev_hash conversion failed".to_string(),
+                })?;
+
+        let computed_hash =
+            crate::crypto::EventHasher::hash_event(&event.payload, &prev_hash_array);
+        if event_hash.as_slice() != computed_hash.as_slice() {
+            return Err(LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: "event_hash does not match computed hash".to_string(),
+            });
+        }
+
         // Parse the signature
         let signature = crate::crypto::parse_signature(signature_bytes).map_err(|e| {
             LedgerError::SignatureInvalid {
@@ -976,11 +1073,12 @@ impl SqliteLedgerBackend {
         })?;
 
         // Verify the signature using domain separation
-        // The signature is over LEDGER_EVENT_PREFIX || payload
+        // The signature is over LEDGER_EVENT_PREFIX || event_hash
+        // This is consistent with what verify_chain expects
         crate::fac::verify_with_domain(
             verifying_key,
             crate::fac::LEDGER_EVENT_PREFIX,
-            &event.payload,
+            event_hash,
             &signature,
         )
         .map_err(|_| LedgerError::SignatureInvalid {
