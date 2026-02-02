@@ -617,7 +617,8 @@ impl SessionTerminationInfo {
 /// - `Allow`: Request is permitted, proceed with execution
 /// - `Deny`: Request is denied with a reason
 /// - `DedupeCacheHit`: Request matches a cached result (idempotent replay)
-/// - `Terminate`: Request triggered session termination (e.g., firewall violation)
+/// - `Terminate`: Request triggered session termination (e.g., firewall
+///   violation)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolDecision {
     /// Request is allowed. Proceed with execution.
@@ -671,12 +672,12 @@ pub enum ToolDecision {
         termination_info: Box<SessionTerminationInfo>,
 
         /// Optional event to emit (e.g., refinement request).
-        /// Boxed to avoid circular dependency types if possible, but here we use opaque bytes or similar?
-        /// Actually, `CoordinationEvent` is in `apm2_core`.
-        /// We'll store it as opaque bytes or handle it at the call site.
-        /// For now, let's just use `termination_info`.
-        /// Wait, `consume.rs` needs to return the refinement event.
-        /// But `ToolDecision` is generic.
+        /// Boxed to avoid circular dependency types if possible, but here we
+        /// use opaque bytes or similar? Actually, `CoordinationEvent`
+        /// is in `apm2_core`. We'll store it as opaque bytes or handle
+        /// it at the call site. For now, let's just use
+        /// `termination_info`. Wait, `consume.rs` needs to return the
+        /// refinement event. But `ToolDecision` is generic.
         /// Let's add an optional opaque payload.
         refinement_event: Option<Vec<u8>>, // Serialized CoordinationEvent
     },

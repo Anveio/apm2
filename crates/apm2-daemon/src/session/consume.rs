@@ -54,11 +54,12 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::episode::decision::SessionTerminationInfo;
 use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
 use apm2_core::context::{ContextPackManifest, ToolClass};
 use apm2_core::coordination::{ContextRefinementRequest, CoordinationEvent};
 use apm2_core::tool::{ToolRequest, tool_request};
+
+use crate::episode::decision::SessionTerminationInfo;
 
 /// Maximum number of refinement attempts before giving up.
 pub const MAX_REFINEMENT_ATTEMPTS: u32 = 10;

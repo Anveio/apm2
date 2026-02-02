@@ -37,6 +37,8 @@
 
 use std::sync::Arc;
 
+use apm2_core::context::ContextPackManifest;
+use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -51,9 +53,6 @@ use super::decision::{
 use super::dedupe::{DedupeCache, DedupeCacheConfig, SharedDedupeCache};
 use super::error::EpisodeId;
 use super::runtime::Hash;
-
-use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
-use apm2_core::context::ContextPackManifest;
 
 // =============================================================================
 // BrokerError
@@ -491,22 +490,23 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         // This must happen before capability checks because a firewall violation
         // triggers session termination, which is more severe than a capability denial.
         if let Some(context_manifest) = self.context_manifest.read().await.as_ref() {
-            // Only FileRead operations are currently subject to the context firewall allowlist
-            // in DefaultContextFirewall.
+            // Only FileRead operations are currently subject to the context firewall
+            // allowlist in DefaultContextFirewall.
             if request.tool_class == super::tool_class::ToolClass::Read {
                 if let Some(ref path) = request.path {
-                    let firewall = DefaultContextFirewall::new(context_manifest, FirewallMode::HardFail);
+                    let firewall =
+                        DefaultContextFirewall::new(context_manifest, FirewallMode::HardFail);
                     let path_str = path.to_string_lossy();
-                    
+
                     if let Err(e) = firewall.validate_read(&path_str, None) {
                         warn!(path = %path_str, error = %e, "context firewall violation");
-                        
+
                         let termination_info = SessionTerminationInfo::new(
                             request.episode_id.to_string(),
                             "CONTEXT_MISS",
                             "FAILURE",
                         );
-                        
+
                         return Ok(ToolDecision::Terminate {
                             request_id: request.request_id.clone(),
                             termination_info: Box::new(termination_info),
