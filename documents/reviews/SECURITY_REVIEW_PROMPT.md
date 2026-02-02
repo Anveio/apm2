@@ -219,6 +219,33 @@ decision_tree:
 
     - id: PHASE_7_EXECUTE_ACTIONS
       purpose: "Post findings (Assurance-Case format) to PR and update status check."
+      comment_content:
+        structure:
+          - section: "Verdict Banner"
+            format: "## Verdict: PASS | FAIL"
+            content: "Clear verdict with SCP determination and severity summary"
+          - section: "Summary"
+            content: "1-2 paragraph overview of security scope and key conclusions"
+          - section: "SCP Determination"
+            content: "Which security-critical areas were touched and why"
+          - section: "Markov Blanket Analysis"
+            content: "Input/validation/output mapping for each boundary"
+          - section: "BLOCKER FINDINGS"
+            format: "### **BLOCKER FINDINGS**"
+            content: "Numbered list of blockers, each with:"
+            item_structure:
+              - "Issue: What security invariant is violated"
+              - "Impact: Attack surface or vulnerability exposed"
+              - "Consequence: Blast radius if exploited"
+              - "Required Fix: Clear, actionable remediation"
+          - section: "MAJOR FINDINGS"
+            format: "### **MAJOR FINDINGS**"
+            content: "Numbered list of majors with same structure as blockers"
+          - section: "POSITIVE OBSERVATIONS"
+            format: "### **POSITIVE OBSERVATIONS (PASS)**"
+            content: "Security invariants correctly upheld; defense-in-depth wins"
+          - section: "Assurance Case"
+            content: "Claim-Argument-Evidence structure for final verdict"
       steps[3]:
         - id: WRITE_FINDINGS
           action: write_file

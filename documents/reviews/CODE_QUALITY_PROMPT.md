@@ -179,7 +179,10 @@ decision_tree:
       comment_content:
         structure:
           - section: "Verdict Banner"
-            content: "PASS or FAIL with severity summary"
+            format: "## Verdict: PASS | FAIL"
+            content: "Clear verdict with overall severity summary"
+          - section: "Summary"
+            content: "1-2 paragraph overview of what was reviewed and key conclusions"
           - section: "Ticket Requirements"
             content: "Enumerated list of DOD criteria from bound ticket"
           - section: "Requirements Verification"
@@ -191,10 +194,23 @@ decision_tree:
               - "Invariant Adherence: Conformance to Rust Standards references"
           - section: "Lenses Applied"
             content: "Summary of each lens from PHASE_4 and what was checked"
-          - section: "Findings"
-            content: "All BLOCKER/MAJOR/MINOR/NIT items with severity tags"
-          - section: "Recommendations"
-            content: "For any blockers: clear, actionable remediation steps"
+          - section: "BLOCKER FINDINGS"
+            format: "### **BLOCKER FINDINGS**"
+            content: "Numbered list of blockers, each with:"
+            item_structure:
+              - "Issue: What is wrong"
+              - "Impact: What breaks or is at risk"
+              - "Consequence: Downstream effects if unaddressed"
+              - "Required Fix: Clear, actionable remediation"
+          - section: "MAJOR FINDINGS"
+            format: "### **MAJOR FINDINGS**"
+            content: "Numbered list of majors with same structure as blockers"
+          - section: "MINOR/NIT FINDINGS"
+            format: "### **MINOR FINDINGS** / ### **NITS**"
+            content: "Optional sections for lower-severity items"
+          - section: "POSITIVE OBSERVATIONS"
+            format: "### **POSITIVE OBSERVATIONS (PASS)**"
+            content: "What the PR does well; specific invariants correctly upheld"
       steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
