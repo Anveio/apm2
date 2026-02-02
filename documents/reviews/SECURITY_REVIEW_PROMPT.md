@@ -219,20 +219,21 @@ decision_tree:
 
     - id: PHASE_7_EXECUTE_ACTIONS
       purpose: "Post findings (Assurance-Case format) to PR and update status check."
-      steps[2]:
+      steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "security_findings.md"
           content: "$FINDINGS_ASSURANCE_CASE"
-        - id: UPDATE_STATUS
+        - id: POST_AND_UPDATE
           action: command
           run: |
             if [ "$verdict" == "PASS" ]; then
-              # For approvals, post the detailed findings first, then the official approval banner.
               gh pr comment $PR_URL --body-file security_findings.md
               cargo xtask security-review-exec approve $ticket_id
             else
-              # For denials, the xtask tool incorporates the reason directly into the status banner.
               cat security_findings.md | cargo xtask security-review-exec deny $ticket_id --reason -
             fi
             rm security_findings.md
+        - id: TERMINATE
+          action: output
+          content: "DONE"

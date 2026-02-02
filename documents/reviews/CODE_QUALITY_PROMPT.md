@@ -176,18 +176,36 @@ decision_tree:
 
     - id: PHASE_6_PUBLISH_RESULTS
       purpose: "Post PR comment and update status checks."
-      steps[2]:
+      comment_content:
+        structure:
+          - section: "Verdict Banner"
+            content: "PASS or FAIL with severity summary"
+          - section: "Ticket Requirements"
+            content: "Enumerated list of DOD criteria from bound ticket"
+          - section: "Requirements Verification"
+            content: "For each requirement: evidence of how the code satisfies it"
+          - section: "Quality Analysis"
+            subsections:
+              - "Simplicity: Minimal moving parts, no unnecessary abstraction"
+              - "Elegance: Idiomatic patterns, clean data flow"
+              - "Invariant Adherence: Conformance to Rust Standards references"
+          - section: "Lenses Applied"
+            content: "Summary of each lens from PHASE_4 and what was checked"
+          - section: "Findings"
+            content: "All BLOCKER/MAJOR/MINOR/NIT items with severity tags"
+          - section: "Recommendations"
+            content: "For any blockers: clear, actionable remediation steps"
+      steps[3]:
         - id: WRITE_FINDINGS
           action: write_file
           path: "quality_findings.md"
           content: "$FORMATTED_FINDINGS"
-        - id: UPDATE_STATUS
+        - id: POST_AND_UPDATE
           action: command
           run: |
-            # If PASS, update status. If FAIL, the reviewer should post findings manually or via a future exec tool.
-            # For now, we consolidate to avoid double-posting during automated runs.
+            gh pr comment $PR_URL --body-file quality_findings.md
             gh api --method POST "/repos/{owner}/{repo}/statuses/$HEAD_SHA" -f state="$VERDICT_STATE" -f context="ai-review/code-quality" -f description="Code quality review $VERDICT_STATE"
-            if [ "$VERDICT_STATE" == "failure" ]; then
-              gh pr comment $PR_URL --body-file quality_findings.md
-            fi
             rm quality_findings.md
+        - id: TERMINATE
+          action: output
+          content: "DONE"
