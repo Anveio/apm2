@@ -245,7 +245,7 @@ fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
 
-    // Determine socket path (uses operator socket for privileged CLI operations)
+    // Determine socket path
     let socket_path = cli.socket.clone().unwrap_or_else(|| {
         // Try to load from config, or use default
         if cli.config.exists() {
@@ -253,8 +253,7 @@ fn main() -> Result<()> {
                 return config.daemon.operator_socket;
             }
         }
-        // Per TCK-00249: ${XDG_RUNTIME_DIR}/apm2/operator.sock
-        // Falls back to /tmp/apm2/operator.sock if XDG_RUNTIME_DIR is not set
+        // Fallback: ${XDG_RUNTIME_DIR}/apm2/operator.sock or /tmp/apm2/operator.sock
         std::env::var("XDG_RUNTIME_DIR").map_or_else(
             |_| PathBuf::from("/tmp/apm2/operator.sock"),
             |runtime_dir| {
