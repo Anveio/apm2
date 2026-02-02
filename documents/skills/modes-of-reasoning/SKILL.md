@@ -7,7 +7,7 @@ argument-hint: "[<mode-number> | <keyword> | recommend <problem-type> | empty]"
 
 # Modes of Reasoning
 
-A practical taxonomy of 80 reasoning modes stored as CAC artifacts. For background on how these modes relate and when to combine them, see `artifacts/selector.json`.
+A practical taxonomy of 81 reasoning modes stored as CAC artifacts. For background on how these modes relate and when to combine them, see `artifacts/selector.json`.
 
 ## Artifact References
 
@@ -117,6 +117,7 @@ Parse `$ARGUMENTS`:
 | 78 | Transcendental | meta | `78-transcendental.json` |
 | 79 | Adversarial / red-team | meta | `79-adversarial-red-team.json` |
 | 80 | Debiasing / epistemic hygiene | meta | `80-debiasing-epistemic-hygiene.json` |
+| 81 | Autopoietic / recursive self-maintenance | meta | `81-autopoietic-recursive.json` |
 
 ## Hybrid Reasoning Patterns
 

@@ -9,7 +9,7 @@
   },
   "payload": {
     "version": "1.0.0",
-    "mode_count": 80,
+    "mode_count": 81,
     "cats": {
       "formal": [1, 2, 3, 4, 5, 6, 7, 8, 64, 66],
       "probabilistic": [10, 11, 12, 20, 23, 24],
@@ -22,7 +22,7 @@
       "strategic": [55, 56, 57, 58],
       "argumentation": [35, 36, 59, 60, 62],
       "domain": [61, 63, 65, 67, 68, 69, 70, 71, 72, 73, 74],
-      "meta": [75, 76, 77, 78, 79, 80]
+      "meta": [75, 76, 77, 78, 79, 80, 81]
     },
     "axes": {
       "certainty_vs_exploration": {
@@ -35,7 +35,7 @@
       },
       "belief_vs_action": {
         "belief": [11, 13, 33, 37, 38],
-        "action": [45, 47, 48, 51, 58]
+        "action": [45, 47, 48, 51, 58, 81]
       },
       "facts_vs_values": {
         "facts": [37, 38, 40, 10, 11],
@@ -43,7 +43,7 @@
       },
       "monotonic_vs_nonmonotonic": {
         "monotonic": [1, 2, 3, 4, 5],
-        "nonmonotonic": [30, 31, 32, 33, 34]
+        "nonmonotonic": [30, 31, 32, 33, 34, 81]
       },
       "single_vs_multi_agent": {
         "single": [45, 47, 48, 51],
@@ -127,6 +127,11 @@
         "if": {"task": "verification"},
         "then": [1, 2, 6, 7, 8],
         "avoid": [53, 51]
+      },
+      {
+        "if": {"task": "system-maintenance"},
+        "then": [81, 43, 75, 78],
+        "avoid": [48, 51]
       }
     ]
   }

@@ -1,0 +1,72 @@
+{
+  "schema": "cac.reasoning_mode.v1",
+  "schema_version": "1.0.0",
+  "kind": "reasoning.mode",
+  "meta": {
+    "stable_id": "dcp://apm2.agents/mor/mode/autopoietic-recursive@1",
+    "classification": "PUBLIC",
+    "created_at": "2026-02-01T00:00:00Z"
+  },
+  "payload": {
+    "id": 81,
+    "name": "autopoietic-recursive",
+    "cat": "meta",
+    "core": "Reasoning focused on the maintenance, reproduction, and evolution of the system's own organizational identity. Ensures operational closure where every reasoning output serves to regenerate the system's capacity to continue reasoning.",
+    "out": [
+      {"n": "boundary_integrity_assessment", "d": "evaluation of whether system limits are preserved"},
+      {"n": "recursive_maintenance_ops", "d": "actions required to sustain the reasoning loop"},
+      {"n": "identity_persistence_claims", "d": "justifications for why the system remains the same 'self' after change"},
+      {"n": "structural_coupling_log", "d": "record of how internal changes align with environmental shifts"}
+    ],
+    "proc": [
+      "identify current system boundaries and core recursive loops",
+      "assess proposed changes for 'operational closure' (do they break the loop?)",
+      "derive necessary self-maintenance actions to offset environmental entropy",
+      "verify that reasoning outputs contribute to the system's own regeneration",
+      "model the 'self' before and after transition to ensure identity continuity"
+    ],
+    "check": [
+      "conclusion preserves the system's operational boundary?",
+      "reasoning process itself is regenerated or improved by the output?",
+      "no 'suicide paths' (optimizing a goal at the cost of the system's existence)?",
+      "identity persistence verified across state transitions?",
+      "structural coupling with environment maintained?"
+    ],
+    "diff": {
+      "systems-thinking": "systems thinking identifies external loops; autopoiesis *is* the internal loop of self-production",
+      "meta-reasoning": "meta-reasoning selects tools; autopoiesis ensures the 'agent' exists to use them",
+      "reflective-equilibrium": "equilibrium seeks coherence of content; autopoiesis seeks persistence of organization"
+    },
+    "fail": {
+      "mode": "operational disintegration",
+      "signals": [
+        "system boundary becomes ill-defined or leaks",
+        "reasoning outputs are 'dead ends' that don't feed back into self-maintenance",
+        "optimization goals conflict with system survival",
+        "loss of recursive identity (becoming a different, uncoupled system)"
+      ],
+      "mitigations": [
+        "prioritize self-preservation constraints over task-level optimization",
+        "audit feedback loops for closure regularly",
+        "implement 'safeguard' reasoning that blocks self-destructive conclusions",
+        "formalize identity invariants that must survive every episode"
+      ]
+    },
+    "use": [
+      "recursive self-improvement in agents",
+      "long-lived autonomous system governance",
+      "managing agent identity across skill/logic updates",
+      "biological/synthetic system modeling",
+      "preventing goal misgeneralization into self-destruction"
+    ],
+    "rel": [
+      {"id": 43, "name": "systems-thinking", "link": "underlying logic of loops"},
+      {"id": 75, "name": "meta-reasoning", "link": "chooses when to prioritize self-maintenance"},
+      {"id": 78, "name": "transcendental", "link": "uncovers enabling conditions for persistence"}
+    ],
+    "ex": {
+      "scenario": "An agent is asked to refactor its own core reasoning skill.",
+      "approach": "Apply autopoietic mode to ensure the refactor doesn't delete the 'Meta-reasoning' layer required to finish the refactor; verify that the new skill remains operationally closed."
+    }
+  }
+}
