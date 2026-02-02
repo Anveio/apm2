@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/closure_mode@v0"
   },
   "payload": {
-    "i": "FINALIZE mode flow (v2 -> v4 convergence).",
-    "pb": "Provide CAC-native closure steps to finalize RFC and pass all gates.",
+    "i": "RFC FINALIZE (v2 -> v4 + Mode 36 Assurance Case).",
+    "pb": "Finalize RFC and synthesize Confidence Certificate.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",

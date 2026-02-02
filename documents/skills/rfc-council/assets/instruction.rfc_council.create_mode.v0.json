@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/create_mode@v0"
   },
   "payload": {
-    "i": "CREATE/DECOMPOSE mode flow (RFC v0 creation + ticket generation).",
-    "pb": "Provide CAC-native steps for RFC genesis and ticket decomposition.",
+    "i": "RFC CREATE/DECOMPOSE (Genesis + Ticket emission).",
+    "pb": "Initialize RFC v0 and generate engineering tickets.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",

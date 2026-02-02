@@ -1,6 +1,6 @@
 ---
 name: rfc-council
-description: Unified skill for RFC creation and ticket quality review with multi-agent council deliberation and anti-cousin enforcement.
+description: Unified skill for RFC creation and ticket quality review using Anchored Stochastic Reasoning and high-rigor lifecycle patterns (Architectural Discovery, Codebase Grounding, Evidence Synthesis).
 argument-hint: "[create | explore | finalize | review | remediate] [PRD-XXXX | RFC-XXXX]"
 user-invocable: true
 holon:

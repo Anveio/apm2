@@ -30,6 +30,10 @@ decision_tree:
           action: command
           run: "command -v cargo git gh rg timeout >/dev/null && echo OK"
           capture_as: core_tools_ok
+        - id: OPERATIONAL_CONSTRAINTS
+          action: |
+            1) MAX_RUNTIME: Never allow a subagent to work continuously for >=15 minutes. Terminate and restart with warm handoff to prevent context rot.
+            2) CWD_DISCIPLINE: Periodically verify current directory. If inside a worktree, `cd` back to the main repository root before loop transitions.
         - id: ENTER_QUEUE_LOOP
           action: "Invoke the queue loop and do not stop until stop conditions are satisfied."
       decisions[3]:

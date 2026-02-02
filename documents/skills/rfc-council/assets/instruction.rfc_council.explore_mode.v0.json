@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/explore_mode@v0"
   },
   "payload": {
-    "i": "EXPLORE mode flow (v0 -> v2 grounding).",
-    "pb": "Provide CAC-native exploration steps to ground design in codebase evidence.",
+    "i": "RFC EXPLORE (v0 -> v2 grounding via Modes 61 + 40).",
+    "pb": "Ground design in codebase evidence.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",

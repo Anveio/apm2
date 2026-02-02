@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/council_protocol@v0"
   },
   "payload": {
-    "i": "Council protocol (multi-agent deliberation, cycles, quorum, outputs).",
-    "pb": "Define CAC-native council orchestration for rigorous ticket review.",
+    "i": "COUNCIL Protocol (Deliberation, Quorum, Output).",
+    "pb": "Orchestrate multi-agent council for ticket review.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",

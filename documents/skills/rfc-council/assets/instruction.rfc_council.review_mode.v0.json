@@ -18,8 +18,8 @@
     "stable_id": "dcp://apm2.local/instructions/rfc_council/review_mode@v0"
   },
   "payload": {
-    "i": "Review mode flow (load inputs, gate execution, refinement, bundle emit).",
-    "pb": "Provide CAC-native review execution plan with refinement loop and verdict.",
+    "i": "RFC REVIEW execution (gates 1-9 + Mode 59 remediation).",
+    "pb": "Execute gates and synthesize remediations.",
     "t": {
       "sys": "APM2",
       "repo": "/home/ubuntu/Projects/apm2-rfc-consensus",

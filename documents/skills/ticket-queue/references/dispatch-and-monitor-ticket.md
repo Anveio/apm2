@@ -13,7 +13,7 @@ decision_tree:
         - id: REQUIRE_DEDICATED_LOG
           action: "The implementer MUST run with a durable log you can tail out-of-band. Prefer the exact commands in `references/commands.md` (`start-claude-implementer-with-log` or `start-codex-implementer-with-json-log`). Record PID + log path."
         - id: CHECK_CADENCE
-          action: "While implementer is running: follow `references/subagent-supervision.md` (3-minute cadence; STUCK threshold 5 minutes; restart on no-progress)."
+          action: "While implementer is running: follow `references/subagent-supervision.md` (3-minute cadence; STUCK threshold 5 minutes; restart on no-progress; 15-minute hard limit for context rot mitigation)."
         - id: PR_STATUS_CHECK
           action: command
           run: "timeout 30s gh pr view <BRANCH_NAME> --json state,reviewDecision,statusCheckRollup,headRefOid,url"

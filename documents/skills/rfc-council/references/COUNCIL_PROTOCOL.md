@@ -11,22 +11,13 @@ decision_tree:
 
 ## Overview
 
-The COUNCIL protocol is a multi-agent deliberation process designed to prevent "cognitive entropy collapse" (premature convergence on suboptimal designs). It achieves this by:
+The COUNCIL protocol is a multi-agent deliberation process for RFC ticket validation.
 
-1. **Lifecycle-Adaptive Subagents**: Spawns 3 subagents with specialized roles that shift focus based on RFC version (v0/v2/v4).
-2. **Anchored Stochastic Reasoning**: Each subagent uses **2 fixed Anchor Modes** and selects **3 strictly random modes** from `modes-of-reasoning/artifacts/selector.json`. This ensures core rigor while forcing subagents to synthesize new perspectives for every session, preventing model-mode entrenchment.
-3. **Agent-Native Principles**: Subagents apply Stochastic Cognition and Tool-Loop patterns to their analysis, treating all assessments as probabilistic.
-4. **Structured Deliberation**: 3 review cycles with inter-cycle onboarding notes enable progressive refinement.
+1. **Lifecycle-Adaptive Subagents**: 3 subagents with roles focused on RFC version (v0/v2/v4).
+2. **Anchored Stochastic Reasoning**: Each subagent uses **2 fixed Anchor Modes** and selects **3 strictly random modes** from `modes-of-reasoning/artifacts/selector.json`.
+3. **Agent-Native Principles**: Assess via Stochastic Cognition and Tool-Loop patterns.
+4. **Structured Deliberation**: 3 review cycles with inter-cycle convergence triggers.
 5. **Quorum Consensus**: Findings converge through 2/3 voting (2 of 3 agents must agree).
-
-### Why Maximum Entropy?
-
-Traditional council designs assign fixed reasoning specializations to each agent (e.g., "SA-1 always uses deductive reasoning"). This creates predictable blind spots and model-mode entrenchment. Maximum entropy selection forces:
-
-- **Perspective diversity**: Same agent applies different lenses each session
-- **Cross-pollination**: Structural rigorists must sometimes think heuristically
-- **Emergent insights**: Random mode combinations reveal unexpected connections
-- **Anti-confirmation bias**: Harder to find only what you're looking for
 
 ---
 
