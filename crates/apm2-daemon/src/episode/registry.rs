@@ -407,3 +407,85 @@ mod tests {
         assert_eq!(holon2.unwrap().type_name(), "ClaudeCodeHolon");
     }
 }
+
+// =============================================================================
+// Session Registry (TCK-00259)
+// =============================================================================
+
+use std::collections::VecDeque;
+use std::sync::RwLock;
+
+use crate::session::{SessionRegistry, SessionRegistryError, SessionState};
+
+/// Maximum number of sessions tracked in the session registry.
+///
+/// Per CTR-1303: In-memory stores must have `max_entries` limit to prevent
+/// denial-of-service via memory exhaustion.
+pub const MAX_SESSIONS: usize = 10_000;
+
+/// In-memory session registry for tracking active sessions.
+///
+/// # Capacity Limits (CTR-1303)
+///
+/// This registry enforces a maximum of [`MAX_SESSIONS`] entries to prevent
+/// memory exhaustion. When the limit is reached, the oldest entry (by insertion
+/// order) is evicted to make room for the new session.
+#[derive(Debug, Default)]
+pub struct InMemorySessionRegistry {
+    /// Sessions stored with insertion order for LRU eviction.
+    sessions: RwLock<(VecDeque<String>, HashMap<String, SessionState>)>,
+    /// Sessions indexed by ephemeral handle for efficient lookup.
+    sessions_by_handle: RwLock<HashMap<String, String>>,
+}
+
+impl InMemorySessionRegistry {
+    /// Creates a new empty session registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SessionRegistry for InMemorySessionRegistry {
+    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+        let mut guard = self.sessions.write().expect("lock poisoned");
+        let mut handles = self.sessions_by_handle.write().expect("lock poisoned");
+        let (order, sessions) = &mut *guard;
+
+        if sessions.contains_key(&session.session_id) {
+            return Err(SessionRegistryError::DuplicateSessionId {
+                session_id: session.session_id,
+            });
+        }
+
+        // CTR-1303: Evict oldest entry if at capacity
+        while sessions.len() >= MAX_SESSIONS {
+            if let Some(oldest_key) = order.pop_front() {
+                if let Some(evicted) = sessions.remove(&oldest_key) {
+                    handles.remove(&evicted.ephemeral_handle);
+                }
+            } else {
+                break;
+            }
+        }
+
+        let session_id = session.session_id.clone();
+        let handle = session.ephemeral_handle.clone();
+        order.push_back(session_id.clone());
+        handles.insert(handle, session_id.clone());
+        sessions.insert(session_id, session);
+        Ok(())
+    }
+
+    fn get_session(&self, session_id: &str) -> Option<SessionState> {
+        let guard = self.sessions.read().expect("lock poisoned");
+        guard.1.get(session_id).cloned()
+    }
+
+    fn get_session_by_handle(&self, handle: &str) -> Option<SessionState> {
+        let handles = self.sessions_by_handle.read().expect("lock poisoned");
+        let session_id = handles.get(handle)?;
+        let guard = self.sessions.read().expect("lock poisoned");
+        guard.1.get(session_id).cloned()
+    }
+}
