@@ -165,8 +165,10 @@ rfc_contracts_and_versioning:
         - "diff bytes are stored in CAS; diff_hash is the CAS BLAKE3 hash."
         - "Diff content is newline-normalized to LF before hashing for diff_hash."
         - "binary_detected=true MUST trigger ReviewBlocked reason_code=BINARY_UNSUPPORTED in v0."
+        - "file_manifest length MUST be <= 100000; violations emit ReviewBlocked reason_code=INVALID_BUNDLE with CAS logs."
       notes:
         - "Bundle must be CAS-hosted; pulses only carry hashes."
+        - "base uses GitObjectRef (schemas/apm2/git_object_ref.schema.json) with object_kind limited to commit/tree."
     review_artifact_bundle_v1:
       status: "NEW_WORK_REQUIRED"
       schema_path: "schemas/apm2/review_artifact_bundle_v1.yaml"

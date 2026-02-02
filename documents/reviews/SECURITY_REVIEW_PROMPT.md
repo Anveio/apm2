@@ -184,12 +184,16 @@ decision_tree:
 
     - id: PHASE_7_EXECUTE_ACTIONS
       purpose: "Post findings (Assurance-Case format) to PR and update status check."
-      steps[2]:
+      steps[3]:
+        - id: WRITE_FINDINGS
+          action: write_file
+          path: "security_findings.md"
+          content: "$FINDINGS_ASSURANCE_CASE"
         - id: POST_COMMENT
           action: command
-          run: "gh pr comment $PR_URL --body \"$FINDINGS_ASSURANCE_CASE\""
+          run: "gh pr comment $PR_URL --body-file security_findings.md"
         - id: UPDATE_STATUS
           action: command
           run: |
-            IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL"
-            ELSE: "cargo xtask security-review-exec deny $PR_URL --reason \"$FINDINGS_ASSURANCE_CASE\""
+            IF verdict == PASS: "cargo xtask security-review-exec approve $PR_URL && rm security_findings.md"
+            ELSE: "cat security_findings.md | cargo xtask security-review-exec deny $PR_URL --reason - && rm security_findings.md"

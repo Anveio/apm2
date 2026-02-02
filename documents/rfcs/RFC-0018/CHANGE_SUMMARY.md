@@ -2,25 +2,25 @@
 
 ## Files changed/created and why
 - `documents/rfcs/RFC-0018/01_problem_and_imports.yaml` — added evidence-backed gap for missing topic/CAS allowlists in CapabilityManifest.
-- `documents/rfcs/RFC-0018/02_design_decisions.yaml` — removed non-pulse rows from HEF truth-plane table, added layering note, tightened tool profile mapping, CAS auth layering, and projection semantics.
+- `documents/rfcs/RFC-0018/02_design_decisions.yaml` — removed non-pulse rows from HEF truth-plane table, added layering note, tightened tool profile mapping, CAS auth layering, projection semantics, and bounded reviewer tool outputs.
 - `documents/rfcs/RFC-0018/03_trust_boundaries.yaml` — clarified daemon-side CAS allowlist enforcement and marked NEW WORK REQUIRED (TCK-00314).
-- `documents/rfcs/RFC-0018/04_contracts_and_versioning.yaml` — made changeset_digest non-circular (omit field from hash input), expanded artifact rules.
+- `documents/rfcs/RFC-0018/04_contracts_and_versioning.yaml` — made changeset_digest non-circular (omit field from hash input), expanded artifact rules, and set ChangeSetBundle file_manifest limits.
 - `documents/rfcs/RFC-0018/05_rollout_and_ops.yaml` — kept RFC-0017 prerequisites explicit in rollout guardrails.
-- `documents/rfcs/RFC-0018/06_ticket_decomposition.yaml` — added TCK-00315 (ListFiles/Search tool surface) and corrected TCK-00314 layering.
+- `documents/rfcs/RFC-0018/06_ticket_decomposition.yaml` — added TCK-00315 (ListFiles/Search tool surface) and corrected TCK-00314 layering; added bounds for navigation outputs.
 - `documents/rfcs/RFC-0018/07_test_and_evidence.yaml` — clarified local projection sink semantics; added ChangeSetBundle determinism unit test.
-- `documents/rfcs/RFC-0018/08_risks_and_open_questions.yaml` — added tool-surface risk and digest option open question.
+- `documents/rfcs/RFC-0018/08_risks_and_open_questions.yaml` — added tool-surface risk, digest option note, and large-bundle risk.
 - `documents/rfcs/RFC-0018/09_governance_and_gates.yaml` — aligned GATE-HEF-FAC-V0 evidence categories with security evidence IDs.
 - `documents/rfcs/RFC-0018/EVIDENCE_APPENDIX.md` — added evidence for tool protocol surfaces and RequestTool stub; added BLAKE3 evidence.
 - `documents/rfcs/RFC-0018/requirements/REQ-HEF-0003.yaml` — enforced exact-topic allowlists (no wildcards for session.sock).
 - `documents/rfcs/RFC-0018/requirements/REQ-HEF-0005.yaml` — required CAS hash allowlists for FAC artifacts.
-- `documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml` — enumerated minimal reviewer tool profile and NEW WORK REQUIRED navigation tool surface.
-- `documents/rfcs/RFC-0018/requirements/REQ-HEF-0011.yaml` — expanded ReviewBlocked reason codes.
+- `documents/rfcs/RFC-0018/requirements/REQ-HEF-0010.yaml` — enumerated minimal reviewer tool profile and NEW WORK REQUIRED navigation tool surface; added bounded outputs.
+- `documents/rfcs/RFC-0018/requirements/REQ-HEF-0011.yaml` — expanded ReviewBlocked reason codes and invalid-bundle acceptance criteria.
 - `documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0002.yaml` — expanded red-team scope to include CAS allowlist denials.
 - `documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0009.yaml` — added no-GitHub constraints.
 - `documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0010.yaml` — added no-GitHub constraints.
 - `documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0011.yaml` — added no-GitHub constraints.
 - `documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0012.yaml` — added local projection sink constraint.
-- `schemas/apm2/changeset_bundle_v1.yaml` — schema stub with non-circular digest rule and commit/tree restriction.
+- `schemas/apm2/changeset_bundle_v1.yaml` — schema stub with non-circular digest rule, commit/tree restriction, and file_manifest bounds.
 - `schemas/apm2/review_artifact_bundle_v1.yaml` — schema stub for review artifacts.
 - `schemas/apm2/review_blocked_v1.yaml` — schema stub with expanded reason codes.
 

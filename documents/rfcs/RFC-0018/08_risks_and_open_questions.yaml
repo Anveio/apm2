@@ -56,6 +56,14 @@ rfc_risks_and_open_questions:
         - "TCK-00315 adds ListFiles/Search tool surfaces with allowlist enforcement."
       evidence_ids:
         - "EVID-HEF-0011"
+    - id: "RSK-HEF-0007"
+      statement: "Large changesets may exceed ChangeSetBundle file_manifest limits and be blocked in v0."
+      impact: "Reviews stall for extremely large PRs until partitioning/streaming is available."
+      likelihood: "MEDIUM"
+      mitigations:
+        - "ReviewBlocked with reason_code=INVALID_BUNDLE provides explicit failure + evidence."
+        - "Future work may add streaming/partitioned bundles beyond v0."
+      evidence_ids: []
   open_questions:
     - id: "Q-HEF-0001"
       question: "Should episode_id be added to existing Session/Tool kernel events, or should new Episode* events be added?"
@@ -76,4 +84,4 @@ rfc_risks_and_open_questions:
     - id: "Q-HEF-0005"
       question: "Should changeset_digest remain embedded in ChangeSetBundle (Option A) or move to ledger event only (Option B)?"
       decision_needed_by: "2026-02-22"
-      resolution_plan: "Re-evaluate circularity risk vs convenience; keep Option A unless ledger-only digest simplifies validation."
+      resolution_plan: "For v0, keep Option A to align with CAS/EventHasher BLAKE3 hashing and single canonical bundle witness; reconsider Option B only if ledger-only binding demonstrably simplifies validation and avoids redundancy."

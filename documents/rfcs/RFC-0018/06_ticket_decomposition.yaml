@@ -405,6 +405,6 @@ rfc_ticket_decomposition:
       files_to_create: []
       acceptance_criteria:
         - "ListFiles/Search requests are denied unless allowlisted."
-        - "Navigation outputs are bounded and logged to CAS."
+        - "Navigation outputs are bounded (max_bytes=65536, max_lines=2000) and logged to CAS."
       evidence_ids:
         - "EVID-HEF-0011"

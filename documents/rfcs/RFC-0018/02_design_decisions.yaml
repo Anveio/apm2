@@ -190,6 +190,7 @@ rfc_design_decisions:
         name: "ChangeSetBundleV1 + changeset_digest binding"
         required_artifacts:
           - "ChangeSetBundleV1 stored in CAS (canonical diff + manifest)"
+          - "file_manifest length <= 100000 (oversize bundles are invalid in v0)"
           - "changeset_digest computed via BLAKE3-256 over canonical bundle bytes with changeset_digest omitted from the hash input"
           - "binary_detected=true forces ReviewBlocked(BINARY_UNSUPPORTED) in v0"
         ledger_anchor:
@@ -522,7 +523,9 @@ rfc_design_decisions:
         All review decisions MUST bind to a canonical ChangeSetBundleV1 stored in
         CAS. The changeset_digest is computed as BLAKE3-256 over canonical bundle
         bytes with the changeset_digest field omitted from the hash input, and is
-        anchored by a ledger event before any review or gate decision.
+        anchored by a ledger event before any review or gate decision. Bundles
+        that exceed declared bounds or violate canonicalization MUST emit
+        ReviewBlocked with reason_code=INVALID_BUNDLE and CAS logs.
       context: |
         FAC v0 autonomy requires reviewers to see the exact diff without GitHub
         reads. Canonicalization prevents mismatched diffs and TOCTOU attacks.
@@ -561,6 +564,11 @@ rfc_design_decisions:
         - tool: "ListFiles/Search"
           proto_ref: "proto/tool_protocol.proto:41-51 (not defined; NEW WORK REQUIRED TCK-00315)"
           handler_ref: "NEW WORK REQUIRED (TCK-00315)"
+      bounds_and_semantics:
+        - "GitOperation.DIFF is scoped strictly to ChangeSetBundle inputs (base + bundle); no arbitrary repo diffs."
+        - "GitOperation.DIFF output bounded: max_bytes=262144, max_lines=4000; violations emit ReviewBlocked reason_code=TOOL_FAILED with CAS logs."
+        - "GitOperation.STATUS output bounded: max_bytes=16384, max_lines=500; violations emit ReviewBlocked reason_code=TOOL_FAILED with CAS logs."
+        - "ArtifactFetch is CAS-scoped only (no external artifact stores in v0) and must use allowlisted hashes; max_bytes=4194304; violations emit ReviewBlocked reason_code=INVALID_BUNDLE with CAS logs."
       context: |
         Autonomy requires reviewers to operate entirely inside Forge with
         deterministic inputs and evidence-carrying outputs.
@@ -582,9 +590,10 @@ rfc_design_decisions:
       title: "ReviewBlocked semantics (explicit liveness failures)"
       statement: |
         ReviewBlocked is a first-class, ledger-anchored outcome with explicit
-        reason codes (including BINARY_UNSUPPORTED, missing artifacts, invalid
-        bundles, and timeouts) and CAS logs. Retries are bounded by HTF windows;
-        blocked outcomes must be surfaced as durable receipts.
+        reason codes (including apply/tool failures, BINARY_UNSUPPORTED, missing
+        artifacts, invalid bundles, policy/context denials, and timeouts) and
+        CAS logs. Retries are bounded by HTF windows; blocked outcomes must be
+        surfaced as durable receipts.
       context: |
         Liveness requires reviewers to fail loudly and reproducibly when inputs
         are missing or invalid.

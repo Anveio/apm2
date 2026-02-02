@@ -176,10 +176,14 @@ decision_tree:
 
     - id: PHASE_6_PUBLISH_RESULTS
       purpose: "Post PR comment and update status checks."
-      steps[2]:
+      steps[3]:
+        - id: WRITE_FINDINGS
+          action: write_file
+          path: "quality_findings.md"
+          content: "$FORMATTED_FINDINGS"
         - id: POST_COMMENT
           action: command
-          run: "gh pr comment $PR_URL --body \"$FORMATTED_FINDINGS\""
+          run: "gh pr comment $PR_URL --body-file quality_findings.md && rm quality_findings.md"
         - id: UPDATE_STATUS
           action: command
           run: "gh api --method POST \"/repos/{owner}/{repo}/statuses/$HEAD_SHA\" -f state=\"$VERDICT_STATE\" -f context=\"ai-review/code-quality\""

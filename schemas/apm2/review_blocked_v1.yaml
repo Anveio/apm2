@@ -31,6 +31,9 @@ properties:
       - "APPLY_FAILED"
       - "TOOL_FAILED"
       - "BINARY_UNSUPPORTED"
+      - "MISSING_ARTIFACT"
+      - "INVALID_BUNDLE"
+      - "TIMEOUT"
       - "POLICY_DENIED"
       - "CONTEXT_MISS"
   blocked_log_hash:

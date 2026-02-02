@@ -5,14 +5,12 @@ decision_tree:
   nodes[1]:
     - id: INIT
       purpose: "Initialize orchestration posture, then loop until all tickets are merged."
-      context_files[4]:
+      context_files[3]:
         - path: documents/README.md
         - path: documents/skills/README.md
           purpose: "Root-level module index, repository-wide constraints, and canonical dev workflow."
         - path: documents/skills/ticket/SKILL.md
           purpose: "Instructions to be passed to the implementer subagent. The orchestrator MUST NOT execute this skill itself."
-        - path: xtask/src/tasks/check.rs
-          purpose: "Defines `cargo xtask check` behavior, including reviewer health auto-remediation."
         - path: xtask/src/reviewer_state.rs
           purpose: "Reviewer state schema (PID + log file) and stale thresholds."
       steps[6]:

@@ -5,19 +5,21 @@
   "meta": {
     "stable_id": "dcp://apm2.agents/mor/mode/autopoietic-recursive@1",
     "classification": "PUBLIC",
-    "created_at": "2026-02-01T00:00:00Z"
+    "created_at": "2026-02-01T00:00:00Z",
+    "updated_at": "2026-02-02T00:00:00Z"
   },
   "payload": {
     "id": 81,
     "name": "autopoietic-recursive",
     "cat": "meta",
-    "core": "Reasoning focused on maintaining, reproducing, and evolving the system's own organizational identity through self-referential operations. Key terms: OPERATIONAL CLOSURE = every process output becomes input to another process within the system boundary, forming a regenerative loop. STRUCTURAL COUPLING = system changes track environmental changes without losing boundary integrity. IDENTITY PERSISTENCE = the organizational pattern (not specific components) remains recognizable across state transitions.",
+    "core": "Reasoning focused on maintaining, reproducing, and evolving the system's own organizational identity through self-referential operations. Key terms: OPERATIONAL CLOSURE = every process output becomes input to another process within the system boundary, forming a regenerative loop. STRUCTURAL COUPLING = system changes track environmental changes without losing boundary integrity. IDENTITY PERSISTENCE = the organizational pattern (not specific components) remains recognizable across state transitions. REGENERATIVE CAPACITY = the system can produce the components and processes needed to sustain itself, including the capacity to produce those components.",
     "out": [
       {"n": "boundary_inventory", "d": "explicit list: what is inside the system (components, processes, state) vs outside (environment, inputs, outputs); boundary permeability rules (what crosses, under what conditions)"},
       {"n": "closure_map", "d": "directed graph showing how each internal process produces outputs consumed by other internal processes; gaps = closure violations"},
       {"n": "identity_invariants", "d": "named properties that must survive any valid transition (e.g., 'can still invoke meta-reasoning', 'config schema backward-compatible'); with rationale for each"},
       {"n": "maintenance_ops", "d": "concrete actions to regenerate system capacity: resource acquisition, error recovery, state cleanup, capability refresh"},
-      {"n": "coupling_log", "d": "record of environment changes detected, internal adaptations made, boundary adjustments; timestamped"}
+      {"n": "coupling_log", "d": "record of environment changes detected, internal adaptations made, boundary adjustments; timestamped"},
+      {"n": "health_signals", "d": "early-warning indicators: closure gap count, invariant violation rate, adaptation latency trend, boundary permeability ratio; thresholds for escalation"}
     ],
     "proc": [
       "STEP 1 - Boundary inventory: enumerate all components, processes, and state that constitute the system; distinguish from environment (external inputs, consumers, dependencies) -> produces boundary_inventory",
@@ -25,14 +27,16 @@
       "STEP 3 - Define identity invariants: list properties that must persist across any valid state transition; for each, specify: name, current value, acceptable variation range, verification method -> produces identity_invariants",
       "STEP 4 - Assess proposed change: given a proposed modification, simulate before/after states; check (a) boundary preserved, (b) closure maintained, (c) all invariants still hold; if any fail, derive compensating actions -> produces maintenance_ops",
       "STEP 5 - Execute with coupling awareness: implement change while monitoring environment; log any environmental shifts that require internal adaptation; verify structural coupling maintained -> produces coupling_log",
-      "STEP 6 - Post-transition verification: re-run closure map and invariant checks on new state; confirm system can still perform self-maintenance (recursively verify the verification capability exists)"
+      "STEP 6 - Post-transition verification: re-run closure map and invariant checks on new state; confirm system can still perform self-maintenance (recursively verify the verification capability exists)",
+      "STEP 7 - Health signal update: compute health_signals from current state; compare to previous period; flag degradation trends before they become failures"
     ],
     "quick_check": [
       "Boundary explicitly defined? (can point to list of in vs out)",
       "At least one closure loop verified? (output -> internal consumer -> output)",
       "Identity invariants named and testable? (not just 'system survives')",
       "Proposed change checked against invariants BEFORE execution?",
-      "Self-maintenance capability preserved? (can still run this mode after change)"
+      "Self-maintenance capability preserved? (can still run this mode after change)",
+      "Health signals trending stable or improving? (no 3-period degradation streak)"
     ],
     "check": [
       "boundary_inventory exists with explicit in/out classification for every component",
@@ -41,7 +45,8 @@
       "proposed changes evaluated against invariants with pass/fail per invariant",
       "no 'suicide paths': no action sequence where goal achievement destroys self-maintenance capability",
       "structural coupling verified: environment changes logged, internal adaptations documented",
-      "recursive self-check: the autopoietic-recursive mode itself remains invocable after transition"
+      "recursive self-check: the autopoietic-recursive mode itself remains invocable after transition",
+      "health_signals computed with all 4 indicators; no indicator in red zone (closure_gap_count > 2, invariant_violation_rate > 0.1, adaptation_latency > 2x baseline, permeability_ratio < 0.8 or > 1.2)"
     ],
     "diff": {
       "systems-thinking": {
@@ -86,6 +91,13 @@
         "symptom": "listing preconditions for capability without operationalizing maintenance; outputs are static requirements rather than dynamic maintenance operations",
         "resolution": "Transcendental produces 'X requires Y to be possible' (static). Autopoiesis produces 'to maintain Y, perform Z continuously' (dynamic). If your output has no maintenance_ops and no coupling_log, you've done transcendental analysis, not autopoietic reasoning."
       }
+    ],
+    "warning_signs": [
+      {"sign": "closure gap emergence", "indicator": "new process outputs not consumed by any internal process", "action": "immediate: add consumer or designate as coupling point; root-cause: check if dependency was removed"},
+      {"sign": "invariant drift", "indicator": "invariant verification passing but with increasing margin erosion", "action": "investigate cause before threshold breach; add stricter sub-invariant if needed"},
+      {"sign": "adaptation backlog", "indicator": "environment changes detected but adaptations queued rather than processed", "action": "increase processing capacity or prioritize; flag if queue > 3 items"},
+      {"sign": "boundary blur", "indicator": "difficulty classifying new components as inside/outside", "action": "revisit boundary definition; may indicate scope creep or missing abstraction layer"},
+      {"sign": "recursive depth exhaustion", "indicator": "self-check passes but meta-self-check (checking the checker) fails", "action": "halt self-modification; restore from known-good state; investigate infinite regress risk"}
     ],
     "fail": {
       "mode": "operational disintegration",
@@ -149,20 +161,78 @@
       "goal misgeneralization prevention: catching when optimization would destroy the optimizer",
       "agent constitution: defining invariants that bound acceptable self-modification"
     ],
+    "when_overkill": [
+      "simple stateless computation: no persistent identity to maintain",
+      "externally-managed systems: lifecycle controlled by external orchestrator (use that instead)",
+      "read-only analysis: no self-modification proposed (use systems-thinking mode 43)",
+      "one-shot tasks: no continuity requirement after completion"
+    ],
+    "when_essential": [
+      "any self-modifying operation on reasoning capabilities",
+      "long-running autonomous agents without human checkpoints",
+      "systems where failure mode is 'lose ability to recover'",
+      "hot-reload or live-update of core logic",
+      "agents that define their own goals or modify their reward signals"
+    ],
     "rel": [
       {"id": 43, "name": "systems-thinking", "role": "provides loop analysis vocabulary; autopoiesis applies it reflexively"},
       {"id": 75, "name": "meta-reasoning", "role": "decides when to invoke autopoiesis for self-modification safety"},
       {"id": 78, "name": "transcendental", "role": "identifies static preconditions; autopoiesis operationalizes maintenance"},
       {"id": 33, "name": "belief-revision", "role": "updates content; autopoiesis updates organization while preserving identity"},
-      {"id": 77, "name": "reflective-equilibrium", "role": "coherentizes beliefs; autopoiesis coherentizes organizational structure"}
+      {"id": 77, "name": "reflective-equilibrium", "role": "coherentizes beliefs; autopoiesis coherentizes organizational structure"},
+      {"id": 36, "name": "assurance-case", "role": "documents safety arguments; autopoiesis provides living evidence of maintained invariants"},
+      {"id": 79, "name": "adversarial-red-team", "role": "finds attacks; autopoiesis defines what must survive attacks"}
+    ],
+    "anti_patterns": [
+      {
+        "name": "closure theater",
+        "symptom": "drawing elaborate closure diagrams for simple stateless functions",
+        "why_harmful": "overhead without benefit; obscures actual critical paths",
+        "fix": "apply when_essential checklist; if none match, use simpler mode"
+      },
+      {
+        "name": "invariant inflation",
+        "symptom": "30+ invariants, most trivial or redundant",
+        "why_harmful": "verification cost explodes; real invariants hidden in noise; change velocity drops to zero",
+        "fix": "cap at 5-7 invariants; each must gate a capability without which system cannot self-maintain"
+      },
+      {
+        "name": "boundary ossification",
+        "symptom": "refusing all boundary changes as 'identity threatening'",
+        "why_harmful": "prevents healthy evolution; system becomes brittle museum piece",
+        "fix": "distinguish organizational pattern (must persist) from specific components (may change); track identity through transitions, not stasis"
+      },
+      {
+        "name": "infinite regress trap",
+        "symptom": "verifying the verifier of the verifier of the verifier...",
+        "why_harmful": "halting problem; consumes all resources on meta-verification",
+        "fix": "bound recursion depth (typically 2); at base level, use external anchor (human check, formal proof, trusted hardware)"
+      }
     ],
     "micro_ex": {
       "scenario": "Agent asked to delete unused logging code to reduce memory footprint.",
-      "boundary_check": "logging code is inside system boundary (component: observability module)",
-      "closure_check": "logging outputs consumed by: (a) debug mode, (b) error recovery, (c) audit trail",
-      "invariant_check": "invariant 'can diagnose failures' requires logging; deletion violates invariant",
+      "boundary_inventory_snippet": {
+        "inside": ["observability_module", "debug_mode", "error_recovery", "audit_trail"],
+        "outside": ["memory_monitor", "user_request"],
+        "coupling_points": ["log_output_to_external_store"]
+      },
+      "closure_check": {
+        "observability_module.log()": {
+          "outputs": ["log_record"],
+          "consumers": ["debug_mode.display()", "error_recovery.analyze()", "audit_trail.append()"],
+          "status": "CLOSED (all consumers internal)"
+        }
+      },
+      "invariant_check": {
+        "invariant": "can_diagnose_failures",
+        "current_value": true,
+        "after_deletion": false,
+        "verification": "simulate error -> check if recovery path has visibility",
+        "result": "FAIL - deletion breaks invariant"
+      },
       "decision": "block deletion; propose alternative: lazy-load logging module to reduce memory while preserving capability",
-      "insight": "optimization that destroys observability = suicide path; autopoiesis catches it"
+      "health_signals_before": {"closure_gap_count": 0, "invariant_violation_rate": 0.0},
+      "insight": "optimization that destroys observability = suicide path; autopoiesis catches it before execution"
     },
     "ex": {
       "scenario": "Agent asked to refactor its own core reasoning skill (meta-reasoning module).",
