@@ -276,11 +276,11 @@ pub fn deny(ticket_id: Option<&str>, reason: &str, dry_run: bool) -> Result<()> 
     } else {
         println!("  Using current branch");
     }
-    
-    if reason != "-" {
-        println!("  Reason: {actual_reason}");
-    } else {
+
+    if reason == "-" {
         println!("  Reason: (read from stdin)");
+    } else {
+        println!("  Reason: {actual_reason}");
     }
 
     if dry_run {

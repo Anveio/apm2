@@ -571,17 +571,15 @@ mod tests {
             let prompt_path = review_type.prompt_path().unwrap();
             let full_path = repo_root.join(prompt_path);
             let content = std::fs::read_to_string(&full_path)
-                .unwrap_or_else(|_| panic!("Failed to read prompt: {}", prompt_path));
+                .unwrap_or_else(|_| panic!("Failed to read prompt: {prompt_path}"));
 
             assert!(
                 content.contains("$PR_URL"),
-                "Prompt {} missing $PR_URL placeholder",
-                prompt_path
+                "Prompt {prompt_path} missing $PR_URL placeholder"
             );
             assert!(
                 content.contains("$HEAD_SHA"),
-                "Prompt {} missing $HEAD_SHA placeholder",
-                prompt_path
+                "Prompt {prompt_path} missing $HEAD_SHA placeholder"
             );
         }
     }
