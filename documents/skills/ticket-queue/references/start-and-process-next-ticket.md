@@ -12,16 +12,14 @@ decision_tree:
           action: "Use `gh pr list`. Identify numeric successor from `documents/work/tickets/`."
         - id: VERIFY_UNBLOCKED
           action: "Check `dependencies.tickets` in `documents/work/tickets/<TICKET_ID>.yaml`. Verify merged status."
-        - id: DISPATCH_IMPLEMENTER
-          action: "Spawn background implementer. Execute `/ticket <TICKET_ID>`. NO branch management."
-        - id: MONITOR_TO_MERGE
-          action: "Proceed to monitoring (60s loop)."
+        - id: DISPATCH_TO_MONITOR
+          action: "Proceed to monitoring (60s loop). The monitor will handle implementer activation if needed."
       decisions[2]:
         - id: NO_TICKET
           if: "tickets complete OR no unblocked tickets"
           then:
             next_reference: references/stop-or-blocked-no-unblocked.md
         - id: MONITOR
-          if: "ticket dispatched"
+          if: "always"
           then:
             next_reference: references/dispatch-and-monitor-ticket.md

@@ -16,10 +16,8 @@ decision_tree:
           capture_as: branch_name_maybe
         - id: NORMALIZE_BRANCH_NAME
           action: "Strip `remotes/origin/` prefix."
-        - id: DISPATCH_IMPLEMENTER
-          action: "Spawn background implementer. Execute `/ticket <TICKET_ID>`. NO branch management."
-        - id: MONITOR_TO_MERGE
-          action: "Proceed to monitoring (60s loop)."
+        - id: DISPATCH_TO_MONITOR
+          action: "Proceed to monitoring (60s loop). The monitor will handle implementer activation if needed."
       decisions[1]:
         - id: MONITOR
           if: "always"

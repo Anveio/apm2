@@ -20,7 +20,7 @@ commands[22]:
     command: "gh pr view <BRANCH_NAME> --json state,reviewDecision,statusCheckRollup,comments --jq '\"State: \(.state)\nReview: \(.reviewDecision)\nChecks: \" + (if .statusCheckRollup == null then \"None\" else ([.statusCheckRollup[] | \"\(.name):\(.conclusion // .status)\"] | join(\", \")) end)'"
     purpose: "Show PR state, review, CI, comments."
   - name: check-ai-reviews
-    command: "gh api repos/:owner/:repo/commits/$(gh pr view <BRANCH_NAME> --json headRefOid --jq .headRefOid)/status --jq '.statuses[] | select(.context | startswith(\"ai-review/\")) | \"\(.context): \(.state)\"''"
+    command: "gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/$(gh pr view <BRANCH_NAME> --json headRefOid --jq .headRefOid)/status --jq '.statuses[] | select(.context | startswith(\"ai-review/\")) | \"\(.context): \(.state)\"'"
     purpose: "Query custom AI review statuses directly via GitHub API."
   - name: trigger-reviews
     command: "cargo xtask review security <PR_URL> & cargo xtask review quality <PR_URL> &"
@@ -64,6 +64,14 @@ commands[22]:
   - name: start-claude-implementer-with-log
     command: "bash -lc 'set -euo pipefail; mkdir -p \"$HOME/.apm2/ticket-queue/logs\"; log=\"$HOME/.apm2/ticket-queue/logs/<TICKET_ID>.implementer.log\"; script -q \"$log\" -c \"claude --agent rust-developer --verbose \\\"Follow ticket skill for <TICKET_ID>\\\"\" & echo \"PID=$! LOG=$log\"'"
     purpose: "Spawn Claude implementer. Execute /ticket."
-  - name: list-workflow-runs
-    command: "gh api \"repos/{owner}/{repo}/actions/runs\" --jq '.workflow_runs | map(select(.head_branch == \"<BRANCH_NAME>\" and .event == \"pull_request\")) | .[0:3] | .[] | \"\(.id) \(.status) \(.head_sha[0:7]) \(.created_at)\"'
+  - name: check-ticket-unblocked
+    command: |
+      deps=$(rg "tickets:" -A 10 "documents/work/tickets/<TICKET_ID>.yaml" | grep -o "TCK-[0-9]{5}")
+      if [ -z "$deps" ]; then echo "UNBLOCKED"; exit 0; fi
+      merged=$(gh pr list --state merged --limit 100 --json headRefName --jq '.[].headRefName' | rg -o "TCK-[0-9]{5}")
+      for d in $deps; do
+        if ! echo "$merged" | grep -q "$d"; then echo "BLOCKED_BY_$d"; exit 1; fi
+      done
+      echo "UNBLOCKED"
+    purpose: "Verify all ticket dependencies are merged to main."
     purpose: "List GitHub Actions runs."

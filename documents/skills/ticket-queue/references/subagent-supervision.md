@@ -14,7 +14,7 @@ decision_tree:
           action: "Ensure log shows `/ticket` initialization."
         - id: CHECK_LOG
           action: command
-          run: "bash -lc 'set -euo pipefail; stat -c \"%y %n\" <IMPLEMENTER_LOG_FILE>; tail -n 120 <IMPLEMENTER_LOG_FILE> | rg -n \"tool|Tool|Bash\\(|Read\\(|Edit\\(|Write\\(|exec|command|skill|ticket\" || true'"
+          run: "bash -lc 'set -euo pipefail; if [ -f \"<IMPLEMENTER_LOG_FILE>\" ]; then stat -c \"%y %n\" <IMPLEMENTER_LOG_FILE>; tail -n 120 <IMPLEMENTER_LOG_FILE> | rg -n \"tool|Tool|Bash\\(|Read\\(|Edit\\(|Write\\(|exec|command|skill|ticket\" || true; else echo \"Log file not yet created\"; fi'"
           capture_as: implementer_recent_activity
         - id: CHECK_FEEDBACK
           action: command
@@ -31,10 +31,12 @@ decision_tree:
             STUCK if:
             (a) no log update >=5m
             (b) repeated errors/API loops
-            (c) no skill call within 3m
+            (c) no skill call within 10m (startup allowance)
             (d) runtime >=15m.
+        - id: WARM_HANDOFF_DEF
+          action: "WARM HANDOFF: When restarting, provide the new implementer with the last 100 lines of the previous log and a summary of the current PR state."
         - id: MAX_RUNTIME_RESP
-          action: "If >=15m: Terminate. Start NEW implementer with WARM HANDOFF."
+          action: "If >=15m: Terminate. Start NEW implementer with WARM HANDOFF to prevent context rot."
         - id: STUCK_RESP
           action: "If STUCK: Terminate. Restart with error snippet, ticket ID."
         - id: NO_SELF_FIX

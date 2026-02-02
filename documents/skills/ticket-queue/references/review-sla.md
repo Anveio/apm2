@@ -14,11 +14,11 @@ decision_tree:
           capture_as: pr_meta
         - id: CHECK_AI_STATUS
           action: command
-          run: "gh api repos/:owner/:repo/commits/<headRefOid>/status --jq '.statuses[] | select(.context | startswith(\"ai-review/")) | \"\(.context): \(.state)\"''"
+          run: "gh api repos/$(gh repo view --json nameWithOwner -q .nameWithOwner)/commits/<headRefOid>/status --jq '.statuses[] | select(.context | startswith(\"ai-review/\")) | \"\(.context): \(.state)\"'"
           capture_as: ai_status
         - id: LOAD_REVIEWER_STATE
           action: command
-          run: "python3 - <<'PY'\nimport json, os, time\nfrom pathlib import Path\np = Path.home()/.apm2/reviewer_state.json'\nif p.exists():\n    data = json.loads(p.read_text())\n    for k,v in (data.get('reviewers') or {}).items():\n        print(f\"{k}\tpid={v.get('pid')}\tstarted_at={v.get('started_at')}\tlog_file={v.get('log_file')}\tpr_url={v.get('pr_url')}\")\nPY"
+          run: "python3 - <<'PY'\nimport json, os, time\nfrom pathlib import Path\np = Path.home() / '.apm2' / 'reviewer_state.json'\nif p.exists():\n    data = json.loads(p.read_text())\n    for k,v in (data.get('reviewers') or {}).items():\n        print(f\"{k}\tpid={v.get('pid')}\tstarted_at={v.get('started_at')}\tlog_file={v.get('log_file')}\tpr_url={v.get('pr_url')}\")\nPY"
           capture_as: reviewer_state_summary
         - id: IDENTIFY_PIDS_AND_LOGS
           action: "Set <SEC_PID>, <SEC_LOG>, <QUAL_PID>, <QUAL_LOG> from summary."
