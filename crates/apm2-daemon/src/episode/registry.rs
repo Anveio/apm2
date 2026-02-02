@@ -530,7 +530,7 @@ mod session_registry_tests {
         let registry = InMemorySessionRegistry::new();
         let session = make_session("sess-1", "handle-1");
 
-        registry.register_session(session.clone()).unwrap();
+        registry.register_session(session).unwrap();
 
         let retrieved = registry.get_session("sess-1");
         assert!(retrieved.is_some());
@@ -584,7 +584,7 @@ mod session_registry_tests {
             SessionRegistryError::DuplicateSessionId { session_id } => {
                 assert_eq!(session_id, "sess-1");
             },
-            other => panic!("Expected DuplicateSessionId, got: {other:?}"),
+            other @ SessionRegistryError::RegistrationFailed { .. } => panic!("Expected DuplicateSessionId, got: {other:?}"),
         }
     }
 
