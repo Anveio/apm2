@@ -412,14 +412,15 @@ pub fn new_shared_registry() -> MetricsResult<SharedMetricsRegistry> {
 /// Truncates a label value to prevent denial-of-service via unbounded labels.
 ///
 /// This function is UTF-8 safe and will not panic on multi-byte characters.
-/// It finds the last valid character boundary at or before `MAX_LABEL_VALUE_LEN`
-/// bytes and truncates there.
+/// It finds the last valid character boundary at or before
+/// `MAX_LABEL_VALUE_LEN` bytes and truncates there.
 fn truncate_label(value: &str) -> &str {
     if value.len() <= MAX_LABEL_VALUE_LEN {
         value
     } else {
-        // Find the last valid UTF-8 character boundary at or before MAX_LABEL_VALUE_LEN.
-        // This prevents panics when truncating multi-byte UTF-8 characters.
+        // Find the last valid UTF-8 character boundary at or before
+        // MAX_LABEL_VALUE_LEN. This prevents panics when truncating multi-byte
+        // UTF-8 characters.
         let end = value
             .char_indices()
             .map(|(i, _)| i)
