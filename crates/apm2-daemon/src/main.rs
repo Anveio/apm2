@@ -19,6 +19,17 @@
 //! - `apm2_daemon_context_firewall_denials_total` (counter)
 //! - `apm2_daemon_session_terminations_total` (counter)
 //!
+//! ## Current Integration Status
+//!
+//! Currently, only `ipc_requests_total` is actively recorded via `handlers.rs`
+//! for JSON-based IPC requests. The other metrics (sessions, tool mediation,
+//! capabilities, firewall, terminations) are defined and instrumented in
+//! `PrivilegedDispatcher` and `ToolBroker`, but those components use the binary
+//! protocol which is not yet wired into this main.rs.
+//!
+//! TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` and `ToolBroker` into main.rs
+//! to enable all metrics.
+//!
 //! See RFC-0017 for architecture details.
 
 mod handlers;

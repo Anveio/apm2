@@ -1217,6 +1217,21 @@ pub struct PrivilegedDispatcher {
     /// - `session_spawned`: When `SpawnEpisode` succeeds
     /// - `ipc_request_completed`: For each dispatched request
     /// - `capability_granted`: When `IssueCapability` succeeds
+    ///
+    /// # Integration Status
+    ///
+    /// **NOTE**: This dispatcher uses the binary protocol
+    /// (`PrivilegedMessageType`) which is not currently wired into
+    /// `main.rs`. The daemon's main connection handler uses JSON-based
+    /// `IpcRequest` via `handlers::dispatch()` instead.
+    ///
+    /// These metrics will become active when the binary protocol path is
+    /// integrated into the daemon's connection handling. Until then, the
+    /// JSON-based IPC path in `handlers.rs` correctly records
+    /// `ipc_request_completed` metrics.
+    ///
+    /// TODO(TCK-FUTURE): Wire `PrivilegedDispatcher` into `main.rs` to enable
+    /// these metrics for binary protocol requests.
     metrics: Option<SharedMetricsRegistry>,
 }
 
@@ -1295,6 +1310,12 @@ impl PrivilegedDispatcher {
     /// - `session_spawned`: When `SpawnEpisode` succeeds
     /// - `ipc_request_completed`: For each dispatched request
     /// - `capability_granted`: When `IssueCapability` succeeds
+    ///
+    /// # Integration Status
+    ///
+    /// **NOTE**: This method is currently only exercised in tests. The binary
+    /// protocol path is not yet wired into `main.rs`. See the `metrics` field
+    /// documentation for details.
     #[must_use]
     pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
         self.metrics = Some(metrics);

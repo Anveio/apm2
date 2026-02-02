@@ -364,8 +364,22 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Prometheus metrics registry for daemon health observability (TCK-00268).
     ///
     /// When present, the broker emits metrics for:
-    /// - `tool_mediation_completed`: After each tool mediation decision
+    /// - `tool_mediation_latency`: After each tool mediation decision
     /// - `context_firewall_denial`: When context firewall denies a request
+    /// - `session_terminated`: When context firewall triggers termination
+    ///
+    /// # Integration Status
+    ///
+    /// **NOTE**: The `ToolBroker` is not currently instantiated in `main.rs`.
+    /// It is used by the `PrivilegedDispatcher` binary protocol path which is
+    /// not yet wired into the daemon's connection handling.
+    ///
+    /// These metrics will become active when the binary protocol and tool
+    /// mediation flows are integrated into the daemon. Until then, they are
+    /// exercised only in unit tests.
+    ///
+    /// TODO(TCK-FUTURE): Wire `ToolBroker` into `main.rs` via
+    /// `PrivilegedDispatcher` to enable tool mediation metrics.
     metrics: Option<SharedMetricsRegistry>,
 }
 
@@ -489,8 +503,15 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
     /// Adds a metrics registry to the broker (TCK-00268).
     ///
     /// When set, the broker will emit metrics for:
-    /// - `tool_mediation_completed`: After each tool mediation decision
+    /// - `tool_mediation_latency`: After each tool mediation decision
     /// - `context_firewall_denial`: When context firewall denies a request
+    /// - `session_terminated`: When context firewall triggers termination
+    ///
+    /// # Integration Status
+    ///
+    /// **NOTE**: This method is currently only exercised in tests. The
+    /// `ToolBroker` is not yet wired into `main.rs`. See the `metrics`
+    /// field documentation for details.
     #[must_use]
     pub fn with_metrics(mut self, metrics: SharedMetricsRegistry) -> Self {
         self.metrics = Some(metrics);
