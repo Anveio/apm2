@@ -410,11 +410,23 @@ pub fn new_shared_registry() -> MetricsResult<SharedMetricsRegistry> {
 }
 
 /// Truncates a label value to prevent denial-of-service via unbounded labels.
+///
+/// This function is UTF-8 safe and will not panic on multi-byte characters.
+/// It finds the last valid character boundary at or before `MAX_LABEL_VALUE_LEN`
+/// bytes and truncates there.
 fn truncate_label(value: &str) -> &str {
     if value.len() <= MAX_LABEL_VALUE_LEN {
         value
     } else {
-        &value[..MAX_LABEL_VALUE_LEN]
+        // Find the last valid UTF-8 character boundary at or before MAX_LABEL_VALUE_LEN.
+        // This prevents panics when truncating multi-byte UTF-8 characters.
+        let end = value
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= MAX_LABEL_VALUE_LEN)
+            .last()
+            .unwrap_or(0);
+        &value[..end]
     }
 }
 
@@ -573,6 +585,81 @@ mod tests {
         // Should not panic and encoding should work
         let output = registry.encode_text().unwrap();
         assert!(output.contains("apm2_daemon_sessions_active"));
+    }
+
+    #[test]
+    fn test_label_truncation_utf8_safety() {
+        // Test that truncation is UTF-8 safe and does not panic on multi-byte
+        // characters at the boundary. This is a regression test for CRASH-001.
+        let registry = MetricsRegistry::new().unwrap();
+        let metrics = registry.daemon_metrics();
+
+        // Create a string with multi-byte UTF-8 characters that crosses the
+        // 64-byte boundary. Each emoji is 4 bytes, so 16 emojis = 64 bytes.
+        // Adding one more character would cross the boundary.
+        let emoji_label = "\u{1F600}".repeat(20); // 80 bytes of emojis
+        assert!(emoji_label.len() > MAX_LABEL_VALUE_LEN);
+
+        // This should NOT panic - it should truncate at a character boundary
+        metrics.session_spawned(&emoji_label);
+
+        // Verify encoding works
+        let output = registry.encode_text().unwrap();
+        assert!(output.contains("apm2_daemon_sessions_active"));
+
+        // Test with mixed ASCII and multi-byte characters near the boundary
+        // 60 ASCII bytes + 2 emojis (8 bytes) = 68 bytes
+        let mixed_label = format!("{}{}", "a".repeat(60), "\u{1F600}\u{1F600}");
+        assert!(mixed_label.len() > MAX_LABEL_VALUE_LEN);
+
+        // This should NOT panic
+        metrics.session_spawned(&mixed_label);
+        let output = registry.encode_text().unwrap();
+        assert!(output.contains("apm2_daemon_sessions_active"));
+
+        // Test boundary case: exactly at boundary with multi-byte char
+        // 63 ASCII bytes + 1 emoji (4 bytes) = 67 bytes, truncation happens
+        // mid-emoji which must not panic
+        let boundary_label = format!("{}{}", "b".repeat(63), "\u{1F600}");
+        assert!(boundary_label.len() > MAX_LABEL_VALUE_LEN);
+
+        // This should NOT panic - should truncate before the emoji
+        metrics.session_spawned(&boundary_label);
+        let output = registry.encode_text().unwrap();
+        assert!(output.contains("apm2_daemon_sessions_active"));
+    }
+
+    #[test]
+    fn test_truncate_label_direct() {
+        // Direct unit tests for the truncate_label function
+
+        // Short string - no truncation
+        let short = "hello";
+        assert_eq!(truncate_label(short), "hello");
+
+        // Exactly at limit - no truncation
+        let exact = "a".repeat(MAX_LABEL_VALUE_LEN);
+        assert_eq!(truncate_label(&exact), exact);
+
+        // ASCII over limit - truncated to limit
+        let long_ascii = "a".repeat(100);
+        assert_eq!(truncate_label(&long_ascii).len(), MAX_LABEL_VALUE_LEN);
+
+        // Multi-byte at boundary - must truncate before incomplete char
+        // 63 'a' chars + one 4-byte emoji = 67 bytes
+        let boundary = format!("{}{}", "a".repeat(63), "\u{1F600}");
+        let truncated = truncate_label(&boundary);
+        // Should truncate to 63 bytes (before the emoji)
+        assert_eq!(truncated.len(), 63);
+        assert_eq!(truncated, "a".repeat(63));
+
+        // All multi-byte characters - should truncate at char boundary
+        let emojis = "\u{1F600}".repeat(20); // 80 bytes
+        let truncated = truncate_label(&emojis);
+        // Should be 64 bytes or less, at a char boundary (so divisible by 4)
+        assert!(truncated.len() <= MAX_LABEL_VALUE_LEN);
+        assert_eq!(truncated.len() % 4, 0); // emoji is 4 bytes
+        assert_eq!(truncated.len(), 64); // exactly 16 emojis fit
     }
 
     #[test]
