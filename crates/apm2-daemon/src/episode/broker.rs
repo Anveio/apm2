@@ -2384,7 +2384,7 @@ mod tests {
     async fn test_credential_is_redacted_in_debug() {
         // TCK-00262: Verify Credential debug output is redacted
         let credential = Credential::new("super_secret_token");
-        let debug_output = format!("{:?}", credential);
+        let debug_output = format!("{credential:?}");
 
         assert!(
             !debug_output.contains("super_secret_token"),
