@@ -560,9 +560,17 @@ async fn async_main(args: Args) -> Result<()> {
     // Per security review:
     // - Item 1: Dispatchers persist across connections (no state loss)
     // - Item 2: TokenMinter uses stable secret (tokens valid across connections)
-    // - Item 3: FailClosedManifestStore denies all tools by default
-    let dispatcher_state: SharedDispatcherState =
-        Arc::new(DispatcherState::new(metrics_registry.clone()));
+    // - Item 3: Shared ManifestStore allows SpawnEpisode manifests to be visible
+    //
+    // BLOCKER 1 FIX: Use with_session_registry to wire global session registry
+    // from DaemonStateHandle into PrivilegedDispatcher. This ensures sessions
+    // spawned via IPC are visible to daemon's persistent state.
+    let dispatcher_state: SharedDispatcherState = Arc::new(
+        DispatcherState::with_session_registry(
+            state.session_registry().clone(),
+            metrics_registry.clone(),
+        ),
+    );
 
     // TCK-00279: Start ProtocolServer-only control plane
     // This is the ONLY control-plane listener. Legacy JSON IPC has been removed per
