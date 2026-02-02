@@ -27,6 +27,9 @@ Line ranges are from `nl -ba` output.
   `crates/apm2-core/src/evidence/cas.rs:1-18`,
   `crates/apm2-core/src/evidence/cas.rs:27-31`,
   `crates/apm2-core/src/evidence/cas.rs:119-150`.
+- CAS/EventHasher hashing uses BLAKE3:
+  `crates/apm2-core/src/evidence/cas.rs:1-18`,
+  `crates/apm2-core/src/crypto/hash.rs:98-110`.
 
 ## Kernel event schema (truth-plane)
 - KernelEvent payload list (no defect or episode events shown):
@@ -68,6 +71,8 @@ Line ranges are from `nl -ba` output.
 - Ledger API exposes append/read/head but no outbox/pulse publisher surface:
   `crates/apm2-core/src/ledger/storage.rs:412-518`,
   `crates/apm2-core/src/ledger/storage.rs:719-736`. Ticket: `TCK-00304`.
+- CapabilityManifest lacks pulse topic allowlists and CAS hash allowlists:
+  `crates/apm2-daemon/src/episode/capability.rs:511-526`. Ticket: `TCK-00314`.
 
 ## FAC v0 autonomy gaps
 - KernelEvent payload list does not include ChangeSetPublished, ReviewReceiptRecorded,

@@ -24,6 +24,13 @@ rfc_test_and_evidence:
         framework: "bash"
         evidence_ids:
           - "EVID-HEF-0008"
+      - id: "UT-HEF-FAC-0001"
+        name: "ChangeSetBundle canonicalization determinism"
+        scope: "Same bundle inputs -> same changeset_digest"
+        coverage_target: ">90%"
+        framework: "cargo test"
+        evidence_ids:
+          - "EVID-HEF-0009"
     integration:
       - id: "IT-HEF-0001"
         name: "Subscription ACL enforcement"
@@ -51,7 +58,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0001"
       - id: "IT-HEF-0005"
         name: "Unauthorized publish/subscribe attempts (red-team)"
-        scope: "Session tries to publish or subscribe privileged topics"
+        scope: "Session tries to publish or subscribe privileged topics; CAS hash allowlist denies unauthorized reads"
         test_environment: "Local daemon + session client"
         evidence_ids:
           - "EVID-HEF-0002"
@@ -87,7 +94,7 @@ rfc_test_and_evidence:
           - "EVID-HEF-0011"
       - id: "IT-HEF-FAC-0004"
         name: "FAC v0 autonomous run (end-to-end)"
-        scope: "ChangeSetPublished -> reviewer episodes -> ReviewReceipt -> GateReceipt -> projection; no GitHub reads for truth"
+        scope: "ChangeSetPublished -> reviewer episodes -> ReviewReceipt -> GateReceipt -> projection; no GitHub reads for truth (network_access=DISALLOWED)"
         test_environment: "Local daemon + fac harness"
         evidence_ids:
           - "EVID-HEF-0012"

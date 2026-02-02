@@ -69,6 +69,7 @@ rfc_ticket_decomposition:
         - "crates/apm2-daemon/src/protocol/pulse_acl.rs (ACL evaluation)"
       acceptance_criteria:
         - "Session subscriptions are deny-by-default; only capability-manifest allowlisted topics are accepted."
+        - "Session wildcard patterns are rejected in Phase 1."
         - "Operator subscriptions can access full topic taxonomy."
       evidence_ids:
         - "EVID-HEF-0002"
@@ -265,6 +266,7 @@ rfc_ticket_decomposition:
         - "crates/apm2-core/src/fac/changeset_bundle.rs (bundle canonicalization)"
       acceptance_criteria:
         - "ChangeSetBundleV1 canonicalization is defined and deterministic."
+        - "Deterministic digest test exists (same bundle inputs -> same changeset_digest)."
         - "Ledger event ChangeSetPublished references changeset_digest + CAS hash."
       evidence_ids:
         - "EVID-HEF-0009"
@@ -277,6 +279,10 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0011"
       depends_on:
         - "TCK-00310"
+        - "TCK-00314"
+        - "RFC-0017:TCK-00254"
+        - "RFC-0017:TCK-00256"
+        - "RFC-0017:TCK-00260"
       risk_tier: "T3"
       summary: |
         Implement reviewer workspace snapshot/apply semantics from
@@ -300,6 +306,9 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0010"
       depends_on:
         - "TCK-00310"
+        - "TCK-00314"
+        - "RFC-0017:TCK-00254"
+        - "RFC-0017:TCK-00260"
       risk_tier: "T3"
       summary: |
         Store reviewer outputs (review text + tool logs) in CAS and anchor via a
@@ -328,6 +337,9 @@ rfc_ticket_decomposition:
         - "TCK-00310"
         - "TCK-00311"
         - "TCK-00312"
+        - "RFC-0017:TCK-00256"
+        - "RFC-0017:TCK-00260"
+        - "RFC-0017:TCK-00252"
       risk_tier: "T3"
       summary: |
         Build an end-to-end FAC v0 harness that drives ChangeSetPublished ->
@@ -341,3 +353,30 @@ rfc_ticket_decomposition:
         - "EVID-HEF-0012 produced; GATE-HEF-FAC-V0 passes."
       evidence_ids:
         - "EVID-HEF-0012"
+
+    - ticket_id: "TCK-00314"
+      title: "HEF NEW WORK REQUIRED: Capability allowlists for pulse topics + CAS reads"
+      requirement_ids:
+        - "REQ-HEF-0003"
+        - "REQ-HEF-0005"
+      depends_on:
+        - "TCK-00302"
+        - "RFC-0017:TCK-00254"
+      risk_tier: "T3"
+      summary: |
+        Extend capability manifests/leases to include explicit allowlists for
+        pulse topic subscriptions and CAS hash reads (diff bundles, snapshots,
+        review artifacts). Enforce allowlists at SubscribePulse handling and
+        CAS retrieval paths. Phase 1 session.sock forbids wildcards; allowlists
+        must enumerate exact topics.
+      files_to_modify:
+        - "crates/apm2-daemon/src/episode/capability.rs (add topic_allowlist + cas_hash_allowlist fields)"
+        - "crates/apm2-daemon/src/protocol/session_dispatch.rs (enforce topic allowlist)"
+        - "crates/apm2-core/src/evidence/cas.rs or CAS access layer (enforce cas_hash_allowlist)"
+      files_to_create: []
+      acceptance_criteria:
+        - "Session subscriptions reject any topic not explicitly allowlisted."
+        - "Session wildcard patterns are rejected in Phase 1."
+        - "CAS reads for ChangeSetBundle/Review artifacts are denied unless hash allowlisted."
+      evidence_ids:
+        - "EVID-HEF-0002"

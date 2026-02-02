@@ -17,7 +17,9 @@ rfc_evidence_artifact:
         timeout_seconds: 1800
         network_access: "DISALLOWED"
         allowlist_hosts: []
-        constraints: []
+        constraints:
+          - "GITHUB_TOKEN and GH_TOKEN must be unset."
+          - "No GitHub reads for truth; CAS + ledger only."
   data:
     classification: "INTERNAL"
     redaction:

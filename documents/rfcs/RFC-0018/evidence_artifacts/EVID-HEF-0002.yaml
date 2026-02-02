@@ -3,7 +3,7 @@ rfc_evidence_artifact:
   template_version: "2026-01-23"
   id: "EVID-HEF-0002"
   category: "SECURITY_SCAN_RESULTS"
-  title: "HEF red-team: unauthorized subscribe/publish attempts denied"
+  title: "HEF red-team: unauthorized subscribe/publish and CAS allowlist denials"
   capture:
     paths:
       - "evidence/rfc/RFC-0018/redteam/acl_denials/"

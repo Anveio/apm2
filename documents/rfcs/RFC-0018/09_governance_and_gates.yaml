@@ -49,6 +49,9 @@ rfc_governance_and_gates:
     - gate_id: "GATE-HEF-FAC-V0"
       status: "PENDING"
       evidence_ids:
+        - "EVID-HEF-0001"
+        - "EVID-HEF-0002"
+        - "EVID-HEF-0003"
         - "EVID-HEF-0009"
         - "EVID-HEF-0010"
         - "EVID-HEF-0011"

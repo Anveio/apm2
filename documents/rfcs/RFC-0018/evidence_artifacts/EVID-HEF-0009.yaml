@@ -17,7 +17,9 @@ rfc_evidence_artifact:
         timeout_seconds: 900
         network_access: "DISALLOWED"
         allowlist_hosts: []
-        constraints: []
+        constraints:
+          - "GITHUB_TOKEN and GH_TOKEN must be unset."
+          - "gh binary must not be required for diff retrieval."
   data:
     classification: "INTERNAL"
     redaction:

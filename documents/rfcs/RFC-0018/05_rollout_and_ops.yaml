@@ -24,6 +24,7 @@ rfc_rollout_and_ops:
           - "Unauthorized subscribe attempts return PERMISSION_DENIED."
           - "Pulse size and queue caps enforced."
           - "Projection-only posture enforced; xtask direct GitHub status writes disabled or routed via daemon (TCK-00309)."
+          - "FAC v0 gate evidence requires RFC-0017 prerequisites: TCK-00254, TCK-00256, TCK-00260."
           - "Enable-by-default is blocked until GATE-HEF-PROJECTION-ONLY and GATE-HEF-FAC-V0 pass."
         rollback_steps:
           - "Disable operator subscriptions; revert to Phase 1A shadow emit."
@@ -37,6 +38,7 @@ rfc_rollout_and_ops:
         guardrails:
           - "Session token validation enforced before ACL evaluation."
           - "Per-connection resource caps enforced."
+          - "FAC v0 gate evidence requires RFC-0017 prerequisites: TCK-00254, TCK-00256, TCK-00260."
           - "Enable-by-default is blocked until GATE-HEF-PROJECTION-ONLY and GATE-HEF-FAC-V0 pass."
         rollback_steps:
           - "Disable session subscriptions; keep operator subscriptions."

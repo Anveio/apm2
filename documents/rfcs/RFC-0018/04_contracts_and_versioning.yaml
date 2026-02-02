@@ -141,22 +141,36 @@ rfc_contracts_and_versioning:
       status: "NEW_WORK_REQUIRED"
       schema_path: "schemas/apm2/changeset_bundle_v1.yaml"
       required_fields:
+        - "schema (const: apm2.changeset_bundle.v1)"
+        - "schema_version"
         - "changeset_id (opaque)"
         - "base_selector (resolved commit/tree id)"
         - "changeset_digest (32 bytes)"
-        - "diff_format (e.g., unified diff; canonical)"
-        - "diff_bytes (CAS content hash)"
+        - "diff_format (git_unified_diff)"
+        - "diff_hash (CAS content hash)"
         - "file_manifest (sorted, stable)"
+        - "binary_detected (bool)"
+      digest_rules:
+        algorithm: "BLAKE3-256"
+        source: "EventHasher::hash_content over canonical ChangeSetBundle bytes"
+        notes:
+          - "Aligns with CAS hashing (BLAKE3) to avoid dual hash families."
       canonicalization_rules:
-        - "file_manifest sorted lexicographically by path"
-        - "diff_bytes hashed after canonical newline normalization"
-        - "all strings ASCII or UTF-8 normalized; length-bounded"
+        - "Canonical JSON serialization (RFC 8785/JCS) over the bundle object."
+        - "file_manifest sorted lexicographically by normalized path (no '.', '..', or backslashes)."
+        - "All paths use '/' separators and are UTF-8 NFC normalized."
+        - "diff_format is fixed to git_unified_diff; no alternate encodings in v0."
+        - "diff bytes are stored in CAS; diff_hash is the CAS BLAKE3 hash."
+        - "Diff content is newline-normalized to LF before hashing for diff_hash."
+        - "binary_detected=true MUST trigger ReviewBlocked reason_code=BINARY_UNSUPPORTED in v0."
       notes:
         - "Bundle must be CAS-hosted; pulses only carry hashes."
     review_artifact_bundle_v1:
       status: "NEW_WORK_REQUIRED"
       schema_path: "schemas/apm2/review_artifact_bundle_v1.yaml"
       required_fields:
+        - "schema (const: apm2.review_artifact_bundle.v1)"
+        - "schema_version"
         - "review_id"
         - "changeset_digest"
         - "review_text_hash (CAS)"
@@ -171,6 +185,8 @@ rfc_contracts_and_versioning:
       status: "NEW_WORK_REQUIRED"
       schema_path: "schemas/apm2/review_blocked_v1.yaml"
       required_fields:
+        - "schema (const: apm2.review_blocked.v1)"
+        - "schema_version"
         - "blocked_id"
         - "changeset_digest"
         - "reason_code"
@@ -186,6 +202,7 @@ rfc_contracts_and_versioning:
     - "SubscribePulseRequest is accepted only after handshake and privilege checks."
     - "Session subscriptions require valid session_token before ACL evaluation."
     - "Session subscriptions are deny-by-default; only capability-manifest allowlisted topics are accepted."
+    - "Phase 1 session.sock rejects wildcard patterns; allowlists must enumerate exact topics."
     - "since_ledger_cursor is a resume hint; correctness requires ledger catch-up."
     - "Pulse replay buffer is optional and non-authoritative; absence is allowed."
     - "Clients must treat pulses as hints and verify via ledger/CAS."

@@ -40,9 +40,10 @@ rfc_design_decisions:
   truth_plane_preconditions:
     description: |
       Truth-Plane Preconditions define the minimal ledger/CAS artifacts that must
-      exist before a pulse topic is meaningful. If a trigger or artifact is
-      missing from the truth-plane, it is labeled NEW WORK REQUIRED and must be
-      tracked as a dependency.
+      exist before a Pulse Plane topic is meaningful. This table is HEF-only and
+      covers pulse topics exclusively. If a trigger or artifact is missing from
+      the truth-plane, it is labeled NEW WORK REQUIRED and must be tracked as a
+      dependency.
     table:
       - category: "system"
         topic_pattern: "ledger.head"
@@ -172,52 +173,11 @@ rfc_design_decisions:
           - "Add defect event type to kernel_events.proto"
           - "Ledger emission path for DefectRecord"
 
-      - category: "fac_v0"
-        topic_pattern: "N/A (non-pulse: ChangeSetBundleV1)"
-        trigger_events:
-          - "ChangeSetPublished (ledger event)"
-        required_pointers:
-          - "changeset_digest"
-          - "changeset_bundle_hash (CAS)"
-        preconditions_status: "NEW_WORK_REQUIRED"
-        evidence:
-          - "proto/kernel_events.proto:73-93"
-          - "proto/kernel_events.proto:726-744"
-        new_work_required:
-          - "Define ChangeSetPublished event in kernel_events.proto"
-          - "Define ChangeSetBundleV1 CAS schema + canonicalization"
-
-      - category: "fac_v0"
-        topic_pattern: "N/A (non-pulse: ReviewReceipt)"
-        trigger_events:
-          - "ReviewReceiptRecorded (ledger event)"
-        required_pointers:
-          - "review_receipt_id"
-          - "changeset_digest"
-          - "review_artifact_bundle_hash (CAS)"
-        preconditions_status: "NEW_WORK_REQUIRED"
-        evidence:
-          - "proto/kernel_events.proto:73-93"
-          - "proto/kernel_events.proto:436-466"
-        new_work_required:
-          - "Define ReviewReceiptRecorded event in kernel_events.proto"
-          - "Define ReviewArtifactBundleV1 CAS schema + canonicalization"
-
-      - category: "fac_v0"
-        topic_pattern: "N/A (non-pulse: ReviewBlocked)"
-        trigger_events:
-          - "ReviewBlockedRecorded (ledger event)"
-        required_pointers:
-          - "review_blocked_id"
-          - "changeset_digest"
-          - "blocked_reason_code"
-          - "blocked_log_hash (CAS)"
-        preconditions_status: "NEW_WORK_REQUIRED"
-        evidence:
-          - "proto/kernel_events.proto:73-93"
-        new_work_required:
-          - "Define ReviewBlockedRecorded event in kernel_events.proto"
-          - "Define blocked reason codes + CAS log bundle"
+  layering_note: |
+    FAC v0 artifacts (ChangeSetBundle, ReviewReceipt, ReviewBlocked) are
+    truth-plane objects anchored in the ledger + CAS. HEF pulses are derived
+    wakeups that may reference those artifacts but never replace them; FAC
+    preconditions are specified separately below.
 
   fac_v0_autonomy_preconditions:
     description: |
@@ -230,7 +190,8 @@ rfc_design_decisions:
         name: "ChangeSetBundleV1 + changeset_digest binding"
         required_artifacts:
           - "ChangeSetBundleV1 stored in CAS (canonical diff + manifest)"
-          - "changeset_digest computed from canonical bundle bytes"
+          - "changeset_digest computed via BLAKE3-256 over canonical bundle bytes"
+          - "binary_detected=true forces ReviewBlocked(BINARY_UNSUPPORTED) in v0"
         ledger_anchor:
           - "ChangeSetPublished ledger event referencing changeset_digest + cas_ref"
         preconditions_status: "PARTIAL"
@@ -411,9 +372,10 @@ rfc_design_decisions:
         Operator connections may subscribe broadly. Session connections are
         deny-by-default: sessions may subscribe only to topics explicitly
         enumerated in the session capability manifest/lease (episode_id/work_id/gate_id
-        scopes). Capability manifests may grant only within policy (never broaden
-        beyond policy). Sessions never publish pulse topics; daemon-only publish
-        from outbox after ledger commit.
+        scopes). Phase 1 session.sock forbids wildcards; allowlists must enumerate
+        exact topics. Capability manifests may grant only within policy (never
+        broaden beyond policy). Sessions never publish pulse topics; daemon-only
+        publish from outbox after ledger commit.
       context: |
         Pulse traffic crosses the IPC boundary and must preserve RFC-0017 trust
         boundaries and SoD. Enforcement points: SubscribePulse handling in
@@ -578,8 +540,11 @@ rfc_design_decisions:
       title: "Reviewer episode contract (minimal tools, CAS logging, no GitHub truth)"
       statement: |
         Reviewer episodes MUST receive a workspace snapshot/apply input derived
-        from ChangeSetBundleV1, run a minimal approved tool set, and emit review
-        artifacts/logs into CAS. Reviewer decisions never depend on GitHub reads.
+        from ChangeSetBundleV1, run a minimal approved tool set
+        (FileRead + GitOperation{DIFF, STATUS} + ArtifactFetch), and emit review
+        artifacts/logs into CAS. ShellExec is forbidden by default and requires
+        explicit capability allowlist. Reviewer decisions never depend on GitHub
+        reads.
       context: |
         Autonomy requires reviewers to operate entirely inside Forge with
         deterministic inputs and evidence-carrying outputs.
@@ -601,8 +566,9 @@ rfc_design_decisions:
       title: "ReviewBlocked semantics (explicit liveness failures)"
       statement: |
         ReviewBlocked is a first-class, ledger-anchored outcome with explicit
-        reason codes and CAS logs. Retries are bounded by HTF windows; blocked
-        outcomes must be surfaced as durable receipts.
+        reason codes (including BINARY_UNSUPPORTED) and CAS logs. Retries are
+        bounded by HTF windows; blocked outcomes must be surfaced as durable
+        receipts.
       context: |
         Liveness requires reviewers to fail loudly and reproducibly when inputs
         are missing or invalid.

@@ -44,6 +44,7 @@ rfc_risks_and_open_questions:
       likelihood: "HIGH"
       mitigations:
         - "TCK-00310..TCK-00313 implement FAC v0 preconditions and tests."
+        - "FAC v0 evidence depends on RFC-0017 tickets TCK-00254, TCK-00256, and TCK-00260 (capability manifest, SpawnEpisode, tool broker)."
         - "GATE-HEF-FAC-V0 blocks enable-by-default until evidence exists."
       evidence_ids:
         - "EVID-HEF-0012"
@@ -60,3 +61,7 @@ rfc_risks_and_open_questions:
       question: "Do we require a small in-memory pulse replay buffer for short reconnects, or force pure ledger catch-up?"
       decision_needed_by: "2026-02-20"
       resolution_plan: "Define operator UX needs; keep buffer optional and non-authoritative if added."
+    - id: "Q-HEF-0004"
+      question: "Should ReviewReceiptRecorded be a new kernel event, or should review success be represented via GateReceipt evidence bundles only?"
+      decision_needed_by: "2026-02-20"
+      resolution_plan: "Compare schema churn vs audit clarity; keep v0 path consistent with FAC receipt semantics."

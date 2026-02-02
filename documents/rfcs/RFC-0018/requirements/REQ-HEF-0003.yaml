@@ -8,10 +8,12 @@ rfc_requirement:
     Pulse subscriptions must be denied by default. operator.sock may subscribe
     broadly; session.sock may subscribe only to topics explicitly allowlisted in
     the session capability manifest/lease (episode_id/work_id/gate_id scopes).
-    Sessions never publish pulse topics; daemon-only publish from outbox.
+    Phase 1 session.sock forbids wildcards; allowlists must enumerate exact
+    topics. Sessions never publish pulse topics; daemon-only publish from outbox.
   acceptance_criteria:
     - "Session subscriptions are denied unless the topic is explicitly allowlisted in the capability manifest/lease."
     - "Sessions cannot subscribe to arbitrary work_id/gate_id scopes outside their allowlist."
+    - "Session wildcard patterns are rejected in Phase 1."
     - "Session attempts to publish pulses are denied."
     - "Operator subscriptions honor ACLs and capability restrictions."
   evidence:

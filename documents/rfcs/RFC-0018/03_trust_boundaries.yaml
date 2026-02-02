@@ -22,7 +22,7 @@ rfc_trust_boundaries:
         - "PulseEvent -> filtered delivery to subscriber"
       authn_authz:
         authn: "Session connections must present a valid session_token before subscription; operator connections rely on socket privilege."
-        authz: "Default-deny ACLs; session subscriptions require explicit allowlist in capability manifest/lease; daemon-only publish."
+        authz: "Default-deny ACLs; session subscriptions require explicit allowlist in capability manifest/lease (NEW WORK REQUIRED: add topic allowlists, TCK-00314); daemon-only publish."
       risks:
         - "Unauthorized subscription to privileged topics"
         - "Pulse-driven authority escalation"
@@ -96,9 +96,9 @@ rfc_trust_boundaries:
       name: "FAC v0 ChangeSetBundle distribution boundary"
       description: |
         ChangeSetBundle CAS references are delivered to reviewer episodes via
-        capability-manifest allowlists. Pulses do not grant CAS reads; access is
-        policy-gated and scoped to explicit hashes (changeset_bundle_hash,
-        workspace_snapshot_hash).
+        capability-manifest allowlists (NEW WORK REQUIRED: add CAS hash allowlists,
+        TCK-00314). Pulses do not grant CAS reads; access is policy-gated and
+        scoped to explicit hashes (changeset_bundle_hash, workspace_snapshot_hash).
       actors:
         - "PRINCIPAL-DAEMON"
         - "PRINCIPAL-AGENT"
@@ -110,7 +110,7 @@ rfc_trust_boundaries:
         - "Pulse hint -> consumer fetches CAS via policy gate"
       authn_authz:
         authn: "Session token + lease-bound capability manifest"
-        authz: "Explicit CAS hash allowlist; deny-by-default"
+        authz: "Explicit CAS hash allowlist; deny-by-default (NEW WORK REQUIRED: TCK-00314)"
       risks:
         - "Unauthorized CAS read of diff artifacts"
         - "Mismatched changeset_digest vs bundle hash"

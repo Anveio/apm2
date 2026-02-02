@@ -46,6 +46,9 @@ rfc_problem_and_imports:
       - Daemon ledger event emission for work claims is stubbed in-memory
         (StubLedgerEventEmitter) and not a persisted outbox
         (crates/apm2-daemon/src/protocol/dispatch.rs:148-169).
+      - CapabilityManifest currently contains only manifest metadata and
+        capabilities; it does not include pulse topic allowlists or CAS hash
+        allowlists (crates/apm2-daemon/src/episode/capability.rs:511-526).
       - Runtime IPC defines EpisodeCreated/Started/Stopped but these are IPC
         messages, not ledger events (proto/apm2d_runtime_v1.proto:29-55).
       - GitHub projection is write-only; ledger remains the source of truth

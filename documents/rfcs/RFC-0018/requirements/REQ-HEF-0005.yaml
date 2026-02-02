@@ -7,10 +7,12 @@ rfc_requirement:
   statement: |
     Pulse payloads must not include file paths, tool arguments, diffs, or
     secrets. Only opaque IDs, hashes, and bounded metadata are permitted. Pulses
-    do not grant CAS read access.
+    do not grant CAS read access; CAS reads require explicit hash allowlists in
+    capability manifests/leases.
   acceptance_criteria:
     - "No human-readable note field exists in Phase 1."
     - "CAS access remains policy-gated; pulses carry hashes only."
+    - "CAS reads for FAC artifacts require explicit hash allowlists."
   evidence:
     evidence_ids:
       - "EVID-HEF-0001"
