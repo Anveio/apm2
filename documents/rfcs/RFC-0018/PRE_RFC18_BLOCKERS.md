@@ -38,6 +38,20 @@ Evidence for stub/durable gaps in truth-plane: stub policy/CAS in tool broker an
 CAS implementation (`crates/apm2-daemon/src/episode/broker.rs:155-180`,
 `crates/apm2-daemon/src/episode/broker.rs:196-212`, `crates/apm2-core/src/evidence/cas.rs:187-190`).
 
+## Prerequisite Ticket Ordering (Dependency-Driven)
+Ordering is dependency-driven, not numeric. TCK-00286 adds policy enforcement fixes in Layer E,
+so session/tool viability and FAC v0 tickets must depend on it through the session viability
+and FAC v0 prerequisite chain.
+
+Layer A (control-plane routing cutover + privileged dispatcher viability): TCK-00287, TCK-00289
+Layer B (CLI dual-socket + protocol alignment): TCK-00288
+Layer C (session viability: RequestTool/EmitEvent/PublishEvidence): TCK-00290
+Layer D (tool plane viability): TCK-00291
+Layer E (policy/capability enforcement): TCK-00286, TCK-00292
+Layer F (evidence durability): TCK-00293
+
+xtask staging (parallel, non-authoritative): TCK-00294, TCK-00295, TCK-00296, TCK-00297
+
 ## Reachability Map (Daemon Control Plane)
 Status legend: REACHABLE, STUBBED, UNREACHABLE, BYPASS.
 

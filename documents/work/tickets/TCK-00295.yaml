@@ -1,52 +1,59 @@
-acceptance_criteria:
-  - criterion: xtask can optionally emit internal receipt/event artifacts when daemon is available
-    verification: Integration test shows optional receipt emission without blocking xtask run
-  - criterion: xtask remains non-authoritative even when emitting internal artifacts
-    verification: Banner remains and docs note non-authoritative status
-  - criterion: GitHub status writes remain unchanged in Stage X1
-    verification: Existing status write behavior preserved
-
-implementation:
-  summary: |
-    Stage X1: once internal truth-plane artifacts exist, allow xtask to optionally
-    emit internal receipts/events in addition to GitHub status writes. xtask remains
-    explicitly non-authoritative and must not block on daemon availability.
-  files_to_modify:
-    - path: xtask/src/tasks/review.rs
-      changes: |
-        - Add optional --emit-internal flag to send receipt/event to daemon
-    - path: xtask/src/tasks/aat.rs
-      changes: |
-        - Add optional --emit-internal flag to send receipt/event to daemon
-    - path: xtask/src/tasks/security_review_exec.rs
-      changes: |
-        - Add optional --emit-internal flag to send receipt/event to daemon
-  implementation_steps:
-    - "Add optional internal receipt emission to xtask tasks"
-    - "Ensure daemon unavailability does not block xtask run"
-    - "Document optional internal emission as non-authoritative"
-
-notes: |
-  Phase: xtask Stage X1 (optional internal receipts).
-  Scope: Optional internal receipt emission from xtask.
-  Risk tier: T2 (medium).
-  Keeps xtask usable: YES.
-
-schema_version: "2026-01-26"
-template_version: "2026-01-26"
-
-test_requirements:
-  - test_id: IT-00295-01
-    description: Optional internal receipt emission does not block xtask
-    verification_command: cargo test -p xtask xtask_optional_internal_receipts
-
-ticket:
-  depends_on:
-    - TCK-00293
-    - TCK-00310
-    - TCK-00312
-  id: TCK-00295
-  requirement_ids: []
-  rfc_id: RFC-0018
-  status: READY
-  title: "xtask Stage X1: optional internal receipts/events (still non-authoritative)"
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00295"
+    title: "xtask Stage X1: optional internal receipts/events (still non-authoritative)"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0001"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0001.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0001"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0001.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets:
+      - ticket_id: "TCK-00294"
+        reason: "Stage X0 banner and non-authoritative labeling must land first."
+      - ticket_id: "TCK-00290"
+        reason: "Session endpoints must exist to emit internal receipts/events."
+      - ticket_id: "TCK-00293"
+        reason: "CAS durability required for internal artifact emission."
+      - ticket_id: "TCK-00310"
+        reason: "ChangeSetBundle/ChangeSetPublished required for internal FAC receipts."
+      - ticket_id: "TCK-00312"
+        reason: "ReviewReceiptRecorded required for internal review receipts."
+  scope:
+    in_scope:
+      - "Add optional flags for xtask to emit internal receipts/events."
+      - "Keep xtask non-authoritative and non-blocking on daemon availability."
+    out_of_scope:
+      - "Removing GitHub status writes (later stages)."
+  plan:
+    steps:
+      - "Add optional --emit-internal flag to xtask review/aat/security tasks."
+      - "Ensure daemon unavailability does not block xtask runs."
+      - "Document optional internal emission as non-authoritative."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0001"
+    criteria:
+      - "xtask can optionally emit internal receipts/events without blocking."
+      - "xtask remains explicitly non-authoritative."
+      - "GitHub status writes remain unchanged in Stage X1."
+  notes:
+    security: |
+      Internal receipt emission must not elevate xtask authority; it is additive
+      scaffolding only.
+    verification: |
+      IT-00295-01: cargo test -p xtask xtask_optional_internal_receipts
+    general: |
+      Stage X1 is optional and must not block or change existing dev workflows.

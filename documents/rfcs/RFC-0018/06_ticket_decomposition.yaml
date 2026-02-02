@@ -307,6 +307,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0009"
       depends_on:
+        - "TCK-00286"
         - "TCK-00287"
         - "TCK-00288"
         - "TCK-00290"
@@ -336,6 +337,7 @@ rfc_ticket_decomposition:
         - "REQ-HEF-0010"
         - "REQ-HEF-0011"
       depends_on:
+        - "TCK-00286"
         - "TCK-00287"
         - "TCK-00288"
         - "TCK-00290"
@@ -367,6 +369,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0010"
       depends_on:
+        - "TCK-00286"
         - "TCK-00287"
         - "TCK-00288"
         - "TCK-00290"
@@ -472,6 +475,7 @@ rfc_ticket_decomposition:
       requirement_ids:
         - "REQ-HEF-0010"
       depends_on:
+        - "TCK-00286"
         - "TCK-00290"
         - "TCK-00291"
         - "TCK-00292"

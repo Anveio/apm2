@@ -1,52 +1,47 @@
-acceptance_criteria:
-  - criterion: xtask review/aat/push/security commands print NON-AUTHORITATIVE banner
-    verification: Manual run shows banner before any GitHub status writes
-  - criterion: Documentation explicitly marks xtask outputs as non-authoritative
-    verification: Docs updated with NON-AUTHORITATIVE notice
-
-implementation:
-  summary: |
-    Stage X0: keep xtask usable but explicitly non-authoritative. Print a banner
-    for review/aat/push/security commands and update docs to mark outputs as
-    scaffolding only.
-  files_to_modify:
-    - path: xtask/src/tasks/aat.rs
-      changes: |
-        - Print NON-AUTHORITATIVE banner at task start
-    - path: xtask/src/tasks/review.rs
-      changes: |
-        - Print NON-AUTHORITATIVE banner at task start
-    - path: xtask/src/tasks/push.rs
-      changes: |
-        - Print NON-AUTHORITATIVE banner at task start
-    - path: xtask/src/tasks/security_review_exec.rs
-      changes: |
-        - Print NON-AUTHORITATIVE banner at task start
-    - path: documents/rfcs/RFC-0018/CHANGE_SUMMARY.md
-      changes: |
-        - Note xtask outputs are non-authoritative scaffolding
-  implementation_steps:
-    - "Add banner to all xtask status-writing tasks"
-    - "Update RFC-0018 docs to mark xtask as non-authoritative"
-
-notes: |
-  Phase: xtask Stage X0 (non-authoritative banner).
-  Scope: xtask banner + docs clarification.
-  Risk tier: T1 (low).
-  Keeps xtask usable: YES.
-
-schema_version: "2026-01-26"
-template_version: "2026-01-26"
-
-test_requirements:
-  - test_id: DOC-00294-01
-    description: NON-AUTHORITATIVE banner present in xtask output
-    verification_command: cargo xtask selftest
-
-ticket:
-  depends_on: []
-  id: TCK-00294
-  requirement_ids: []
-  rfc_id: RFC-0018
-  status: READY
-  title: "xtask Stage X0: explicit NON-AUTHORITATIVE banner (keep usable)"
+ticket_meta:
+  schema_version: "2026-01-29"
+  template_version: "2026-01-29"
+  ticket:
+    id: "TCK-00294"
+    title: "xtask Stage X0: explicit NON-AUTHORITATIVE banner (keep usable)"
+  binds:
+    prd_id: "PRD-0009"
+    rfc_id: "RFC-0018"
+    requirements:
+      - requirement_id: "REQ-HEF-0001"
+        requirement_ref: "documents/rfcs/RFC-0018/requirements/REQ-HEF-0001.yaml#rfc_requirement"
+    evidence_artifacts:
+      - evidence_id: "EVID-HEF-0001"
+        artifact_ref: "documents/rfcs/RFC-0018/evidence_artifacts/EVID-HEF-0001.yaml#rfc_evidence_artifact"
+  custody:
+    agent_roles:
+      - "AGENT_IMPLEMENTER"
+    responsibility_domains:
+      - "DOMAIN_SECURITY"
+      - "DOMAIN_RUNTIME"
+  dependencies:
+    tickets: []
+  scope:
+    in_scope:
+      - "Print NON-AUTHORITATIVE banner for xtask review/aat/push/security tasks."
+      - "Document xtask outputs as non-authoritative scaffolding."
+    out_of_scope:
+      - "Disabling GitHub status writes (later stages)."
+  plan:
+    steps:
+      - "Add banner to xtask status-writing tasks."
+      - "Update RFC-0018 docs to mark xtask as non-authoritative."
+  definition_of_done:
+    evidence_ids:
+      - "EVID-HEF-0001"
+    criteria:
+      - "xtask status-writing tasks print NON-AUTHORITATIVE banner."
+      - "Docs explicitly label xtask outputs as non-authoritative."
+  notes:
+    security: |
+      xtask remains usable but must be explicitly non-authoritative to avoid
+      truth-plane confusion.
+    verification: |
+      DOC-00294-01: cargo xtask selftest
+    general: |
+      Stage X0 is required before any further xtask authority reduction.

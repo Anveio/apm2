@@ -66,3 +66,16 @@ Commands that are not authoritative or bypass the daemon must require explicit d
 Dev-only gating rule:
 - Require `--dev` (or `APM2_DEV_MODE=1`) for any command above.
 - In dev mode, print a banner and never emit truth-plane artifacts.
+
+## Prerequisite Ordering (Dependency-Driven)
+Ordering is dependency-driven (not numeric). CLI alignment (TCK-00288) depends on the routing
+cutover (TCK-00287) and sits in Layer B of the prerequisite tranche.
+
+Layer A (control-plane routing cutover + privileged dispatcher viability): TCK-00287, TCK-00289
+Layer B (CLI dual-socket + protocol alignment): TCK-00288
+Layer C (session viability: RequestTool/EmitEvent/PublishEvidence): TCK-00290
+Layer D (tool plane viability): TCK-00291
+Layer E (policy/capability enforcement): TCK-00286, TCK-00292
+Layer F (evidence durability): TCK-00293
+
+xtask staging (parallel, non-authoritative): TCK-00294, TCK-00295, TCK-00296, TCK-00297
