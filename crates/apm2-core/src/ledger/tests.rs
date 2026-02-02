@@ -810,3 +810,200 @@ fn tck_00182_reader_includes_consensus_fields() {
     let event = reader.read_one(seq_id).unwrap();
     assert_eq!(event.quorum_cert, Some(vec![0x01, 0x02, 0x03]));
 }
+
+// =============================================================================
+// TCK-00265: Signature Verification on Ledger Ingestion
+// =============================================================================
+
+/// Test that unsigned events are rejected (ADV-007).
+#[test]
+fn tck_00265_unsigned_event_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create an event without a signature
+    let event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+
+    // Attempt to append with verification should fail
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::UnsignedEvent { .. })));
+}
+
+/// Test that events with empty signature are rejected.
+#[test]
+fn tck_00265_empty_signature_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create an event with an empty signature
+    let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+    event.signature = Some(vec![]); // Empty signature
+
+    // Attempt to append with verification should fail
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::UnsignedEvent { .. })));
+}
+
+/// Test that events with invalid signatures are rejected.
+#[test]
+fn tck_00265_invalid_signature_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+    let wrong_signer = Signer::generate();
+
+    // Create an event and sign with wrong key
+    let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+
+    // Sign with wrong_signer but verify with signer
+    let signature = crate::fac::sign_with_domain(
+        &wrong_signer,
+        crate::fac::LEDGER_EVENT_PREFIX,
+        &event.payload,
+    );
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (wrong key)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that events with tampered payload are rejected.
+#[test]
+fn tck_00265_tampered_event_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create and sign an event
+    let original_payload = b"original payload".to_vec();
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::fac::LEDGER_EVENT_PREFIX, &original_payload);
+
+    // Create event with different payload but same signature (tampered)
+    let mut event = EventRecord::new(
+        "test.event",
+        "session-1",
+        "actor-1",
+        b"tampered payload".to_vec(), // Different from what was signed
+    );
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (tampered)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that properly signed events are accepted.
+#[test]
+fn tck_00265_valid_signature_accepted() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create and properly sign an event
+    let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+
+    let signature =
+        crate::fac::sign_with_domain(&signer, crate::fac::LEDGER_EVENT_PREFIX, &event.payload);
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Append with verification should succeed
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_ok());
+    let seq_id = result.unwrap();
+    assert_eq!(seq_id, 1);
+
+    // Verify the event was stored
+    let stored_event = ledger.read_one(seq_id).unwrap();
+    assert_eq!(stored_event.payload, b"payload");
+    assert_eq!(stored_event.signature, Some(signature.to_bytes().to_vec()));
+}
+
+/// Test that malformed signatures are rejected.
+#[test]
+fn tck_00265_malformed_signature_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create an event with malformed signature (wrong length)
+    let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+    event.signature = Some(vec![0x42; 32]); // Wrong length (should be 64)
+
+    // Attempt to append with verification should fail
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test that signatures with wrong domain prefix are rejected.
+#[test]
+fn tck_00265_wrong_domain_prefix_rejected() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Create an event and sign with wrong domain prefix
+    let mut event = EventRecord::new("test.event", "session-1", "actor-1", b"payload".to_vec());
+
+    // Sign with a different domain prefix
+    let signature = crate::fac::sign_with_domain(
+        &signer,
+        crate::fac::GATE_LEASE_ISSUED_PREFIX, // Wrong prefix!
+        &event.payload,
+    );
+    event.signature = Some(signature.to_bytes().to_vec());
+
+    // Attempt to append with verification should fail (wrong domain)
+    let result = ledger.append_verified(&event, &signer.verifying_key());
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(LedgerError::SignatureInvalid { .. })));
+}
+
+/// Test multiple valid signed events can be appended.
+#[test]
+fn tck_00265_multiple_signed_events() {
+    use crate::crypto::Signer;
+
+    let ledger = Ledger::in_memory().unwrap();
+    let signer = Signer::generate();
+
+    // Append multiple properly signed events
+    for i in 0u64..5 {
+        let payload = format!("payload-{i}").into_bytes();
+        let mut event = EventRecord::new("test.event", "session-1", "actor-1", payload.clone());
+
+        let signature =
+            crate::fac::sign_with_domain(&signer, crate::fac::LEDGER_EVENT_PREFIX, &payload);
+        event.signature = Some(signature.to_bytes().to_vec());
+
+        let result = ledger.append_verified(&event, &signer.verifying_key());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), i + 1);
+    }
+
+    // Verify all events were stored
+    let stats = ledger.stats().unwrap();
+    assert_eq!(stats.event_count, 5);
+}

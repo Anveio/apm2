@@ -77,6 +77,13 @@ pub enum LedgerError {
         details: String,
     },
 
+    /// Event is unsigned but signature is required.
+    #[error("unsigned event rejected: {details}")]
+    UnsignedEvent {
+        /// Details about why the event was rejected.
+        details: String,
+    },
+
     /// Crypto operation failed.
     #[error("crypto error: {0}")]
     Crypto(String),
@@ -886,6 +893,103 @@ impl SqliteLedgerBackend {
 
         // Append the event
         self.append(&event)
+    }
+
+    /// Appends an event to the ledger after verifying its signature.
+    ///
+    /// This method provides signature verification on ingestion per RFC-0017
+    /// DD-006. It rejects:
+    /// 1. Unsigned events (signature field is None or empty)
+    /// 2. Events with invalid signatures
+    ///
+    /// The signature is verified using domain separation with
+    /// `LEDGER_EVENT_PREFIX` to prevent cross-context replay attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event to append (must have signature field populated)
+    /// * `verifying_key` - The public key to verify the signature against
+    ///
+    /// # Returns
+    ///
+    /// The sequence ID assigned to the event.
+    ///
+    /// # Errors
+    ///
+    /// - `UnsignedEvent` if the event has no signature
+    /// - `SignatureInvalid` if the signature verification fails
+    /// - Other `LedgerError` variants for storage errors
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use apm2_core::crypto::Signer;
+    /// use apm2_core::fac::{LEDGER_EVENT_PREFIX, sign_with_domain};
+    /// use apm2_core::ledger::{EventRecord, Ledger};
+    ///
+    /// let ledger = Ledger::in_memory().unwrap();
+    /// let signer = Signer::generate();
+    ///
+    /// let mut event = EventRecord::new(
+    ///     "test.event",
+    ///     "session-1",
+    ///     "actor-1",
+    ///     b"payload".to_vec(),
+    /// );
+    ///
+    /// // Sign the payload with domain separation
+    /// let signature =
+    ///     sign_with_domain(&signer, LEDGER_EVENT_PREFIX, &event.payload);
+    /// event.signature = Some(signature.to_bytes().to_vec());
+    ///
+    /// // Append with signature verification
+    /// let seq_id = ledger
+    ///     .append_verified(&event, &signer.verifying_key())
+    ///     .unwrap();
+    /// ```
+    pub fn append_verified(
+        &self,
+        event: &EventRecord,
+        verifying_key: &crate::crypto::VerifyingKey,
+    ) -> Result<u64, LedgerError> {
+        // Check for unsigned event
+        let signature_bytes =
+            event
+                .signature
+                .as_ref()
+                .ok_or_else(|| LedgerError::UnsignedEvent {
+                    details: "event signature is missing".to_string(),
+                })?;
+
+        if signature_bytes.is_empty() {
+            return Err(LedgerError::UnsignedEvent {
+                details: "event signature is empty".to_string(),
+            });
+        }
+
+        // Parse the signature
+        let signature = crate::crypto::parse_signature(signature_bytes).map_err(|e| {
+            LedgerError::SignatureInvalid {
+                seq_id: 0,
+                details: format!("failed to parse signature: {e}"),
+            }
+        })?;
+
+        // Verify the signature using domain separation
+        // The signature is over LEDGER_EVENT_PREFIX || payload
+        crate::fac::verify_with_domain(
+            verifying_key,
+            crate::fac::LEDGER_EVENT_PREFIX,
+            &event.payload,
+            &signature,
+        )
+        .map_err(|_| LedgerError::SignatureInvalid {
+            seq_id: 0,
+            details: "signature verification failed".to_string(),
+        })?;
+
+        // Signature is valid, append the event
+        self.append(event)
     }
 
     /// Verifies a single event's hash and signature.
