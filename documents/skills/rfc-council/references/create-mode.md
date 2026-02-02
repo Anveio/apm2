@@ -47,8 +47,15 @@ decision_tree:
             - SA-2: Identify implementability risks and missing codebase knowledge.
             - SA-3: Identify trust boundary gaps and security unknowns.
 
-            Constraint: Each SA selects **5 strictly random reasoning modes** from modes-of-reasoning
-            (see COUNCIL_PROTOCOL.md Step 3: Stochastic Mode Selection for algorithm).
+            Constraint: Each SA selects **2 Anchor + 3 Random** modes.
+
+        - id: PHASE_2_5_TRANSCENDENTAL_ANCHOR
+          action: |
+            Perform **Mode 78 (Transcendental)** analysis on core PRD requirements:
+            1. ANCHOR: State the requirement as an "Accepted Fact" (e.g., "The system must support X").
+            2. QUESTION: Ask "What must be true in the existing architecture for X to be possible?"
+            3. DERIVE: Infer non-negotiable preconditions.
+            4. VALIDATE: If a precondition is missing in the current system, log it as a BLOCKER in 08_risks_and_open_questions.yaml.
 
         - id: PHASE_3_TICKET_CREATION
           condition: "mode is DECOMPOSE"

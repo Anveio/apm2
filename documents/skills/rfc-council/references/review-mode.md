@@ -23,13 +23,13 @@ decision_tree:
 
         - id: ITERATIVE_GATE_EXECUTION
           action: |
-            For each gate in the invariant order (1-7):
+            For each gate in the invariant order (1-9):
             1. Execute gate (TRUSTED -> DETERMINISTIC -> LLM-ASSISTED).
             2. If gate FAILS with BLOCKER/MAJOR findings:
-               a. PROPOSE_EDITS: Generate remediations (TICKET_REWRITTEN, DEPENDENCY_FIXED, etc.).
-               b. APPLY_EDITS: Modify tickets if substance test passes.
-               c. DELTA_QUALITY_CHECK: Verify fix is not PROSE_ONLY.
-               d. RE-RUN: Repeat gate check once to verify fix.
+               a. **Mode 59 (Dialectical)**: Define Thesis (Requirement) vs Antithesis (Constraint).
+               b. SYNTHESIZE: Generate a novel remediation that transcends the tension.
+               c. APPLY_EDITS: Modify tickets/RFC.
+               d. RE-RUN: Repeat gate check once to verify synthesis.
             3. Record final findings for the gate.
 
         - id: COMPUTE_DEPTH
