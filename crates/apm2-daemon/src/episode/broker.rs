@@ -37,8 +37,8 @@
 
 use std::sync::Arc;
 
-use apm2_core::context::ContextPackManifest;
 use apm2_core::context::firewall::{ContextAwareValidator, DefaultContextFirewall, FirewallMode};
+use apm2_core::context::ContextPackManifest;
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
