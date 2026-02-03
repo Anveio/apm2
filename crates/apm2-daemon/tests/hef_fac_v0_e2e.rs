@@ -42,13 +42,18 @@
 #![allow(clippy::items_after_statements)]
 
 use apm2_core::crypto::Signer;
-use apm2_core::events::CHANGESET_PUBLISHED_DOMAIN_PREFIX;
+use apm2_core::events::{
+    CHANGESET_PUBLISHED_DOMAIN_PREFIX,
+    // Ledger-specific domain prefixes for review events (distinct from FAC prefixes)
+    // to maintain domain separation per security review (SEC-CTRL-FAC-0012).
+    REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX,
+    REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX,
+};
 use apm2_core::fac::{
     ChangeKind, ChangeSetBundleV1, ChangeSetPublished, ChangeSetPublishedProto, FileChange,
-    GateReceiptBuilder, GitObjectRef, HashAlgo, REVIEW_BLOCKED_RECORDED_PREFIX,
-    REVIEW_RECEIPT_RECORDED_PREFIX, ReasonCode, ReviewArtifactBundleV1, ReviewBlockedRecorded,
-    ReviewBlockedRecordedProto, ReviewMetadata, ReviewReceiptRecorded, ReviewReceiptRecordedProto,
-    ReviewVerdict, sign_with_domain,
+    GateReceiptBuilder, GitObjectRef, HashAlgo, ReasonCode, ReviewArtifactBundleV1,
+    ReviewBlockedRecorded, ReviewBlockedRecordedProto, ReviewMetadata, ReviewReceiptRecorded,
+    ReviewReceiptRecordedProto, ReviewVerdict, sign_with_domain,
 };
 use apm2_core::htf::TimeEnvelopeRef;
 use apm2_core::ledger::{EventRecord, Ledger};
@@ -754,12 +759,15 @@ fn test_fac_v0_full_e2e_autonomous_flow() {
     );
 
     // Append ReviewReceiptRecorded to ledger (MAJOR-1 fix: ledger anchoring)
+    // Security: Use ledger-specific domain prefix
+    // (apm2.event.review_receipt_recorded:) NOT the FAC event prefix
+    // (REVIEW_RECEIPT_RECORDED:) to maintain domain separation.
     let review_proto: ReviewReceiptRecordedProto = review_receipt.clone().into();
     let review_payload = review_proto.encode_to_vec();
     let review_prev_hash = harness.ledger.last_event_hash().expect("ledger head");
     let review_ledger_sig = sign_with_domain(
         &harness.reviewer_signer,
-        REVIEW_RECEIPT_RECORDED_PREFIX,
+        REVIEW_RECEIPT_RECORDED_DOMAIN_PREFIX,
         &review_payload,
     );
 
@@ -982,12 +990,15 @@ fn test_fac_v0_e2e_blocked_path() {
 
     // Step 3: Append ReviewBlockedRecorded to ledger (MAJOR-1 fix: ledger
     // anchoring)
+    // Security: Use ledger-specific domain prefix
+    // (apm2.event.review_blocked_recorded:) NOT the FAC event prefix
+    // (REVIEW_BLOCKED_RECORDED:) to maintain domain separation.
     let blocked_proto: ReviewBlockedRecordedProto = blocked.clone().into();
     let blocked_payload = blocked_proto.encode_to_vec();
     let blocked_prev_hash = harness.ledger.last_event_hash().expect("ledger head");
     let blocked_ledger_sig = sign_with_domain(
         &harness.reviewer_signer,
-        REVIEW_BLOCKED_RECORDED_PREFIX,
+        REVIEW_BLOCKED_RECORDED_DOMAIN_PREFIX,
         &blocked_payload,
     );
 
@@ -1099,4 +1110,146 @@ fn test_wrong_key_verification_fails() {
             .is_err(),
         "Wrong key verification must fail"
     );
+}
+
+/// Test: Ledger rejects events signed with FAC domain prefixes.
+///
+/// This is a critical security test verifying domain separation between:
+/// 1. FAC event-level prefixes (e.g., `REVIEW_RECEIPT_RECORDED:`)
+/// 2. Ledger-level prefixes (e.g., `apm2.event.review_receipt_recorded:`)
+///
+/// The ledger must reject events signed with FAC prefixes because:
+/// - Accepting them would allow cross-context signature replay
+/// - An attacker could take a valid FAC event signature and use it to inject
+///   malformed payloads into the ledger
+///
+/// Security: SEC-CTRL-FAC-0012 (domain separation)
+#[test]
+fn test_ledger_rejects_fac_domain_prefix() {
+    use apm2_core::fac::REVIEW_RECEIPT_RECORDED_PREFIX as FAC_PREFIX;
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle();
+    let changeset_digest = bundle.changeset_digest();
+    let time_envelope_ref = harness.test_envelope_hash();
+
+    // Create a valid ReviewReceiptRecorded event
+    let review_bundle = create_test_review_artifact_bundle(changeset_digest, time_envelope_ref);
+    let review_bundle_hash = review_bundle.compute_cas_hash();
+
+    let receipt = ReviewReceiptRecorded::create(
+        "RR-fac-prefix-test".to_string(),
+        changeset_digest,
+        review_bundle_hash,
+        time_envelope_ref,
+        harness.reviewer_actor_id.clone(),
+        &harness.reviewer_signer,
+    )
+    .expect("create receipt");
+
+    // Sign for ledger with the WRONG prefix (FAC prefix instead of ledger prefix)
+    let proto: ReviewReceiptRecordedProto = receipt.into();
+    let payload = proto.encode_to_vec();
+    let prev_hash = harness.ledger.last_event_hash().expect("ledger head");
+
+    // Intentionally use FAC domain prefix (REVIEW_RECEIPT_RECORDED:)
+    // instead of ledger prefix (apm2.event.review_receipt_recorded:)
+    let wrong_sig = sign_with_domain(&harness.reviewer_signer, FAC_PREFIX, &payload);
+
+    let mut record = EventRecord::new(
+        "review_receipt_recorded",
+        "session-fac-prefix-test",
+        &harness.reviewer_actor_id,
+        payload,
+    );
+    record.prev_hash = Some(prev_hash);
+    record.signature = Some(wrong_sig.to_bytes().to_vec());
+
+    // The ledger MUST reject this because it uses the ledger domain prefix
+    // (apm2.event.review_receipt_recorded:) for verification, not the FAC prefix
+    let result = harness
+        .ledger
+        .append_verified(&record, &harness.reviewer_signer.verifying_key());
+
+    assert!(
+        result.is_err(),
+        "Ledger must reject events signed with FAC domain prefix. \
+         This is a critical security check for domain separation."
+    );
+
+    // Verify the error is specifically a signature verification failure
+    match result {
+        Err(apm2_core::ledger::LedgerError::SignatureInvalid { details, .. }) => {
+            assert!(
+                details.contains("signature verification failed"),
+                "Expected signature verification failure, got: {details}"
+            );
+        },
+        Err(other) => panic!("Expected SignatureInvalid error, got: {other:?}"),
+        Ok(_) => panic!("Ledger incorrectly accepted event with FAC domain prefix"),
+    }
+
+    println!("[SECURITY] Ledger correctly rejected FAC domain prefix");
+    println!("  - FAC prefix: REVIEW_RECEIPT_RECORDED:");
+    println!("  - Ledger prefix: apm2.event.review_receipt_recorded:");
+    println!("  [OK] Domain separation enforced");
+}
+
+/// Test: Ledger rejects `ReviewBlockedRecorded` signed with FAC prefix.
+///
+/// Same as above but for the blocked path.
+#[test]
+fn test_ledger_rejects_fac_blocked_prefix() {
+    use apm2_core::fac::REVIEW_BLOCKED_RECORDED_PREFIX as FAC_PREFIX;
+
+    let harness = FacV0TestHarness::new();
+    let bundle = create_test_changeset_bundle();
+    let changeset_digest = bundle.changeset_digest();
+    let time_envelope_ref = harness.test_envelope_hash();
+
+    // Create a valid ReviewBlockedRecorded event
+    let blocked_logs = b"test blocked logs";
+    let logs_result = harness.cas.store(blocked_logs).expect("CAS store");
+
+    let blocked = ReviewBlockedRecorded::create(
+        "RB-fac-prefix-test".to_string(),
+        changeset_digest,
+        ReasonCode::ApplyFailed,
+        logs_result.hash,
+        time_envelope_ref,
+        harness.reviewer_actor_id.clone(),
+        &harness.reviewer_signer,
+    )
+    .expect("create blocked");
+
+    // Sign for ledger with the WRONG prefix (FAC prefix instead of ledger prefix)
+    let proto: ReviewBlockedRecordedProto = blocked.into();
+    let payload = proto.encode_to_vec();
+    let prev_hash = harness.ledger.last_event_hash().expect("ledger head");
+
+    // Intentionally use FAC domain prefix (REVIEW_BLOCKED_RECORDED:)
+    // instead of ledger prefix (apm2.event.review_blocked_recorded:)
+    let wrong_sig = sign_with_domain(&harness.reviewer_signer, FAC_PREFIX, &payload);
+
+    let mut record = EventRecord::new(
+        "review_blocked_recorded",
+        "session-fac-prefix-test",
+        &harness.reviewer_actor_id,
+        payload,
+    );
+    record.prev_hash = Some(prev_hash);
+    record.signature = Some(wrong_sig.to_bytes().to_vec());
+
+    // The ledger MUST reject this
+    let result = harness
+        .ledger
+        .append_verified(&record, &harness.reviewer_signer.verifying_key());
+
+    assert!(
+        result.is_err(),
+        "Ledger must reject ReviewBlockedRecorded signed with FAC domain prefix"
+    );
+
+    println!("[SECURITY] Ledger correctly rejected FAC blocked prefix");
+    println!("  [OK] Domain separation enforced for ReviewBlocked");
 }
