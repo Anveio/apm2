@@ -30,6 +30,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use apm2_core::determinism::canonicalize_json;
 use bytes::Bytes;
 use prost::Message;
 use subtle::ConstantTimeEq;
@@ -534,7 +535,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build canonical payload (deterministic JSON with actual event data)
+        // Build payload as JSON with actual event type and hex-encoded payload
         let payload_json = serde_json::json!({
             "event_type": event_type,
             "session_id": session_id,
@@ -542,12 +543,19 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "payload": hex::encode(payload),
         });
 
-        let payload_bytes =
-            serde_json::to_vec(&payload_json).map_err(|e| LedgerEventError::SigningFailed {
-                message: format!("payload serialization failed: {e}"),
+        // MAJOR 1 FIX (TCK-00290): Use JCS (RFC 8785) canonicalization for signing.
+        // This matches the production SqliteLedgerEventEmitter and ensures
+        // deterministic JSON representation per RFC-0016. Using
+        // serde_json::to_vec is non-deterministic because it does not guarantee
+        // key ordering.
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
             })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
 
-        // Build canonical bytes for signing (domain prefix + payload)
+        // Build canonical bytes for signing (domain prefix + JCS payload)
         let mut canonical_bytes =
             Vec::with_capacity(SESSION_EVENT_DOMAIN_PREFIX.len() + payload_bytes.len());
         canonical_bytes.extend_from_slice(SESSION_EVENT_DOMAIN_PREFIX);

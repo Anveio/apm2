@@ -27,6 +27,7 @@ use apm2_daemon::episode::executor::ContentAddressedStore;
 use apm2_daemon::episode::{
     Capability, CapabilityManifestBuilder, CapabilityScope, RiskTier, ToolClass,
 };
+use apm2_daemon::htf::{ClockConfig, HolonicClock};
 use apm2_daemon::protocol::LedgerEventEmitter;
 use apm2_daemon::protocol::credentials::PeerCredentials;
 use apm2_daemon::protocol::dispatch::{ConnectionContext, StubLedgerEventEmitter};
@@ -67,6 +68,14 @@ fn make_session_ctx() -> ConnectionContext {
         }),
         Some("session-001".to_string()),
     )
+}
+
+/// Creates a test clock for session dispatcher tests.
+///
+/// Per TCK-00290 MAJOR 2 FIX, the session dispatcher now fails-closed when
+/// no clock is configured. Tests that use `EmitEvent` must configure a clock.
+fn test_clock() -> Arc<HolonicClock> {
+    Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("failed to create test clock"))
 }
 
 fn make_test_manifest(tools: Vec<ToolClass>) -> apm2_daemon::episode::CapabilityManifest {
@@ -261,9 +270,11 @@ fn session_event_evidence_persist_emit_event_success() {
     let minter = test_minter();
     let store = Arc::new(InMemoryManifestStore::new());
     let ledger = Arc::new(StubLedgerEventEmitter::new());
+    let clock = test_clock();
 
-    let dispatcher =
-        SessionDispatcher::with_manifest_store(minter.clone(), store).with_ledger(ledger.clone());
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_ledger(ledger.clone())
+        .with_clock(clock);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -487,13 +498,15 @@ fn session_event_evidence_persist_full_config_integration() {
     let ledger = Arc::new(StubLedgerEventEmitter::new());
     let cas_config = DurableCasConfig::new(temp_dir.path());
     let cas: Arc<dyn ContentAddressedStore> = Arc::new(DurableCas::new(cas_config).unwrap());
+    let clock = test_clock();
 
     // Register manifest
     let manifest = make_test_manifest(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute]);
     store.register("session-001", manifest);
 
-    // Create fully-configured dispatcher
-    let dispatcher = SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas);
+    // Create fully-configured dispatcher with clock
+    let dispatcher =
+        SessionDispatcher::with_all_stores(minter.clone(), store, ledger, cas).with_clock(clock);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 
@@ -568,9 +581,11 @@ fn session_event_evidence_persist_emit_event_sequence_monotonic() {
     let minter = test_minter();
     let store = Arc::new(InMemoryManifestStore::new());
     let ledger = Arc::new(StubLedgerEventEmitter::new());
+    let clock = test_clock();
 
-    let dispatcher =
-        SessionDispatcher::with_manifest_store(minter.clone(), store).with_ledger(ledger);
+    let dispatcher = SessionDispatcher::with_manifest_store(minter.clone(), store)
+        .with_ledger(ledger)
+        .with_clock(clock);
     let ctx = make_session_ctx();
     let token = test_token(&minter);
 

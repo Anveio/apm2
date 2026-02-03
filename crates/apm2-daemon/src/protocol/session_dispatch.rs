@@ -666,12 +666,45 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
             // Build BrokerToolRequest
             let request_id = format!("REQ-{}", uuid::Uuid::new_v4());
-            let episode_id = EpisodeId::new(&token.session_id).unwrap_or_else(|_| {
-                // Fallback to a default episode ID if session_id is invalid
-                EpisodeId::new("session-episode").expect("default episode id")
-            });
+
+            // BLOCKER 1 FIX (TCK-00290): Fail-closed if session ID is not valid for
+            // EpisodeId. Per SEC-CTRL-FAC-0015, we must not use a hardcoded
+            // fallback that could cause cross-session ID collision. Return
+            // SESSION_ERROR_INVALID instead.
+            let episode_id = match EpisodeId::new(&token.session_id) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        session_id = %token.session_id,
+                        error = %e,
+                        "Session ID not valid for EpisodeId (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInvalid,
+                        format!("session ID not valid for episode: {e}"),
+                    ));
+                },
+            };
+
             let dedupe_key = DedupeKey::new(&request.dedupe_key);
             let args_hash = *blake3::hash(&request.arguments).as_bytes();
+
+            // BLOCKER 2 FIX (TCK-00290): Derive risk tier from capability manifest.
+            // Per the security review, we must not hardcode Tier0. Get the risk tier
+            // from the manifest's capability for this tool class, or default to Tier0
+            // if no specific tier is configured (fail-open for tier, fail-closed for
+            // access).
+            let risk_tier = self
+                .manifest_store
+                .as_ref()
+                .and_then(|store| store.get_manifest(&token.session_id))
+                .and_then(|manifest| {
+                    manifest
+                        .find_by_tool_class(tool_class)
+                        .next()
+                        .map(|cap| cap.risk_tier_required)
+                })
+                .unwrap_or(RiskTier::Tier0);
 
             let broker_request = BrokerToolRequest::new(
                 &request_id,
@@ -679,7 +712,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 tool_class,
                 dedupe_key,
                 args_hash,
-                RiskTier::Tier0, // Default risk tier
+                risk_tier,
             )
             .with_inline_args(request.arguments);
 
@@ -843,32 +876,38 @@ impl<M: ManifestStore> SessionDispatcher<M> {
 
     /// Gets an HTF-compliant monotonic timestamp.
     ///
-    /// # TCK-00290 BLOCKER 3: Time Monotonicity
+    /// # TCK-00290 MAJOR 2 FIX: Time Monotonicity
     ///
-    /// Per RFC-0016, timestamps must come from `HolonicClock` for monotonicity.
-    /// Using `SystemTime::now()` directly violates time monotonicity
-    /// guarantees.
+    /// Per RFC-0016 and SEC-CTRL-FAC-0015, timestamps must come from
+    /// `HolonicClock` for monotonicity. Using `SystemTime::now()` as a
+    /// fallback violates time monotonicity guarantees and creates a
+    /// security vulnerability.
     ///
     /// # Errors
     ///
     /// Returns an error if the clock is not configured or fails (fail-closed).
-    #[allow(clippy::option_if_let_else)]
+    /// Per SEC-CTRL-FAC-0015, we must fail-closed when the clock is required
+    /// rather than falling back to an insecure `SystemTime::now()`.
+    #[allow(clippy::option_if_let_else, clippy::single_match_else)]
     fn get_htf_timestamp(&self) -> ProtocolResult<u64> {
-        if let Some(ref clock) = self.clock {
-            clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
+        // Using match here for clarity - the error paths have important security
+        // comments that would be less readable with map_or_else or if let/else.
+        match &self.clock {
+            Some(clock) => clock.now_hlc().map(|hlc| hlc.wall_ns).map_err(|e| {
                 error!("HolonicClock failed: {}", e);
                 ProtocolError::Serialization {
                     reason: format!("clock failure: {e}"),
                 }
-            })
-        } else {
-            // Fallback to SystemTime if clock not configured (for backwards compatibility)
-            // This is not ideal but allows tests to pass without full clock setup
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0))
+            }),
+            None => {
+                // MAJOR 2 FIX (TCK-00290): Fail-closed when clock is not configured.
+                // Per SEC-CTRL-FAC-0015, we must not fall back to SystemTime::now()
+                // as this violates time monotonicity guarantees.
+                error!("HolonicClock not configured (fail-closed per SEC-CTRL-FAC-0015)");
+                Err(ProtocolError::Serialization {
+                    reason: "holonic clock not configured (fail-closed)".to_string(),
+                })
+            },
         }
     }
 
