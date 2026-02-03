@@ -451,8 +451,9 @@ pub struct ToolBroker<L: ManifestLoader = super::capability::StubManifestLoader>
     /// Content-addressed store for evidence artifacts (TCK-00293).
     ///
     /// Per RFC-0018 HEF requirements, the CAS stores artifacts durably with
-    /// content addressing. In production, this should be a `DurableCas` instance.
-    /// For tests, `StubContentAddressedStore` provides an in-memory fallback.
+    /// content addressing. In production, this should be a `DurableCas`
+    /// instance. For tests, `StubContentAddressedStore` provides an
+    /// in-memory fallback.
     #[allow(dead_code)]
     cas: Arc<dyn ContentAddressedStore>,
 
@@ -3465,10 +3466,10 @@ mod tests {
             PolicyDecision::Deny { rule_id, reason } => {
                 assert_eq!(rule_id, NO_POLICY_RULE_ID);
                 assert!(reason.contains("No policy configured"));
-            }
+            },
             PolicyDecision::Allow { .. } => {
                 panic!("Request should be denied when no policy is configured");
-            }
+            },
         }
     }
 
@@ -3503,10 +3504,10 @@ policy:
             PolicyDecision::Allow { rule_id } => {
                 assert!(rule_id.is_some());
                 assert_eq!(rule_id.unwrap(), "allow-workspace-read");
-            }
+            },
             PolicyDecision::Deny { .. } => {
                 panic!("Request should be allowed by policy");
-            }
+            },
         }
     }
 
@@ -3558,7 +3559,8 @@ policy:
         let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
         let expected_hash = loaded.content_hash;
 
-        let mut broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let mut broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
         broker.set_policy(&loaded);
 
         let manifest = make_manifest(vec![make_read_capability(
@@ -3568,16 +3570,19 @@ policy:
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let decision = broker.request(&request, timestamp_ns(0), None).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         match decision {
             ToolDecision::Allow { policy_hash, .. } => {
                 assert_eq!(policy_hash, expected_hash);
-            }
+            },
             ToolDecision::Deny { policy_hash, .. } => {
                 assert_eq!(policy_hash, expected_hash);
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 
@@ -3601,8 +3606,8 @@ policy:
 
         let loaded = LoadedPolicy::from_yaml(policy_yaml).unwrap();
 
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default())
-            .with_policy(&loaded);
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default()).with_policy(&loaded);
 
         let manifest = make_manifest(vec![make_read_capability(
             "cap-read",
@@ -3611,11 +3616,17 @@ policy:
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         let allowed_request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let allowed_decision = broker.request(&allowed_request, timestamp_ns(0), None).await.unwrap();
+        let allowed_decision = broker
+            .request(&allowed_request, timestamp_ns(0), None)
+            .await
+            .unwrap();
         assert!(allowed_decision.is_allowed());
 
         let outside_request = make_request("req-2", ToolClass::Read, Some("/etc/passwd"));
-        let outside_decision = broker.request(&outside_request, timestamp_ns(1), None).await.unwrap();
+        let outside_decision = broker
+            .request(&outside_request, timestamp_ns(1), None)
+            .await
+            .unwrap();
         assert!(outside_decision.is_denied());
     }
 
@@ -3631,10 +3642,16 @@ policy:
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let decision = broker.request(&request, timestamp_ns(0), None).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         assert!(decision.is_denied());
-        if let ToolDecision::Deny { reason, rule_id, .. } = decision {
+        if let ToolDecision::Deny {
+            reason, rule_id, ..
+        } = decision
+        {
             assert_eq!(rule_id, Some(NO_POLICY_RULE_ID.to_string()));
             assert!(matches!(reason, DenyReason::PolicyDenied { .. }));
         }
@@ -3644,7 +3661,8 @@ policy:
     async fn tool_broker_policy_engine_has_policy_methods() {
         use apm2_core::policy::LoadedPolicy;
 
-        let mut broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default());
+        let mut broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default());
 
         assert!(!broker.has_policy());
 
@@ -3670,8 +3688,9 @@ policy:
 
     #[tokio::test]
     async fn tool_broker_policy_engine_with_policy_arc() {
-        use apm2_core::policy::LoadedPolicy;
         use std::sync::Arc;
+
+        use apm2_core::policy::LoadedPolicy;
 
         let policy_yaml = r#"
 policy:
@@ -3690,8 +3709,8 @@ policy:
         let loaded = Arc::new(LoadedPolicy::from_yaml(policy_yaml).unwrap());
         let expected_hash = loaded.content_hash;
 
-        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(ToolBrokerConfig::default())
-            .with_policy_arc(Arc::clone(&loaded));
+        let broker: ToolBroker<StubManifestLoader> =
+            ToolBroker::new(ToolBrokerConfig::default()).with_policy_arc(Arc::clone(&loaded));
 
         assert!(broker.has_policy());
 
@@ -3702,7 +3721,10 @@ policy:
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         let request = make_request("req-1", ToolClass::Read, Some("/workspace/file.rs"));
-        let decision = broker.request(&request, timestamp_ns(0), None).await.unwrap();
+        let decision = broker
+            .request(&request, timestamp_ns(0), None)
+            .await
+            .unwrap();
 
         if let ToolDecision::Allow { policy_hash, .. } = decision {
             assert_eq!(policy_hash, expected_hash);

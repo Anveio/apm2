@@ -498,7 +498,7 @@ impl BrokerToolRequest {
             ToolClass::Inference => Some(tool_request::Tool::Inference(InferenceCall {
                 provider: String::new(),
                 model: String::new(),
-                prompt_hash: Vec::new(),
+                prompt_hash: self.args_hash.to_vec(),
                 max_tokens: 0,
                 temperature_scaled: 0,
                 system_prompt_hash: Vec::new(),
