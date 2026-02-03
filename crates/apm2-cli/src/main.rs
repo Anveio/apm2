@@ -14,6 +14,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 mod client;
 mod commands;
+mod exit_codes;
 
 /// apm2 - AI CLI Process Manager
 #[derive(Parser, Debug)]
@@ -139,6 +140,14 @@ enum Commands {
     // === Event operations (TCK-00288) ===
     /// Event commands (emit events to ledger via session socket)
     Event(commands::event::EventCommand),
+
+    // === Capability operations (TCK-00288) ===
+    /// Capability commands (issue capabilities to sessions via operator socket)
+    Capability(commands::capability::CapabilityCommand),
+
+    // === Evidence operations (TCK-00288) ===
+    /// Evidence commands (publish evidence artifacts via session socket)
+    Evidence(commands::evidence::EvidenceCommand),
 
     // === Factory (Agent) orchestration ===
     /// Factory commands (runs Markdown specs)
@@ -356,11 +365,11 @@ fn main() -> Result<()> {
             std::process::exit(i32::from(exit_code));
         },
         Commands::Episode(episode_cmd) => {
-            // Episode commands use specific exit codes per TCK-00174:
-            // 0=success, 1=error, 2=episode_not_found
+            // Episode commands use RFC-0018 exit codes.
             // We use std::process::exit to bypass anyhow Result handling
             // and ensure precise exit codes are returned.
-            let exit_code = commands::episode::run_episode(&episode_cmd, &socket_path);
+            let exit_code =
+                commands::episode::run_episode(&episode_cmd, &operator_socket, &session_socket);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Consensus(consensus_cmd) => {
@@ -387,6 +396,18 @@ fn main() -> Result<()> {
             // Event commands use session_socket for session-scoped EmitEvent operation.
             // Exit codes: 0=success, 1=error
             let exit_code = commands::event::run_event(&event_cmd, &session_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Capability(capability_cmd) => {
+            // Capability commands use operator_socket for privileged IssueCapability
+            // operation. Exit codes per RFC-0018.
+            let exit_code = commands::capability::run_capability(&capability_cmd, &operator_socket);
+            std::process::exit(i32::from(exit_code));
+        },
+        Commands::Evidence(evidence_cmd) => {
+            // Evidence commands use session_socket for session-scoped PublishEvidence
+            // operation. Exit codes per RFC-0018.
+            let exit_code = commands::evidence::run_evidence(&evidence_cmd, &session_socket);
             std::process::exit(i32::from(exit_code));
         },
         Commands::Factory(cmd) => match cmd {

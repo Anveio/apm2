@@ -7,16 +7,22 @@
 //!
 //! - `apm2 work claim --actor-id <id> --role <role>` - Claim work from the
 //!   queue
+//! - `apm2 work status --work-id <id>` - Query work status
 //!
 //! # Protocol
 //!
 //! Uses `OperatorClient` for privileged operations via operator.sock.
 //! All communication uses tag-based protobuf framing per DD-009 and RFC-0017.
 //!
-//! # Exit Codes
+//! # Exit Codes (RFC-0018)
 //!
 //! - 0: Success
-//! - 1: Error (daemon connection, validation, etc.)
+//! - 10: Validation error
+//! - 11: Permission denied
+//! - 12: Not found
+//! - 20: Daemon unavailable
+//! - 21: Protocol error
+//! - 22: Policy deny
 
 use std::path::Path;
 
@@ -25,14 +31,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::client::protocol::{OperatorClient, ProtocolClientError};
-
-/// Exit codes for work commands.
-pub mod exit_codes {
-    /// Success exit code.
-    pub const SUCCESS: u8 = 0;
-    /// General error exit code.
-    pub const ERROR: u8 = 1;
-}
+use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 /// Work command group.
 #[derive(Debug, Args)]
@@ -53,6 +52,12 @@ pub enum WorkSubcommand {
     /// Requests a work assignment with policy-resolved capabilities.
     /// The daemon validates the credential signature and returns work details.
     Claim(ClaimArgs),
+
+    /// Query work status (TCK-00288).
+    ///
+    /// Returns the current status of a work item including assigned
+    /// actor, role, and associated session information.
+    Status(StatusArgs),
 }
 
 /// Role for work claiming.
@@ -113,6 +118,14 @@ pub struct ClaimArgs {
     pub nonce: Option<String>,
 }
 
+/// Arguments for `apm2 work status`.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Work identifier to query.
+    #[arg(long, required = true)]
+    pub work_id: String,
+}
+
 // ============================================================================
 // Response Types for JSON output
 // ============================================================================
@@ -131,6 +144,28 @@ pub struct ClaimResponse {
     pub policy_resolved_ref: String,
     /// Blake3 hash of the sealed context pack (hex-encoded).
     pub context_pack_hash: String,
+}
+
+/// Response for work status command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusResponse {
+    /// Work identifier.
+    pub work_id: String,
+    /// Current work status.
+    pub status: String,
+    /// Actor who claimed this work (if claimed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// Role of the actor (if claimed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Associated session ID (if spawned).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Lease ID (if claimed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
 }
 
 /// Error response for JSON output.
@@ -153,6 +188,7 @@ pub fn run_work(cmd: &WorkCommand, socket_path: &Path) -> u8 {
 
     match &cmd.subcommand {
         WorkSubcommand::Claim(args) => run_claim(args, socket_path, json_output),
+        WorkSubcommand::Status(args) => run_status(args, socket_path, json_output),
     }
 }
 
@@ -164,7 +200,7 @@ fn run_claim(args: &ClaimArgs, socket_path: &Path, json_output: bool) -> u8 {
             json_output,
             "invalid_actor_id",
             "Actor ID cannot be empty",
-            exit_codes::ERROR,
+            exit_codes::VALIDATION_ERROR,
         );
     }
 
@@ -177,7 +213,7 @@ fn run_claim(args: &ClaimArgs, socket_path: &Path, json_output: bool) -> u8 {
                     json_output,
                     "invalid_signature",
                     &format!("Invalid signature hex: {e}"),
-                    exit_codes::ERROR,
+                    exit_codes::VALIDATION_ERROR,
                 );
             },
         },
@@ -193,7 +229,7 @@ fn run_claim(args: &ClaimArgs, socket_path: &Path, json_output: bool) -> u8 {
                     json_output,
                     "invalid_nonce",
                     &format!("Invalid nonce hex: {e}"),
-                    exit_codes::ERROR,
+                    exit_codes::VALIDATION_ERROR,
                 );
             },
         },
@@ -211,7 +247,7 @@ fn run_claim(args: &ClaimArgs, socket_path: &Path, json_output: bool) -> u8 {
                 json_output,
                 "runtime_error",
                 &format!("Failed to build tokio runtime: {e}"),
-                exit_codes::ERROR,
+                exit_codes::GENERIC_ERROR,
             );
         },
     };
@@ -264,6 +300,49 @@ fn run_claim(args: &ClaimArgs, socket_path: &Path, json_output: bool) -> u8 {
     }
 }
 
+/// Execute the status command.
+///
+/// Note: Work status query is not yet implemented in the protocol layer.
+/// This command returns a stub response indicating the feature is pending.
+fn run_status(args: &StatusArgs, _socket_path: &Path, json_output: bool) -> u8 {
+    // Validate work ID
+    if args.work_id.is_empty() {
+        return output_error(
+            json_output,
+            "invalid_work_id",
+            "Work ID cannot be empty",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    // TODO(TCK-00288): Implement work status query via OperatorClient.
+    // The protocol layer does not yet have a QueryWorkStatus message.
+    // For now, return a stub response.
+    let status_response = StatusResponse {
+        work_id: args.work_id.clone(),
+        status: "PENDING_PROTOCOL_SUPPORT".to_string(),
+        actor_id: None,
+        role: None,
+        session_id: None,
+        lease_id: None,
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_response).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("Work Status");
+        println!("  Work ID:  {}", status_response.work_id);
+        println!("  Status:   {}", status_response.status);
+        println!();
+        println!("Note: Work status query requires protocol support (pending).");
+    }
+
+    exit_codes::SUCCESS
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -285,73 +364,45 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
     exit_code
 }
 
-/// Handles protocol client errors and returns appropriate exit code.
+/// Handles protocol client errors and returns appropriate exit code (RFC-0018).
 fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
-    match error {
-        ProtocolClientError::DaemonNotRunning => output_error(
-            json_output,
-            "daemon_not_running",
-            "Daemon is not running. Start with: apm2 daemon",
-            exit_codes::ERROR,
+    let exit_code = map_protocol_error(error);
+    let (code, message) = match error {
+        ProtocolClientError::DaemonNotRunning => (
+            "daemon_not_running".to_string(),
+            "Daemon is not running. Start with: apm2 daemon".to_string(),
         ),
-        ProtocolClientError::ConnectionFailed(msg) => output_error(
-            json_output,
-            "connection_failed",
-            &format!("Failed to connect to daemon: {msg}"),
-            exit_codes::ERROR,
+        ProtocolClientError::ConnectionFailed(msg) => (
+            "connection_failed".to_string(),
+            format!("Failed to connect to daemon: {msg}"),
         ),
-        ProtocolClientError::HandshakeFailed(msg) => output_error(
-            json_output,
-            "handshake_failed",
-            &format!("Protocol handshake failed: {msg}"),
-            exit_codes::ERROR,
+        ProtocolClientError::HandshakeFailed(msg) => (
+            "handshake_failed".to_string(),
+            format!("Protocol handshake failed: {msg}"),
         ),
-        ProtocolClientError::VersionMismatch { client, server } => output_error(
-            json_output,
-            "version_mismatch",
-            &format!("Protocol version mismatch: client {client}, server {server}"),
-            exit_codes::ERROR,
+        ProtocolClientError::VersionMismatch { client, server } => (
+            "version_mismatch".to_string(),
+            format!("Protocol version mismatch: client {client}, server {server}"),
         ),
-        ProtocolClientError::DaemonError { code, message } => {
-            output_error(json_output, code, message, exit_codes::ERROR)
+        ProtocolClientError::DaemonError { code, message } => (code.clone(), message.clone()),
+        ProtocolClientError::IoError(e) => ("io_error".to_string(), format!("I/O error: {e}")),
+        ProtocolClientError::ProtocolError(e) => {
+            ("protocol_error".to_string(), format!("Protocol error: {e}"))
         },
-        ProtocolClientError::IoError(e) => output_error(
-            json_output,
-            "io_error",
-            &format!("I/O error: {e}"),
-            exit_codes::ERROR,
+        ProtocolClientError::DecodeError(msg) => {
+            ("decode_error".to_string(), format!("Decode error: {msg}"))
+        },
+        ProtocolClientError::UnexpectedResponse(msg) => (
+            "unexpected_response".to_string(),
+            format!("Unexpected response: {msg}"),
         ),
-        ProtocolClientError::ProtocolError(e) => output_error(
-            json_output,
-            "protocol_error",
-            &format!("Protocol error: {e}"),
-            exit_codes::ERROR,
+        ProtocolClientError::Timeout => ("timeout".to_string(), "Operation timed out".to_string()),
+        ProtocolClientError::FrameTooLarge { size, max } => (
+            "frame_too_large".to_string(),
+            format!("Frame too large: {size} bytes (max: {max})"),
         ),
-        ProtocolClientError::DecodeError(msg) => output_error(
-            json_output,
-            "decode_error",
-            &format!("Decode error: {msg}"),
-            exit_codes::ERROR,
-        ),
-        ProtocolClientError::UnexpectedResponse(msg) => output_error(
-            json_output,
-            "unexpected_response",
-            &format!("Unexpected response: {msg}"),
-            exit_codes::ERROR,
-        ),
-        ProtocolClientError::Timeout => output_error(
-            json_output,
-            "timeout",
-            "Operation timed out",
-            exit_codes::ERROR,
-        ),
-        ProtocolClientError::FrameTooLarge { size, max } => output_error(
-            json_output,
-            "frame_too_large",
-            &format!("Frame too large: {size} bytes (max: {max})"),
-            exit_codes::ERROR,
-        ),
-    }
+    };
+    output_error(json_output, &code, &message, exit_code)
 }
 
 #[cfg(test)]
@@ -392,6 +443,22 @@ mod tests {
         assert_eq!(restored.work_id, "work-123");
     }
 
+    #[test]
+    fn test_status_response_serialization() {
+        let response = StatusResponse {
+            work_id: "work-123".to_string(),
+            status: "CLAIMED".to_string(),
+            actor_id: Some("actor-1".to_string()),
+            role: Some("implementer".to_string()),
+            session_id: None,
+            lease_id: Some("lease-1".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("work-123"));
+        assert!(!json.contains("session_id")); // Should be skipped when None
+    }
+
     /// SECURITY TEST: Verify responses reject unknown fields.
     #[test]
     fn test_claim_response_rejects_unknown_fields() {
@@ -408,6 +475,22 @@ mod tests {
         assert!(
             result.is_err(),
             "ClaimResponse should reject unknown fields"
+        );
+    }
+
+    /// SECURITY TEST: Verify status responses reject unknown fields.
+    #[test]
+    fn test_status_response_rejects_unknown_fields() {
+        let json = r#"{
+            "work_id": "work-1",
+            "status": "CLAIMED",
+            "malicious": "value"
+        }"#;
+
+        let result: Result<StatusResponse, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "StatusResponse should reject unknown fields"
         );
     }
 }

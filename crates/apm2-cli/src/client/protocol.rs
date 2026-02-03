@@ -35,6 +35,8 @@ use std::time::Duration;
 use apm2_daemon::protocol::{
     // Message decoding
     BoundedDecode,
+    // Capability request
+    CapabilityRequest,
     // Privileged endpoint messages
     ClaimWorkRequest,
     ClaimWorkResponse,
@@ -46,11 +48,16 @@ use apm2_daemon::protocol::{
     // Framing
     FrameCodec,
     HandshakeMessage,
+    IssueCapabilityRequest,
+    IssueCapabilityResponse,
     PrivilegedError,
     PrivilegedErrorCode,
     PrivilegedMessageType,
     // Error types
     ProtocolError,
+    // Evidence publishing
+    PublishEvidenceRequest,
+    PublishEvidenceResponse,
     // Session endpoint messages
     RequestToolRequest,
     RequestToolResponse,
@@ -65,6 +72,8 @@ use apm2_daemon::protocol::{
     WorkRole,
     encode_claim_work_request,
     encode_emit_event_request,
+    encode_issue_capability_request,
+    encode_publish_evidence_request,
     encode_request_tool_request,
     encode_shutdown_request,
     encode_spawn_episode_request,
@@ -505,6 +514,87 @@ impl OperatorClient {
         SpawnEpisodeResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
+
+    /// Issues a capability to a session.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - Target session identifier
+    /// * `tool_class` - Tool class to grant access to
+    /// * `read_patterns` - Path patterns for read access
+    /// * `write_patterns` - Path patterns for write access
+    /// * `duration_secs` - Duration in seconds for the capability grant
+    pub async fn issue_capability(
+        &mut self,
+        session_id: &str,
+        tool_class: &str,
+        read_patterns: &[String],
+        write_patterns: &[String],
+        duration_secs: u64,
+    ) -> Result<IssueCapabilityResponse, ProtocolClientError> {
+        let request = IssueCapabilityRequest {
+            session_id: session_id.to_string(),
+            capability_request: Some(CapabilityRequest {
+                tool_class: tool_class.to_string(),
+                read_patterns: read_patterns.to_vec(),
+                write_patterns: write_patterns.to_vec(),
+                duration_secs,
+            }),
+        };
+        let request_bytes = encode_issue_capability_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_issue_capability_response(&response_frame)
+    }
+
+    /// Decodes an `IssueCapability` response.
+    fn decode_issue_capability_response(
+        frame: &Bytes,
+    ) -> Result<IssueCapabilityResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = PrivilegedError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = PrivilegedErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != PrivilegedMessageType::IssueCapability.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected IssueCapability response (tag {}), got tag {tag}",
+                PrivilegedMessageType::IssueCapability.tag()
+            )));
+        }
+
+        IssueCapabilityResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
 }
 
 // ============================================================================
@@ -722,6 +812,82 @@ impl SessionClient {
         }
 
         EmitEventResponse::decode_bounded(payload, &DecodeConfig::default())
+            .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
+    }
+
+    /// Publishes evidence artifact to content-addressed storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_token` - Session token for authentication
+    /// * `artifact` - Binary artifact content
+    /// * `kind` - Evidence kind for categorization
+    /// * `retention_hint` - Retention hint for storage policy
+    pub async fn publish_evidence(
+        &mut self,
+        session_token: &str,
+        artifact: &[u8],
+        kind: i32,
+        retention_hint: i32,
+    ) -> Result<PublishEvidenceResponse, ProtocolClientError> {
+        let request = PublishEvidenceRequest {
+            session_token: session_token.to_string(),
+            artifact: artifact.to_vec(),
+            kind,
+            retention_hint,
+        };
+        let request_bytes = encode_publish_evidence_request(&request);
+
+        // Send request
+        tokio::time::timeout(self.timeout, self.framed.send(request_bytes))
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Receive response
+        let response_frame = tokio::time::timeout(self.timeout, self.framed.next())
+            .await
+            .map_err(|_| ProtocolClientError::Timeout)?
+            .ok_or_else(|| {
+                ProtocolClientError::UnexpectedResponse("connection closed".to_string())
+            })?
+            .map_err(|e| ProtocolClientError::IoError(io::Error::other(e.to_string())))?;
+
+        // Decode response
+        Self::decode_publish_evidence_response(&response_frame)
+    }
+
+    /// Decodes a `PublishEvidence` response.
+    fn decode_publish_evidence_response(
+        frame: &Bytes,
+    ) -> Result<PublishEvidenceResponse, ProtocolClientError> {
+        if frame.is_empty() {
+            return Err(ProtocolClientError::DecodeError("empty frame".to_string()));
+        }
+
+        let tag = frame[0];
+        let payload = &frame[1..];
+
+        if tag == 0 {
+            // Error response
+            let err = SessionError::decode_bounded(payload, &DecodeConfig::default())
+                .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))?;
+            let code = SessionErrorCode::try_from(err.code)
+                .map_or_else(|_| err.code.to_string(), |c| format!("{c:?}"));
+            return Err(ProtocolClientError::DaemonError {
+                code,
+                message: err.message,
+            });
+        }
+
+        if tag != SessionMessageType::PublishEvidence.tag() {
+            return Err(ProtocolClientError::UnexpectedResponse(format!(
+                "expected PublishEvidence response (tag {}), got tag {tag}",
+                SessionMessageType::PublishEvidence.tag()
+            )));
+        }
+
+        PublishEvidenceResponse::decode_bounded(payload, &DecodeConfig::default())
             .map_err(|e| ProtocolClientError::DecodeError(e.to_string()))
     }
 }

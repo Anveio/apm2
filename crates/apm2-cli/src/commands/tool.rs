@@ -13,10 +13,15 @@
 //! Uses `SessionClient` for session-scoped operations via session.sock.
 //! All communication uses tag-based protobuf framing per DD-009 and RFC-0017.
 //!
-//! # Exit Codes
+//! # Exit Codes (RFC-0018)
 //!
 //! - 0: Success
-//! - 1: Error (daemon connection, validation, etc.)
+//! - 10: Validation error
+//! - 11: Permission denied
+//! - 12: Not found
+//! - 20: Daemon unavailable
+//! - 21: Protocol error
+//! - 22: Policy deny
 
 use std::path::Path;
 
@@ -25,14 +30,7 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use crate::client::protocol::{ProtocolClientError, SessionClient};
-
-/// Exit codes for tool commands.
-pub mod exit_codes {
-    /// Success exit code.
-    pub const SUCCESS: u8 = 0;
-    /// General error exit code.
-    pub const ERROR: u8 = 1;
-}
+use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
 /// Tool command group.
 #[derive(Debug, Args)]
@@ -127,7 +125,7 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
             json_output,
             "invalid_session_token",
             "Session token cannot be empty",
-            exit_codes::ERROR,
+            exit_codes::VALIDATION_ERROR,
         );
     }
 
@@ -137,7 +135,7 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
             json_output,
             "invalid_tool_id",
             "Tool ID cannot be empty",
-            exit_codes::ERROR,
+            exit_codes::VALIDATION_ERROR,
         );
     }
 
@@ -165,7 +163,7 @@ fn run_request(args: &RequestArgs, socket_path: &Path, json_output: bool) -> u8 
                 json_output,
                 "runtime_error",
                 &format!("Failed to build tokio runtime: {e}"),
-                exit_codes::ERROR,
+                exit_codes::GENERIC_ERROR,
             );
         },
     };
@@ -237,73 +235,45 @@ fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> 
     exit_code
 }
 
-/// Handles protocol client errors and returns appropriate exit code.
+/// Handles protocol client errors and returns appropriate exit code (RFC-0018).
 fn handle_protocol_error(json_output: bool, error: &ProtocolClientError) -> u8 {
-    match error {
-        ProtocolClientError::DaemonNotRunning => output_error(
-            json_output,
-            "daemon_not_running",
-            "Daemon is not running. Start with: apm2 daemon",
-            exit_codes::ERROR,
+    let exit_code = map_protocol_error(error);
+    let (code, message) = match error {
+        ProtocolClientError::DaemonNotRunning => (
+            "daemon_not_running".to_string(),
+            "Daemon is not running. Start with: apm2 daemon".to_string(),
         ),
-        ProtocolClientError::ConnectionFailed(msg) => output_error(
-            json_output,
-            "connection_failed",
-            &format!("Failed to connect to daemon: {msg}"),
-            exit_codes::ERROR,
+        ProtocolClientError::ConnectionFailed(msg) => (
+            "connection_failed".to_string(),
+            format!("Failed to connect to daemon: {msg}"),
         ),
-        ProtocolClientError::HandshakeFailed(msg) => output_error(
-            json_output,
-            "handshake_failed",
-            &format!("Protocol handshake failed: {msg}"),
-            exit_codes::ERROR,
+        ProtocolClientError::HandshakeFailed(msg) => (
+            "handshake_failed".to_string(),
+            format!("Protocol handshake failed: {msg}"),
         ),
-        ProtocolClientError::VersionMismatch { client, server } => output_error(
-            json_output,
-            "version_mismatch",
-            &format!("Protocol version mismatch: client {client}, server {server}"),
-            exit_codes::ERROR,
+        ProtocolClientError::VersionMismatch { client, server } => (
+            "version_mismatch".to_string(),
+            format!("Protocol version mismatch: client {client}, server {server}"),
         ),
-        ProtocolClientError::DaemonError { code, message } => {
-            output_error(json_output, code, message, exit_codes::ERROR)
+        ProtocolClientError::DaemonError { code, message } => (code.clone(), message.clone()),
+        ProtocolClientError::IoError(e) => ("io_error".to_string(), format!("I/O error: {e}")),
+        ProtocolClientError::ProtocolError(e) => {
+            ("protocol_error".to_string(), format!("Protocol error: {e}"))
         },
-        ProtocolClientError::IoError(e) => output_error(
-            json_output,
-            "io_error",
-            &format!("I/O error: {e}"),
-            exit_codes::ERROR,
+        ProtocolClientError::DecodeError(msg) => {
+            ("decode_error".to_string(), format!("Decode error: {msg}"))
+        },
+        ProtocolClientError::UnexpectedResponse(msg) => (
+            "unexpected_response".to_string(),
+            format!("Unexpected response: {msg}"),
         ),
-        ProtocolClientError::ProtocolError(e) => output_error(
-            json_output,
-            "protocol_error",
-            &format!("Protocol error: {e}"),
-            exit_codes::ERROR,
+        ProtocolClientError::Timeout => ("timeout".to_string(), "Operation timed out".to_string()),
+        ProtocolClientError::FrameTooLarge { size, max } => (
+            "frame_too_large".to_string(),
+            format!("Frame too large: {size} bytes (max: {max})"),
         ),
-        ProtocolClientError::DecodeError(msg) => output_error(
-            json_output,
-            "decode_error",
-            &format!("Decode error: {msg}"),
-            exit_codes::ERROR,
-        ),
-        ProtocolClientError::UnexpectedResponse(msg) => output_error(
-            json_output,
-            "unexpected_response",
-            &format!("Unexpected response: {msg}"),
-            exit_codes::ERROR,
-        ),
-        ProtocolClientError::Timeout => output_error(
-            json_output,
-            "timeout",
-            "Operation timed out",
-            exit_codes::ERROR,
-        ),
-        ProtocolClientError::FrameTooLarge { size, max } => output_error(
-            json_output,
-            "frame_too_large",
-            &format!("Frame too large: {size} bytes (max: {max})"),
-            exit_codes::ERROR,
-        ),
-    }
+    };
+    output_error(json_output, &code, &message, exit_code)
 }
 
 #[cfg(test)]

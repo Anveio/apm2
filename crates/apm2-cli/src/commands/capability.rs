@@ -1,16 +1,16 @@
-//! Event management CLI commands.
+//! Capability management CLI commands.
 //!
-//! This module implements `apm2 event` subcommands for ledger event emission
-//! using the protocol-based session socket (TCK-00288).
+//! This module implements `apm2 capability` subcommands for capability
+//! operations using the protocol-based operator socket (TCK-00288).
 //!
 //! # Commands
 //!
-//! - `apm2 event emit --session-token <token> --event-type <type>` - Emit event
-//!   to ledger
+//! - `apm2 capability issue --session-id <id> --tool-class <class>` - Issue
+//!   capability to session
 //!
 //! # Protocol
 //!
-//! Uses `SessionClient` for session-scoped operations via session.sock.
+//! Uses `OperatorClient` for privileged operations via operator.sock.
 //! All communication uses tag-based protobuf framing per DD-009 and RFC-0017.
 //!
 //! # Exit Codes (RFC-0018)
@@ -28,66 +28,68 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
-use crate::client::protocol::{ProtocolClientError, SessionClient};
+use crate::client::protocol::{OperatorClient, ProtocolClientError};
 use crate::exit_codes::{codes as exit_codes, map_protocol_error};
 
-/// Event command group.
+/// Capability command group.
 #[derive(Debug, Args)]
-pub struct EventCommand {
+pub struct CapabilityCommand {
     /// Output format (text or json).
     #[arg(long, default_value = "false")]
     pub json: bool,
 
     #[command(subcommand)]
-    pub subcommand: EventSubcommand,
+    pub subcommand: CapabilitySubcommand,
 }
 
-/// Event subcommands.
+/// Capability subcommands.
 #[derive(Debug, Subcommand)]
-pub enum EventSubcommand {
-    /// Emit a signed event to the ledger.
+pub enum CapabilitySubcommand {
+    /// Issue a capability to a session.
     ///
-    /// Events are recorded in the daemon's ledger with cryptographic
-    /// signatures for tamper-evidence.
-    Emit(EmitArgs),
+    /// Grants additional tool access or path patterns to an existing session.
+    /// Requires operator privileges.
+    Issue(IssueArgs),
 }
 
-/// Arguments for `apm2 event emit`.
+/// Arguments for `apm2 capability issue`.
 #[derive(Debug, Args)]
-pub struct EmitArgs {
-    /// Session token for authentication.
-    ///
-    /// Obtained from `apm2 episode spawn` response.
+pub struct IssueArgs {
+    /// Target session identifier.
     #[arg(long, required = true)]
-    pub session_token: String,
+    pub session_id: String,
 
-    /// Event type identifier (e.g., "work.started", "tool.executed").
+    /// Tool class to grant access to (e.g., "`file_read`", "`shell_exec`").
     #[arg(long, required = true)]
-    pub event_type: String,
+    pub tool_class: String,
 
-    /// Event payload as JSON string.
-    #[arg(long, default_value = "{}")]
-    pub payload: String,
-
-    /// Correlation ID for event tracing.
+    /// Path patterns for read access (can be specified multiple times).
     #[arg(long)]
-    pub correlation_id: Option<String>,
+    pub read_pattern: Vec<String>,
+
+    /// Path patterns for write access (can be specified multiple times).
+    #[arg(long)]
+    pub write_pattern: Vec<String>,
+
+    /// Duration in seconds for the capability grant.
+    #[arg(long, default_value = "3600")]
+    pub duration_secs: u64,
 }
 
 // ============================================================================
 // Response Types for JSON output
 // ============================================================================
 
-/// Response for event emit command.
+/// Response for capability issue command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EmitResponse {
-    /// Event identifier in the ledger.
-    pub event_id: String,
-    /// Sequence number in the session.
-    pub seq: u64,
-    /// Timestamp when event was recorded (nanoseconds since epoch).
-    pub timestamp_ns: u64,
+pub struct IssueResponse {
+    /// Unique identifier for this capability grant.
+    pub capability_id: String,
+    /// Unix timestamp when capability was granted.
+    pub granted_at: u64,
+    /// Unix timestamp when capability expires.
+    pub expires_at: u64,
 }
 
 /// Error response for JSON output.
@@ -104,49 +106,36 @@ pub struct ErrorResponse {
 // Command execution
 // ============================================================================
 
-/// Runs the event command, returning an appropriate exit code.
-pub fn run_event(cmd: &EventCommand, socket_path: &Path) -> u8 {
+/// Runs the capability command, returning an appropriate exit code.
+pub fn run_capability(cmd: &CapabilityCommand, socket_path: &Path) -> u8 {
     let json_output = cmd.json;
 
     match &cmd.subcommand {
-        EventSubcommand::Emit(args) => run_emit(args, socket_path, json_output),
+        CapabilitySubcommand::Issue(args) => run_issue(args, socket_path, json_output),
     }
 }
 
-/// Execute the emit command.
-fn run_emit(args: &EmitArgs, socket_path: &Path, json_output: bool) -> u8 {
-    // Validate session token
-    if args.session_token.is_empty() {
+/// Execute the issue command.
+fn run_issue(args: &IssueArgs, socket_path: &Path, json_output: bool) -> u8 {
+    // Validate session ID
+    if args.session_id.is_empty() {
         return output_error(
             json_output,
-            "invalid_session_token",
-            "Session token cannot be empty",
+            "invalid_session_id",
+            "Session ID cannot be empty",
             exit_codes::VALIDATION_ERROR,
         );
     }
 
-    // Validate event type
-    if args.event_type.is_empty() {
+    // Validate tool class
+    if args.tool_class.is_empty() {
         return output_error(
             json_output,
-            "invalid_event_type",
-            "Event type cannot be empty",
+            "invalid_tool_class",
+            "Tool class cannot be empty",
             exit_codes::VALIDATION_ERROR,
         );
     }
-
-    // Parse payload as JSON bytes
-    let payload = args.payload.as_bytes().to_vec();
-
-    // Generate correlation ID if not provided
-    let correlation_id = args.correlation_id.clone().unwrap_or_else(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("cli-{ts}")
-    });
 
     // Build async runtime
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -164,38 +153,39 @@ fn run_emit(args: &EmitArgs, socket_path: &Path, json_output: bool) -> u8 {
         },
     };
 
-    // Execute emit
+    // Execute issue capability
     let result = rt.block_on(async {
-        let mut client = SessionClient::connect(socket_path).await?;
+        let mut client = OperatorClient::connect(socket_path).await?;
         client
-            .emit_event(
-                &args.session_token,
-                &args.event_type,
-                &payload,
-                &correlation_id,
+            .issue_capability(
+                &args.session_id,
+                &args.tool_class,
+                &args.read_pattern,
+                &args.write_pattern,
+                args.duration_secs,
             )
             .await
     });
 
     match result {
         Ok(response) => {
-            let emit_response = EmitResponse {
-                event_id: response.event_id,
-                seq: response.seq,
-                timestamp_ns: response.timestamp_ns,
+            let issue_response = IssueResponse {
+                capability_id: response.capability_id,
+                granted_at: response.granted_at,
+                expires_at: response.expires_at,
             };
 
             if json_output {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&emit_response)
+                    serde_json::to_string_pretty(&issue_response)
                         .unwrap_or_else(|_| "{}".to_string())
                 );
             } else {
-                println!("Event emitted successfully");
-                println!("  Event ID:     {}", emit_response.event_id);
-                println!("  Sequence:     {}", emit_response.seq);
-                println!("  Timestamp:    {} ns", emit_response.timestamp_ns);
+                println!("Capability issued successfully");
+                println!("  Capability ID:  {}", issue_response.capability_id);
+                println!("  Granted At:     {}", issue_response.granted_at);
+                println!("  Expires At:     {}", issue_response.expires_at);
             }
 
             exit_codes::SUCCESS
@@ -271,30 +261,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_emit_response_serialization() {
-        let response = EmitResponse {
-            event_id: "evt-123".to_string(),
-            seq: 42,
-            timestamp_ns: 1_704_067_200_000_000_000,
+    fn test_issue_response_serialization() {
+        let response = IssueResponse {
+            capability_id: "cap-123".to_string(),
+            granted_at: 1_704_067_200,
+            expires_at: 1_704_070_800,
         };
 
         let json = serde_json::to_string(&response).unwrap();
-        let restored: EmitResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.event_id, "evt-123");
-        assert_eq!(restored.seq, 42);
+        let restored: IssueResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.capability_id, "cap-123");
     }
 
     /// SECURITY TEST: Verify responses reject unknown fields.
     #[test]
-    fn test_emit_response_rejects_unknown_fields() {
+    fn test_issue_response_rejects_unknown_fields() {
         let json = r#"{
-            "event_id": "evt-1",
-            "seq": 1,
-            "timestamp_ns": 0,
+            "capability_id": "cap-1",
+            "granted_at": 0,
+            "expires_at": 0,
             "malicious": "value"
         }"#;
 
-        let result: Result<EmitResponse, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "EmitResponse should reject unknown fields");
+        let result: Result<IssueResponse, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "IssueResponse should reject unknown fields"
+        );
     }
 }
