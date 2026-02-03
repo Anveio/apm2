@@ -1,8 +1,9 @@
-//! Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018, TCK-00301).
+//! Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018,
+//! TCK-00301).
 //!
 //! This module implements topic validation and pattern matching for the Holonic
-//! Event Fabric (HEF) pulse subscription system. Topics are ASCII, dot-delimited,
-//! length-bounded strings with constrained wildcard support.
+//! Event Fabric (HEF) pulse subscription system. Topics are ASCII,
+//! dot-delimited, length-bounded strings with constrained wildcard support.
 //!
 //! # Topic Grammar
 //!
@@ -31,7 +32,8 @@
 //! # Security Invariants
 //!
 //! - [INV-HEF-0003] All string IDs are ASCII-only and length-bounded
-//! - [INV-HEF-0007] Invalid patterns rejected with reason code `INVALID_PATTERN`
+//! - [INV-HEF-0007] Invalid patterns rejected with reason code
+//!   `INVALID_PATTERN`
 //! - Bounded matching prevents CPU exhaustion (no backtracking, no regex)
 //!
 //! # Example
@@ -115,7 +117,8 @@ pub enum TopicError {
         position: usize,
     },
 
-    /// Topic contains an empty segment (consecutive dots or leading/trailing dot).
+    /// Topic contains an empty segment (consecutive dots or leading/trailing
+    /// dot).
     EmptySegment {
         /// Segment index (0-based) where empty segment was found.
         segment_index: usize,
@@ -158,7 +161,10 @@ impl fmt::Display for TopicError {
                 write!(f, "topic too long: {len} characters exceeds maximum {max}")
             },
             Self::NonAscii { position } => {
-                write!(f, "topic contains non-ASCII character at position {position}")
+                write!(
+                    f,
+                    "topic contains non-ASCII character at position {position}"
+                )
             },
             Self::EmptySegment { segment_index } => {
                 write!(f, "empty segment at index {segment_index}")
@@ -610,9 +616,9 @@ impl TopicPattern {
         let pattern_len = self.segments.len();
         let topic_len = topic_segments.len();
 
-        // If pattern has terminal wildcard, topic must have at least (pattern_len - 1) segments
-        // plus at least one segment for the `>` to consume (i.e., >= pattern_len segments total)
-        // Otherwise, lengths must match exactly
+        // If pattern has terminal wildcard, topic must have at least (pattern_len - 1)
+        // segments plus at least one segment for the `>` to consume (i.e., >=
+        // pattern_len segments total) Otherwise, lengths must match exactly
         if self.has_terminal {
             // Terminal wildcard: pattern segments before `>` must match exactly,
             // and `>` must match at least one additional segment.
@@ -767,7 +773,8 @@ fn contains_embedded_wildcard(segment: &str) -> bool {
 /// - Double wildcards `**` or `>>`
 fn detect_regex_patterns(pattern: &str) -> Result<(), PatternError> {
     // Check for regex quantifiers after non-separator characters
-    // We need to be careful: "a.*" is regex, but "a.*.b" is valid (dot-wildcard-dot)
+    // We need to be careful: "a.*" is regex, but "a.*.b" is valid
+    // (dot-wildcard-dot)
     let bytes = pattern.as_bytes();
     let len = bytes.len();
 
@@ -883,7 +890,8 @@ impl PatternValidationResult {
 ///
 /// # Returns
 ///
-/// A `PatternValidationResult` containing accepted patterns and rejection reasons.
+/// A `PatternValidationResult` containing accepted patterns and rejection
+/// reasons.
 pub fn validate_patterns<'a, I>(patterns: I) -> PatternValidationResult
 where
     I: IntoIterator<Item = &'a str>,
