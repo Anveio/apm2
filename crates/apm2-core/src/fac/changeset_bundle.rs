@@ -78,6 +78,7 @@ use super::policy_resolution::MAX_STRING_LENGTH;
 use crate::crypto::{Signature, Signer, VerifyingKey};
 // Re-export proto type for wire format serialization
 pub use crate::events::ChangeSetPublished as ChangeSetPublishedProto;
+use crate::htf::TimeEnvelopeRef;
 
 // =============================================================================
 // Resource Limits
@@ -697,6 +698,10 @@ pub struct ChangeSetPublished {
     /// domain.
     #[serde(with = "serde_bytes")]
     pub publisher_signature: [u8; 64],
+    /// HTF time envelope reference for temporal authority (RFC-0016).
+    /// Binds the changeset publication to verifiable HTF time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_envelope_ref: Option<TimeEnvelopeRef>,
 }
 
 impl ChangeSetPublished {
@@ -720,6 +725,43 @@ impl ChangeSetPublished {
         cas_hash: [u8; 32],
         published_at: u64,
         publisher_actor_id: String,
+        signer: &Signer,
+    ) -> Result<Self, ChangeSetBundleError> {
+        Self::create_with_time_envelope(
+            work_id,
+            changeset_digest,
+            cas_hash,
+            published_at,
+            publisher_actor_id,
+            None,
+            signer,
+        )
+    }
+
+    /// Creates a new `ChangeSetPublished` event with an HTF time envelope
+    /// reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `work_id` - The work item ID
+    /// * `changeset_digest` - BLAKE3 digest of the canonical bundle
+    /// * `cas_hash` - CAS hash of the full bundle artifact
+    /// * `published_at` - Timestamp when published
+    /// * `publisher_actor_id` - ID of the publishing actor
+    /// * `time_envelope_ref` - Optional HTF time envelope reference for
+    ///   temporal authority
+    /// * `signer` - Signer to authorize the event
+    ///
+    /// # Errors
+    ///
+    /// Returns error if any string field exceeds `MAX_STRING_LENGTH`.
+    pub fn create_with_time_envelope(
+        work_id: String,
+        changeset_digest: [u8; 32],
+        cas_hash: [u8; 32],
+        published_at: u64,
+        publisher_actor_id: String,
+        time_envelope_ref: Option<TimeEnvelopeRef>,
         signer: &Signer,
     ) -> Result<Self, ChangeSetBundleError> {
         // Validate inputs
@@ -746,6 +788,7 @@ impl ChangeSetPublished {
             published_at,
             publisher_actor_id,
             publisher_signature: [0u8; 64],
+            time_envelope_ref,
         };
 
         // Sign
@@ -764,6 +807,7 @@ impl ChangeSetPublished {
     /// - `cas_hash` (32 bytes)
     /// - `published_at` (8 bytes BE)
     /// - `publisher_actor_id` (len + bytes)
+    /// - `time_envelope_ref` (1 byte flag + 32 bytes hash if present)
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // All strings are bounded by MAX_STRING_LENGTH
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -785,6 +829,15 @@ impl ChangeSetPublished {
         // 5. publisher_actor_id
         bytes.extend_from_slice(&(self.publisher_actor_id.len() as u32).to_be_bytes());
         bytes.extend_from_slice(self.publisher_actor_id.as_bytes());
+
+        // 6. time_envelope_ref (optional: 1 byte flag + 32 bytes hash if present)
+        // Including this in the signed payload ensures signature coverage per RFC-0016.
+        if let Some(ref envelope_ref) = self.time_envelope_ref {
+            bytes.push(1); // present flag
+            bytes.extend_from_slice(envelope_ref.as_bytes());
+        } else {
+            bytes.push(0); // not present flag
+        }
 
         bytes
     }
@@ -840,6 +893,11 @@ impl TryFrom<ChangeSetPublishedProto> for ChangeSetPublished {
             ChangeSetBundleError::InvalidData("publisher_signature must be 64 bytes".into())
         })?;
 
+        // Convert time_envelope_ref from proto format to domain type
+        let time_envelope_ref = proto
+            .time_envelope_ref
+            .and_then(|ter| TimeEnvelopeRef::from_slice(&ter.hash));
+
         Ok(Self {
             work_id: proto.work_id,
             changeset_digest,
@@ -847,12 +905,16 @@ impl TryFrom<ChangeSetPublishedProto> for ChangeSetPublished {
             published_at: proto.published_at,
             publisher_actor_id: proto.publisher_actor_id,
             publisher_signature,
+            time_envelope_ref,
         })
     }
 }
 
 impl From<ChangeSetPublished> for ChangeSetPublishedProto {
     fn from(event: ChangeSetPublished) -> Self {
+        // Import the proto TimeEnvelopeRef type
+        use crate::events::TimeEnvelopeRef as TimeEnvelopeRefProto;
+
         Self {
             work_id: event.work_id,
             changeset_digest: event.changeset_digest.to_vec(),
@@ -860,9 +922,10 @@ impl From<ChangeSetPublished> for ChangeSetPublishedProto {
             published_at: event.published_at,
             publisher_actor_id: event.publisher_actor_id,
             publisher_signature: event.publisher_signature.to_vec(),
-            // HTF time envelope reference (RFC-0016): not yet populated by this conversion.
-            // The daemon clock service (TCK-00240) will stamp envelopes at runtime boundaries.
-            time_envelope_ref: None,
+            // Convert HTF time envelope reference to proto format
+            time_envelope_ref: event.time_envelope_ref.map(|ter| TimeEnvelopeRefProto {
+                hash: ter.as_bytes().to_vec(),
+            }),
         }
     }
 }
