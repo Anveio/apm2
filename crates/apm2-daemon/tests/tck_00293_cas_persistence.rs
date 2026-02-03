@@ -90,10 +90,7 @@ fn cas_persistence_restart_multiple_artifacts() {
         let cas = DurableCas::new(config).unwrap();
 
         for (i, (artifact, hash)) in artifacts.iter().zip(&hashes).enumerate() {
-            assert!(
-                cas.exists(hash),
-                "Artifact {i} should exist after restart"
-            );
+            assert!(cas.exists(hash), "Artifact {i} should exist after restart");
             let retrieved = cas.retrieve(hash).unwrap();
             assert_eq!(&retrieved, artifact, "Artifact {i} content should match");
         }
