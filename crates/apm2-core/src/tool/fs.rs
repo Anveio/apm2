@@ -225,7 +225,8 @@ impl FilesystemTool {
     ///
     /// # Errors
     ///
-    /// Returns a `ToolError` if the path cannot be accessed or if the glob pattern is invalid.
+    /// Returns a `ToolError` if the path cannot be accessed or if the glob
+    /// pattern is invalid.
     pub fn list_files(&self, req: &ListFiles) -> Result<Vec<u8>, ToolError> {
         // If pattern is provided, treat path/pattern as a glob.
         // If pattern is empty, just list the directory (non-recursive).
@@ -234,7 +235,11 @@ impl FilesystemTool {
 
         let mut output = String::new();
         let mut count = 0;
-        let max_entries = if req.max_entries == 0 { 2000 } else { req.max_entries };
+        let max_entries = if req.max_entries == 0 {
+            2000
+        } else {
+            req.max_entries
+        };
 
         if req.pattern.is_empty() {
             // Simple directory list
@@ -246,7 +251,7 @@ impl FilesystemTool {
                 let entry = entry.map_err(|e| Self::map_io_error(&e))?;
                 let file_name = entry.file_name();
                 let name = file_name.to_string_lossy();
-                
+
                 if !output.is_empty() {
                     output.push('\n');
                 }
@@ -261,7 +266,7 @@ impl FilesystemTool {
             // Security: Pattern matches are relative to root.
             // We construct the glob pattern: root / pattern
             let pattern_str = root.join(&req.pattern).to_string_lossy().to_string();
-            
+
             for entry in glob::glob(&pattern_str).map_err(|e| ToolError {
                 error_code: "INVALID_PATTERN".to_string(),
                 message: e.to_string(),
@@ -273,9 +278,11 @@ impl FilesystemTool {
                 }
                 match entry {
                     Ok(path) => {
-                        // Return path relative to root if possible, else just filename or full path relative to workspace?
-                        // Usually list_files expects paths relative to `path`.
-                        let display_path = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+                        // Return path relative to root if possible, else just filename or full path
+                        // relative to workspace? Usually list_files expects
+                        // paths relative to `path`.
+                        let display_path =
+                            path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
                         if !output.is_empty() {
                             output.push('\n');
                         }
@@ -285,12 +292,14 @@ impl FilesystemTool {
                         }
                         count += 1;
                     },
-                    Err(e) => return Err(ToolError {
-                        error_code: "GLOB_ERROR".to_string(),
-                        message: e.to_string(),
-                        retryable: false,
-                        retry_after_ms: 0,
-                    }),
+                    Err(e) => {
+                        return Err(ToolError {
+                            error_code: "GLOB_ERROR".to_string(),
+                            message: e.to_string(),
+                            retryable: false,
+                            retry_after_ms: 0,
+                        });
+                    },
                 }
             }
         }
@@ -307,7 +316,7 @@ impl FilesystemTool {
         // Scope acts as a glob pattern relative to workspace root
         // Ensure no traversal in scope
         if req.scope.contains("..") {
-             return Err(ToolError {
+            return Err(ToolError {
                 error_code: "PATH_TRAVERSAL".to_string(),
                 message: "Path traversal sequences (..) are not allowed".to_string(),
                 retryable: false,
@@ -316,14 +325,26 @@ impl FilesystemTool {
         }
 
         // Resolve scope relative to workspace root
-        let pattern_str = self.workspace_root.join(&req.scope).to_string_lossy().to_string();
+        let pattern_str = self
+            .workspace_root
+            .join(&req.scope)
+            .to_string_lossy()
+            .to_string();
         info!("Searching for '{}' in scope: {:?}", req.query, pattern_str);
 
         let mut output = String::new();
         let mut line_count = 0;
         let mut byte_count = 0;
-        let max_lines = if req.max_lines == 0 { 2000 } else { req.max_lines };
-        let max_bytes = if req.max_bytes == 0 { 65536 } else { req.max_bytes };
+        let max_lines = if req.max_lines == 0 {
+            2000
+        } else {
+            req.max_lines
+        };
+        let max_bytes = if req.max_bytes == 0 {
+            65536
+        } else {
+            req.max_bytes
+        };
 
         for entry in glob::glob(&pattern_str).map_err(|e| ToolError {
             error_code: "INVALID_PATTERN".to_string(),
@@ -335,40 +356,38 @@ impl FilesystemTool {
                 break;
             }
 
-            match entry {
-                Ok(path) => {
-                    if path.is_file() {
-                        // Read file line by line
-                        let file = fs::File::open(&path).map_err(|e| Self::map_io_error(&e))?;
-                        let reader = std::io::BufReader::new(file);
-                        use std::io::BufRead;
+            if let Ok(path) = entry {
+                if path.is_file() {
+                    use std::io::BufRead;
+                    // Read file line by line
+                    let file = fs::File::open(&path).map_err(|e| Self::map_io_error(&e))?;
+                    let reader = std::io::BufReader::new(file);
 
-                        let rel_path = path.strip_prefix(&self.workspace_root).unwrap_or(&path).to_string_lossy().into_owned();
+                    let rel_path = path
+                        .strip_prefix(&self.workspace_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
 
-                        for (i, line) in reader.lines().enumerate() {
-                            if line_count >= max_lines || byte_count >= max_bytes {
-                                break;
-                            }
-                            match line {
-                                Ok(content) => {
-                                    if content.contains(&req.query) {
-                                        let matched_line = format!("{}:{}:{}\n", rel_path, i + 1, content);
-                                        let len = matched_line.len() as u64;
-                                        if byte_count + len > max_bytes {
-                                            break;
-                                        }
-                                        output.push_str(&matched_line);
-                                        byte_count += len;
-                                        line_count += 1;
-                                    }
-                                },
-                                Err(_) => continue, // Skip binary/invalid utf8 lines
-                            }
+                    for (i, line) in reader.lines().enumerate() {
+                        if line_count >= max_lines || byte_count >= max_bytes {
+                            break;
                         }
+                        if let Ok(content) = line {
+                            if content.contains(&req.query) {
+                                let matched_line = format!("{}:{}:{}\n", rel_path, i + 1, content);
+                                let len = matched_line.len() as u64;
+                                if byte_count + len > max_bytes {
+                                    break;
+                                }
+                                output.push_str(&matched_line);
+                                byte_count += len;
+                                line_count += 1;
+                            }
+                        } // Skip binary/invalid utf8 lines
                     }
-                },
-                Err(_) => continue,
-            }
+                }
+            } // Skip invalid glob entries
         }
 
         Ok(output.into_bytes())
