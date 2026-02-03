@@ -169,18 +169,23 @@ impl std::str::FromStr for ReasonCode {
 impl ReasonCode {
     /// Returns the numeric code for this reason.
     ///
-    /// Used for canonical encoding.
+    /// Used for canonical encoding and wire format serialization.
+    /// Values match the protobuf `ReviewBlockedReasonCode` enum:
+    /// - 0 = UNSPECIFIED (not used in Rust)
+    /// - 1 = APPLY_FAILED
+    /// - 2 = TOOL_FAILED
+    /// - etc.
     #[must_use]
     pub const fn to_code(self) -> u8 {
         match self {
-            Self::ApplyFailed => 0,
-            Self::ToolFailed => 1,
-            Self::BinaryUnsupported => 2,
-            Self::MissingArtifact => 3,
-            Self::InvalidBundle => 4,
-            Self::Timeout => 5,
-            Self::PolicyDenied => 6,
-            Self::ContextMiss => 7,
+            Self::ApplyFailed => 1,
+            Self::ToolFailed => 2,
+            Self::BinaryUnsupported => 3,
+            Self::MissingArtifact => 4,
+            Self::InvalidBundle => 5,
+            Self::Timeout => 6,
+            Self::PolicyDenied => 7,
+            Self::ContextMiss => 8,
         }
     }
 
@@ -188,17 +193,20 @@ impl ReasonCode {
     ///
     /// # Errors
     ///
-    /// Returns error if the code is invalid.
+    /// Returns error if the code is invalid or 0 (UNSPECIFIED).
     pub fn from_code(code: u8) -> Result<Self, ReviewBlockedError> {
         match code {
-            0 => Ok(Self::ApplyFailed),
-            1 => Ok(Self::ToolFailed),
-            2 => Ok(Self::BinaryUnsupported),
-            3 => Ok(Self::MissingArtifact),
-            4 => Ok(Self::InvalidBundle),
-            5 => Ok(Self::Timeout),
-            6 => Ok(Self::PolicyDenied),
-            7 => Ok(Self::ContextMiss),
+            1 => Ok(Self::ApplyFailed),
+            2 => Ok(Self::ToolFailed),
+            3 => Ok(Self::BinaryUnsupported),
+            4 => Ok(Self::MissingArtifact),
+            5 => Ok(Self::InvalidBundle),
+            6 => Ok(Self::Timeout),
+            7 => Ok(Self::PolicyDenied),
+            8 => Ok(Self::ContextMiss),
+            0 => Err(ReviewBlockedError::InvalidReasonCode(
+                "UNSPECIFIED (0) is not a valid reason code".to_string(),
+            )),
             _ => Err(ReviewBlockedError::InvalidReasonCode(format!(
                 "invalid code: {code}"
             ))),
@@ -651,11 +659,14 @@ mod tests {
 
     #[test]
     fn test_reason_code_to_code_roundtrip() {
-        for code in 0..8u8 {
+        // Values 1-8 are valid (0 is UNSPECIFIED per protobuf)
+        for code in 1..=8u8 {
             let reason = ReasonCode::from_code(code).unwrap();
             assert_eq!(reason.to_code(), code);
         }
-        assert!(ReasonCode::from_code(8).is_err());
+        // 0 (UNSPECIFIED) and 9+ are invalid
+        assert!(ReasonCode::from_code(0).is_err());
+        assert!(ReasonCode::from_code(9).is_err());
     }
 
     #[test]
