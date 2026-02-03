@@ -361,7 +361,8 @@ impl FilesystemTool {
     /// # Security
     ///
     /// This method ensures all matched files are within the workspace sandbox.
-    /// Files outside the workspace (including via symlinks) are silently skipped.
+    /// Files outside the workspace (including via symlinks) are silently
+    /// skipped.
     pub fn search(&self, req: &Search) -> Result<Vec<u8>, ToolError> {
         // Scope acts as a glob pattern relative to workspace root
         // Defense-in-depth: Check for path traversal in scope.
