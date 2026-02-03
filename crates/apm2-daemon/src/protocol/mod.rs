@@ -29,6 +29,8 @@
 //!   [`ServerHandshake`])
 //! - [`messages`]: Protocol buffer message types ([`messages::Receipt`],
 //!   [`messages::TelemetryFrame`], etc.)
+//! - [`pulse_topic`]: HEF topic grammar and wildcard matching ([`TopicPattern`],
+//!   [`validate_topic`]) (RFC-0018, TCK-00301)
 //! - [`server`]: UDS server ([`ProtocolServer`], [`Connection`])
 //! - [`session_token`]: Per-connection session tokens ([`SessionToken`],
 //!   [`TokenMinter`]) for authenticating session-scoped requests (TCK-00250)
@@ -101,6 +103,8 @@ pub mod framing;
 pub mod golden_vectors;
 pub mod handshake;
 pub mod messages;
+/// Topic grammar and wildcard matching for HEF Pulse Plane (RFC-0018, TCK-00301).
+pub mod pulse_topic;
 pub mod server;
 /// Session-scoped endpoint dispatcher for RFC-0017 IPC (TCK-00252).
 pub mod session_dispatch;
@@ -228,4 +232,25 @@ pub use session_token::{SessionToken, SessionTokenError, TokenMinter};
 pub use socket_manager::{
     SocketManager, SocketManagerConfig, SocketType, default_operator_socket_path,
     default_session_socket_path,
+};
+// CTR-PROTO-010: HEF Topic Grammar (RFC-0018, TCK-00301)
+#[allow(unused_imports)]
+pub use pulse_topic::{
+    // Constants
+    MAX_SEGMENT_COUNT,
+    MAX_SEGMENT_LEN,
+    MAX_TOPIC_LEN,
+    MAX_WILDCARDS,
+    MIN_SEGMENT_LEN,
+    SEGMENT_SEPARATOR,
+    WILDCARD_SINGLE,
+    WILDCARD_TERMINAL,
+    // Types
+    PatternError,
+    PatternValidationResult,
+    TopicError,
+    TopicPattern,
+    // Functions
+    validate_patterns,
+    validate_topic,
 };
