@@ -22,12 +22,12 @@ pub const USE_HEF_PROJECTION_ENV: &str = "USE_HEF_PROJECTION";
 
 /// Checks if HEF projection logic is enabled.
 ///
-/// Returns `true` if the `USE_HEF_PROJECTION` environment variable is set to "true"
-/// (case-insensitive).
+/// Returns `true` if the `USE_HEF_PROJECTION` environment variable is set to
+/// "true" (case-insensitive).
 ///
-/// Per TCK-00309, this flag defaults to `false`. When `true`, xtask must NOT write
-/// status checks directly to GitHub, as these should be handled by the daemon's
-/// projection logic.
+/// Per TCK-00309, this flag defaults to `false`. When `true`, xtask must NOT
+/// write status checks directly to GitHub, as these should be handled by the
+/// daemon's projection logic.
 pub fn use_hef_projection() -> bool {
     std::env::var(USE_HEF_PROJECTION_ENV)
         .map(|v| v.to_lowercase() == "true")
@@ -372,9 +372,10 @@ mod tests {
     // =============================================================================
 
     #[test]
+    #[allow(unsafe_code)]
     fn test_use_hef_projection_env_var() {
         // SERIAL TEST: Modifies environment variables, must be single test
-        
+
         // 1. Default (unset) -> false
         unsafe { std::env::remove_var(USE_HEF_PROJECTION_ENV) };
         assert!(!use_hef_projection(), "Default should be false");
