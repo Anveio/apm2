@@ -175,6 +175,32 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
+    /// Emits a signed `SessionStarted` event to the ledger (TCK-00289).
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The session ID being started
+    /// * `work_id` - The work ID this session is associated with
+    /// * `lease_id` - The lease ID authorizing this session
+    /// * `actor_id` - The actor starting the session
+    /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    ///
+    /// # Returns
+    ///
+    /// The signed event that was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LedgerEventError` if signing or persistence fails.
+    fn emit_session_started(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
     /// Queries a signed event by event ID.
     fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent>;
 
@@ -369,6 +395,97 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
     fn get_event(&self, event_id: &str) -> Option<SignedLedgerEvent> {
         let guard = self.events.read().expect("lock poisoned");
         guard.1.get(event_id).cloned()
+    }
+
+    fn emit_session_started(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        // Domain prefix for session events (must be at function start per clippy)
+        const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build canonical payload (deterministic JSON)
+        let payload = serde_json::json!({
+            "event_type": "session_started",
+            "session_id": session_id,
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "actor_id": actor_id,
+        });
+
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("payload serialization failed: {e}"),
+            })?;
+
+        // Build canonical bytes for signing (domain prefix + payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_STARTED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "session_started".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // CTR-1303: Persist to bounded in-memory store with LRU eviction
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            // Evict oldest entries if at capacity
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(work_id.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            session_id = %session_id,
+            work_id = %signed_event.work_id,
+            "SessionStarted event signed and persisted"
+        );
+
+        Ok(signed_event)
     }
 
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
@@ -2281,11 +2398,16 @@ impl PrivilegedDispatcher {
                     );
 
                     // Emit LeaseIssueDenied event for audit logging.
-                    // RFC-0016 HTF compliance: Use placeholder timestamp (0) for stub
-                    // implementation. In production, this would derive timestamp from
-                    // HolonicClock via episode_runtime to ensure deterministic replay
-                    // and avoid forbidden SystemTime::now() usage.
-                    let timestamp_ns = 0u64;
+                    // TCK-00289: Use HTF-compliant timestamp per RFC-0016.
+                    // Fail-closed: if clock fails, we still reject the spawn (already
+                    // doing that) but log at warning level instead of emitting event.
+                    let timestamp_ns = match self.get_htf_timestamp_ns() {
+                        Ok(ts) => ts,
+                        Err(e) => {
+                            warn!(error = %e, "HTF timestamp error for LeaseIssueDenied - skipping event emission");
+                            0u64 // Use 0 only for best-effort event, spawn is still denied
+                        },
+                    };
 
                     // Best-effort event emission - don't fail spawn on event error.
                     // If no Tokio runtime is available (e.g., in unit tests), skip the
@@ -2361,6 +2483,10 @@ impl PrivilegedDispatcher {
 
         // TCK-00287 BLOCKER 2: Generate session token for client authentication
         // The token is HMAC-signed and bound to this session's lease_id.
+        //
+        // NOTE: TokenMinter uses SystemTime for TTL calculation, which is
+        // acceptable since token expiry is not a protocol-authoritative event.
+        // The HTF clock is used for ledger events that require causal ordering.
         let spawn_time = SystemTime::now();
         let ttl = Duration::from_secs(DEFAULT_SESSION_TOKEN_TTL_SECS);
         let session_token =
@@ -2417,6 +2543,45 @@ impl PrivilegedDispatcher {
             };
             metrics.daemon_metrics().session_spawned(role_str);
         }
+
+        // TCK-00289: Emit SessionStarted ledger event for audit trail.
+        // Per DOD: "ClaimWork/SpawnEpisode persist state and emit ledger events"
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not proceed without valid timestamp
+                warn!(error = %e, "HTF timestamp generation failed for SessionStarted - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // Derive actor_id from credentials (same pattern as ClaimWork)
+        let actor_id = ctx
+            .peer_credentials()
+            .map_or_else(|| "unknown".to_string(), derive_actor_id);
+
+        if let Err(e) = self.event_emitter.emit_session_started(
+            &session_id,
+            &request.work_id,
+            &claim.lease_id,
+            &actor_id,
+            timestamp_ns,
+        ) {
+            warn!(error = %e, "SessionStarted event emission failed");
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("event emission failed: {e}"),
+            ));
+        }
+
+        debug!(
+            session_id = %session_id,
+            work_id = %request.work_id,
+            "SessionStarted event emitted successfully"
+        );
 
         Ok(PrivilegedResponse::SpawnEpisode(SpawnEpisodeResponse {
             session_id,

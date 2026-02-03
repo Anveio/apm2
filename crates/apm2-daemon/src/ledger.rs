@@ -163,6 +163,82 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         .flatten()
     }
 
+    fn emit_session_started(
+        &self,
+        session_id: &str,
+        work_id: &str,
+        lease_id: &str,
+        actor_id: &str,
+        timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        // Domain prefix for session events (must be at function start per clippy)
+        const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
+
+        // Generate unique event ID
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        // Build canonical payload (deterministic JSON)
+        let payload = serde_json::json!({
+            "event_type": "session_started",
+            "session_id": session_id,
+            "work_id": work_id,
+            "lease_id": lease_id,
+            "actor_id": actor_id,
+        });
+
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("payload serialization failed: {e}"),
+            })?;
+
+        // Build canonical bytes for signing (domain prefix + payload)
+        let mut canonical_bytes =
+            Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(SESSION_STARTED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        // Sign the canonical bytes
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "session_started".to_string(),
+            work_id: work_id.to_string(),
+            actor_id: actor_id.to_string(),
+            payload: payload_bytes.clone(),
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns,
+        };
+
+        // Persist to SQLite
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| LedgerEventError::PersistenceFailed {
+                message: "connection lock poisoned".to_string(),
+            })?;
+
+        conn.execute(
+            "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signed_event.event_id,
+                signed_event.event_type,
+                signed_event.work_id,
+                signed_event.actor_id,
+                signed_event.payload,
+                signed_event.signature,
+                signed_event.timestamp_ns
+            ],
+        ).map_err(|e| LedgerEventError::PersistenceFailed {
+            message: format!("sqlite insert failed: {e}"),
+        })?;
+
+        info!(event_id = %event_id, session_id = %session_id, "Persisted SessionStarted event");
+
+        Ok(signed_event)
+    }
+
     fn get_events_by_work_id(&self, work_id: &str) -> Vec<SignedLedgerEvent> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
