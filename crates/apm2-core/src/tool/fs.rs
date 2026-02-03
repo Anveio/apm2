@@ -233,14 +233,22 @@ impl FilesystemTool {
         let root = self.resolve_path(&req.path)?;
         info!("Listing files: {:?} pattern={:?}", root, req.pattern);
 
-        if req.pattern.contains("..") {
+        // Defense-in-depth: Check for path traversal in pattern.
+        // Uses the same logic as resolve_path for consistency.
+        if Self::contains_path_traversal(&req.pattern) {
             return Err(ToolError {
                 error_code: "PATH_TRAVERSAL".to_string(),
-                message: "Path traversal sequences (..) are not allowed".to_string(),
+                message: "Path traversal sequences (..) are not allowed in pattern".to_string(),
                 retryable: false,
                 retry_after_ms: 0,
             });
         }
+
+        // Canonicalize workspace root for boundary checks on matched paths
+        let canonical_root = self
+            .workspace_root
+            .canonicalize()
+            .map_err(|e| Self::map_io_error(&e))?;
 
         let mut output = String::new();
         let mut count = 0;
@@ -287,6 +295,21 @@ impl FilesystemTool {
                 }
                 match entry {
                     Ok(path) => {
+                        // Security: Verify matched path is within workspace boundary.
+                        // This guards against symlink attacks and glob edge cases.
+                        if let Ok(canonical_path) = path.canonicalize() {
+                            if !canonical_path.starts_with(&canonical_root) {
+                                // Skip files outside the sandbox boundary silently
+                                // (do not expose that they exist)
+                                continue;
+                            }
+                        }
+                        // If canonicalize fails (e.g., broken symlink), skip the entry
+                        // to avoid exposing information about files we cannot verify.
+                        else {
+                            continue;
+                        }
+
                         // Return path relative to root if possible, else just filename or full path
                         // relative to workspace? Usually list_files expects
                         // paths relative to `path`.
@@ -314,6 +337,19 @@ impl FilesystemTool {
         }
 
         Ok(output.into_bytes())
+    }
+
+    /// Check if a path contains path traversal sequences.
+    ///
+    /// Returns true if the path contains `..` as a path component.
+    fn contains_path_traversal(path: &str) -> bool {
+        // Split by both forward and back slashes for cross-platform safety
+        for component in path.split(['/', '\\']) {
+            if component == ".." {
+                return true;
+            }
+        }
+        false
     }
 
     /// Execute a search request.

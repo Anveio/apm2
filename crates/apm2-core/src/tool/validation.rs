@@ -552,6 +552,15 @@ fn validate_list_files(req: &ListFiles, errors: &mut Vec<ValidationError>) {
         });
     }
 
+    // Security: Validate pattern does not contain path traversal sequences
+    if contains_path_traversal(&req.pattern) {
+        errors.push(ValidationError {
+            field: "list_files.pattern".to_string(),
+            rule: "no_path_traversal".to_string(),
+            message: "pattern must not contain path traversal sequences (..)".to_string(),
+        });
+    }
+
     if req.max_entries > MAX_LIST_FILES_ENTRIES {
         errors.push(ValidationError {
             field: "list_files.max_entries".to_string(),
@@ -1162,5 +1171,87 @@ mod artifact_fetch_tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.field == "artifact_fetch.max_bytes"));
+    }
+}
+
+#[cfg(test)]
+mod list_files_tests {
+    use super::*;
+
+    #[test]
+    fn test_list_files_valid() {
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "**/*.rs".to_string(),
+                max_entries: 100,
+            })),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn test_list_files_pattern_path_traversal() {
+        // Test path traversal in pattern field
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "../secret/*".to_string(),
+                max_entries: 100,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.field == "list_files.pattern"));
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
+    }
+
+    #[test]
+    fn test_list_files_pattern_traversal_middle() {
+        // Test path traversal in the middle of pattern
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "src/../../../etc/passwd".to_string(),
+                max_entries: 100,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
+    }
+
+    #[test]
+    fn test_list_files_pattern_backslash_traversal() {
+        // Test path traversal with backslashes (Windows-style)
+        let req = ToolRequest {
+            consumption_mode: false,
+            request_id: "req-001".to_string(),
+            session_token: "session-abc".to_string(),
+            dedupe_key: String::new(),
+            tool: Some(tool_request::Tool::ListFiles(ListFiles {
+                path: "/workspace".to_string(),
+                pattern: "..\\secret\\*".to_string(),
+                max_entries: 100,
+            })),
+        };
+        let result = req.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.rule == "no_path_traversal"));
     }
 }
