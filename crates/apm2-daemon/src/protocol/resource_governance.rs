@@ -47,7 +47,7 @@
 //! - [INV-RG-005] All limit violations return errors, never panic
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -409,17 +409,27 @@ impl DropPriority {
 ///
 /// # Thread Safety
 ///
-/// Uses atomic operations for lock-free access.
+/// Uses a Mutex to protect both tokens and `last_refill` timestamp together,
+/// ensuring atomic read-modify-write operations and preventing race conditions
+/// between concurrent refill and `try_acquire` operations.
 #[derive(Debug)]
 pub struct RateLimiter {
-    /// Current token count (scaled by 1000 for sub-token precision).
-    tokens: AtomicU64,
-    /// Last refill timestamp.
-    last_refill: RwLock<Instant>,
+    /// Protected state: (tokens scaled by 1000, last refill timestamp).
+    /// Using Mutex ensures atomic updates to both fields together.
+    state: std::sync::Mutex<RateLimiterState>,
     /// Tokens per second (rate).
     rate: u64,
     /// Maximum tokens (burst capacity).
     burst: u64,
+}
+
+/// Internal state for the rate limiter, protected by Mutex.
+#[derive(Debug)]
+struct RateLimiterState {
+    /// Current token count (scaled by 1000 for sub-token precision).
+    tokens: u64,
+    /// Last refill timestamp.
+    last_refill: Instant,
 }
 
 impl RateLimiter {
@@ -432,9 +442,11 @@ impl RateLimiter {
     #[must_use]
     pub fn new(rate: u64, burst: u64) -> Self {
         Self {
-            // Start with full burst capacity (scaled by 1000)
-            tokens: AtomicU64::new(burst * 1000),
-            last_refill: RwLock::new(Instant::now()),
+            state: std::sync::Mutex::new(RateLimiterState {
+                // Start with full burst capacity (scaled by 1000)
+                tokens: burst * 1000,
+                last_refill: Instant::now(),
+            }),
             rate,
             burst,
         }
@@ -448,66 +460,66 @@ impl RateLimiter {
 
     /// Attempts to acquire a token for sending a pulse.
     ///
+    /// This method atomically refills tokens based on elapsed time and then
+    /// attempts to consume one token. The Mutex ensures no race conditions
+    /// between concurrent refill and acquire operations.
+    ///
     /// # Returns
     ///
     /// `Ok(())` if a token was acquired,
     /// `Err(ResourceError::RateLimitExceeded)` if rate limit is exceeded.
-    pub fn try_acquire(&self) -> Result<(), ResourceError> {
-        self.refill();
-
-        // Try to consume one token (1000 scaled units)
-        let mut current = self.tokens.load(Ordering::Relaxed);
-        loop {
-            if current < 1000 {
-                return Err(ResourceError::RateLimitExceeded {
-                    current_rate: self.rate,
-                    max_rate: self.rate,
-                });
-            }
-            match self.tokens.compare_exchange_weak(
-                current,
-                current - 1000,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(new_current) => current = new_current,
-            }
-        }
-    }
-
-    /// Refills tokens based on elapsed time.
     #[allow(clippy::cast_possible_truncation)]
-    fn refill(&self) {
-        let now = Instant::now();
-        let mut last = self.last_refill.write().expect("lock poisoned");
+    pub fn try_acquire(&self) -> Result<(), ResourceError> {
+        let mut state = self.state.lock().expect("lock poisoned");
 
-        let elapsed = now.duration_since(*last);
+        // Refill tokens based on elapsed time (done atomically with acquire)
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill);
         // Truncation is intentional: milliseconds since last refill will never
         // exceed u64::MAX in practice (would require ~584 million years).
         let elapsed_ms = elapsed.as_millis() as u64;
 
-        if elapsed_ms == 0 {
-            return;
+        if elapsed_ms > 0 {
+            // Calculate tokens to add (rate is per second, scale by 1000)
+            let tokens_to_add = (elapsed_ms * self.rate * 1000) / 1000;
+            let max_tokens = self.burst * 1000;
+            state.tokens = (state.tokens + tokens_to_add).min(max_tokens);
+            state.last_refill = now;
         }
 
-        // Calculate tokens to add (rate is per second, scale by 1000)
-        let tokens_to_add = (elapsed_ms * self.rate * 1000) / 1000;
-        let max_tokens = self.burst * 1000;
+        // Try to consume one token (1000 scaled units)
+        if state.tokens < 1000 {
+            return Err(ResourceError::RateLimitExceeded {
+                current_rate: self.rate,
+                max_rate: self.rate,
+            });
+        }
 
-        // Add tokens up to burst capacity
-        let current = self.tokens.load(Ordering::Relaxed);
-        let new_tokens = (current + tokens_to_add).min(max_tokens);
-        self.tokens.store(new_tokens, Ordering::Relaxed);
-
-        *last = now;
+        state.tokens -= 1000;
+        Ok(())
     }
 
     /// Returns the current token count (for testing/monitoring).
+    ///
+    /// This also performs a refill based on elapsed time.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn available_tokens(&self) -> u64 {
-        self.refill();
-        self.tokens.load(Ordering::Relaxed) / 1000
+        let mut state = self.state.lock().expect("lock poisoned");
+
+        // Refill tokens based on elapsed time
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill);
+        let elapsed_ms = elapsed.as_millis() as u64;
+
+        if elapsed_ms > 0 {
+            let tokens_to_add = (elapsed_ms * self.rate * 1000) / 1000;
+            let max_tokens = self.burst * 1000;
+            state.tokens = (state.tokens + tokens_to_add).min(max_tokens);
+            state.last_refill = now;
+        }
+
+        state.tokens / 1000
     }
 }
 
@@ -689,7 +701,13 @@ impl ConnectionState {
         self.subscriptions.values()
     }
 
-    /// Checks rate limit and queue limits for pulse delivery.
+    /// Atomically checks all delivery limits and reserves queue slot if
+    /// allowed.
+    ///
+    /// This method combines check and reservation into a single atomic
+    /// operation to prevent TOCTOU vulnerabilities. It also ensures rate
+    /// limit tokens are only consumed after all other checks pass to
+    /// prevent token leaks.
     ///
     /// # Arguments
     ///
@@ -698,6 +716,101 @@ impl ConnectionState {
     /// # Errors
     ///
     /// Returns `ResourceError` if any limit would be exceeded.
+    ///
+    /// # Thread Safety
+    ///
+    /// Uses CAS loops to atomically reserve queue depth and bytes in-flight,
+    /// preventing race conditions where multiple threads could pass the check
+    /// simultaneously before any increment occurs.
+    pub fn try_reserve_enqueue(&self, payload_size: usize) -> Result<(), ResourceError> {
+        // Check payload size first (stateless check, no reservation needed)
+        if payload_size > self.config.max_pulse_payload_bytes {
+            return Err(ResourceError::PayloadTooLarge {
+                size: payload_size,
+                max: self.config.max_pulse_payload_bytes,
+            });
+        }
+
+        // Atomically reserve queue depth slot using CAS loop
+        loop {
+            let current_depth = self.queue_depth.load(Ordering::Acquire);
+            if current_depth >= self.config.max_queue_depth {
+                return Err(ResourceError::QueueFull {
+                    current: current_depth,
+                    max: self.config.max_queue_depth,
+                });
+            }
+
+            if self
+                .queue_depth
+                .compare_exchange_weak(
+                    current_depth,
+                    current_depth + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+            // CAS failed, retry
+        }
+
+        // Atomically reserve bytes in-flight using CAS loop
+        loop {
+            let current_bytes = self.bytes_in_flight.load(Ordering::Acquire);
+            if current_bytes + payload_size > self.config.max_bytes_in_flight {
+                // Rollback queue depth reservation
+                self.queue_depth.fetch_sub(1, Ordering::Release);
+                return Err(ResourceError::BytesInFlightExceeded {
+                    current: current_bytes,
+                    requested: payload_size,
+                    max: self.config.max_bytes_in_flight,
+                });
+            }
+
+            if self
+                .bytes_in_flight
+                .compare_exchange_weak(
+                    current_bytes,
+                    current_bytes + payload_size,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+            // CAS failed, retry
+        }
+
+        // Only consume rate limit token AFTER all other checks pass and
+        // reservations are made. This prevents token leak on queue rejection.
+        if let Err(e) = self.rate_limiter.try_acquire() {
+            // Rollback reservations on rate limit failure
+            self.queue_depth.fetch_sub(1, Ordering::Release);
+            self.bytes_in_flight
+                .fetch_sub(payload_size, Ordering::Release);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Checks delivery limits without reserving (for read-only validation).
+    ///
+    /// NOTE: This is a TOCTOU-prone check. For actual enqueue operations,
+    /// use `try_reserve_enqueue` which atomically checks AND reserves.
+    /// This method is only for pre-validation or monitoring purposes.
+    ///
+    /// # Arguments
+    ///
+    /// * `payload_size` - Size of the pulse payload in bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceError` if any limit would be exceeded.
+    #[allow(dead_code)]
     pub fn check_delivery_limits(&self, payload_size: usize) -> Result<(), ResourceError> {
         // Check payload size
         if payload_size > self.config.max_pulse_payload_bytes {
@@ -707,11 +820,8 @@ impl ConnectionState {
             });
         }
 
-        // Check rate limit
-        self.rate_limiter.try_acquire()?;
-
-        // Check queue depth
-        let current_depth = self.queue_depth.load(Ordering::Relaxed);
+        // Check queue depth (non-reserving check)
+        let current_depth = self.queue_depth.load(Ordering::Acquire);
         if current_depth >= self.config.max_queue_depth {
             return Err(ResourceError::QueueFull {
                 current: current_depth,
@@ -719,8 +829,8 @@ impl ConnectionState {
             });
         }
 
-        // Check bytes in-flight
-        let current_bytes = self.bytes_in_flight.load(Ordering::Relaxed);
+        // Check bytes in-flight (non-reserving check)
+        let current_bytes = self.bytes_in_flight.load(Ordering::Acquire);
         if current_bytes + payload_size > self.config.max_bytes_in_flight {
             return Err(ResourceError::BytesInFlightExceeded {
                 current: current_bytes,
@@ -732,15 +842,20 @@ impl ConnectionState {
         Ok(())
     }
 
-    /// Records that a pulse was enqueued.
+    /// Records that a pulse was enqueued (for use after `try_reserve_enqueue`).
     ///
-    /// # Arguments
-    ///
-    /// * `payload_size` - Size of the pulse payload in bytes
-    pub fn record_enqueue(&self, payload_size: usize) {
-        self.queue_depth.fetch_add(1, Ordering::Relaxed);
-        self.bytes_in_flight
-            .fetch_add(payload_size, Ordering::Relaxed);
+    /// NOTE: This method is now a no-op since `try_reserve_enqueue` atomically
+    /// reserves the slot. It is kept for API compatibility but callers should
+    /// use `try_reserve_enqueue` directly.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use try_reserve_enqueue which atomically reserves. This is now a no-op."
+    )]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn record_enqueue(&self, _payload_size: usize) {
+        // No-op: try_reserve_enqueue already performed the reservation
+        // atomically. This method is kept for backwards compatibility
+        // during migration.
     }
 
     /// Records that a pulse was delivered/dequeued.
@@ -932,7 +1047,11 @@ impl SubscriptionRegistry {
         conn.check_subscription_limits(pattern_count)
     }
 
-    /// Checks delivery limits for a pulse.
+    /// Atomically checks delivery limits and reserves queue slot for a pulse.
+    ///
+    /// This method combines check and reservation into a single atomic
+    /// operation to prevent TOCTOU vulnerabilities. Rate limit tokens are
+    /// only consumed after all other checks pass to prevent token leaks.
     ///
     /// # Arguments
     ///
@@ -942,6 +1061,36 @@ impl SubscriptionRegistry {
     /// # Errors
     ///
     /// Returns `ResourceError` if limits would be exceeded.
+    pub fn try_reserve_enqueue(
+        &self,
+        connection_id: &str,
+        payload_size: usize,
+    ) -> Result<(), ResourceError> {
+        let connections = self.connections.read().expect("lock poisoned");
+        let conn =
+            connections
+                .get(connection_id)
+                .ok_or_else(|| ResourceError::ConnectionNotFound {
+                    connection_id: connection_id.to_string(),
+                })?;
+        conn.try_reserve_enqueue(payload_size)
+    }
+
+    /// Checks delivery limits for a pulse (non-reserving).
+    ///
+    /// NOTE: This is a TOCTOU-prone check. For actual enqueue operations,
+    /// use `try_reserve_enqueue` which atomically checks AND reserves.
+    /// This method is only for pre-validation or monitoring purposes.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_id` - Connection identifier
+    /// * `payload_size` - Size of the pulse payload
+    ///
+    /// # Errors
+    ///
+    /// Returns `ResourceError` if limits would be exceeded.
+    #[allow(dead_code)]
     pub fn check_delivery_limits(
         &self,
         connection_id: &str,
@@ -959,15 +1108,18 @@ impl SubscriptionRegistry {
 
     /// Records that a pulse was enqueued for a connection.
     ///
-    /// # Arguments
-    ///
-    /// * `connection_id` - Connection identifier
-    /// * `payload_size` - Size of the pulse payload
-    pub fn record_enqueue(&self, connection_id: &str, payload_size: usize) {
-        let connections = self.connections.read().expect("lock poisoned");
-        if let Some(conn) = connections.get(connection_id) {
-            conn.record_enqueue(payload_size);
-        }
+    /// NOTE: This method is now a no-op since `try_reserve_enqueue` atomically
+    /// reserves the slot. It is kept for API compatibility but callers should
+    /// use `try_reserve_enqueue` directly.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use try_reserve_enqueue which atomically reserves. This is now a no-op."
+    )]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn record_enqueue(&self, _connection_id: &str, _payload_size: usize) {
+        // No-op: try_reserve_enqueue already performed the reservation
+        // atomically. This method is kept for backwards compatibility
+        // during migration.
     }
 
     /// Records that a pulse was delivered for a connection.
@@ -1367,17 +1519,92 @@ mod tests {
         fn queue_and_bytes_tracking() {
             let conn = ConnectionState::new("conn-1", ResourceQuotaConfig::for_testing());
 
-            conn.record_enqueue(100);
+            // Use try_reserve_enqueue which atomically reserves
+            conn.try_reserve_enqueue(100).unwrap();
             assert_eq!(conn.queue_depth(), 1);
             assert_eq!(conn.bytes_in_flight(), 100);
 
-            conn.record_enqueue(200);
+            conn.try_reserve_enqueue(200).unwrap();
             assert_eq!(conn.queue_depth(), 2);
             assert_eq!(conn.bytes_in_flight(), 300);
 
             conn.record_dequeue(100);
             assert_eq!(conn.queue_depth(), 1);
             assert_eq!(conn.bytes_in_flight(), 200);
+        }
+
+        #[test]
+        fn try_reserve_enqueue_enforces_queue_limit() {
+            let config = ResourceQuotaConfig {
+                max_queue_depth: 2,
+                max_bytes_in_flight: 10000,
+                max_burst_pulses: 100,
+                ..ResourceQuotaConfig::for_testing()
+            };
+            let conn = ConnectionState::new("conn-1", config);
+
+            // First two should succeed
+            assert!(conn.try_reserve_enqueue(50).is_ok());
+            assert!(conn.try_reserve_enqueue(50).is_ok());
+            assert_eq!(conn.queue_depth(), 2);
+
+            // Third should fail with QueueFull
+            let result = conn.try_reserve_enqueue(50);
+            assert!(matches!(result, Err(ResourceError::QueueFull { .. })));
+            // Queue depth should still be 2 (no reservation made)
+            assert_eq!(conn.queue_depth(), 2);
+        }
+
+        #[test]
+        fn try_reserve_enqueue_enforces_bytes_limit() {
+            let config = ResourceQuotaConfig {
+                max_queue_depth: 100,
+                max_bytes_in_flight: 150,
+                max_burst_pulses: 100,
+                ..ResourceQuotaConfig::for_testing()
+            };
+            let conn = ConnectionState::new("conn-1", config);
+
+            // First should succeed
+            assert!(conn.try_reserve_enqueue(100).is_ok());
+            assert_eq!(conn.bytes_in_flight(), 100);
+
+            // Second should fail (100 + 100 > 150)
+            let result = conn.try_reserve_enqueue(100);
+            assert!(matches!(
+                result,
+                Err(ResourceError::BytesInFlightExceeded { .. })
+            ));
+            // Queue depth should be rolled back
+            assert_eq!(conn.queue_depth(), 1);
+            assert_eq!(conn.bytes_in_flight(), 100);
+        }
+
+        #[test]
+        fn try_reserve_enqueue_no_token_leak_on_queue_full() {
+            let config = ResourceQuotaConfig {
+                max_queue_depth: 1,
+                max_bytes_in_flight: 10000,
+                max_burst_pulses: 2, // Only 2 tokens
+                max_pulses_per_sec: 1,
+                ..ResourceQuotaConfig::for_testing()
+            };
+            let conn = ConnectionState::new("conn-1", config);
+
+            // First enqueue should succeed (uses 1 token)
+            assert!(conn.try_reserve_enqueue(50).is_ok());
+
+            // Second should fail due to queue full (NOT rate limit)
+            // and should NOT consume a token
+            let result = conn.try_reserve_enqueue(50);
+            assert!(matches!(result, Err(ResourceError::QueueFull { .. })));
+
+            // Dequeue the first item
+            conn.record_dequeue(50);
+
+            // Now we should still be able to enqueue because the token wasn't
+            // consumed on the failed attempt
+            assert!(conn.try_reserve_enqueue(50).is_ok());
         }
     }
 
@@ -1455,20 +1682,23 @@ mod tests {
         }
 
         #[test]
-        fn check_delivery_limits_through_registry() {
+        fn try_reserve_enqueue_through_registry() {
             let registry = SubscriptionRegistry::new(ResourceQuotaConfig::for_testing());
             registry.register_connection("conn-1");
 
-            // Should succeed for reasonable payload
-            assert!(registry.check_delivery_limits("conn-1", 100).is_ok());
+            // Should succeed for reasonable payload and atomically reserve
+            assert!(registry.try_reserve_enqueue("conn-1", 100).is_ok());
 
-            // Record some usage
-            registry.record_enqueue("conn-1", 100);
-
-            // Stats should reflect usage
+            // Stats should reflect usage (reservation is atomic)
             let stats = registry.connection_stats("conn-1").unwrap();
             assert_eq!(stats.queue_depth, 1);
             assert_eq!(stats.bytes_in_flight, 100);
+
+            // Add another
+            assert!(registry.try_reserve_enqueue("conn-1", 50).is_ok());
+            let stats = registry.connection_stats("conn-1").unwrap();
+            assert_eq!(stats.queue_depth, 2);
+            assert_eq!(stats.bytes_in_flight, 150);
         }
 
         #[test]
