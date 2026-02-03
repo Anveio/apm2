@@ -259,6 +259,16 @@ impl FilesystemTool {
         } else {
             // Glob pattern
             // Security: Pattern matches are relative to root.
+            // Explicitly block traversal in pattern before joining.
+            if req.pattern.contains("..") {
+                return Err(ToolError {
+                    error_code: "PATH_TRAVERSAL".to_string(),
+                    message: "Path traversal sequences (..) are not allowed in pattern".to_string(),
+                    retryable: false,
+                    retry_after_ms: 0,
+                });
+            }
+
             // We construct the glob pattern: root / pattern
             let pattern_str = root.join(&req.pattern).to_string_lossy().to_string();
             
@@ -307,7 +317,7 @@ impl FilesystemTool {
         // Scope acts as a glob pattern relative to workspace root
         // Ensure no traversal in scope
         if req.scope.contains("..") {
-             return Err(ToolError {
+            return Err(ToolError {
                 error_code: "PATH_TRAVERSAL".to_string(),
                 message: "Path traversal sequences (..) are not allowed".to_string(),
                 retryable: false,
@@ -316,14 +326,26 @@ impl FilesystemTool {
         }
 
         // Resolve scope relative to workspace root
-        let pattern_str = self.workspace_root.join(&req.scope).to_string_lossy().to_string();
+        let pattern_str = self
+            .workspace_root
+            .join(&req.scope)
+            .to_string_lossy()
+            .to_string();
         info!("Searching for '{}' in scope: {:?}", req.query, pattern_str);
 
         let mut output = String::new();
         let mut line_count = 0;
         let mut byte_count = 0;
-        let max_lines = if req.max_lines == 0 { 2000 } else { req.max_lines };
-        let max_bytes = if req.max_bytes == 0 { 65536 } else { req.max_bytes };
+        let max_lines = if req.max_lines == 0 {
+            2000
+        } else {
+            req.max_lines
+        };
+        let max_bytes = if req.max_bytes == 0 {
+            65536
+        } else {
+            req.max_bytes
+        };
 
         for entry in glob::glob(&pattern_str).map_err(|e| ToolError {
             error_code: "INVALID_PATTERN".to_string(),
@@ -338,12 +360,16 @@ impl FilesystemTool {
             match entry {
                 Ok(path) => {
                     if path.is_file() {
+                        use std::io::BufRead;
                         // Read file line by line
                         let file = fs::File::open(&path).map_err(|e| Self::map_io_error(&e))?;
                         let reader = std::io::BufReader::new(file);
-                        use std::io::BufRead;
 
-                        let rel_path = path.strip_prefix(&self.workspace_root).unwrap_or(&path).to_string_lossy().into_owned();
+                        let rel_path = path
+                            .strip_prefix(&self.workspace_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned();
 
                         for (i, line) in reader.lines().enumerate() {
                             if line_count >= max_lines || byte_count >= max_bytes {
@@ -352,7 +378,8 @@ impl FilesystemTool {
                             match line {
                                 Ok(content) => {
                                     if content.contains(&req.query) {
-                                        let matched_line = format!("{}:{}:{}\n", rel_path, i + 1, content);
+                                        let matched_line =
+                                            format!("{}:{}:{}\n", rel_path, i + 1, content);
                                         let len = matched_line.len() as u64;
                                         if byte_count + len > max_bytes {
                                             break;
@@ -362,12 +389,12 @@ impl FilesystemTool {
                                         line_count += 1;
                                     }
                                 },
-                                Err(_) => continue, // Skip binary/invalid utf8 lines
+                                Err(_) => {}, // Skip binary/invalid utf8 lines
                             }
                         }
                     }
                 },
-                Err(_) => continue,
+                Err(_) => {}, // Skip invalid glob entries
             }
         }
 
@@ -467,6 +494,22 @@ mod tests {
                 offset: 0,
 
                 limit: 0,
+            })
+            .unwrap_err();
+
+        assert_eq!(err.error_code, "PATH_TRAVERSAL");
+    }
+
+    #[test]
+    fn test_list_files_traversal_blocked() {
+        let temp_dir = TempDir::new().unwrap();
+        let tool = FilesystemTool::new(temp_dir.path().to_path_buf());
+
+        let err = tool
+            .list_files(&ListFiles {
+                path: ".".to_string(),
+                pattern: "../outside.txt".to_string(),
+                max_entries: 10,
             })
             .unwrap_err();
 
