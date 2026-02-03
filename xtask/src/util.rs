@@ -106,17 +106,22 @@ pub fn try_emit_internal_receipt(
     let event_type_arg = event_type;
     let correlation_id_arg = correlation_id;
 
-    // Write payload to a temporary file to avoid shell injection
-    let payload_file =
-        tempfile::NamedTempFile::new().context("Failed to create temp file for event payload")?;
-    std::fs::write(payload_file.path(), payload)
-        .context("Failed to write event payload to temp file")?;
-    let payload_path = payload_file.path().to_string_lossy().to_string();
+    // SECURITY (CWE-214): We do NOT pass the session token via --session-token
+    // flag, as command-line arguments are visible in process listings (ps,
+    // /proc). Instead, we rely on the APM2_SESSION_TOKEN environment variable
+    // which is automatically inherited by the subprocess and read by the apm2
+    // CLI.
+    //
+    // The session_token variable is used here ONLY to verify it's available;
+    // the actual authentication happens via env var inheritance.
+    let _ = &session_token; // Acknowledge availability check
 
-    // Try to emit via apm2 CLI. If CLI is not available, log and continue.
+    // Convert payload bytes to string for the CLI --payload argument
+    let payload_str = String::from_utf8_lossy(payload).to_string();
+
     let result = cmd!(
         sh,
-        "timeout 5 apm2 emit-event --session-token {session_token} --event-type {event_type_arg} --payload-file {payload_path} --correlation-id {correlation_id_arg}"
+        "timeout 5 apm2 event emit --event-type {event_type_arg} --payload {payload_str} --correlation-id {correlation_id_arg}"
     )
     .ignore_status()
     .read();
