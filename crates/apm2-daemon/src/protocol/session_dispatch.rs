@@ -63,6 +63,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use apm2_core::coordination::ContextRefinementRequest;
+use apm2_core::events::{DefectRecorded, DefectSource};
 use bytes::Bytes;
 use prost::Message;
 use tracing::{debug, error, info, warn};
@@ -87,9 +89,6 @@ use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
 use crate::episode::{CapabilityManifest, EpisodeId, SharedToolBroker, ToolClass};
 use crate::htf::{ClockError, HolonicClock};
-use crate::session::consume::ConsumeSessionError;
-use apm2_core::coordination::ContextRefinementRequest;
-use apm2_core::events::{DefectRecorded, DefectSource, TimeEnvelopeRef};
 
 // ============================================================================
 // Message Type Tags (for routing)
@@ -585,15 +584,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             let defect_id = format!("DEF-MISS-{}", uuid::Uuid::new_v4());
 
             // Construct payload description
-            let description = format!("Context miss for path: {}", path);
+            let description = format!("Context miss for path: {path}");
             let payload = description.as_bytes();
 
             // Store in CAS if available
-            let cas_hash = if let Some(ref cas) = self.cas {
-                cas.store(payload).to_vec()
-            } else {
-                vec![0u8; 32]
-            };
+            let cas_hash = self
+                .cas
+                .as_ref()
+                .map_or_else(|| vec![0u8; 32], |cas| cas.store(payload).to_vec());
 
             let defect = DefectRecorded {
                 defect_id,
@@ -990,7 +988,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // TCK-00307: Emit DefectRecorded for ContextMiss
                 if termination_info.rationale_code == "CONTEXT_MISS" {
                     if let Some(event_bytes) = refinement_event {
-                        if let Ok(req) = serde_json::from_slice::<ContextRefinementRequest>(&event_bytes) {
+                        if let Ok(req) =
+                            serde_json::from_slice::<ContextRefinementRequest>(&event_bytes)
+                        {
                             self.emit_context_miss_defect(session_id, &req.missed_path);
                         }
                     }
