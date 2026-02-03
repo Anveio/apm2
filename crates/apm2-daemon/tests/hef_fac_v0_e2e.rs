@@ -119,11 +119,11 @@ impl Drop for EnvVarGuard {
         match self.previous.as_ref() {
             Some(value) => unsafe {
                 // SAFETY: Tests control env mutation scope; guard restores on drop.
-                std::env::set_var(self.key, value)
+                std::env::set_var(self.key, value);
             },
             None => unsafe {
                 // SAFETY: Tests control env mutation scope; guard restores on drop.
-                std::env::remove_var(self.key)
+                std::env::remove_var(self.key);
             },
         }
     }
@@ -533,11 +533,14 @@ async fn test_changeset_published_ledger_anchoring() {
 /// - `ReviewReceiptRecorded` event is appended to ledger
 /// - `changeset_digest` and `artifact_bundle_hash` are correctly bound
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Test-only: serial execution via mutex is intentional
 async fn test_review_receipt_ledger_anchoring() {
     enforce_evid_hef_0012_env_constraints();
 
     let mut harness = FacV0TestHarness::new();
-    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+    let _git_lock = GIT_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // First, establish context with ChangeSetPublished
     let bundle = create_test_changeset_bundle(vec![("src/lib.rs", ChangeKind::Modify)]);
@@ -805,11 +808,14 @@ async fn test_review_blocked_apply_failed() {
 
 /// Tests `ReviewBlockedRecorded` for tool failure on `GitOperation` bounds.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Test-only: serial execution via mutex is intentional
 async fn test_review_blocked_tool_failure_on_git_bounds() {
     enforce_evid_hef_0012_env_constraints();
 
     let harness = FacV0TestHarness::new();
-    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+    let _git_lock = GIT_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let bundle = create_test_changeset_bundle(vec![("big.txt", ChangeKind::Modify)]);
 
     let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
@@ -887,11 +893,14 @@ async fn test_review_blocked_tool_failure_on_git_bounds() {
 
 /// Tests `ReviewBlockedRecorded` for tool failure on `git status` bounds.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Test-only: serial execution via mutex is intentional
 async fn test_review_blocked_tool_failure_on_git_status_bounds() {
     enforce_evid_hef_0012_env_constraints();
 
     let harness = FacV0TestHarness::new();
-    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+    let _git_lock = GIT_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let bundle = create_test_changeset_bundle(vec![("status.txt", ChangeKind::Modify)]);
 
     let bundle_bytes = bundle.canonical_bytes().expect("serialize bundle");
@@ -976,13 +985,16 @@ async fn test_review_blocked_tool_failure_on_git_status_bounds() {
     );
 }
 
-/// Tests git environment isolation (GIT_DIR/GIT_WORK_TREE ignored).
+/// Tests git environment isolation (`GIT_DIR`/`GIT_WORK_TREE` ignored).
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Test-only: serial execution via mutex is intentional
 async fn test_git_operation_ignores_env_overrides() {
     enforce_evid_hef_0012_env_constraints();
 
     let harness = FacV0TestHarness::new();
-    let _git_lock = GIT_TEST_MUTEX.lock().unwrap_or_else(|err| err.into_inner());
+    let _git_lock = GIT_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let file_path = harness.workspace_root().join("env_isolation.txt");
     std::fs::write(&file_path, b"base\n").expect("write base file");
     harness.init_git_repo();
@@ -1083,7 +1095,7 @@ async fn test_review_blocked_missing_artifact() {
     );
 }
 
-/// Tests `ReviewBlockedRecorded` for artifact fetch max_bytes enforcement.
+/// Tests `ReviewBlockedRecorded` for artifact fetch `max_bytes` enforcement.
 #[tokio::test]
 async fn test_review_blocked_artifact_fetch_max_bytes() {
     enforce_evid_hef_0012_env_constraints();
@@ -1304,12 +1316,16 @@ async fn test_domain_separation_rejects_fac_prefix() {
 /// 7. `ReviewReceiptRecorded` ledger anchoring
 /// 8. Ledger-only truth verification
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Test-only: serial execution via mutex is intentional
 async fn test_fac_v0_full_e2e_autonomous_flow() {
     // =========================================================================
     // Step 0: EVID-HEF-0012 Environment Constraints
     // =========================================================================
     enforce_evid_hef_0012_env_constraints();
 
+    let _git_lock = GIT_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut harness = FacV0TestHarness::new();
 
     // =========================================================================
