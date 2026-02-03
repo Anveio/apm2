@@ -74,3 +74,114 @@ pub use storage::{
     ArtifactRef, CURRENT_RECORD_VERSION, EventRecord, Ledger, LedgerError, LedgerStats,
     SqliteLedgerBackend,
 };
+
+// ============================================================================
+// Post-Commit Notification (TCK-00304: HEF Outbox)
+// ============================================================================
+
+/// Channel capacity for commit notifications.
+///
+/// Per TCK-00304: Channel type is
+/// `tokio::sync::mpsc::Sender<CommitNotification>` with capacity 1024. This
+/// bounds memory usage while providing sufficient buffering for burst
+/// scenarios.
+pub const COMMIT_NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+
+/// Notification sent after a successful ledger commit.
+///
+/// Per DD-HEF-0007, pulse emission order is: CAS persist -> ledger commit ->
+/// outbox enqueue -> pulse publish. This struct carries the minimal information
+/// needed for the daemon's pulse publisher to emit `PulseEvent` messages.
+///
+/// # Design Constraints (TCK-00304)
+///
+/// - Defined in apm2-core with NO daemon type dependencies
+/// - Contains only primitive types and stdlib types
+/// - Used with `tokio::sync::mpsc::Sender<CommitNotification>` (capacity 1024)
+/// - Sent via `try_send()` for non-blocking notification
+/// - Notification drops are acceptable (fire-and-forget, never fails commit)
+///
+/// # Security Invariants
+///
+/// - [INV-HEF-OUTBOX-001] Notification MUST only be sent AFTER `tx.commit()`
+///   succeeds
+/// - [INV-HEF-OUTBOX-002] Notification failure MUST NOT fail the ledger commit
+/// - [INV-HEF-OUTBOX-003] Notification is best-effort; drops are logged but
+///   acceptable
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitNotification {
+    /// Ledger sequence ID of the committed event.
+    ///
+    /// Authoritative for ordering and catch-up per DD-HEF-0001.
+    pub seq_id: u64,
+
+    /// Blake3 hash of the committed event (32 bytes).
+    ///
+    /// Used for content verification and deduplication.
+    pub event_hash: [u8; 32],
+
+    /// Event type discriminant (e.g., `WorkEvent`, `GateReceipt`).
+    ///
+    /// Used by the pulse publisher to determine the topic and envelope fields.
+    pub event_type: String,
+
+    /// Namespace of the committed event.
+    ///
+    /// Used for topic routing (e.g., "kernel", "holon-1").
+    pub namespace: String,
+
+    /// Optional consensus index for BFT-committed events.
+    ///
+    /// Present only for `TotalOrder` events that went through BFT consensus.
+    pub consensus_index: Option<ConsensusIndex>,
+}
+
+impl CommitNotification {
+    /// Creates a new commit notification.
+    #[must_use]
+    pub fn new(
+        seq_id: u64,
+        event_hash: [u8; 32],
+        event_type: impl Into<String>,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            seq_id,
+            event_hash,
+            event_type: event_type.into(),
+            namespace: namespace.into(),
+            consensus_index: None,
+        }
+    }
+
+    /// Creates a commit notification with consensus index.
+    #[must_use]
+    pub fn with_consensus(
+        seq_id: u64,
+        event_hash: [u8; 32],
+        event_type: impl Into<String>,
+        namespace: impl Into<String>,
+        consensus_index: ConsensusIndex,
+    ) -> Self {
+        Self {
+            seq_id,
+            event_hash,
+            event_type: event_type.into(),
+            namespace: namespace.into(),
+            consensus_index: Some(consensus_index),
+        }
+    }
+}
+
+/// Type alias for the commit notification sender.
+///
+/// Per TCK-00304: Uses `tokio::sync::mpsc::Sender` with capacity 1024.
+/// The sender is stored optionally in `BftLedgerBackend` and used via
+/// `try_send()` for non-blocking notification.
+pub type CommitNotificationSender = tokio::sync::mpsc::Sender<CommitNotification>;
+
+/// Type alias for the commit notification receiver.
+///
+/// Used by the daemon's pulse publisher to drain notifications and emit
+/// `PulseEvent` messages.
+pub type CommitNotificationReceiver = tokio::sync::mpsc::Receiver<CommitNotification>;
