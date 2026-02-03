@@ -113,6 +113,36 @@ impl std::fmt::Display for LedgerEventError {
 
 impl std::error::Error for LedgerEventError {}
 
+/// Error type for HTF timestamp generation (TCK-00289).
+///
+/// # Security (Fail-Closed)
+///
+/// Per RFC-0016 and the security policy, HTF timestamp errors must be
+/// propagated rather than returning a fallback value. Returning 0 would
+/// violate fail-closed security posture and could allow operations to
+/// proceed with invalid timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HtfTimestampError {
+    /// HLC is not enabled on the clock.
+    HlcNotEnabled,
+    /// Clock error occurred.
+    ClockError {
+        /// Error message from the clock.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for HtfTimestampError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HlcNotEnabled => write!(f, "HLC not enabled on clock"),
+            Self::ClockError { message } => write!(f, "clock error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for HtfTimestampError {}
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -1254,9 +1284,6 @@ pub struct PrivilegedDispatcher {
     /// Lease validator for `GATE_EXECUTOR` spawn validation (TCK-00257).
     lease_validator: Arc<dyn LeaseValidator>,
 
-    /// Holonic clock for HTF-compliant timestamps (TCK-00289).
-    clock: Arc<HolonicClock>,
-
     /// Token minter for session token generation (TCK-00287).
     ///
     /// Shared with `SessionDispatcher` to ensure tokens minted during
@@ -1308,6 +1335,11 @@ pub struct PrivilegedDispatcher {
 }
 
 impl Default for PrivilegedDispatcher {
+    /// Creates a default dispatcher (TEST ONLY).
+    ///
+    /// # Warning: RSK-2503 Mixed Clock Domain Hazard
+    ///
+    /// See `new()` for details on clock domain hazards.
     fn default() -> Self {
         Self::new()
     }
@@ -1320,7 +1352,19 @@ impl Default for PrivilegedDispatcher {
 pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
 
 impl PrivilegedDispatcher {
-    /// Creates a new dispatcher with default decode configuration.
+    /// Creates a new dispatcher with default decode configuration (TEST ONLY).
+    ///
+    /// # Warning: RSK-2503 Mixed Clock Domain Hazard
+    ///
+    /// This constructor creates an internal `HolonicClock` instance. For
+    /// production code, use `with_shared_state` or `with_dependencies` to
+    /// inject a shared clock and prevent mixed clock domain hazards.
+    ///
+    /// # Usage
+    ///
+    /// This constructor is intended for unit tests only. Production code
+    /// should use `with_shared_state` or `with_dependencies` with a
+    /// properly initialized and shared `HolonicClock`.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
@@ -1329,6 +1373,10 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn new() -> Self {
         // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        // WARNING: This creates an internal clock which can cause RSK-2503
+        // (Mixed Clock Domain Hazard) if used in production alongside other
+        // components with their own clocks. Use with_shared_state or
+        // with_dependencies for production code.
         let holonic_clock = Arc::new(
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("default ClockConfig should always succeed"),
@@ -1341,7 +1389,6 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
-            clock: Arc::clone(&holonic_clock),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
@@ -1349,7 +1396,19 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Creates a new dispatcher with custom decode configuration.
+    /// Creates a new dispatcher with custom decode configuration (TEST ONLY).
+    ///
+    /// # Warning: RSK-2503 Mixed Clock Domain Hazard
+    ///
+    /// This constructor creates an internal `HolonicClock` instance. For
+    /// production code, use `with_shared_state` or `with_dependencies` to
+    /// inject a shared clock and prevent mixed clock domain hazards.
+    ///
+    /// # Usage
+    ///
+    /// This constructor is intended for unit tests only. Production code
+    /// should use `with_shared_state` or `with_dependencies` with a
+    /// properly initialized and shared `HolonicClock`.
     ///
     /// Uses stub implementations for policy resolver, work registry, event
     /// emitter, session registry, and lease validator. No metrics are emitted.
@@ -1358,6 +1417,10 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_decode_config(decode_config: DecodeConfig) -> Self {
         // TCK-00289: Create default HolonicClock for HTF-compliant timestamps
+        // WARNING: This creates an internal clock which can cause RSK-2503
+        // (Mixed Clock Domain Hazard) if used in production alongside other
+        // components with their own clocks. Use with_shared_state or
+        // with_dependencies for production code.
         let holonic_clock = Arc::new(
             HolonicClock::new(ClockConfig::default(), None)
                 .expect("default ClockConfig should always succeed"),
@@ -1370,7 +1433,6 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry: Arc::new(InMemorySessionRegistry::default()),
             lease_validator: Arc::new(StubLeaseValidator::new()),
-            clock: Arc::clone(&holonic_clock),
             token_minter: Arc::new(TokenMinter::new(TokenMinter::generate_secret())),
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
@@ -1378,10 +1440,42 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Creates a new dispatcher with custom dependencies.
+    /// Creates a new dispatcher with custom dependencies (PRODUCTION).
     ///
     /// This is the production constructor for real governance integration.
     /// Does not include metrics; use `with_metrics` to add them.
+    ///
+    /// # TCK-00289: Clock Injection (RSK-2503 Prevention)
+    ///
+    /// The `clock` parameter MUST be a shared `HolonicClock` instance that is
+    /// also used by other components in the system. This prevents the mixed
+    /// clock domain hazard (RSK-2503) that would occur if each component
+    /// created its own clock.
+    ///
+    /// # TCK-00287: State Sharing
+    ///
+    /// The `token_minter` and `manifest_store` parameters MUST be `Arc::clone`
+    /// copies of the same instances used by `SessionDispatcher`. This ensures:
+    /// - Tokens minted during `SpawnEpisode` can be validated by
+    ///   `SessionDispatcher`
+    /// - Capability manifests registered during `SpawnEpisode` are accessible
+    ///   for tool request validation
+    ///
+    /// Callers must ensure proper sharing by cloning the Arcs BEFORE passing
+    /// to this constructor:
+    /// ```ignore
+    /// let token_minter = Arc::new(TokenMinter::new(...));
+    /// let manifest_store = Arc::new(InMemoryManifestStore::new());
+    /// let priv_dispatcher = PrivilegedDispatcher::with_dependencies(
+    ///     ...,
+    ///     Arc::clone(&token_minter),  // Clone BEFORE passing
+    ///     Arc::clone(&manifest_store), // Clone BEFORE passing
+    /// );
+    /// let session_dispatcher = SessionDispatcher::with_manifest_store(
+    ///     (*token_minter).clone(),
+    ///     manifest_store,
+    /// );
+    /// ```
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn with_dependencies(
@@ -1404,7 +1498,6 @@ impl PrivilegedDispatcher {
             episode_runtime,
             session_registry,
             lease_validator,
-            clock: Arc::clone(&clock),
             token_minter,
             manifest_store,
             metrics: None,
@@ -1412,9 +1505,10 @@ impl PrivilegedDispatcher {
         }
     }
 
-    /// Creates a new dispatcher with shared token minter and manifest store.
+    /// Creates a new dispatcher with shared token minter and manifest store
+    /// (PRODUCTION).
     ///
-    /// # TCK-00287
+    /// # TCK-00287: State Sharing
     ///
     /// This constructor is used by `DispatcherState` to wire up shared
     /// dependencies between `PrivilegedDispatcher` and `SessionDispatcher`:
@@ -1424,6 +1518,14 @@ impl PrivilegedDispatcher {
     ///   `SpawnEpisode` are accessible for tool request validation
     /// - `session_registry`: Uses the global daemon session registry instead of
     ///   an internal stub
+    ///
+    /// # TCK-00289: Clock Injection (RSK-2503 Prevention)
+    ///
+    /// The `clock` parameter MUST be a shared `HolonicClock` instance that is
+    /// also used by other components in the system. This prevents the mixed
+    /// clock domain hazard (RSK-2503) that would occur if each component
+    /// created its own clock.
+    #[must_use]
     pub fn with_shared_state(
         token_minter: Arc<TokenMinter>,
         manifest_store: Arc<InMemoryManifestStore>,
@@ -1438,7 +1540,6 @@ impl PrivilegedDispatcher {
             episode_runtime: Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
             session_registry,
             lease_validator: Arc::new(StubLeaseValidator::new()),
-            clock: Arc::clone(&clock),
             token_minter,
             manifest_store,
             metrics: None,
@@ -1545,18 +1646,28 @@ impl PrivilegedDispatcher {
     /// # Panics
     ///
     /// This method expects the `HolonicClock` to have HLC enabled. If HLC is
-    /// not enabled (which would be a configuration error for production),
-    /// this logs a warning and returns 0. In production, the clock should
-    /// always be configured with HLC enabled.
-    #[must_use]
-    fn get_htf_timestamp_ns(&self) -> u64 {
+    /// not enabled, this returns an error (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HtfTimestampError` if the clock operation fails.
+    ///
+    /// # Security (Fail-Closed)
+    ///
+    /// Per RFC-0016 and TCK-00289 DOD, this method fails closed rather than
+    /// returning a fallback value like 0. Returning 0 would violate security
+    /// policy and allow operations to proceed with invalid timestamps.
+    fn get_htf_timestamp_ns(&self) -> Result<u64, HtfTimestampError> {
         match self.holonic_clock.now_hlc() {
-            Ok(hlc) => hlc.wall_ns,
+            Ok(hlc) => Ok(hlc.wall_ns),
             Err(e) => {
-                // Log warning but don't fail - return 0 as fallback.
-                // This should never happen in production as HLC should be enabled.
-                warn!(error = %e, "HLC clock error, using fallback timestamp 0");
-                0
+                // TCK-00289: Fail-closed - do not return 0 as fallback.
+                // This is a security-critical operation that must not proceed
+                // with invalid timestamps.
+                warn!(error = %e, "HLC clock error - failing closed per RFC-0016");
+                Err(HtfTimestampError::ClockError {
+                    message: e.to_string(),
+                })
             },
         }
     }
@@ -1873,7 +1984,17 @@ impl PrivilegedDispatcher {
         // TCK-00289: Use HTF-compliant timestamp from HolonicClock.
         // Per RFC-0016, timestamps must come from the HTF clock source to ensure
         // monotonicity and causal ordering.
-        let timestamp_ns = self.get_htf_timestamp_ns();
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not proceed without valid timestamp
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
         let signed_event = match self.event_emitter.emit_work_claimed(&claim, timestamp_ns) {
             Ok(event) => event,
             Err(e) => {
@@ -2390,7 +2511,7 @@ impl PrivilegedDispatcher {
         }
 
         // 3. Generate HTF-compliant timestamps
-        let Ok(mono_tick) = self.clock.now_mono_tick() else {
+        let Ok(mono_tick) = self.holonic_clock.now_mono_tick() else {
             warn!("Clock error during IssueCapability");
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::PolicyResolutionFailed,
@@ -2399,19 +2520,19 @@ impl PrivilegedDispatcher {
         };
         let _mono_tick = mono_tick.value();
 
-        // For grant/expire times, we ideally use Wall Time or HLC Wall Time.
-        // RFC-0016 prefers HLC if available.
-        #[allow(clippy::cast_possible_truncation)]
-        let now_wall = self.clock.now_hlc().map_or_else(
-            |_| {
-                // Fallback to system time if HLC disabled (best effort)
-                SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64
+        // For grant/expire times, use HLC Wall Time per RFC-0016.
+        // TCK-00289: Fail-closed - do not fall back to SystemTime if HLC disabled.
+        let now_wall = match self.holonic_clock.now_hlc() {
+            Ok(hlc) => hlc.wall_ns,
+            Err(e) => {
+                // TCK-00289: Fail-closed - do not use SystemTime fallback
+                warn!(error = %e, "HLC clock error during IssueCapability - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::PolicyResolutionFailed,
+                    format!("HTF timestamp error: {e}"),
+                ));
             },
-            |hlc| hlc.wall_ns,
-        );
+        };
 
         // Duration is in seconds, convert to nanoseconds
         let duration_ns =
