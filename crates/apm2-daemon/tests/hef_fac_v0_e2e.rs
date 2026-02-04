@@ -158,15 +158,18 @@ impl FacV0TestHarness {
     fn new() -> Self {
         // Create temporary workspace directory
         let temp_dir = TempDir::new().expect("create temp dir");
-        let workspace_root = temp_dir.path().to_path_buf();
+        let workspace_root = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace dir");
+        let repo_path = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_path).expect("create repo dir");
 
-        // Create workspace manager
-        let workspace_manager = WorkspaceManager::new(workspace_root.clone());
-
-        // Create reviewer capability manifest with Read allowed
-        let reviewer_manifest = create_reviewer_capability_manifest();
-        let capability_validator =
-            CapabilityValidator::new(reviewer_manifest).expect("valid capability validator");
+        // Init upstream repo
+        Command::new("git").arg("init").current_dir(&repo_path).output().expect("git init");
+        Command::new("git").args(["config", "user.email", "test@example.com"]).current_dir(&repo_path).output().expect("git config");
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&repo_path).output().expect("git config");
+        std::fs::write(repo_path.join("README.md"), "initial\n").expect("write readme");
+        Command::new("git").args(["add", "."]).current_dir(&repo_path).output().expect("git add");
+        Command::new("git").args(["commit", "-m", "initial"]).current_dir(&repo_path).output().expect("git commit");
 
         // Create CAS
         let cas_dir = temp_dir.path().join("cas");
@@ -174,6 +177,14 @@ impl FacV0TestHarness {
         let cas_config = DurableCasConfig::new(&cas_dir);
         let cas: Arc<dyn ContentAddressedStore> =
             Arc::new(DurableCas::new(cas_config).expect("create cas"));
+
+        // Create workspace manager
+        let workspace_manager = WorkspaceManager::new(workspace_root.clone(), cas.clone(), repo_path);
+
+        // Create reviewer capability manifest with Read allowed
+        let reviewer_manifest = create_reviewer_capability_manifest();
+        let capability_validator =
+            CapabilityValidator::new(reviewer_manifest).expect("valid capability validator");
 
         // Create ledger (in-memory for tests)
         let ledger = Ledger::in_memory().expect("create ledger");
@@ -190,11 +201,11 @@ impl FacV0TestHarness {
         // Create executor with real handlers rooted at workspace
         let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
         executor
-            .register_handler(Box::new(ReadFileHandler::with_root(workspace_root)))
+            .register_handler(Box::new(ReadFileHandler::with_root(workspace_root.clone())))
             .expect("register ReadFileHandler");
         executor
             .register_handler(Box::new(GitOperationHandler::with_root(
-                temp_dir.path().to_path_buf(),
+                workspace_root.clone(),
             )))
             .expect("register GitOperationHandler");
         executor
@@ -276,6 +287,43 @@ impl FacV0TestHarness {
             .status()
             .expect("git command");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Creates a valid changeset bundle by diffing the real repo state.
+    fn create_valid_changeset(&self) -> ChangeSetBundleV1 {
+        let repo_path = self._temp_dir.path().join("repo");
+        
+        // Get HEAD commit
+        let output = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo_path).output().expect("rev-parse");
+        let head_commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        
+        // Modify file
+        std::fs::write(repo_path.join("README.md"), "modified\n").expect("write readme");
+        
+        // Diff
+        let output = Command::new("git").arg("diff").current_dir(&repo_path).output().expect("git diff");
+        let diff_bytes = output.stdout;
+        let diff_hash = self.cas.store(&diff_bytes);
+        
+        // Reset repo to clean state
+        Command::new("git").args(["checkout", "."]).current_dir(&repo_path).output().expect("git checkout .");
+        
+        ChangeSetBundleV1::builder()
+            .changeset_id("cs-valid-001")
+            .base(GitObjectRef {
+                algo: HashAlgo::Sha1,
+                object_kind: "commit".to_string(),
+                object_id: head_commit,
+            })
+            .diff_hash(diff_hash)
+            .file_manifest(vec![FileChange {
+                path: "README.md".to_string(),
+                change_kind: ChangeKind::Modify,
+                old_path: None,
+            }])
+            .binary_detected(false)
+            .build()
+            .expect("valid bundle")
     }
 
     /// Creates a signed ledger event for `ChangeSetPublished`.
@@ -1331,10 +1379,8 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
     // =========================================================================
     // Step 1: Create and validate changeset bundle
     // =========================================================================
-    let bundle = create_test_changeset_bundle(vec![
-        ("src/lib.rs", ChangeKind::Modify),
-        ("tests/integration.rs", ChangeKind::Add),
-    ]);
+    // TCK-00318: Use real changeset from git diff
+    let bundle = harness.create_valid_changeset();
 
     bundle.validate().expect("changeset should be valid");
     assert!(!bundle.binary_detected, "no binary files in test bundle");
@@ -1393,6 +1439,12 @@ async fn test_fac_v0_full_e2e_autonomous_flow() {
         .expect("apply should succeed");
 
     assert_eq!(apply_result.changeset_digest, bundle.changeset_digest);
+    
+    // TCK-00318: Verify apply effect
+    let readme_path = harness.workspace_root().join("README.md");
+    let content = std::fs::read_to_string(&readme_path).expect("read readme");
+    assert_eq!(content, "modified\n");
+
     harness.advance_time(100);
 
     // =========================================================================
@@ -1717,20 +1769,64 @@ async fn test_fac_v0_e2e_blocked_path() {
 #[test]
 fn test_workspace_apply_produces_correct_result() {
     let temp_dir = TempDir::new().expect("create temp dir");
-    let workspace_manager = WorkspaceManager::new(temp_dir.path().to_path_buf());
+    let repo_path = temp_dir.path().join("repo");
+    let workspace_root = temp_dir.path().join("workspace");
+    std::fs::create_dir_all(&repo_path).expect("create repo");
+    
+    // Init repo
+    Command::new("git").arg("init").current_dir(&repo_path).output().expect("git init");
+    Command::new("git").args(["config", "user.email", "test@example.com"]).current_dir(&repo_path).output().expect("git config");
+    Command::new("git").args(["config", "user.name", "Test"]).current_dir(&repo_path).output().expect("git config");
+    std::fs::write(repo_path.join("README.md"), "initial\n").expect("write readme");
+    Command::new("git").args(["add", "."]).current_dir(&repo_path).output().expect("git add");
+    Command::new("git").args(["commit", "-m", "initial"]).current_dir(&repo_path).output().expect("git commit");
+    
+    let output = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&repo_path).output().expect("rev-parse");
+    let head_commit = String::from_utf8(output.stdout).unwrap().trim().to_string();
 
-    let bundle = create_test_changeset_bundle(vec![
-        ("src/main.rs", ChangeKind::Add),
-        ("Cargo.toml", ChangeKind::Modify),
-        ("README.md", ChangeKind::Delete),
-    ]);
+    std::fs::write(repo_path.join("README.md"), "modified\n").expect("write readme");
+    let output = Command::new("git").arg("diff").current_dir(&repo_path).output().expect("git diff");
+    let diff_bytes = output.stdout;
+    
+    let cas_dir = temp_dir.path().join("cas");
+    std::fs::create_dir_all(&cas_dir).expect("create cas dir");
+    let cas_config = DurableCasConfig::new(&cas_dir);
+    let cas: Arc<dyn ContentAddressedStore> =
+        Arc::new(DurableCas::new(cas_config).expect("create cas"));
+    let diff_hash = cas.store(&diff_bytes);
+    
+    // Reset repo
+    Command::new("git").args(["checkout", "."]).current_dir(&repo_path).output().expect("git checkout .");
+
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root,
+        cas,
+        repo_path,
+    );
+
+    let bundle = ChangeSetBundleV1::builder()
+        .changeset_id("cs-valid-001")
+        .base(GitObjectRef {
+            algo: HashAlgo::Sha1,
+            object_kind: "commit".to_string(),
+            object_id: head_commit,
+        })
+        .diff_hash(diff_hash)
+        .file_manifest(vec![FileChange {
+            path: "README.md".to_string(),
+            change_kind: ChangeKind::Modify,
+            old_path: None,
+        }])
+        .binary_detected(false)
+        .build()
+        .expect("valid bundle");
 
     let result = workspace_manager
         .apply(&bundle)
         .expect("apply should succeed");
 
     assert_eq!(result.changeset_digest, bundle.changeset_digest);
-    assert_eq!(result.files_modified, 3);
+    assert_eq!(result.files_modified, 1);
     assert!(result.applied_at_ns > 0, "applied_at_ns should be positive");
 }
 
@@ -1920,7 +2016,13 @@ async fn test_tool_executor_validates_arguments() {
 #[test]
 fn test_workspace_snapshot_captures_state() {
     let temp_dir = TempDir::new().expect("create temp dir");
-    let workspace_manager = WorkspaceManager::new(temp_dir.path().to_path_buf());
+    let cas: Arc<dyn ContentAddressedStore> =
+        Arc::new(apm2_daemon::episode::StubContentAddressedStore::new());
+    let workspace_manager = WorkspaceManager::new(
+        temp_dir.path().to_path_buf(),
+        cas,
+        PathBuf::from("/repo"),
+    );
 
     let snapshot1 = workspace_manager
         .snapshot("work-001")

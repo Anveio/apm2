@@ -44,6 +44,8 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
 
 use apm2_core::crypto::Signer;
 use apm2_core::fac::{
@@ -53,6 +55,8 @@ use apm2_core::fac::{
 };
 use apm2_core::htf::TimeEnvelopeRef;
 use thiserror::Error;
+
+use crate::episode::executor::ContentAddressedStore;
 
 // =============================================================================
 // Resource Limits
@@ -689,24 +693,36 @@ impl ReviewCompletionResultBuilder {
 }
 
 // =============================================================================
-// Workspace Manager (Stub)
+// Workspace Manager
 // =============================================================================
 
 /// Workspace manager for snapshot and apply operations.
 ///
-/// This is a stub implementation that will be wired to actual filesystem
-/// and CAS operations in a future ticket.
+/// This implementation manages the episode workspace, handling git checkout
+/// and patch application with strict containment.
 #[derive(Debug)]
 pub struct WorkspaceManager {
     /// Workspace root directory.
     pub workspace_root: PathBuf,
+    /// Content-addressed store for fetching artifacts (TCK-00318).
+    cas: Arc<dyn ContentAddressedStore>,
+    /// Path to the local git mirror/repo (TCK-00318).
+    repo_path: PathBuf,
 }
 
 impl WorkspaceManager {
     /// Creates a new workspace manager.
     #[must_use]
-    pub const fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+    pub fn new(
+        workspace_root: PathBuf,
+        cas: Arc<dyn ContentAddressedStore>,
+        repo_path: PathBuf,
+    ) -> Self {
+        Self {
+            workspace_root,
+            cas,
+            repo_path,
+        }
     }
 
     /// Takes a snapshot of the current workspace state.
@@ -733,15 +749,108 @@ impl WorkspaceManager {
 
     /// Applies a changeset bundle to the workspace.
     ///
+    /// # TCK-00318: Safe Patch Apply
+    ///
+    /// 1. Validates file changes against workspace root
+    /// 2. Clones base repo to workspace (local clone)
+    /// 3. Checks out base commit
+    /// 4. Fetches diff from CAS
+    /// 5. Applies diff using `git apply`
+    ///
     /// # Errors
     ///
-    /// Returns error if apply fails for any reason.
+    /// Returns error if apply fails, artifact is missing, or git commands fail.
     #[allow(clippy::cast_possible_truncation)] // Safe: nanoseconds since epoch won't overflow u64 until 2554
     pub fn apply(&self, bundle: &ChangeSetBundleV1) -> Result<ApplyResult, WorkspaceError> {
         // Validate file changes first
         validate_file_changes(bundle, &self.workspace_root)?;
 
-        // Stub: In production, this would actually apply the diff
+        // Ensure workspace parent exists, but we'll let git clone create the root
+        if let Some(parent) = self.workspace_root.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                WorkspaceError::IoError(format!("failed to create workspace parent: {e}"))
+            })?;
+        }
+
+        // Clean workspace if it exists (fresh start)
+        if self.workspace_root.exists() {
+            std::fs::remove_dir_all(&self.workspace_root).map_err(|e| {
+                WorkspaceError::IoError(format!("failed to clean workspace: {e}"))
+            })?;
+        }
+
+        // 1. Checkout base from repo_path
+        // git clone --no-checkout --local repo_path workspace_root
+        let output = Command::new("git")
+            .arg("clone")
+            .arg("--no-checkout")
+            .arg("--local")
+            .arg(&self.repo_path)
+            .arg(&self.workspace_root)
+            .output()
+            .map_err(|e| WorkspaceError::IoError(format!("git clone failed: {e}")))?;
+
+        if !output.status.success() {
+            return Err(WorkspaceError::ApplyFailed(format!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        // Checkout base commit
+        let output = Command::new("git")
+            .current_dir(&self.workspace_root)
+            .arg("checkout")
+            .arg("-f") // Force overwrite
+            .arg(&bundle.base.object_id)
+            .output()
+            .map_err(|e| WorkspaceError::IoError(format!("git checkout failed: {e}")))?;
+
+        if !output.status.success() {
+            return Err(WorkspaceError::ApplyFailed(format!(
+                "git checkout failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        // 2. Fetch diff from CAS
+        let diff_bytes = self
+            .cas
+            .retrieve(&bundle.diff_hash)
+            .ok_or_else(|| {
+                WorkspaceError::MissingArtifact(format!(
+                    "diff hash not found: {}",
+                    hex::encode(bundle.diff_hash)
+                ))
+            })?;
+
+        // 3. Apply diff
+        let mut child = Command::new("git")
+            .current_dir(&self.workspace_root)
+            .arg("apply")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| WorkspaceError::IoError(format!("git apply spawn failed: {e}")))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(&diff_bytes).map_err(|e| {
+                WorkspaceError::IoError(format!("failed to write to git apply stdin: {e}"))
+            })?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| WorkspaceError::IoError(format!("git apply wait failed: {e}")))?;
+
+        if !output.status.success() {
+            return Err(WorkspaceError::ApplyFailed(format!(
+                "git apply failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
         let applied_at_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -896,7 +1005,13 @@ mod tests {
 
     #[test]
     fn test_workspace_manager_snapshot() {
-        let manager = WorkspaceManager::new(PathBuf::from("/workspace"));
+        use crate::episode::broker::StubContentAddressedStore;
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let manager = WorkspaceManager::new(
+            PathBuf::from("/workspace"),
+            cas,
+            PathBuf::from("/repo"),
+        );
         let snapshot = manager.snapshot("work-001").unwrap();
         assert_eq!(snapshot.work_id, "work-001");
         assert_eq!(snapshot.file_count, 0); // stub returns 0
