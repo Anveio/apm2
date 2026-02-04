@@ -47,6 +47,28 @@ rfc_risks_and_open_questions:
       evidence_ids: []
       source_ref: "crates/apm2-daemon/src/projection/mod.rs:3-12"
 
+    - id: "RSK-0005"
+      statement: "TOCTOU race in symlink validation: attacker could swap symlink target between canonicalize and file operation"
+      impact: "MEDIUM - Potential workspace escape via race condition"
+      likelihood: "LOW - Requires local filesystem access during narrow time window; attacker must control symlink creation"
+      mitigations:
+        - "Use O_NOFOLLOW when opening files where applicable"
+        - "Open file first, then verify via fstat that it's within root"
+        - "Consider openat2() with RESOLVE_BENEATH on Linux"
+      accepted_risk_rationale: |
+        ACCEPTED for v0: Exploitation requires:
+        1. Local filesystem access during tool execution window
+        2. Ability to create symlinks in workspace
+        3. Timing precision to win race
+
+        Existing path validation catches most escape attempts. Defense-in-depth
+        mitigations (O_NOFOLLOW, fstat) will be implemented in TCK-00319 as
+        security hardening. This is a defense-in-depth concern, not a primary
+        security boundary breach - the primary boundary is workspace isolation
+        via root containment, which remains intact.
+      evidence_ids: []
+      source_ref: "crates/apm2-daemon/src/episode/handlers.rs:206-220"
+
   open_questions:
     - id: "Q-0001"
       question: "Should ToolLogIndex include tool invocation metadata (timestamps, input hashes) or only result hashes?"

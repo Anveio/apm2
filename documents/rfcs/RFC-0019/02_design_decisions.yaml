@@ -139,3 +139,113 @@ rfc_design_decisions:
       impacted_requirement_ids:
         - "REQ-0006"
       evidence_ids: []
+
+    - id: "DEC-0005"
+      title: "Capability manifest storage and loading"
+      statement: "Store capability manifests as CAS artifacts (JSON-serialized) and load by hash during SpawnEpisode, with hash verification on load"
+      context: |
+        REQ-0002 requires real capability manifests, not empty allowlist stubs.
+        Need to decide storage format and integrity verification approach.
+      alternatives:
+        - id: "ALT-0001"
+          name: "In-memory manifest registry"
+          pros:
+            - "Fast lookup"
+            - "Simple implementation"
+          cons:
+            - "Lost on restart"
+            - "Not durable or auditable"
+          security_tradeoffs:
+            - "No integrity verification"
+          operability_tradeoffs:
+            - "Cannot reproduce manifest state"
+        - id: "ALT-0002"
+          name: "CAS-backed manifest storage with hash verification"
+          pros:
+            - "Durable and immutable"
+            - "Content addressing ensures integrity"
+            - "Manifest versions are auditable"
+          cons:
+            - "CAS dependency for spawn"
+          security_tradeoffs:
+            - "Content hash prevents tampering"
+          operability_tradeoffs:
+            - "Manifest history preserved"
+      chosen_rationale: "ALT-0002 chosen: CAS provides integrity, durability, and auditability; aligns with truth-is-internal principle"
+      impacted_requirement_ids:
+        - "REQ-0002"
+      evidence_ids: []
+
+    - id: "DEC-0006"
+      title: "Episode event persistence mechanism"
+      statement: "Stream episode events directly to ledger via LedgerEventEmitter, replacing in-memory buffer"
+      context: |
+        REQ-0005 requires episode events to persist to ledger and survive daemon restart.
+        Current in-memory buffer loses events on crash.
+      alternatives:
+        - id: "ALT-0001"
+          name: "Keep in-memory buffer with periodic flush"
+          pros:
+            - "Lower write frequency"
+            - "Batching efficiency"
+          cons:
+            - "Events lost on crash"
+            - "Ordering guarantees complex"
+          security_tradeoffs:
+            - "Crash window loses audit trail"
+          operability_tradeoffs:
+            - "Delayed event visibility"
+        - id: "ALT-0002"
+          name: "Direct ledger streaming"
+          pros:
+            - "Events durable immediately"
+            - "Survives daemon restart"
+            - "Simple ordering (ledger sequence)"
+          cons:
+            - "Higher write frequency"
+            - "Ledger dependency for each event"
+          security_tradeoffs:
+            - "Full audit trail preserved"
+          operability_tradeoffs:
+            - "Real-time event visibility"
+      chosen_rationale: "ALT-0002 chosen: durability and audit trail outweigh write frequency cost; ledger is designed for event append workload"
+      impacted_requirement_ids:
+        - "REQ-0005"
+      evidence_ids: []
+
+    - id: "DEC-0007"
+      title: "xtask authority reduction approach"
+      statement: "Stage xtask demotion via explicit CLI flags, defaulting to projection worker for GitHub writes"
+      context: |
+        REQ-0007 requires reducing xtask authority progressively.
+        Need to balance backward compatibility with security improvement.
+      alternatives:
+        - id: "ALT-0001"
+          name: "Hard cutover - remove xtask GitHub writes immediately"
+          pros:
+            - "Clean break"
+            - "Forces projection worker adoption"
+          cons:
+            - "Breaking change for existing workflows"
+            - "No fallback if projection worker fails"
+          security_tradeoffs:
+            - "Immediate authority reduction"
+          operability_tradeoffs:
+            - "Operational risk during transition"
+        - id: "ALT-0002"
+          name: "Staged cutover with explicit flags"
+          pros:
+            - "Backward compatible"
+            - "Gradual migration"
+            - "Fallback available during transition"
+          cons:
+            - "Longer transition period"
+            - "Two write paths temporarily"
+          security_tradeoffs:
+            - "Legacy path requires explicit flag"
+          operability_tradeoffs:
+            - "Controlled rollout"
+      chosen_rationale: "ALT-0002 chosen: staged rollout reduces operational risk; explicit flags maintain audit trail; legacy path deprecated not removed"
+      impacted_requirement_ids:
+        - "REQ-0007"
+      evidence_ids: []

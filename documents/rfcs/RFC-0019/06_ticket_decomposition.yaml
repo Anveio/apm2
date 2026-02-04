@@ -109,6 +109,7 @@ rfc_ticket_decomposition:
             - "Amend ListFiles/Search handlers to use workspace root"
             - "Amend GitOperation handlers similarly"
             - "Path traversal prevention"
+            - "TOCTOU race mitigation: use O_NOFOLLOW or fstat verification (RSK-0005)"
           out_of_scope:
             - "Workspace creation (TCK-00318)"
         binds:
@@ -120,12 +121,14 @@ rfc_ticket_decomposition:
           - "AGENT_IMPLEMENTER"
         responsibility_domains:
           - "DOMAIN_DAEMON"
+          - "DOMAIN_SECURITY"
         dependencies:
           - "TCK-00318"
         definition_of_done:
           criteria:
             - "Tool handlers rooted to workspace, not daemon CWD"
             - "Symlink escape blocked"
+            - "TOCTOU race mitigated via O_NOFOLLOW or fstat verification"
             - "ListFiles/Search reflect patched workspace"
           evidence_ids:
             - "EVID-0003"

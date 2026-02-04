@@ -83,6 +83,33 @@ rfc_trust_boundaries:
           mitigation: "Projection receipts anchor all external writes; divergence detection"
       evidence_ids: []
 
+    - id: "TB-0005"
+      name: "Capability Manifest Integrity Boundary"
+      description: |
+        Capability manifests determine what tools sessions can execute.
+        Manifest integrity must be verified from storage through assignment.
+      actors:
+        - "PolicyResolver"
+        - "SpawnEpisode handler"
+        - "CAS"
+        - "SessionDispatcher"
+      entrypoints:
+        - "SpawnEpisode policy resolution"
+        - "Manifest load from CAS"
+      data_flows:
+        - "PolicyResolved -> manifest_hash -> CAS lookup -> CapabilityManifest -> Session"
+      authn_authz:
+        authn: "Manifest identified by content hash (CAS-addressed)"
+        authz: "PolicyResolver determines which manifest hash is assigned"
+      risks:
+        - id: "RSK-TB-008"
+          description: "Manifest tampering between storage and use"
+          mitigation: "CAS content addressing ensures integrity; hash verification on load"
+        - id: "RSK-TB-009"
+          description: "Policy resolution assigns wrong manifest"
+          mitigation: "Policy rules are auditable; manifest assignment logged in spawn event"
+      evidence_ids: []
+
     - id: "TB-0004"
       name: "GitHub Projection Boundary"
       description: |
