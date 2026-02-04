@@ -224,7 +224,7 @@ pub use reviewer_manifest::{
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
     EpisodeEvent, EpisodeRuntime, EpisodeRuntimeConfig, Hash, LeaseIssueDenialReason,
-    MAX_CONCURRENT_EPISODES, MAX_EVENTS_BUFFER_SIZE, new_shared_runtime,
+    MAX_CONCURRENT_EPISODES, MAX_EVENTS_BUFFER_SIZE, RootedHandlerFactory, new_shared_runtime,
     new_shared_runtime_with_clock, new_shared_runtime_with_clock_initialized,
 };
 pub use scope::{

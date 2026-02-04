@@ -442,30 +442,40 @@ impl DispatcherState {
             .with_cas(Arc::clone(&cas))
             .with_default_budget(crate::episode::EpisodeBudget::default());
 
-        // Register tool handler factories
-        // Use closure factories to create fresh handlers for each episode/executor
-        // TCK-00319: Using deprecated .new() methods - these use CWD as root which is
-        // acceptable for dev/testing but production should migrate to workspace-rooted
-        // handlers via register_handlers_with_root() or explicit with_root() calls.
+        // Register workspace-rooted tool handler factories (TCK-00319)
+        // Use rooted factories that accept workspace_root at episode start time.
+        // This ensures handlers are isolated to the episode's workspace, not the
+        // daemon's CWD.
         let cas_for_handlers = Arc::clone(&cas);
-        #[allow(deprecated)]
-        {
-            episode_runtime = episode_runtime
-                // ReadFileHandler
-                .with_handler_factory(|| Box::new(ReadFileHandler::new()))
-                // WriteFileHandler
-                .with_handler_factory(|| Box::new(WriteFileHandler::new()))
-                // ExecuteHandler
-                .with_handler_factory(|| Box::new(ExecuteHandler::new()))
-                // GitOperationHandler
-                .with_handler_factory(|| Box::new(GitOperationHandler::new()))
-                // ArtifactFetchHandler (needs CAS)
-                .with_handler_factory(move || Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone())))
-                // ListFilesHandler
-                .with_handler_factory(|| Box::new(ListFilesHandler::new()))
-                // SearchHandler
-                .with_handler_factory(|| Box::new(SearchHandler::new()));
-        }
+        episode_runtime = episode_runtime
+            // ReadFileHandler - reads files within workspace
+            .with_rooted_handler_factory(|root| {
+                Box::new(ReadFileHandler::with_root(root))
+            })
+            // WriteFileHandler - writes files within workspace
+            .with_rooted_handler_factory(|root| {
+                Box::new(WriteFileHandler::with_root(root))
+            })
+            // ExecuteHandler - executes commands within workspace
+            .with_rooted_handler_factory(|root| {
+                Box::new(ExecuteHandler::with_root(root))
+            })
+            // GitOperationHandler - git operations within workspace
+            .with_rooted_handler_factory(|root| {
+                Box::new(GitOperationHandler::with_root(root))
+            })
+            // ArtifactFetchHandler - CAS operations (not workspace-rooted)
+            .with_handler_factory(move || {
+                Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone()))
+            })
+            // ListFilesHandler - lists files within workspace
+            .with_rooted_handler_factory(|root| {
+                Box::new(ListFilesHandler::with_root(root))
+            })
+            // SearchHandler - searches files within workspace
+            .with_rooted_handler_factory(|root| {
+                Box::new(SearchHandler::with_root(root))
+            });
 
         let episode_runtime = Arc::new(episode_runtime);
 

@@ -47,6 +47,88 @@ use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 
 // =============================================================================
+// Platform-Specific O_NOFOLLOW Support (TCK-00319 TOCTOU Mitigation)
+// =============================================================================
+
+/// Opens a file with O_NOFOLLOW on Unix platforms to prevent TOCTOU symlink attacks.
+///
+/// # Security (TCK-00319)
+///
+/// On Unix, this uses `OpenOptionsExt::custom_flags(libc::O_NOFOLLOW)` to ensure
+/// the kernel rejects symlinks at open time. This closes the TOCTOU window between
+/// path validation and file access.
+///
+/// On non-Unix platforms, falls back to standard open (symlink checks are still
+/// performed via `reject_symlinks_in_path` for defense in depth).
+///
+/// # Arguments
+///
+/// * `path` - The validated path to open
+///
+/// # Returns
+///
+/// An async file handle or error if open fails.
+#[cfg(unix)]
+async fn open_file_nofollow(path: &Path) -> Result<tokio::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Use std::fs::OpenOptions to set custom_flags (O_NOFOLLOW), then wrap in tokio
+    let std_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
+#[cfg(not(unix))]
+async fn open_file_nofollow(path: &Path) -> Result<tokio::fs::File, std::io::Error> {
+    // Non-Unix fallback: rely on symlink checks in validation
+    tokio::fs::File::open(path).await
+}
+
+/// Opens a file for writing with O_NOFOLLOW on Unix platforms.
+///
+/// # Security (TCK-00319)
+///
+/// See `open_file_nofollow` for security rationale.
+#[cfg(unix)]
+async fn open_file_write_nofollow(
+    path: &Path,
+    create: bool,
+    append: bool,
+) -> Result<tokio::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // Use std::fs::OpenOptions to set custom_flags (O_NOFOLLOW), then wrap in tokio
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).custom_flags(nix::libc::O_NOFOLLOW);
+    if create {
+        options.create(true);
+    }
+    if append {
+        options.append(true);
+    }
+    let std_file = options.open(path)?;
+    Ok(tokio::fs::File::from_std(std_file))
+}
+
+#[cfg(not(unix))]
+async fn open_file_write_nofollow(
+    path: &Path,
+    create: bool,
+    append: bool,
+) -> Result<tokio::fs::File, std::io::Error> {
+    // Non-Unix fallback
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true);
+    if create {
+        options.create(true);
+    }
+    if append {
+        options.append(true);
+    }
+    options.open(path).await
+}
+
+// =============================================================================
 // Path Validation Helpers (TCK-00319 Security Module)
 // =============================================================================
 
@@ -297,6 +379,10 @@ pub struct ReadFileHandler {
     root: PathBuf,
 }
 
+/// TCK-00319: Default implementation is restricted to test builds only.
+/// Production code MUST use `ReadFileHandler::with_root()` with an explicit
+/// workspace path.
+#[cfg(test)]
 impl Default for ReadFileHandler {
     fn default() -> Self {
         Self {
@@ -307,9 +393,23 @@ impl Default for ReadFileHandler {
 
 impl ReadFileHandler {
     /// Creates a new read file handler using CWD as root.
+    ///
+    /// # Security Warning (TCK-00319)
+    ///
+    /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
+    /// explicitly specify the workspace directory. This prevents:
+    /// - Tool operations accessing daemon-local files
+    /// - Path traversal attacks escaping the intended workspace
+    #[deprecated(
+        since = "0.1.0",
+        note = "use with_root() with explicit workspace path for production code"
+    )]
+    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root: PathBuf::from("."),
+        }
     }
 
     /// Creates a new read file handler with a specific root directory.
@@ -357,8 +457,10 @@ impl ToolHandler for ReadFileHandler {
         let validated_path =
             validate_path_with_toctou_mitigation(&read_args.path, &canonical_root)?;
 
-        // Open file (use validated path for safety)
-        let mut file = tokio::fs::File::open(&validated_path).await.map_err(|e| {
+        // TCK-00319: Open file with O_NOFOLLOW to prevent TOCTOU symlink attacks
+        // This ensures the kernel rejects symlinks at open time, closing the window
+        // between validation and access.
+        let mut file = open_file_nofollow(&validated_path).await.map_err(|e| {
             ToolHandlerError::ExecutionFailed {
                 message: format!("failed to open file '{}': {}", read_args.path.display(), e),
             }
@@ -454,6 +556,10 @@ pub struct WriteFileHandler {
     root: PathBuf,
 }
 
+/// TCK-00319: Default implementation is restricted to test builds only.
+/// Production code MUST use `WriteFileHandler::with_root()` with an explicit
+/// workspace path.
+#[cfg(test)]
 impl Default for WriteFileHandler {
     fn default() -> Self {
         Self {
@@ -464,9 +570,23 @@ impl Default for WriteFileHandler {
 
 impl WriteFileHandler {
     /// Creates a new write file handler using CWD as root.
+    ///
+    /// # Security Warning (TCK-00319)
+    ///
+    /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
+    /// explicitly specify the workspace directory. This prevents:
+    /// - Tool operations accessing daemon-local files
+    /// - Path traversal attacks escaping the intended workspace
+    #[deprecated(
+        since = "0.1.0",
+        note = "use with_root() with explicit workspace path for production code"
+    )]
+    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root: PathBuf::from("."),
+        }
     }
 
     /// Creates a new write file handler with a specific root directory.
@@ -552,12 +672,9 @@ impl ToolHandler for WriteFileHandler {
 
         if write_args.append {
             // Append mode: cannot be strictly atomic, but standard O_APPEND is safe
-            // for appends
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .append(true)
-                .open(&validated_path)
+            // for appends.
+            // TCK-00319: Use O_NOFOLLOW to prevent TOCTOU symlink attacks.
+            let mut file = open_file_write_nofollow(&validated_path, true, true)
                 .await
                 .map_err(|e| ToolHandlerError::ExecutionFailed {
                     message: format!("failed to open file for append: {e}"),
@@ -691,6 +808,10 @@ pub struct ExecuteHandler {
     root: PathBuf,
 }
 
+/// TCK-00319: Default implementation is restricted to test builds only.
+/// Production code MUST use `ExecuteHandler::with_root()` with an explicit
+/// workspace path.
+#[cfg(test)]
 impl Default for ExecuteHandler {
     fn default() -> Self {
         Self {
@@ -701,9 +822,23 @@ impl Default for ExecuteHandler {
 
 impl ExecuteHandler {
     /// Creates a new execute handler using CWD as root.
+    ///
+    /// # Security Warning (TCK-00319)
+    ///
+    /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
+    /// explicitly specify the workspace directory. This prevents:
+    /// - Tool operations accessing daemon-local files
+    /// - Path traversal attacks escaping the intended workspace
+    #[deprecated(
+        since = "0.1.0",
+        note = "use with_root() with explicit workspace path for production code"
+    )]
+    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root: PathBuf::from("."),
+        }
     }
 
     /// Creates a new execute handler with a specific root directory.
@@ -1021,6 +1156,10 @@ pub struct GitOperationHandler {
     root: PathBuf,
 }
 
+/// TCK-00319: Default implementation is restricted to test builds only.
+/// Production code MUST use `GitOperationHandler::with_root()` with an explicit
+/// workspace path.
+#[cfg(test)]
 impl Default for GitOperationHandler {
     fn default() -> Self {
         Self {
@@ -1034,9 +1173,23 @@ const GIT_TIMEOUT_MS: u64 = 30_000;
 
 impl GitOperationHandler {
     /// Creates a new git operation handler using CWD as root.
+    ///
+    /// # Security Warning (TCK-00319)
+    ///
+    /// Using CWD as root is a security anti-pattern. Prefer `with_root()` to
+    /// explicitly specify the workspace directory. This prevents:
+    /// - Tool operations accessing daemon-local files
+    /// - Path traversal attacks escaping the intended workspace
+    #[deprecated(
+        since = "0.1.0",
+        note = "use with_root() with explicit workspace path for production code"
+    )]
+    #[allow(clippy::new_without_default)] // TCK-00319: Default is test-only
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root: PathBuf::from("."),
+        }
     }
 
     /// Creates a new git operation handler with a specific root directory.
