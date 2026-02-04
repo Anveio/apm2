@@ -125,6 +125,7 @@ pub mod claude_parser;
 
 // TCK-00163: Capability manifest and validation
 pub mod capability;
+pub mod reviewer_manifest;
 pub mod scope;
 pub mod tool_class;
 
@@ -207,6 +208,12 @@ pub use raw_adapter::{
 };
 pub use registry::{
     AdapterRegistry, InMemorySessionRegistry, PersistentRegistryError, PersistentSessionRegistry,
+};
+// Re-export reviewer manifest types (TCK-00317)
+pub use reviewer_manifest::{
+    DAEMON_DELEGATOR_ID, REVIEWER_V0_MANIFEST_ID, build_reviewer_v0_manifest,
+    build_reviewer_v0_manifest_dynamic, is_reviewer_v0_manifest_hash, reviewer_v0_manifest,
+    reviewer_v0_manifest_hash,
 };
 pub use ring_buffer::{RingBuffer, tier_defaults};
 pub use runtime::{
