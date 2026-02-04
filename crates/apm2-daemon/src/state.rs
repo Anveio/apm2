@@ -28,6 +28,10 @@ use tokio::sync::RwLock;
 use crate::cas::{DurableCas, DurableCasConfig};
 use crate::episode::capability::StubManifestLoader;
 use crate::episode::executor::ContentAddressedStore;
+use crate::episode::handlers::{
+    ArtifactFetchHandler, ExecuteHandler, GitOperationHandler, ListFilesHandler, ReadFileHandler,
+    SearchHandler, WriteFileHandler,
+};
 use crate::episode::{
     CapabilityManifest, EpisodeRuntime, EpisodeRuntimeConfig, InMemorySessionRegistry,
     PersistentRegistryError, PersistentSessionRegistry, SharedToolBroker, ToolBrokerConfig,
@@ -424,14 +428,38 @@ impl DispatcherState {
             signing_key,
         ));
         let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&sqlite_conn)));
-        let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
+
+        // TCK-00316: Initialize EpisodeRuntime with CAS and handlers
+        let mut episode_runtime = EpisodeRuntime::new(EpisodeRuntimeConfig::default());
+        episode_runtime = episode_runtime.with_cas(Arc::clone(&cas));
+
+        // Register tool handler factories
+        // Use closure factories to create fresh handlers for each episode/executor
+        let cas_for_handlers = Arc::clone(&cas);
+        episode_runtime = episode_runtime
+            // ReadFileHandler
+            .with_handler_factory(|| Box::new(ReadFileHandler::new()))
+            // WriteFileHandler
+            .with_handler_factory(|| Box::new(WriteFileHandler::new()))
+            // ExecuteHandler
+            .with_handler_factory(|| Box::new(ExecuteHandler::new()))
+            // GitOperationHandler
+            .with_handler_factory(|| Box::new(GitOperationHandler::new()))
+            // ArtifactFetchHandler (needs CAS)
+            .with_handler_factory(move || Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone())))
+            // ListFilesHandler
+            .with_handler_factory(|| Box::new(ListFilesHandler::new()))
+            // SearchHandler
+            .with_handler_factory(|| Box::new(SearchHandler::new()));
+
+        let episode_runtime = Arc::new(episode_runtime);
 
         let privileged_dispatcher = PrivilegedDispatcher::with_dependencies(
             DecodeConfig::default(),
             policy_resolver,
             work_registry,
             Arc::clone(&event_emitter) as Arc<dyn crate::protocol::dispatch::LedgerEventEmitter>,
-            episode_runtime,
+            Arc::clone(&episode_runtime),
             session_registry,
             lease_validator,
             Arc::clone(&clock),
@@ -453,7 +481,8 @@ impl DispatcherState {
                 .with_ledger(event_emitter)
                 .with_cas(cas)
                 .with_clock(clock)
-                .with_broker(broker);
+                .with_broker(broker)
+                .with_episode_runtime(episode_runtime);
 
         Self {
             privileged_dispatcher,

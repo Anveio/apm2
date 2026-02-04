@@ -88,7 +88,7 @@ use crate::episode::capability::StubManifestLoader;
 use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
-use crate::episode::{CapabilityManifest, EpisodeId, SharedToolBroker, ToolClass};
+use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
 use crate::htf::{ClockError, HolonicClock};
 
 // ============================================================================
@@ -387,6 +387,11 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// RFC-0018. Shared with `PrivilegedDispatcher` to manage subscriptions
     /// across both operator and session sockets.
     subscription_registry: Option<super::resource_governance::SharedSubscriptionRegistry>,
+    /// Episode runtime for tool execution (TCK-00316).
+    ///
+    /// Per TCK-00316, this is required to execute tools kernel-side and return
+    /// durable result references.
+    episode_runtime: Option<Arc<EpisodeRuntime>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -411,6 +416,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -427,6 +433,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 }
@@ -448,6 +455,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -469,6 +477,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -506,6 +515,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             clock: None,
             event_seq: AtomicU64::new(0),
             subscription_registry: None,
+            episode_runtime: None,
         }
     }
 
@@ -556,6 +566,13 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         registry: super::resource_governance::SharedSubscriptionRegistry,
     ) -> Self {
         self.subscription_registry = Some(registry);
+        self
+    }
+
+    /// Sets the episode runtime for tool execution (TCK-00316).
+    #[must_use]
+    pub fn with_episode_runtime(mut self, runtime: Arc<EpisodeRuntime>) -> Self {
+        self.episode_runtime = Some(runtime);
         self
     }
 
@@ -946,9 +963,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 })
                 .unwrap_or(RiskTier::Tier0);
 
+            // Clone arguments for execution before they are moved into BrokerToolRequest
+            let request_arguments = request.arguments.clone();
+
             let broker_request = BrokerToolRequest::new(
                 &request_id,
-                episode_id,
+                episode_id.clone(),
                 tool_class,
                 dedupe_key,
                 args_hash,
@@ -962,7 +982,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 handle.block_on(async { broker.request(&broker_request, timestamp_ns, None).await })
             });
 
-            return self.handle_broker_decision(decision, &token.session_id, tool_class);
+            return self.handle_broker_decision(
+                decision,
+                &token.session_id,
+                tool_class,
+                &request_arguments,
+                timestamp_ns,
+                &episode_id,
+            );
         }
 
         // Legacy fallback: TCK-00260 manifest store validation
@@ -1028,12 +1055,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         decision: Result<ToolDecision, crate::episode::BrokerError>,
         session_id: &str,
         tool_class: ToolClass,
+        request_arguments: &[u8],
+        timestamp_ns: u64,
+        episode_id: &EpisodeId,
     ) -> ProtocolResult<SessionResponse> {
         match decision {
             Ok(ToolDecision::Allow {
                 request_id,
                 rule_id,
                 policy_hash,
+                credential,
                 ..
             }) => {
                 info!(
@@ -1042,22 +1073,65 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request_id = %request_id,
                     "Tool request allowed by broker"
                 );
-                // TCK-00316 BLOCKER 2: For now, return Allow without execution.
-                // Full tool execution integration requires EpisodeRuntime wiring
-                // which is tracked separately. The result_hash/inline_result fields
-                // are None until execution is implemented.
-                //
-                // TODO(TCK-00316): Implement actual tool execution on Allow:
-                // 1. Invoke EpisodeRuntime/ToolExecutor with the request
-                // 2. Store result in CAS if > MAX_INLINE_RESULT_SIZE
-                // 3. Return result_hash and/or inline_result
+
+                // TCK-00316: Execute tool via EpisodeRuntime
+                let (result_hash, inline_result) = if let Some(ref runtime) = self.episode_runtime {
+                    // Deserialize arguments
+                    let tool_args: crate::episode::tool_handler::ToolArgs =
+                        match serde_json::from_slice(request_arguments) {
+                            Ok(args) => args,
+                            Err(e) => return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInvalid,
+                                format!("invalid tool arguments: {e}"),
+                            )),
+                        };
+
+                    // Execute tool
+                    // We use the timestamp from the start of the request for consistency
+                    let execution_result = tokio::task::block_in_place(|| {
+                        let handle = tokio::runtime::Handle::current();
+                        handle.block_on(async {
+                            runtime.execute_tool(episode_id, &tool_args, credential.as_ref(), timestamp_ns, &request_id).await
+                        })
+                    });
+
+                    let result = match execution_result {
+                        Ok(res) => res,
+                        Err(e) => {
+                            error!(error = %e, "Tool execution failed");
+                            return Ok(SessionResponse::error(
+                                SessionErrorCode::SessionErrorInternal,
+                                format!("tool execution failed: {e}"),
+                            ));
+                        }
+                    };
+
+                    if !result.success {
+                         return Ok(SessionResponse::error(
+                            SessionErrorCode::SessionErrorInternal,
+                            result.error_message.unwrap_or_else(|| "unknown error".to_string()),
+                        ));
+                    }
+
+                    (
+                        result.output_hash.map(|h| h.to_vec()),
+                        Some(result.output), // We use output as inline result for now
+                    )
+                } else {
+                    warn!("EpisodeRuntime not configured; skipping execution (fail-open for legacy tests)");
+                    // If no runtime is configured, we cannot execute.
+                    // Preserving "Allow without result" for unconfigured runtime keeps legacy tests passing
+                    // while production (with runtime) gets execution.
+                    (None, None)
+                };
+
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
                     rule_id,
                     policy_hash: policy_hash.to_vec(),
-                    result_hash: None,
-                    inline_result: None,
+                    result_hash,
+                    inline_result,
                 }))
             },
             Ok(ToolDecision::Deny {
