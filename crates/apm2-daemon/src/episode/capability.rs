@@ -4409,6 +4409,9 @@ mod cas_loader_tests {
         let hash1 = loader.store_manifest(&manifest).expect("should store");
         let hash2 = loader.store_manifest(&manifest).expect("should store");
 
-        assert_eq!(hash1, hash2, "storing same manifest should produce same hash");
+        assert_eq!(
+            hash1, hash2,
+            "storing same manifest should produce same hash"
+        );
     }
 }

@@ -2963,8 +2963,8 @@ impl PrivilegedDispatcher {
         // - Manifests are stored in CAS and referenced by hash
         // - SpawnEpisode loads the manifest using the hash from PolicyResolution
         // - For Reviewer role: Missing manifests result in fail-closed rejection
-        // - For other roles: Fall back to minimal manifest (until their manifests
-        //   are defined in CAS)
+        // - For other roles: Fall back to minimal manifest (until their manifests are
+        //   defined in CAS)
         //
         // Per DOD item 2 (Policy Resolution Bypass fix):
         // - The manifest is NOT selected by role name; it's loaded by hash
