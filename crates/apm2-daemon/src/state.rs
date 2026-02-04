@@ -316,7 +316,39 @@ impl DispatcherState {
                 signing_key,
             ));
             let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
-            let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
+
+            // TCK-00319 SECURITY: Configure EpisodeRuntime with workspace-rooted handlers
+            // All file/execute handlers MUST use rooted factories that receive the
+            // workspace root at episode start time. This ensures handlers are isolated
+            // to the episode's workspace, not the daemon's CWD.
+            let mut episode_runtime = EpisodeRuntime::new(EpisodeRuntimeConfig::default());
+            episode_runtime = episode_runtime
+                // ReadFileHandler - reads files within workspace
+                .with_rooted_handler_factory(|root| {
+                    Box::new(ReadFileHandler::with_root(root))
+                })
+                // WriteFileHandler - writes files within workspace
+                .with_rooted_handler_factory(|root| {
+                    Box::new(WriteFileHandler::with_root(root))
+                })
+                // ExecuteHandler - executes commands within workspace
+                .with_rooted_handler_factory(|root| {
+                    Box::new(ExecuteHandler::with_root(root))
+                })
+                // GitOperationHandler - git operations within workspace
+                .with_rooted_handler_factory(|root| {
+                    Box::new(GitOperationHandler::with_root(root))
+                })
+                // ListFilesHandler - lists files within workspace
+                .with_rooted_handler_factory(|root| {
+                    Box::new(ListFilesHandler::with_root(root))
+                })
+                // SearchHandler - searches files within workspace
+                .with_rooted_handler_factory(|root| {
+                    Box::new(SearchHandler::with_root(root))
+                });
+
+            let episode_runtime = Arc::new(episode_runtime);
             let clock =
                 Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 

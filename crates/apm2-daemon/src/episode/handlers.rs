@@ -275,9 +275,25 @@ fn reject_symlinks_in_path(path: &Path, root: &Path) -> Result<(), ToolHandlerEr
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Path component doesn't exist yet - this is OK for write operations
-                // where we're creating new files. Stop checking here.
-                break;
+                // TCK-00319 SECURITY FIX: Do NOT break early on NotFound!
+                //
+                // Breaking here allows attackers to bypass symlink checks using
+                // paths like `nonexistent/symlink_to_etc/file`. The attacker can:
+                // 1. Request write to `nonexistent/evil_symlink/secret`
+                // 2. We check `nonexistent` -> NotFound, break loop
+                // 3. create_dir_all creates `nonexistent/`
+                // 4. Attacker races to create `evil_symlink` -> `/etc/`
+                // 5. We write to `/etc/secret`
+                //
+                // Instead, we continue checking remaining components. Non-existent
+                // components are fine (they'll be created), but we MUST detect any
+                // symlinks that might exist later in the path after directory
+                // creation.
+                //
+                // Note: This is safe because we check ALL components, and the final
+                // write uses O_NOFOLLOW. The full TOCTOU-mitigating validation after
+                // create_dir_all (Step 5) provides defense-in-depth.
+                continue;
             },
             Err(e) => {
                 // Other errors (permission denied, etc.) - fail closed
@@ -643,10 +659,15 @@ impl ToolHandler for WriteFileHandler {
         reject_symlinks_in_path(&full_path, &canonical_root)?;
 
         // Step 4: Create parent directories if requested (AFTER symlink validation)
-        // This is safe because we've validated no symlinks exist in existing components
+        // TCK-00319 SECURITY: Full validation BEFORE any filesystem mutations.
+        //
+        // The initial symlink check (Step 3) validates existing components.
+        // After create_dir_all, we MUST re-validate to catch any TOCTOU attacks
+        // where an attacker raced to introduce symlinks during directory creation.
         if write_args.create_parents {
             if let Some(parent) = full_path.parent() {
-                // Parent must be within canonical_root - verify this
+                // Verify parent path syntactically stays within workspace
+                // (defense-in-depth alongside Step 5's full re-validation)
                 if !parent.starts_with(&canonical_root) {
                     return Err(ToolHandlerError::PathValidation {
                         path: parent.display().to_string(),
@@ -658,12 +679,22 @@ impl ToolHandler for WriteFileHandler {
                         message: format!("failed to create parent directories: {e}"),
                     }
                 })?;
+
+                // TCK-00319 SECURITY: Re-validate parent for symlinks IMMEDIATELY
+                // after create_dir_all to catch TOCTOU races. An attacker might:
+                // 1. Wait for create_dir_all to create /workspace/a/
+                // 2. Race to replace /workspace/a/ with symlink to /etc/
+                // 3. We then write to /etc/file
+                //
+                // By re-validating the parent path here, we catch such attacks
+                // before proceeding to the file write.
+                reject_symlinks_in_path(parent, &canonical_root)?;
             }
         }
 
-        // Step 5: Full TOCTOU-mitigating validation (re-checks after directory
-        // creation) This catches any TOCTOU attacks that might have occurred
-        // during create_dir_all
+        // Step 5: Full TOCTOU-mitigating validation (final re-check)
+        // This is defense-in-depth: validates the complete target path after
+        // all directory creation is complete, catching any remaining TOCTOU attacks.
         let validated_path =
             validate_path_with_toctou_mitigation(&write_args.path, &canonical_root)?;
 
