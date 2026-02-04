@@ -2928,7 +2928,7 @@ mod tests {
     fn test_search_validate_rejects_empty_query() {
         let handler = SearchHandler::new();
         let args = ToolArgs::Search(SearchArgs {
-            query: "".to_string(),
+            query: String::new(),
             scope: PathBuf::from("src"),
             max_bytes: None,
             max_lines: None,
