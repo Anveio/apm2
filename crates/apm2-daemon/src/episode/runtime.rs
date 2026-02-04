@@ -420,11 +420,15 @@ struct EpisodeEntry {
 /// Type alias for workspace-rooted handler factory functions (TCK-00319).
 ///
 /// These factories take a workspace root path and produce handlers that are
-/// confined to that workspace. This is the preferred factory type for production
-/// use.
-pub type RootedHandlerFactory =
-    Box<dyn Fn(&std::path::Path) -> Box<dyn ToolHandler> + Send + Sync>;
+/// confined to that workspace. This is the preferred factory type for
+/// production use.
+pub type RootedHandlerFactory = Box<dyn Fn(&std::path::Path) -> Box<dyn ToolHandler> + Send + Sync>;
 
+/// Runtime that manages episode lifecycle and execution.
+///
+/// The `EpisodeRuntime` is the central coordinator for creating, tracking, and
+/// managing episodes. It handles tool handler registration, event buffering,
+/// and workspace-rooted operation for secure file access.
 pub struct EpisodeRuntime {
     /// Configuration.
     config: EpisodeRuntimeConfig,
@@ -640,14 +644,14 @@ impl EpisodeRuntime {
     /// # TCK-00319: Production Handler Registration
     ///
     /// This is the **preferred** method for registering tool handlers in
-    /// production. The factory receives the workspace root path at episode start
-    /// time, allowing handlers to be properly isolated to the episode's
-    /// workspace.
+    /// production. The factory receives the workspace root path at episode
+    /// start time, allowing handlers to be properly isolated to the
+    /// episode's workspace.
     ///
     /// # Arguments
     ///
-    /// * `factory` - A function that takes a workspace root path and returns
-    ///   a tool handler. The handler should be rooted to the provided path.
+    /// * `factory` - A function that takes a workspace root path and returns a
+    ///   tool handler. The handler should be rooted to the provided path.
     ///
     /// # Example
     ///
@@ -661,7 +665,9 @@ impl EpisodeRuntime {
     where
         F: Fn(&std::path::Path) -> Box<dyn ToolHandler> + Send + Sync + 'static,
     {
-        self.rooted_handler_factories.get_mut().push(Box::new(factory));
+        self.rooted_handler_factories
+            .get_mut()
+            .push(Box::new(factory));
         self
     }
 
@@ -898,8 +904,8 @@ impl EpisodeRuntime {
     /// - `EpisodeError::InvalidTransition` if the episode is not in CREATED
     ///   state
     /// - `EpisodeError::InvalidLease` if the lease ID is invalid
-    /// - `EpisodeError::Internal` if the workspace root does not exist or cannot
-    ///   be canonicalized
+    /// - `EpisodeError::Internal` if the workspace root does not exist or
+    ///   cannot be canonicalized
     ///
     /// # Events
     ///
@@ -922,15 +928,14 @@ impl EpisodeRuntime {
             });
         }
 
-        let canonical_root = std::fs::canonicalize(workspace_root).map_err(|e| {
-            EpisodeError::Internal {
+        let canonical_root =
+            std::fs::canonicalize(workspace_root).map_err(|e| EpisodeError::Internal {
                 message: format!(
                     "failed to canonicalize workspace root '{}': {}",
                     workspace_root.display(),
                     e
                 ),
-            }
-        })?;
+            })?;
 
         self.start_internal(episode_id, lease_id, timestamp_ns, Some(&canonical_root))
             .await
@@ -2365,11 +2370,12 @@ mod tests {
         );
     }
 
-    /// TCK-00319: Verify that start_with_workspace correctly initializes
+    /// TCK-00319: Verify that `start_with_workspace` correctly initializes
     /// rooted handlers and that they are confined to the workspace.
     #[tokio::test]
     async fn tck_00319_start_with_workspace_roots_handlers() {
         use std::path::PathBuf;
+
         use crate::episode::broker::StubContentAddressedStore;
         use crate::episode::handlers::ReadFileHandler;
 
@@ -2388,9 +2394,7 @@ mod tests {
         let cas = Arc::new(StubContentAddressedStore::new());
         let runtime = EpisodeRuntime::new(test_config())
             .with_cas(cas)
-            .with_rooted_handler_factory(|root| {
-                Box::new(ReadFileHandler::with_root(root))
-            });
+            .with_rooted_handler_factory(|root| Box::new(ReadFileHandler::with_root(root)));
 
         let episode_id = runtime
             .create(test_envelope_hash(), test_timestamp())
@@ -2399,7 +2403,12 @@ mod tests {
 
         // Start with workspace
         let _handle = runtime
-            .start_with_workspace(&episode_id, "lease-123", test_timestamp() + 1000, &workspace)
+            .start_with_workspace(
+                &episode_id,
+                "lease-123",
+                test_timestamp() + 1000,
+                &workspace,
+            )
             .await
             .unwrap();
 

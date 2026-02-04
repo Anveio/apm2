@@ -50,13 +50,14 @@ use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultDat
 // Platform-Specific O_NOFOLLOW Support (TCK-00319 TOCTOU Mitigation)
 // =============================================================================
 
-/// Opens a file with O_NOFOLLOW on Unix platforms to prevent TOCTOU symlink attacks.
+/// Opens a file with `O_NOFOLLOW` on Unix platforms to prevent TOCTOU symlink
+/// attacks.
 ///
 /// # Security (TCK-00319)
 ///
-/// On Unix, this uses `OpenOptionsExt::custom_flags(libc::O_NOFOLLOW)` to ensure
-/// the kernel rejects symlinks at open time. This closes the TOCTOU window between
-/// path validation and file access.
+/// On Unix, this uses `OpenOptionsExt::custom_flags(libc::O_NOFOLLOW)` to
+/// ensure the kernel rejects symlinks at open time. This closes the TOCTOU
+/// window between path validation and file access.
 ///
 /// On non-Unix platforms, falls back to standard open (symlink checks are still
 /// performed via `reject_symlinks_in_path` for defense in depth).
@@ -69,6 +70,7 @@ use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultDat
 ///
 /// An async file handle or error if open fails.
 #[cfg(unix)]
+#[allow(clippy::unused_async)] // Must be async for API consistency with non-Unix variant
 async fn open_file_nofollow(path: &Path) -> Result<tokio::fs::File, std::io::Error> {
     use std::os::unix::fs::OpenOptionsExt as _;
     // Use std::fs::OpenOptions to set custom_flags (O_NOFOLLOW), then wrap in tokio
@@ -81,16 +83,18 @@ async fn open_file_nofollow(path: &Path) -> Result<tokio::fs::File, std::io::Err
 
 #[cfg(not(unix))]
 async fn open_file_nofollow(path: &Path) -> Result<tokio::fs::File, std::io::Error> {
-    // Non-Unix fallback: rely on symlink checks in validation
+    // Non-Unix fallback: rely on symlink checks in validation (must be async for
+    // await)
     tokio::fs::File::open(path).await
 }
 
-/// Opens a file for writing with O_NOFOLLOW on Unix platforms.
+/// Opens a file for writing with `O_NOFOLLOW` on Unix platforms.
 ///
 /// # Security (TCK-00319)
 ///
 /// See `open_file_nofollow` for security rationale.
 #[cfg(unix)]
+#[allow(clippy::unused_async)] // Must be async for API consistency with non-Unix variant
 async fn open_file_write_nofollow(
     path: &Path,
     create: bool,
@@ -278,22 +282,24 @@ fn reject_symlinks_in_path(path: &Path, root: &Path) -> Result<(), ToolHandlerEr
                 // TCK-00319 SECURITY FIX: Do NOT break early on NotFound!
                 //
                 // Breaking here allows attackers to bypass symlink checks using
-                // paths like `nonexistent/symlink_to_etc/file`. The attacker can:
+                // paths like `nonexistent/symlink_to_etc/file`. The attacker
+                // can:
                 // 1. Request write to `nonexistent/evil_symlink/secret`
                 // 2. We check `nonexistent` -> NotFound, break loop
                 // 3. create_dir_all creates `nonexistent/`
                 // 4. Attacker races to create `evil_symlink` -> `/etc/`
                 // 5. We write to `/etc/secret`
                 //
-                // Instead, we continue checking remaining components. Non-existent
-                // components are fine (they'll be created), but we MUST detect any
+                // Instead, we continue checking remaining components.
+                // Non-existent components are fine (they'll be
+                // created), but we MUST detect any
                 // symlinks that might exist later in the path after directory
                 // creation.
                 //
-                // Note: This is safe because we check ALL components, and the final
-                // write uses O_NOFOLLOW. The full TOCTOU-mitigating validation after
+                // Note: This is safe because we check ALL components, and the
+                // final write uses O_NOFOLLOW. The full
+                // TOCTOU-mitigating validation after
                 // create_dir_all (Step 5) provides defense-in-depth.
-                continue;
             },
             Err(e) => {
                 // Other errors (permission denied, etc.) - fail closed
