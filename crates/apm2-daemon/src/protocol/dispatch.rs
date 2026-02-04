@@ -57,7 +57,7 @@ use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
     CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
-    LeaseIssueDenialReason, validate_custody_domain_overlap,
+    LeaseIssueDenialReason, reviewer_v0_manifest, validate_custody_domain_overlap,
 };
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
@@ -2908,19 +2908,35 @@ impl PrivilegedDispatcher {
             },
         };
 
-        // TCK-00287 MAJOR 3: Register capability manifest in shared store
-        // This allows SessionDispatcher to validate tool requests for this session.
-        // The manifest is constructed from the policy resolution's capability manifest
-        // hash. Note: This uses the stub implementation with an empty
-        // (fail-closed) allowlist. In production, the actual allowlist should
-        // flow through PolicyResolution.
-        let manifest = CapabilityManifest::from_hash_with_default_allowlist(
-            &claim.policy_resolution.capability_manifest_hash,
-        );
-        self.manifest_store.register(&session_id, manifest);
+        // TCK-00317: Register capability manifest in shared store based on role.
+        //
+        // Per RFC-0019 REQ-0002, capability manifests must be real (no empty allowlists).
+        // Per DEC-0005, manifests should be stored in CAS and loaded by hash.
+        //
+        // For now, we use role-based manifest selection:
+        // - Reviewer: Use canonical reviewer v0 manifest (Read, Git, Artifact, ListFiles, Search)
+        // - Other roles: Use empty manifest (fail-closed) until role-specific manifests are defined
+        //
+        // Future: Load manifests from CAS by hash from PolicyResolution.
+        let manifest = match request_role {
+            WorkRole::Reviewer => {
+                // TCK-00317: Use canonical reviewer v0 manifest with real allowlist
+                reviewer_v0_manifest().clone()
+            },
+            _ => {
+                // Fail-closed for other roles until manifests are defined
+                CapabilityManifest::from_hash_with_default_allowlist(
+                    &claim.policy_resolution.capability_manifest_hash,
+                )
+            },
+        };
+        self.manifest_store.register(&session_id, manifest.clone());
 
         debug!(
             session_id = %session_id,
+            role = ?request_role,
+            manifest_id = %manifest.manifest_id,
+            tool_allowlist_len = manifest.tool_allowlist.len(),
             "Capability manifest registered in shared store"
         );
 
