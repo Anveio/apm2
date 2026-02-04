@@ -15,4 +15,4 @@ Traditional agent workflows rely on the agent to "find" the relevant files. **Co
 - **ContextPack**: The output of compilation.
 - **View Commitment**: how bounded packs stay synchronized with an unbounded ledger.
 - **Selector**: how omitted referenced facts remain retrievable.
-- **Zero-Tool Ideal (ZTI)**: The design goal.
+- **Context Discipline**: The design goal.

@@ -25,7 +25,7 @@ pub const REQUIRED_READING: &[&str] = &[
     "documents/security/NETWORK_DEFENSE.cac.json",
     "documents/skills/rust-standards/SKILL.md",
     "documents/skills/glossary/SKILL.md",
-    "documents/skills/laws-of-holonic-agent-systems/SKILL.md",
+    "documents/theory/AGENTS.md",
 ];
 
 const STATUS_CONTEXT: &str = "ai-review/security";

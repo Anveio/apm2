@@ -2,7 +2,7 @@
 
 A **ContextPack** is a pre-compiled, content-addressed, and bounded *view* of the artifacts (files, schemas, policies, evidence) required for a **Holon** to execute a specific task under a fixed context window budget `W`.
 
-ContextPacks are the primary mechanism for achieving the **Zero-Tool Ideal (ZTI)**. They enforce Markov-blanket integrity by serving as a read allowlist: execution is predominantly actuation rather than discovery.
+ContextPacks are the primary mechanism for achieving **Context Discipline**. They enforce Markov-blanket integrity by serving as a read allowlist: execution is predominantly actuation rather than discovery.
 
 ## What Makes a Pack "Verifiable"
 
