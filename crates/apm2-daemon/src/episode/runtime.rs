@@ -851,11 +851,10 @@ impl EpisodeRuntime {
 
             // Initialize tool executor if CAS is configured
             if let Some(ref cas) = self.cas {
-                let budget_tracker = Arc::new(BudgetTracker::from_envelope(
-                    self.default_budget.clone(),
-                ));
+                let budget_tracker =
+                    Arc::new(BudgetTracker::from_envelope(self.default_budget.clone()));
                 let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
-                
+
                 if let Some(ref clock) = self.clock {
                     executor = executor.with_clock(clock.clone());
                 }
@@ -1134,9 +1133,11 @@ impl EpisodeRuntime {
         request_id: &str,
     ) -> Result<ToolResult, EpisodeError> {
         let episodes = self.episodes.read().await;
-        let entry = episodes.get(episode_id.as_str()).ok_or_else(|| EpisodeError::NotFound {
-            id: episode_id.as_str().to_string(),
-        })?;
+        let entry = episodes
+            .get(episode_id.as_str())
+            .ok_or_else(|| EpisodeError::NotFound {
+                id: episode_id.as_str().to_string(),
+            })?;
 
         if !entry.state.is_running() {
             return Err(EpisodeError::InvalidTransition {
@@ -1153,12 +1154,8 @@ impl EpisodeRuntime {
             }
         })?;
 
-        let ctx = ExecutionContext::new(
-            episode_id.clone(),
-            request_id,
-            timestamp_ns,
-        );
-        
+        let ctx = ExecutionContext::new(episode_id.clone(), request_id, timestamp_ns);
+
         let executor_guard = executor.write().await;
         executor_guard
             .execute(&ctx, args, credential)

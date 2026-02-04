@@ -786,7 +786,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args, None).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert_eq!(result.output, b"file contents");
@@ -842,7 +845,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args, None).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Should return failure result, not error
         assert!(!result.success);
@@ -862,7 +868,10 @@ mod tests {
             limit: None,
         });
 
-        executor.execute(&test_context(), &args, None).await.unwrap();
+        executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         let consumed = executor.budget_tracker().consumed();
         assert_eq!(consumed.tool_calls, 1);
@@ -886,7 +895,10 @@ mod tests {
         });
 
         // First execution succeeds
-        executor.execute(&test_context(), &args, None).await.unwrap();
+        executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Second execution fails due to budget
         let result = executor.execute(&test_context(), &args, None).await;
@@ -960,7 +972,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args, None).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Result should be successful
         assert!(result.success);
@@ -989,7 +1004,10 @@ mod tests {
 
         // Execute tool - MockReadHandler returns budget with bytes_io=13
         // but the estimate is based on limit (4096 default)
-        executor.execute(&test_context(), &args, None).await.unwrap();
+        executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         // Budget should be reconciled to actual consumption
         let consumed = executor.budget_tracker().consumed();
@@ -1018,7 +1036,10 @@ mod tests {
             limit: None,
         });
 
-        let result = executor.execute(&test_context(), &args, None).await.unwrap();
+        let result = executor
+            .execute(&test_context(), &args, None)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert!(

@@ -1080,10 +1080,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     let tool_args: crate::episode::tool_handler::ToolArgs =
                         match serde_json::from_slice(request_arguments) {
                             Ok(args) => args,
-                            Err(e) => return Ok(SessionResponse::error(
-                                SessionErrorCode::SessionErrorInvalid,
-                                format!("invalid tool arguments: {e}"),
-                            )),
+                            Err(e) => {
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorInvalid,
+                                    format!("invalid tool arguments: {e}"),
+                                ));
+                            },
                         };
 
                     // Execute tool
@@ -1091,7 +1093,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     let execution_result = tokio::task::block_in_place(|| {
                         let handle = tokio::runtime::Handle::current();
                         handle.block_on(async {
-                            runtime.execute_tool(episode_id, &tool_args, credential.as_ref(), timestamp_ns, &request_id).await
+                            runtime
+                                .execute_tool(
+                                    episode_id,
+                                    &tool_args,
+                                    credential.as_ref(),
+                                    timestamp_ns,
+                                    &request_id,
+                                )
+                                .await
                         })
                     });
 
@@ -1103,13 +1113,15 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                                 SessionErrorCode::SessionErrorInternal,
                                 format!("tool execution failed: {e}"),
                             ));
-                        }
+                        },
                     };
 
                     if !result.success {
-                         return Ok(SessionResponse::error(
+                        return Ok(SessionResponse::error(
                             SessionErrorCode::SessionErrorInternal,
-                            result.error_message.unwrap_or_else(|| "unknown error".to_string()),
+                            result
+                                .error_message
+                                .unwrap_or_else(|| "unknown error".to_string()),
                         ));
                     }
 
@@ -1118,10 +1130,12 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         Some(result.output), // We use output as inline result for now
                     )
                 } else {
-                    warn!("EpisodeRuntime not configured; skipping execution (fail-open for legacy tests)");
+                    warn!(
+                        "EpisodeRuntime not configured; skipping execution (fail-open for legacy tests)"
+                    );
                     // If no runtime is configured, we cannot execute.
-                    // Preserving "Allow without result" for unconfigured runtime keeps legacy tests passing
-                    // while production (with runtime) gets execution.
+                    // Preserving "Allow without result" for unconfigured runtime keeps legacy tests
+                    // passing while production (with runtime) gets execution.
                     (None, None)
                 };
 
