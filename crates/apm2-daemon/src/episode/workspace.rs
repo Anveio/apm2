@@ -405,10 +405,9 @@ pub fn validate_path(path: &str, workspace_root: &Path) -> Result<PathBuf, Works
     }
 
     // Check for control characters
-    if path.chars().any(|c| c.is_control()) {
+    if path.chars().any(char::is_control) {
         return Err(WorkspaceError::PathTraversal(format!(
-            "path contains control character: {:?}",
-            path
+            "path contains control character: {path:?}"
         )));
     }
 
@@ -563,7 +562,7 @@ pub fn validate_path_with_symlink_check(
 /// Per TCK-00318 security requirements:
 /// - Rejects bundles with binary files (v0 limitation)
 /// - Validates all paths in the file manifest for traversal attacks
-/// - Validates old_path for rename operations
+/// - Validates `old_path` for rename operations
 /// - For existing files (MODIFY, DELETE, RENAME), validates symlinks don't
 ///   escape the workspace
 ///
@@ -966,22 +965,13 @@ impl ReviewCompletionResultBuilder {
 // =============================================================================
 
 /// Configuration for workspace materialization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceConfig {
     /// Path to the local git repository or mirror to checkout from.
-    /// If None, assumes workspace_root is already a git repository.
+    /// If None, assumes `workspace_root` is already a git repository.
     pub repo_path: Option<PathBuf>,
     /// Whether to clean the workspace before checkout (git clean -fd).
     pub clean_before_checkout: bool,
-}
-
-impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            repo_path: None,
-            clean_before_checkout: false,
-        }
-    }
 }
 
 impl WorkspaceConfig {
@@ -1091,11 +1081,9 @@ impl WorkspaceManager {
         let git_head = self.get_git_head();
 
         // Compute snapshot hash from work_id and git HEAD (if available)
-        let hash_input = if let Some(ref head) = git_head {
-            format!("{work_id}:{head}")
-        } else {
-            work_id.to_string()
-        };
+        let hash_input = git_head
+            .as_ref()
+            .map_or_else(|| work_id.to_string(), |head| format!("{work_id}:{head}"));
         let snapshot_hash = *blake3::hash(hash_input.as_bytes()).as_bytes();
 
         // Count files in workspace (excluding .git)
@@ -1254,8 +1242,7 @@ impl WorkspaceManager {
                 return Err(WorkspaceError::BaseCommitNotFound(commit_ref.to_string()));
             }
             return Err(WorkspaceError::GitOperationFailed(format!(
-                "git checkout failed: {}",
-                stderr
+                "git checkout failed: {stderr}"
             )));
         }
 
@@ -1278,7 +1265,7 @@ impl WorkspaceManager {
         if let Some(ref git_head) = self.get_git_head() {
             // If snapshot was taken at a different HEAD, checkout that commit
             let expected_prefix = format!("{}:", snapshot.work_id);
-            let hash_input = format!("{}{}", expected_prefix, git_head);
+            let hash_input = format!("{expected_prefix}{git_head}");
             let computed_hash = *blake3::hash(hash_input.as_bytes()).as_bytes();
 
             if computed_hash != snapshot.snapshot_hash {
@@ -1359,8 +1346,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --numstat failed: {}",
-                stderr
+                "git apply --numstat failed: {stderr}"
             )));
         }
 
@@ -1409,8 +1395,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --summary failed: {}",
-                stderr
+                "git apply --summary failed: {stderr}"
             )));
         }
 
@@ -1419,7 +1404,7 @@ impl WorkspaceManager {
             // Look for " rename <old> => <new> (<percent>)"
             if line.trim().starts_with("rename ") {
                 if let Some(arrow_idx) = line.find(" => ") {
-                    let old_part = &line[7..arrow_idx].trim(); // skip " rename "
+                    let old_part = line[7..arrow_idx].trim(); // skip " rename "
                     let old_path = parse_git_path(old_part);
                     if !allowed_paths.contains(old_path.as_str()) {
                         return Err(WorkspaceError::DiffManifestMismatch {
@@ -1478,8 +1463,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply --check failed: {}",
-                stderr
+                "git apply --check failed: {stderr}"
             )));
         }
 
@@ -1518,8 +1502,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::ApplyFailed(format!(
-                "git apply failed: {}",
-                stderr
+                "git apply failed: {stderr}"
             )));
         }
 
@@ -1540,8 +1523,7 @@ impl WorkspaceManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::GitOperationFailed(format!(
-                "git clean failed: {}",
-                stderr
+                "git clean failed: {stderr}"
             )));
         }
 
@@ -2198,5 +2180,125 @@ mod tests {
             result_with_envelope.time_envelope_ref.unwrap().as_bytes(),
             &envelope_bytes
         );
+    }
+
+    // =========================================================================
+    // TCK-00318: Security validation tests for commit_ref injection
+    // =========================================================================
+
+    #[test]
+    fn test_validate_commit_ref_valid_sha1_hash() {
+        // Valid 40-char SHA-1 hash
+        let result = validate_commit_ref("a1b2c3d4e5f6789012345678901234567890abcd");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_commit_ref_valid_branch_name() {
+        // Valid branch names
+        assert!(validate_commit_ref("main").is_ok());
+        assert!(validate_commit_ref("feature/my-feature").is_ok());
+        assert!(validate_commit_ref("release-1.0.0").is_ok());
+        assert!(validate_commit_ref("fix_bug_123").is_ok());
+    }
+
+    #[test]
+    fn test_validate_commit_ref_valid_head_refs() {
+        // Valid HEAD references
+        assert!(validate_commit_ref("HEAD").is_ok());
+        assert!(validate_commit_ref("HEAD~1").is_ok());
+        assert!(validate_commit_ref("HEAD~10").is_ok());
+        assert!(validate_commit_ref("HEAD^1").is_ok());
+        assert!(validate_commit_ref("main~5").is_ok());
+    }
+
+    #[test]
+    fn test_validate_commit_ref_rejects_flag_injection() {
+        // Security: reject refs starting with '-' to prevent flag injection
+        let result = validate_commit_ref("-p");
+        assert!(matches!(result, Err(WorkspaceError::InvalidCommitRef(_))));
+
+        let result = validate_commit_ref("--help");
+        assert!(matches!(result, Err(WorkspaceError::InvalidCommitRef(_))));
+
+        let result = validate_commit_ref("--exec=malicious");
+        assert!(matches!(result, Err(WorkspaceError::InvalidCommitRef(_))));
+    }
+
+    #[test]
+    fn test_validate_commit_ref_rejects_empty() {
+        let result = validate_commit_ref("");
+        assert!(matches!(result, Err(WorkspaceError::InvalidCommitRef(_))));
+    }
+
+    #[test]
+    fn test_validate_commit_ref_rejects_null_byte() {
+        let result = validate_commit_ref("main\0--exec=evil");
+        assert!(matches!(result, Err(WorkspaceError::InvalidCommitRef(_))));
+    }
+
+    #[test]
+    fn test_validate_commit_ref_rejects_shell_metacharacters() {
+        // Reject shell metacharacters that could be used for injection
+        assert!(validate_commit_ref("main;echo pwned").is_err());
+        assert!(validate_commit_ref("main|cat /etc/passwd").is_err());
+        assert!(validate_commit_ref("main$(evil)").is_err());
+        assert!(validate_commit_ref("main`evil`").is_err());
+        assert!(validate_commit_ref("main&background").is_err());
+        assert!(validate_commit_ref("main>output").is_err());
+        assert!(validate_commit_ref("main<input").is_err());
+    }
+
+    #[test]
+    fn test_invalid_commit_ref_error_reason_code() {
+        let err = WorkspaceError::InvalidCommitRef("-p".to_string());
+        assert_eq!(err.reason_code(), ReasonCode::ApplyFailed);
+        assert!(err.is_retryable());
+    }
+
+    // =========================================================================
+    // TCK-00318: Security validation tests for diff/manifest mismatch
+    // =========================================================================
+
+    #[test]
+    fn test_diff_manifest_mismatch_error_reason_code() {
+        let err = WorkspaceError::DiffManifestMismatch {
+            diff_path: "etc/passwd".to_string(),
+        };
+        assert_eq!(err.reason_code(), ReasonCode::InvalidBundle);
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_diff_manifest_mismatch_error_display() {
+        let err = WorkspaceError::DiffManifestMismatch {
+            diff_path: "malicious/file.rs".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("diff/manifest mismatch"));
+        assert!(msg.contains("malicious/file.rs"));
+        assert!(msg.contains("not in manifest"));
+    }
+
+    #[test]
+    fn test_parse_git_path_simple() {
+        // Test simple path parsing
+        assert_eq!(parse_git_path("src/lib.rs"), "src/lib.rs");
+        assert_eq!(parse_git_path("Cargo.toml"), "Cargo.toml");
+    }
+
+    #[test]
+    fn test_parse_git_path_with_braces() {
+        // Test path with git rename braces: {old => new}
+        assert_eq!(
+            parse_git_path("src/{old.rs => new.rs}"),
+            "src/{old.rs => new.rs}"
+        );
+    }
+
+    #[test]
+    fn test_parse_git_path_quoted() {
+        // Test quoted path (git uses quotes for special chars)
+        assert_eq!(parse_git_path("\"src/lib.rs\""), "src/lib.rs");
     }
 }
