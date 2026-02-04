@@ -21,14 +21,9 @@
         "primary_utility": "Design guidance and best practices"
       },
       {
-        "file": "agent_native_software.json",
-        "description": "Doctrine for agent-native software architecture",
-        "primary_utility": "Architectural patterns and constraints"
-      },
-      {
-        "file": "agent_native_protocols.json",
-        "description": "Doctrine for agent-native communication protocols",
-        "primary_utility": "Protocol design and interoperability standards"
+        "file": "agent_native_architecture.json",
+        "description": "Doctrine for agent-native software architecture and protocols",
+        "primary_utility": "Architectural patterns, constraints, and interoperability standards"
       },
       {
         "file": "defects.json",
