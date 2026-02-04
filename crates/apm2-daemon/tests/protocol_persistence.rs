@@ -29,7 +29,7 @@ fn make_privileged_ctx() -> ConnectionContext {
     }))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_persistence_end_to_end() {
     // 1. Setup SQLite
     let db_file = NamedTempFile::new().unwrap();
@@ -43,7 +43,12 @@ async fn test_persistence_end_to_end() {
 
     // 2. Setup DispatcherState with persistence
     let session_registry = Arc::new(InMemorySessionRegistry::new());
-    let state = DispatcherState::with_persistence(session_registry, None, Some(conn_arc.clone()));
+    let state = DispatcherState::with_persistence(
+        session_registry,
+        None,
+        Some(conn_arc.clone()),
+        db_file.path().parent().unwrap().to_path_buf(),
+    );
     let dispatcher = state.privileged_dispatcher();
 
     // 3. ClaimWork

@@ -189,6 +189,7 @@ impl DispatcherState {
             Arc::clone(&manifest_store),
             session_registry,
             clock,
+            std::env::temp_dir(),
             Arc::clone(&subscription_registry),
         );
 
@@ -257,6 +258,7 @@ impl DispatcherState {
             Arc::clone(&manifest_store),
             session_registry,
             clock,
+            std::env::temp_dir(),
             Arc::clone(&subscription_registry),
         );
 
@@ -295,6 +297,7 @@ impl DispatcherState {
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
+        work_dir: impl AsRef<Path>,
     ) -> Self {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
@@ -316,7 +319,13 @@ impl DispatcherState {
                 signing_key,
             ));
             let lease_validator = Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
-            let episode_runtime = Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default()));
+            // Use safe production defaults for EpisodeRuntime: max_concurrent_episodes=100
+            let runtime_config = EpisodeRuntimeConfig::default().with_max_concurrent_episodes(100);
+            let mut episode_runtime = EpisodeRuntime::new(runtime_config);
+            episode_runtime =
+                episode_runtime.with_default_budget(crate::episode::EpisodeBudget::default());
+            let episode_runtime = Arc::new(episode_runtime);
+
             let clock =
                 Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
@@ -331,6 +340,7 @@ impl DispatcherState {
                 clock,
                 token_minter.clone(),
                 manifest_store.clone(),
+                work_dir.as_ref().to_path_buf(),
                 Arc::clone(&subscription_registry),
             )
         } else {
@@ -344,6 +354,7 @@ impl DispatcherState {
                 manifest_store.clone(),
                 session_registry,
                 clock,
+                work_dir.as_ref().to_path_buf(),
                 Arc::clone(&subscription_registry),
             )
         };
@@ -394,6 +405,7 @@ impl DispatcherState {
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Arc<Mutex<Connection>>,
         cas_path: impl AsRef<Path>,
+        work_dir: impl AsRef<Path>,
     ) -> Self {
         use rand::rngs::OsRng;
 
@@ -445,19 +457,51 @@ impl DispatcherState {
         let cas_for_handlers = Arc::clone(&cas);
         episode_runtime = episode_runtime
             // ReadFileHandler
-            .with_handler_factory(|| Box::new(ReadFileHandler::new()))
+            .with_handler_factory(|root| {
+                root.map_or_else(
+                    || Box::new(ReadFileHandler::new()),
+                    |path| Box::new(ReadFileHandler::with_root(path)),
+                )
+            })
             // WriteFileHandler
-            .with_handler_factory(|| Box::new(WriteFileHandler::new()))
+            .with_handler_factory(|root| {
+                root.map_or_else(
+                    || Box::new(WriteFileHandler::new()),
+                    |path| Box::new(WriteFileHandler::with_root(path)),
+                )
+            })
             // ExecuteHandler
-            .with_handler_factory(|| Box::new(ExecuteHandler::new()))
+            .with_handler_factory(|root| {
+                root.map_or_else(
+                    || Box::new(ExecuteHandler::new()),
+                    |path| Box::new(ExecuteHandler::with_root(path)),
+                )
+            })
             // GitOperationHandler
-            .with_handler_factory(|| Box::new(GitOperationHandler::new()))
+            .with_handler_factory(|root| {
+                root.map_or_else(
+                    || Box::new(GitOperationHandler::new()),
+                    |path| Box::new(GitOperationHandler::with_root(path)),
+                )
+            })
             // ArtifactFetchHandler (needs CAS)
-            .with_handler_factory(move || Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone())))
+            .with_handler_factory(move |_root| {
+                Box::new(ArtifactFetchHandler::new(cas_for_handlers.clone()))
+            })
             // ListFilesHandler
-            .with_handler_factory(|| Box::new(ListFilesHandler::new()))
+            .with_handler_factory(|root| {
+                root.map_or_else(
+                    || Box::new(ListFilesHandler::new()),
+                    |path| Box::new(ListFilesHandler::with_root(path)),
+                )
+            })
             // SearchHandler
-            .with_handler_factory(|| Box::new(SearchHandler::new()));
+            .with_handler_factory(|root| {
+                root.map_or_else(
+                    || Box::new(SearchHandler::new()),
+                    |path| Box::new(SearchHandler::with_root(path)),
+                )
+            });
 
         let episode_runtime = Arc::new(episode_runtime);
 
@@ -472,6 +516,7 @@ impl DispatcherState {
             Arc::clone(&clock),
             token_minter.clone(),
             manifest_store.clone(),
+            work_dir.as_ref().to_path_buf(),
             Arc::clone(&subscription_registry),
         );
 

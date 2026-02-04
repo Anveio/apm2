@@ -32,6 +32,7 @@
 //! - [INV-ER004] Episode IDs are unique within the runtime
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -440,7 +441,8 @@ pub struct EpisodeRuntime {
     cas: Option<Arc<dyn ContentAddressedStore>>,
     /// Factories for creating tool handlers.
     #[allow(clippy::type_complexity)]
-    handler_factories: RwLock<Vec<Box<dyn Fn() -> Box<dyn ToolHandler> + Send + Sync>>>,
+    handler_factories:
+        RwLock<Vec<Box<dyn Fn(Option<&Path>) -> Box<dyn ToolHandler> + Send + Sync>>>,
     /// Default budget for new episodes.
     default_budget: EpisodeBudget,
 }
@@ -601,7 +603,7 @@ impl EpisodeRuntime {
     #[must_use]
     pub fn with_handler_factory<F>(mut self, factory: F) -> Self
     where
-        F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
+        F: Fn(Option<&Path>) -> Box<dyn ToolHandler> + Send + Sync + 'static,
     {
         self.handler_factories.get_mut().push(Box::new(factory));
         self
@@ -613,7 +615,7 @@ impl EpisodeRuntime {
     /// (needed because handlers are consumed by the executor).
     pub async fn register_tool_handler_factory<F>(&self, factory: F)
     where
-        F: Fn() -> Box<dyn ToolHandler> + Send + Sync + 'static,
+        F: Fn(Option<&Path>) -> Box<dyn ToolHandler> + Send + Sync + 'static,
     {
         let mut factories = self.handler_factories.write().await;
         factories.push(Box::new(factory));
@@ -764,6 +766,7 @@ impl EpisodeRuntime {
     ///
     /// * `episode_id` - The episode to start
     /// * `lease_id` - Lease authorizing execution
+    /// * `workspace_root` - Optional root directory for tool handlers
     /// * `timestamp_ns` - Current timestamp in nanoseconds since epoch
     ///
     /// # Returns
@@ -785,20 +788,25 @@ impl EpisodeRuntime {
         &self,
         episode_id: &EpisodeId,
         lease_id: impl Into<String>,
+        workspace_root: Option<PathBuf>,
         timestamp_ns: u64,
     ) -> Result<SessionHandle, EpisodeError> {
         let lease_id = lease_id.into();
 
         // Validate lease ID
+
         if lease_id.is_empty() {
             return Err(EpisodeError::InvalidLease {
                 episode_id: episode_id.as_str().to_string(),
+
                 reason: "lease ID cannot be empty".to_string(),
             });
         }
 
         // Generate session ID
+
         let session_seq = self.session_seq.fetch_add(1, Ordering::Relaxed);
+
         let session_id = format!("session-{session_seq}");
 
         let handle = {
@@ -812,48 +820,67 @@ impl EpisodeRuntime {
                     })?;
 
             // Validate transition
+
             super::state::validate_transition(episode_id.as_str(), &entry.state, "Running")?;
 
             // Extract required fields from current state
+
             let (created_at_ns, envelope_hash) = match &entry.state {
                 EpisodeState::Created {
                     created_at_ns,
+
                     envelope_hash,
                 } => (*created_at_ns, *envelope_hash),
+
                 _ => {
                     return Err(EpisodeError::InvalidTransition {
                         id: episode_id.as_str().to_string(),
+
                         from: entry.state.state_name(),
+
                         to: "Running",
                     });
                 },
             };
 
             // Transition to Running
+
             entry.state = EpisodeState::Running {
                 created_at_ns,
+
                 started_at_ns: timestamp_ns,
+
                 envelope_hash,
+
                 lease_id: lease_id.clone(),
+
                 session_id: session_id.clone(),
             };
 
             // Create session handle and store a clone in the entry.
+
             // Both the caller's handle and the runtime's handle share the same
+
             // underlying stop signal channel (INV-SH003), so signals sent via
+
             // `runtime.signal()` are received by the caller's handle.
+
             // Pass timestamp_ns for deterministic timing per HARD-TIME (M05).
+
             let handle = SessionHandle::new(
                 episode_id.clone(),
                 session_id.clone(),
                 lease_id.clone(),
                 timestamp_ns,
             );
+
             entry.handle = Some(handle.clone());
 
             // Initialize tool executor if CAS is configured
+
             if let Some(ref cas) = self.cas {
                 let budget_tracker = Arc::new(BudgetTracker::from_envelope(self.default_budget));
+
                 let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
 
                 if let Some(ref clock) = self.clock {
@@ -861,13 +888,19 @@ impl EpisodeRuntime {
                 }
 
                 // Register handlers from factories
+
                 let factories = self.handler_factories.read().await;
+
                 for factory in factories.iter() {
-                    if let Err(e) = executor.register_handler(factory()) {
+                    if let Err(e) = executor.register_handler(factory(workspace_root.as_deref())) {
                         warn!(
+
                             episode_id = %episode_id,
+
                             error = %e,
+
                             "failed to register handler for episode"
+
                         );
                     }
                 }
@@ -1463,7 +1496,7 @@ mod tests {
             .unwrap();
 
         let handle = runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
@@ -1486,7 +1519,7 @@ mod tests {
         runtime.drain_events().await; // Clear create event
 
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
@@ -1503,7 +1536,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
@@ -1534,7 +1567,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime.drain_events().await; // Clear previous events
@@ -1561,7 +1594,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
@@ -1583,7 +1616,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime.drain_events().await;
@@ -1610,7 +1643,7 @@ mod tests {
             .await
             .unwrap();
         let handle = runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
@@ -1646,7 +1679,7 @@ mod tests {
             .await
             .unwrap();
         let handle1 = runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
@@ -1681,13 +1714,13 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .start(&episode_id, "lease-1", None, test_timestamp() + 1000)
             .await
             .unwrap();
 
         // Try to start again - should fail
         let result = runtime
-            .start(&episode_id, "lease-2", test_timestamp() + 2000)
+            .start(&episode_id, "lease-2", None, test_timestamp() + 2000)
             .await;
         assert!(matches!(
             result,
@@ -1725,7 +1758,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .start(&episode_id, "lease-1", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime
@@ -1739,7 +1772,7 @@ mod tests {
 
         // Try to start again after termination - should fail
         let result = runtime
-            .start(&episode_id, "lease-2", test_timestamp() + 3000)
+            .start(&episode_id, "lease-2", None, test_timestamp() + 3000)
             .await;
         assert!(matches!(
             result,
@@ -1755,7 +1788,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .start(&episode_id, "lease-1", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime
@@ -1789,7 +1822,9 @@ mod tests {
         let result = runtime.observe(&fake_id).await;
         assert!(matches!(result, Err(EpisodeError::NotFound { .. })));
 
-        let result = runtime.start(&fake_id, "lease-1", test_timestamp()).await;
+        let result = runtime
+            .start(&fake_id, "lease-1", None, test_timestamp())
+            .await;
         assert!(matches!(result, Err(EpisodeError::NotFound { .. })));
     }
 
@@ -1827,7 +1862,7 @@ mod tests {
         assert_eq!(runtime.total_count().await, 1);
 
         runtime
-            .start(&ep1, "lease-1", test_timestamp() + 1000)
+            .start(&ep1, "lease-1", None, test_timestamp() + 1000)
             .await
             .unwrap();
         assert_eq!(runtime.active_count().await, 1);
@@ -1847,7 +1882,7 @@ mod tests {
         // Create and terminate an episode
         let ep1 = runtime.create([1u8; 32], test_timestamp()).await.unwrap();
         runtime
-            .start(&ep1, "lease-1", test_timestamp() + 1000)
+            .start(&ep1, "lease-1", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime
@@ -1877,7 +1912,7 @@ mod tests {
             .unwrap();
 
         let result = runtime
-            .start(&episode_id, "", test_timestamp() + 1000)
+            .start(&episode_id, "", None, test_timestamp() + 1000)
             .await;
         assert!(matches!(result, Err(EpisodeError::InvalidLease { .. })));
     }
@@ -1914,7 +1949,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&ep, "lease-1", test_timestamp() + 1000)
+            .start(&ep, "lease-1", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime
@@ -2037,7 +2072,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime
@@ -2075,7 +2110,7 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .start(&episode_id, "lease-123", test_timestamp() + 1000)
+            .start(&episode_id, "lease-123", None, test_timestamp() + 1000)
             .await
             .unwrap();
         runtime

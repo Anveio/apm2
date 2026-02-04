@@ -598,6 +598,7 @@ async fn async_main(args: Args) -> Result<()> {
         state.session_registry().clone(),
         metrics_registry.clone(),
         sqlite_conn,
+        &daemon_config.config.daemon.work_dir,
     ));
 
     // TCK-00279: Start ProtocolServer-only control plane

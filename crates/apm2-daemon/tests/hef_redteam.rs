@@ -414,6 +414,7 @@ async fn test_subscription_explosion_rejected() {
         manifest_store,
         session_registry,
         clock,
+        std::env::temp_dir(),
         registry,
     );
 
@@ -753,6 +754,7 @@ async fn test_out_of_order_spawn_rejected() {
         manifest_store,
         session_registry,
         clock,
+        std::env::temp_dir(),
         registry,
     );
 
@@ -817,6 +819,7 @@ async fn test_claim_work_replay_rejected() {
         manifest_store,
         session_registry,
         clock,
+        std::env::temp_dir(),
         registry,
     );
 

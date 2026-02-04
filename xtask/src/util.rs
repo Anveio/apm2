@@ -375,9 +375,9 @@ pub fn print_non_authoritative_banner() {
 /// Where XXXX is 4 digits and XXXXX is 5 digits.
 static TICKET_BRANCH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Two separate patterns:
-    // 1. ticket/ branches require strict TCK-XXXXX format (with optional RFC-XXXX/)
+    // 1. ticket/ or fix/ branches require TCK-XXXXX format (with optional RFC-XXXX/ and optional suffix)
     // 2. feat/ branches allow any word/hyphen characters
-    Regex::new(r"^(?:ticket/(?:(RFC-\d{4})/)?(TCK-\d{5})|feat/([\w\-]+))$")
+    Regex::new(r"^(?:(?:ticket|fix)/(?:(RFC-\d{4})/)?(TCK-\d{5})(?:-[\w\-]+)?|feat/([\w\-]+))$")
         .expect("Invalid regex pattern for ticket branch")
 });
 

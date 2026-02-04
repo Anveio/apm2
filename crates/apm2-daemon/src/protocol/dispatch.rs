@@ -27,6 +27,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -56,8 +57,8 @@ use super::session_dispatch::InMemoryManifestStore;
 use super::session_token::TokenMinter;
 use crate::episode::registry::InMemorySessionRegistry;
 use crate::episode::{
-    CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeRuntime, EpisodeRuntimeConfig,
-    LeaseIssueDenialReason, validate_custody_domain_overlap,
+    CapabilityManifest, CustodyDomainError, CustodyDomainId, EpisodeId, EpisodeRuntime,
+    EpisodeRuntimeConfig, LeaseIssueDenialReason, validate_custody_domain_overlap,
 };
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::metrics::SharedMetricsRegistry;
@@ -1799,6 +1800,9 @@ pub struct PrivilegedDispatcher {
     /// - Wall time bounds: Observational only, with uncertainty interval
     holonic_clock: Arc<HolonicClock>,
 
+    /// Work directory for episode workspaces.
+    work_dir: PathBuf,
+
     /// Subscription registry for HEF Pulse Plane resource governance
     /// (TCK-00303).
     ///
@@ -1870,6 +1874,7 @@ impl PrivilegedDispatcher {
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
             holonic_clock,
+            work_dir: std::env::temp_dir(),
             subscription_registry,
         }
     }
@@ -1918,6 +1923,7 @@ impl PrivilegedDispatcher {
             manifest_store: Arc::new(InMemoryManifestStore::new()),
             metrics: None,
             holonic_clock,
+            work_dir: std::env::temp_dir(),
             subscription_registry,
         }
     }
@@ -1971,6 +1977,7 @@ impl PrivilegedDispatcher {
         clock: Arc<HolonicClock>,
         token_minter: Arc<TokenMinter>,
         manifest_store: Arc<InMemoryManifestStore>,
+        work_dir: PathBuf,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
         Self {
@@ -1985,6 +1992,7 @@ impl PrivilegedDispatcher {
             manifest_store,
             metrics: None,
             holonic_clock: clock,
+            work_dir,
             subscription_registry,
         }
     }
@@ -2015,6 +2023,7 @@ impl PrivilegedDispatcher {
         manifest_store: Arc<InMemoryManifestStore>,
         session_registry: Arc<dyn SessionRegistry>,
         clock: Arc<HolonicClock>,
+        work_dir: PathBuf,
         subscription_registry: SharedSubscriptionRegistry,
     ) -> Self {
         Self {
@@ -2029,6 +2038,7 @@ impl PrivilegedDispatcher {
             manifest_store,
             metrics: None,
             holonic_clock: clock,
+            work_dir,
             subscription_registry,
         }
     }
@@ -2592,16 +2602,23 @@ impl PrivilegedDispatcher {
             ));
         }
 
-        // SEC-SCP-FAC-0020: Enforce maximum length on work_id to prevent DoS via OOM
+        // Validate request
         if request.work_id.len() > MAX_ID_LENGTH {
-            warn!(
-                work_id_len = request.work_id.len(),
-                max_len = MAX_ID_LENGTH,
-                "SpawnEpisode rejected: work_id exceeds maximum length"
-            );
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!("work_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+                "work_id too long",
+            ));
+        }
+
+        // TCK-00319: Validate work_id format (must be a simple identifier, no path traversal)
+        if request.work_id.contains('/')
+            || request.work_id.contains('\\')
+            || request.work_id == ".."
+            || request.work_id == "."
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "work_id must be a simple identifier (no path separators)",
             ));
         }
 
@@ -2844,10 +2861,55 @@ impl PrivilegedDispatcher {
         let session_id = format!("S-{}", uuid::Uuid::new_v4());
         let ephemeral_handle = EphemeralHandle::generate();
 
+        // TCK-00319: Start episode with workspace root
+        let workspace_root = self.work_dir.join(&request.work_id);
+
+        // Ensure workspace root exists (best effort)
+        if let Err(e) = std::fs::create_dir_all(&workspace_root) {
+            warn!(error = %e, path = %workspace_root.display(), "Failed to create workspace root");
+        }
+
+        // Generate deterministic envelope hash
+        let envelope_hash =
+            *blake3::hash(format!("{}{}", request.work_id, claim.lease_id).as_bytes()).as_bytes();
+
+        // TCK-00289: Use HTF timestamp
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp error during episode start - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // Async execution of episode creation/start
+        let episode_id = match tokio::task::block_in_place(|| {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                let ep_id = self
+                    .episode_runtime
+                    .create(envelope_hash, timestamp_ns)
+                    .await?;
+                self.episode_runtime
+                    .start(&ep_id, &claim.lease_id, Some(workspace_root), timestamp_ns)
+                    .await?;
+                Ok::<EpisodeId, crate::episode::EpisodeError>(ep_id)
+            })
+        }) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %e, "Failed to start episode");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("episode start failed: {e}"),
+                ));
+            },
+        };
+
         // TCK-00256: Persist session state for subsequent IPC calls
-        // The episode_runtime can create/start episodes asynchronously when needed.
-        // For now, we persist the session state with policy constraints reference
-        // so that subsequent async operations can use it.
         let session_state = SessionState {
             session_id: session_id.clone(),
             work_id: request.work_id.clone(),
@@ -2856,7 +2918,7 @@ impl PrivilegedDispatcher {
             lease_id: claim.lease_id.clone(),
             policy_resolved_ref: claim.policy_resolution.policy_resolved_ref.clone(),
             capability_manifest_hash: claim.policy_resolution.capability_manifest_hash.to_vec(),
-            episode_id: None, // Will be set when episode starts in async context
+            episode_id: Some(episode_id.to_string()),
         };
 
         if let Err(e) = self.session_registry.register_session(session_state) {
@@ -3503,8 +3565,8 @@ mod tests {
     mod privileged_routing {
         use super::*;
 
-        #[test]
-        fn test_claim_work_routing() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_claim_work_routing() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -3524,8 +3586,8 @@ mod tests {
             assert!(matches!(response, PrivilegedResponse::ClaimWork(_)));
         }
 
-        #[test]
-        fn test_spawn_episode_routing() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_spawn_episode_routing() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -3560,8 +3622,8 @@ mod tests {
             assert!(matches!(response, PrivilegedResponse::SpawnEpisode(_)));
         }
 
-        #[test]
-        fn test_issue_capability_routing() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_issue_capability_routing() {
             use crate::session::SessionState;
 
             let dispatcher = PrivilegedDispatcher::new();
@@ -3624,8 +3686,8 @@ mod tests {
             assert!(matches!(response, PrivilegedResponse::IssueCapability(_)));
         }
 
-        #[test]
-        fn test_shutdown_routing() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_shutdown_routing() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
@@ -3642,8 +3704,8 @@ mod tests {
             assert!(matches!(response, PrivilegedResponse::Shutdown(_)));
         }
 
-        #[test]
-        fn test_session_socket_returns_permission_denied() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_session_socket_returns_permission_denied() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = ConnectionContext::session(
                 Some(PeerCredentials {
@@ -3710,8 +3772,8 @@ mod tests {
     // ========================================================================
     // ADV-001: Agent calls ClaimWork → PERMISSION_DENIED
     // ========================================================================
-    #[test]
-    fn test_adv_001_session_cannot_claim_work() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_adv_001_session_cannot_claim_work() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_session_ctx();
 
@@ -3737,8 +3799,8 @@ mod tests {
     // ========================================================================
     // ADV-002: Agent calls SpawnEpisode → PERMISSION_DENIED
     // ========================================================================
-    #[test]
-    fn test_adv_002_session_cannot_spawn_episode() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_adv_002_session_cannot_spawn_episode() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_session_ctx();
 
@@ -3759,8 +3821,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_session_cannot_issue_capability() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_session_cannot_issue_capability() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_session_ctx();
 
@@ -3780,8 +3842,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_session_cannot_shutdown() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_session_cannot_shutdown() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_session_ctx();
 
@@ -3803,8 +3865,8 @@ mod tests {
     // ========================================================================
     // Privileged Connection Tests (Success Path)
     // ========================================================================
-    #[test]
-    fn test_privileged_claim_work_stub() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_privileged_claim_work_stub() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -3830,8 +3892,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_privileged_spawn_episode_stub() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_privileged_spawn_episode_stub() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -3872,8 +3934,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_privileged_issue_capability_stub() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_privileged_issue_capability_stub() {
         use crate::session::SessionState;
 
         let dispatcher = PrivilegedDispatcher::new();
@@ -3960,8 +4022,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_privileged_shutdown_stub() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_privileged_shutdown_stub() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -3986,8 +4048,8 @@ mod tests {
     // ========================================================================
     // ADV-005: ClaimWork role validation
     // ========================================================================
-    #[test]
-    fn test_adv_005_claim_work_validation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_adv_005_claim_work_validation() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4049,8 +4111,8 @@ mod tests {
         ///    produce the same derived `actor_id`
         /// 2. Different nonces do NOT affect the derived `actor_id` (stable
         ///    identity)
-        #[test]
-        fn test_actor_id_derived_from_credential_not_user_input() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_actor_id_derived_from_credential_not_user_input() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -4111,8 +4173,8 @@ mod tests {
         /// This is the inverse test of what was previously tested - we now
         /// verify that nonces do NOT produce different `actor_ids` (which
         /// was the bug).
-        #[test]
-        fn test_same_credential_produces_same_actor_id_regardless_of_nonce() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_same_credential_produces_same_actor_id_regardless_of_nonce() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -4152,8 +4214,8 @@ mod tests {
         }
 
         /// Policy resolution is required for work claim.
-        #[test]
-        fn test_policy_resolution_required_for_claim() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_policy_resolution_required_for_claim() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -4197,8 +4259,8 @@ mod tests {
         }
 
         /// Work claim is persisted in registry.
-        #[test]
-        fn test_work_claimed_event_persisted() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_work_claimed_event_persisted() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -4229,8 +4291,8 @@ mod tests {
         }
 
         /// Missing credentials should fail.
-        #[test]
-        fn test_missing_credentials_fails() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_missing_credentials_fails() {
             let dispatcher = PrivilegedDispatcher::new();
             // Privileged connection but no credentials
             let ctx = ConnectionContext::privileged(None);
@@ -4254,8 +4316,8 @@ mod tests {
         /// 1. Deterministic (same credential = same output)
         /// 2. Independent of PID (different PIDs with same UID/GID = same
         ///    output)
-        #[test]
-        fn test_derive_actor_id_deterministic() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_derive_actor_id_deterministic() {
             let creds = PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -4302,8 +4364,8 @@ mod tests {
         }
 
         /// Test work and lease ID generation.
-        #[test]
-        fn test_id_generation_unique() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_id_generation_unique() {
             let work_id1 = generate_work_id();
             let work_id2 = generate_work_id();
             assert_ne!(work_id1, work_id2, "Work IDs should be unique");
@@ -4325,8 +4387,8 @@ mod tests {
         /// 1. A signed event is emitted when work is claimed
         /// 2. The event is queryable from the ledger
         /// 3. The signature is present and has the correct length
-        #[test]
-        fn test_work_claimed_event_signed_and_persisted() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_work_claimed_event_signed_and_persisted() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -4386,8 +4448,8 @@ mod tests {
         /// TCK-00253: Ledger query returns signed event.
         ///
         /// Per acceptance criteria: "Ledger query returns signed event"
-        #[test]
-        fn test_ledger_query_returns_signed_event() {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_ledger_query_returns_signed_event() {
             let dispatcher = PrivilegedDispatcher::new();
             let ctx = make_privileged_ctx();
 
@@ -4424,8 +4486,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gate_executor_requires_lease_id() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_gate_executor_requires_lease_id() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4446,8 +4508,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_gate_executor_with_lease_id_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_gate_executor_with_lease_id_succeeds() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4501,8 +4563,8 @@ mod tests {
     ///
     /// Per security review: `lease_id` must be validated against the claim to
     /// prevent authorization bypass.
-    #[test]
-    fn tck_00256_spawn_with_wrong_lease_id_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_with_wrong_lease_id_fails() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4554,8 +4616,8 @@ mod tests {
     ///
     /// Security Fix Verification: Ensure that omitting `lease_id` (None) is NOT
     /// treated as a valid bypass. It must match the claimed `lease_id`.
-    #[test]
-    fn tck_00256_spawn_with_missing_lease_id_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_with_missing_lease_id_fails() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4602,8 +4664,8 @@ mod tests {
     }
 
     /// SEC-SCP-FAC-0020: `SpawnEpisode` with correct `lease_id` succeeds.
-    #[test]
-    fn tck_00256_spawn_with_correct_lease_id_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_with_correct_lease_id_succeeds() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4644,8 +4706,8 @@ mod tests {
     }
 
     /// SEC-SCP-FAC-0020: Session state is persisted after successful spawn.
-    #[test]
-    fn tck_00256_session_state_persisted() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_session_state_persisted() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4709,8 +4771,8 @@ mod tests {
     /// This test verifies that the ledger is queried for a valid
     /// `GateLeaseIssued` event. If the lease is not found, the spawn is
     /// rejected with `GATE_LEASE_MISSING`.
-    #[test]
-    fn test_adv_004_gate_executor_unknown_lease_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_adv_004_gate_executor_unknown_lease_fails() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4746,8 +4808,8 @@ mod tests {
     ///
     /// This test verifies that the lease's `work_id` must match the request's
     /// `work_id`. A lease for work W-001 cannot be used for spawn on W-002.
-    #[test]
-    fn test_adv_004_gate_executor_work_id_mismatch_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_adv_004_gate_executor_work_id_mismatch_fails() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4789,8 +4851,8 @@ mod tests {
     /// This test verifies that a properly registered lease that matches
     /// the `work_id` passes the lease validation. Note: The spawn may still
     /// fail at the claim validation stage if `ClaimWork` wasn't called first.
-    #[test]
-    fn test_adv_004_gate_executor_valid_lease_passes_validation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_adv_004_gate_executor_valid_lease_passes_validation() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4831,8 +4893,8 @@ mod tests {
     // ========================================================================
     // Protocol Error Tests
     // ========================================================================
-    #[test]
-    fn test_empty_frame_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_empty_frame_error() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4843,8 +4905,8 @@ mod tests {
         assert!(matches!(result, Err(ProtocolError::Serialization { .. })));
     }
 
-    #[test]
-    fn test_unknown_message_type_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unknown_message_type_error() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4855,8 +4917,8 @@ mod tests {
         assert!(matches!(result, Err(ProtocolError::Serialization { .. })));
     }
 
-    #[test]
-    fn test_malformed_payload_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_malformed_payload_error() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4869,8 +4931,8 @@ mod tests {
     // ========================================================================
     // Connection Context Tests
     // ========================================================================
-    #[test]
-    fn test_connection_context_privileged() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_context_privileged() {
         let ctx = ConnectionContext::privileged(Some(PeerCredentials {
             uid: 1000,
             gid: 1000,
@@ -4882,8 +4944,8 @@ mod tests {
         assert!(ctx.session_id().is_none());
     }
 
-    #[test]
-    fn test_connection_context_session() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_connection_context_session() {
         let ctx = ConnectionContext::session(
             Some(PeerCredentials {
                 uid: 1000,
@@ -4901,8 +4963,8 @@ mod tests {
     // ========================================================================
     // Response Encoding Tests
     // ========================================================================
-    #[test]
-    fn test_response_encoding() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_response_encoding() {
         let error_resp = PrivilegedResponse::permission_denied();
         let encoded = error_resp.encode();
         assert!(!encoded.is_empty());
@@ -4929,8 +4991,8 @@ mod tests {
     /// Per acceptance criteria: "Spawn without policy resolution fails"
     /// This test verifies ADV-004 variant: attempting to spawn an episode
     /// without first calling `ClaimWork` to establish policy resolution.
-    #[test]
-    fn tck_00256_spawn_without_policy_resolution_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_without_policy_resolution_fails() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -4966,8 +5028,8 @@ mod tests {
     /// Per acceptance criteria: "Valid policy resolution allows spawn"
     /// This test verifies the integration flow: `ClaimWork` followed by
     /// `SpawnEpisode`.
-    #[test]
-    fn tck_00256_spawn_with_policy_resolution_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_with_policy_resolution_succeeds() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -5033,8 +5095,8 @@ mod tests {
     ///
     /// Per DD-001, the role in the spawn request should match the claimed role.
     /// This test verifies that attempting to spawn with a different role fails.
-    #[test]
-    fn tck_00256_spawn_with_mismatched_role_fails() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_with_mismatched_role_fails() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -5084,8 +5146,8 @@ mod tests {
     ///
     /// Verifies that the spawn response includes the capability manifest hash
     /// from the original policy resolution.
-    #[test]
-    fn tck_00256_spawn_returns_policy_resolution_data() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tck_00256_spawn_returns_policy_resolution_data() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = make_privileged_ctx();
 
@@ -5141,8 +5203,8 @@ mod tests {
     /// Per CTR-1303: In-memory stores must have `max_entries` limit with O(1)
     /// eviction. This test verifies that the registry evicts oldest entries
     /// when at capacity.
-    #[test]
-    fn test_stub_work_registry_capacity_limit() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stub_work_registry_capacity_limit() {
         let registry = StubWorkRegistry::default();
 
         // Register claims up to capacity
@@ -5178,8 +5240,8 @@ mod tests {
     }
 
     /// CTR-1303: `StubWorkRegistry` rejects duplicate `work_ids`.
-    #[test]
-    fn test_stub_work_registry_rejects_duplicates() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stub_work_registry_rejects_duplicates() {
         let registry = StubWorkRegistry::default();
 
         let claim = WorkClaim {
@@ -5222,8 +5284,8 @@ mod tests {
     /// This tests the fail-closed `SoD` enforcement: when the executor's
     /// custody domains overlap with the changeset author's domains, the
     /// spawn must be rejected with `SOD_VIOLATION` error.
-    #[test]
-    fn test_sod_spawn_overlapping_domains_denied() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sod_spawn_overlapping_domains_denied() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = ConnectionContext::privileged(Some(PeerCredentials {
             uid: 1001,
@@ -5297,8 +5359,8 @@ mod tests {
     ///
     /// This tests the happy path: when executor and author domains don't
     /// overlap, the spawn should succeed.
-    #[test]
-    fn test_sod_spawn_non_overlapping_domains_succeeds() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sod_spawn_non_overlapping_domains_succeeds() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = ConnectionContext::privileged(Some(PeerCredentials {
             uid: 1001,
@@ -5361,8 +5423,8 @@ mod tests {
     ///
     /// This tests fail-closed semantics: if author domains cannot be resolved,
     /// the spawn must be rejected to prevent `SoD` bypass.
-    #[test]
-    fn test_sod_spawn_empty_author_domains_denied() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sod_spawn_empty_author_domains_denied() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = ConnectionContext::privileged(Some(PeerCredentials {
             uid: 1001,
@@ -5419,8 +5481,8 @@ mod tests {
     ///
     /// IMPLEMENTER and REVIEWER roles do not require `SoD` validation since
     /// they are not performing trust-critical gate operations.
-    #[test]
-    fn test_sod_non_gate_executor_skips_validation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sod_non_gate_executor_skips_validation() {
         let dispatcher = PrivilegedDispatcher::new();
         let ctx = ConnectionContext::privileged(Some(PeerCredentials {
             uid: 1001,
@@ -5473,8 +5535,8 @@ mod tests {
     ///
     /// Verifies that the internal resolver methods return errors for malformed
     /// IDs, rather than falling back to "UNIVERSAL".
-    #[test]
-    fn test_internal_resolvers_fail_on_malformed_ids() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_internal_resolvers_fail_on_malformed_ids() {
         let dispatcher = PrivilegedDispatcher::new();
 
         // 1. Test resolve_actor_custody_domains

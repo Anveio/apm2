@@ -110,6 +110,10 @@ pub struct DaemonConfig {
     #[serde(default = "default_state_file")]
     pub state_file: PathBuf,
 
+    /// Workspace directory.
+    #[serde(default = "default_work_dir")]
+    pub work_dir: PathBuf,
+
     /// Audit configuration.
     #[serde(default)]
     pub audit: AuditConfig,
@@ -123,6 +127,7 @@ impl Default for DaemonConfig {
             session_socket: default_session_socket(),
             log_dir: default_log_dir(),
             state_file: default_state_file(),
+            work_dir: default_work_dir(),
             audit: AuditConfig::default(),
         }
     }
@@ -189,6 +194,10 @@ fn default_log_dir() -> PathBuf {
 
 fn default_state_file() -> PathBuf {
     PathBuf::from("/var/lib/apm2/state.json")
+}
+
+fn default_work_dir() -> PathBuf {
+    PathBuf::from("/var/lib/apm2/work")
 }
 
 /// Credential profile configuration (in ecosystem file).
