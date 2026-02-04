@@ -477,6 +477,139 @@
         "crates/apm2-core/src/htf/types.rs"
       ],
       "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:hlc",
+      "term": "HLC (Hybrid Logical Clock)",
+      "definition": "A clock that combines physical time with logical ticks to capture causality across distributed systems.",
+      "operationalization": "Implemented in `crates/apm2-core/src/htf/types.rs` and `crates/apm2-daemon/src/htf/clock.rs`.",
+      "theory_refs": [
+        "LAW-04",
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/htf/types.rs",
+        "crates/apm2-daemon/src/htf/clock.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:actor_id",
+      "term": "ActorId",
+      "definition": "The cryptographic identity of an agent or component, typically a hash of a verifying key.",
+      "operationalization": "Implemented in `crates/apm2-daemon/src/projection/divergence_watchdog.rs`.",
+      "theory_refs": [
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/projection/divergence_watchdog.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:ticket",
+      "term": "Ticket",
+      "definition": "The atomic unit of work request/initiation, typically upstream of a Plan. Represents the \"Spec-of-Request\".",
+      "operationalization": "Implemented in `crates/apm2-core/src/ticket_emitter/emitter.rs`.",
+      "theory_refs": [
+        "LAW-01"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/ticket_emitter/emitter.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:work_object",
+      "term": "WorkObject",
+      "definition": "The agent-side stateful representation of a unit of work (ticket, plan, changeset) tracking its lifecycle attempts.",
+      "operationalization": "Implemented in `crates/apm2-holon/src/work.rs`.",
+      "theory_refs": [
+        "LAW-12"
+      ],
+      "implementation_refs": [
+        "crates/apm2-holon/src/work.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:relay",
+      "term": "Relay",
+      "definition": "A node or mechanism that mediates connectivity between Holons to enforce outbound-only security boundaries.",
+      "operationalization": "Implemented in `crates/apm2-core/src/consensus/relay.rs`.",
+      "theory_refs": [
+        "LAW-05"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/consensus/relay.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:handshake",
+      "term": "Handshake",
+      "definition": "The mandatory protocol negotiation (Hello/HelloAck) required before any IPC or network exchange.",
+      "operationalization": "Implemented in `crates/apm2-daemon/src/protocol/handshake.rs`.",
+      "theory_refs": [
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "crates/apm2-daemon/src/protocol/handshake.rs"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:impact_map",
+      "term": "ImpactMap",
+      "definition": "A calculated artifact that determines the \"Blast Radius\" of a change, used to assign Risk Tiers.",
+      "operationalization": "Implemented in `crates/apm2-core/src/impact_map`.",
+      "theory_refs": [
+        "LAW-14"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/impact_map"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:schema_registry",
+      "term": "SchemaRegistry",
+      "definition": "The authoritative store for Protocol Buffer schemas and version mappings, enforcing semantic typing.",
+      "operationalization": "Implemented in `crates/apm2-core/src/schema_registry`.",
+      "theory_refs": [
+        "LAW-13"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/schema_registry"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:refactor_radar",
+      "term": "RefactorRadar",
+      "definition": "A subsystem that monitors codebase complexity and churn to generate proactive maintenance recommendations (Refactoring Tickets).",
+      "operationalization": "Implemented in `crates/apm2-core/src/refactor_radar`.",
+      "theory_refs": [
+        "LAW-06",
+        "LAW-01"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/refactor_radar"
+      ],
+      "node_class": "NORMATIVE"
+    },
+    {
+      "id": "term:crdt",
+      "term": "CRDT (Conflict-free Replicated Data Type)",
+      "definition": "Data structures that guarantee eventual convergence without global synchronization, used for the Data Plane.",
+      "operationalization": "Implemented in `crates/apm2-core/src/consensus/crdt.rs`.",
+      "theory_refs": [
+        "LAW-10"
+      ],
+      "implementation_refs": [
+        "crates/apm2-core/src/consensus/crdt.rs"
+      ],
+      "node_class": "NORMATIVE"
     }
   ],
   "edges": [
@@ -603,6 +736,46 @@
     {
       "source": "term:htf",
       "target": "term:lease",
+      "relation": "governs"
+    },
+    {
+      "source": "term:hlc",
+      "target": "term:htf",
+      "relation": "implements"
+    },
+    {
+      "source": "term:work_object",
+      "target": "term:ticket",
+      "relation": "governs"
+    },
+    {
+      "source": "term:refactor_radar",
+      "target": "term:ticket",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:relay",
+      "target": "term:handshake",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:schema_registry",
+      "target": "term:handshake",
+      "relation": "governs"
+    },
+    {
+      "source": "term:crdt",
+      "target": "term:ledger",
+      "relation": "conflicts_with"
+    },
+    {
+      "source": "term:actor_id",
+      "target": "term:lease",
+      "relation": "depends_on"
+    },
+    {
+      "source": "term:impact_map",
+      "target": "term:gate",
       "relation": "governs"
     }
   ]
