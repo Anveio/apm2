@@ -393,8 +393,8 @@ fn tck_00383_cas_directory_creation() {
 // session token string for use with the session dispatcher.
 // =============================================================================
 
-/// Performs ClaimWork + SpawnEpisode through the privileged dispatcher and
-/// returns the session_token JSON string from the SpawnEpisodeResponse.
+/// Performs `ClaimWork` + `SpawnEpisode` through the privileged dispatcher and
+/// returns the `session_token` JSON string from the `SpawnEpisodeResponse`.
 fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> String {
     let priv_dispatcher = dispatcher_state.privileged_dispatcher();
     let priv_ctx = ConnectionContext::privileged(Some(PeerCredentials {
@@ -440,7 +440,7 @@ fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> String {
 
 /// End-to-end test: spawn a session via the privileged dispatcher, then
 /// use the returned session token to emit an event through the session
-/// dispatcher, verifying it persists to SQLite.
+/// dispatcher, verifying it persists to `SQLite`.
 ///
 /// This test uses a Tokio runtime because `SpawnEpisode` requires an async
 /// runtime for episode creation.
@@ -469,13 +469,15 @@ fn tck_00383_e2e_emit_event_persists_to_sqlite() {
     let session_ctx = make_session_ctx();
 
     let emit_request = EmitEventRequest {
-        session_token: session_token.clone(),
+        session_token,
         event_type: "test.e2e.event".to_string(),
         payload: b"e2e test payload".to_vec(),
         correlation_id: "e2e-corr-001".to_string(),
     };
     let emit_frame = encode_emit_event_request(&emit_request);
-    let response = session_dispatcher.dispatch(&emit_frame, &session_ctx).unwrap();
+    let response = session_dispatcher
+        .dispatch(&emit_frame, &session_ctx)
+        .unwrap();
 
     // Verify EmitEvent succeeded (not a fail-closed error)
     match response {
@@ -537,9 +539,9 @@ fn tck_00383_e2e_publish_evidence_stores_in_cas() {
 
     let artifact_content = b"e2e test evidence artifact payload";
     let evidence_request = PublishEvidenceRequest {
-        session_token: session_token.clone(),
+        session_token,
         artifact: artifact_content.to_vec(),
-        kind: 0, // EvidenceKind::Unspecified
+        kind: 0,           // EvidenceKind::Unspecified
         retention_hint: 0, // RetentionHint::Standard
     };
     let evidence_frame = encode_publish_evidence_request(&evidence_request);
@@ -618,13 +620,15 @@ fn tck_00383_e2e_request_tool_uses_broker() {
     let session_ctx = make_session_ctx();
 
     let tool_request = RequestToolRequest {
-        session_token: session_token.clone(),
+        session_token,
         tool_id: "read".to_string(),
         arguments: vec![1, 2, 3],
         dedupe_key: "e2e-tool-test".to_string(),
     };
     let tool_frame = encode_request_tool_request(&tool_request);
-    let response = session_dispatcher.dispatch(&tool_frame, &session_ctx).unwrap();
+    let response = session_dispatcher
+        .dispatch(&tool_frame, &session_ctx)
+        .unwrap();
 
     // The broker IS wired, so we should NOT get "broker unavailable".
     // We may get other errors (tool not in manifest, etc.) which is expected.

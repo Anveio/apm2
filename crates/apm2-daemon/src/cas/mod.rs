@@ -28,8 +28,8 @@
 //!
 //! - **Directory security**: CAS directories are created with mode 0700
 //!   (owner-only access). The base path must be absolute, free of symlink
-//!   components, and owned by the daemon UID. Existing directories are
-//!   verified to have no group/other permissions (fail-closed).
+//!   components, and owned by the daemon UID. Existing directories are verified
+//!   to have no group/other permissions (fail-closed).
 //! - **Hash verification**: Content is verified against its BLAKE3 hash on both
 //!   store and retrieve operations
 //! - **Immutability**: Stored content cannot be modified; overwrite attempts
@@ -742,15 +742,14 @@ fn validate_no_symlinks(path: &Path) -> Result<(), DurableCasError> {
     for component in path.components() {
         current.push(component);
         // Only check components that actually exist on the filesystem
-        if current.exists() && current.symlink_metadata()
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
+        if current.exists()
+            && current
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
         {
             return Err(DurableCasError::InitializationFailed {
-                message: format!(
-                    "CAS path contains symlink component: {}",
-                    current.display()
-                ),
+                message: format!("CAS path contains symlink component: {}", current.display()),
             });
         }
     }
@@ -764,16 +763,12 @@ fn validate_no_symlinks(path: &Path) -> Result<(), DurableCasError> {
 /// - Owner must match the current effective UID (daemon UID)
 /// - Permissions must not be more permissive than 0700 (no group/other access)
 fn verify_directory_security(path: &Path) -> Result<(), DurableCasError> {
-    let metadata = fs::metadata(path).map_err(|e| {
-        DurableCasError::io(format!("stat directory {}", path.display()), e)
-    })?;
+    let metadata = fs::metadata(path)
+        .map_err(|e| DurableCasError::io(format!("stat directory {}", path.display()), e))?;
 
     if !metadata.is_dir() {
         return Err(DurableCasError::InitializationFailed {
-            message: format!(
-                "CAS path is not a directory: {}",
-                path.display()
-            ),
+            message: format!("CAS path is not a directory: {}", path.display()),
         });
     }
 
@@ -913,8 +908,7 @@ mod tests {
     #[test]
     fn test_content_too_large() {
         let temp_dir = TempDir::new().unwrap();
-        let config =
-            DurableCasConfig::new(temp_dir.path().join("cas")).with_max_artifact_size(100);
+        let config = DurableCasConfig::new(temp_dir.path().join("cas")).with_max_artifact_size(100);
         let cas = DurableCas::new(config).unwrap();
 
         let large_content = vec![0u8; 101];
@@ -986,8 +980,7 @@ mod tests {
     #[test]
     fn test_storage_full() {
         let temp_dir = TempDir::new().unwrap();
-        let config =
-            DurableCasConfig::new(temp_dir.path().join("cas")).with_max_total_size(100);
+        let config = DurableCasConfig::new(temp_dir.path().join("cas")).with_max_total_size(100);
         let cas = DurableCas::new(config).unwrap();
 
         // Fill storage
@@ -1079,7 +1072,7 @@ mod tests {
     // Security tests: CAS directory invariants
     // =========================================================================
 
-    /// SEC-CAS-001: Reject relative paths for CAS base_path.
+    /// SEC-CAS-001: Reject relative paths for CAS `base_path`.
     #[test]
     fn test_reject_relative_path() {
         let config = DurableCasConfig::new("relative/cas/path");
@@ -1133,8 +1126,7 @@ mod tests {
         let base_mode = fs::metadata(&cas_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             base_mode, 0o700,
-            "Base directory should have mode 0700, got {:04o}",
-            base_mode
+            "Base directory should have mode 0700, got {base_mode:04o}",
         );
 
         // Verify objects directory permissions
@@ -1145,8 +1137,7 @@ mod tests {
             & 0o777;
         assert_eq!(
             objects_mode, 0o700,
-            "Objects directory should have mode 0700, got {:04o}",
-            objects_mode
+            "Objects directory should have mode 0700, got {objects_mode:04o}",
         );
 
         // Verify metadata directory permissions
@@ -1157,8 +1148,7 @@ mod tests {
             & 0o777;
         assert_eq!(
             metadata_mode, 0o700,
-            "Metadata directory should have mode 0700, got {:04o}",
-            metadata_mode
+            "Metadata directory should have mode 0700, got {metadata_mode:04o}",
         );
     }
 
@@ -1202,7 +1192,8 @@ mod tests {
             if entry.path().is_dir() {
                 let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
                 assert_eq!(
-                    mode, 0o700,
+                    mode,
+                    0o700,
                     "Shard directory {} should have mode 0700, got {:04o}",
                     entry.path().display(),
                     mode
