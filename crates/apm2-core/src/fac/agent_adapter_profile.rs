@@ -865,7 +865,6 @@ impl AgentAdapterProfileV1 {
     /// # Errors
     ///
     /// Returns error if canonicalization fails.
-    #[must_use]
     pub fn compute_cas_hash(&self) -> Result<[u8; 32], AgentAdapterProfileError> {
         self.canonical_bytes()
             .map(|bytes| *blake3::hash(&bytes).as_bytes())

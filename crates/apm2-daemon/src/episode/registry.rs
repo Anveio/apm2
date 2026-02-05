@@ -204,7 +204,7 @@ impl AdapterRegistry {
         let mut registry = Self {
             adapters: HashMap::new(),
             profile_hash: Some(*profile_hash),
-            profile: Some(profile.clone()),
+            profile: Some(profile),
         };
 
         // Register adapters
