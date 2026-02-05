@@ -128,7 +128,11 @@ pub const MAX_SELECTOR_VALUE_LENGTH: usize = 4096;
 pub const MAX_WORK_ID_LENGTH: usize = 256;
 
 /// Maximum number of deltas in an iteration context.
-pub const MAX_DELTAS: usize = 100;
+///
+/// Kept low (25) to bound total memory: 25 deltas x 1000 files x 4KB paths =
+/// ~100MB max. This aligns with the 20-iteration limit plus a small margin
+/// for edge cases.
+pub const MAX_DELTAS: usize = 25;
 
 /// Default context budget in bytes (500KB).
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 500_000;

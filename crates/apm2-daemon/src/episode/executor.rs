@@ -260,9 +260,16 @@ impl ExecutionContext {
 ///
 /// 1. Create executor with budget tracker and CAS
 /// 2. Optionally set clock via `with_clock()` for time envelope stamping
-/// 3. Register tool handlers via `register_handler()`
-/// 4. Execute tools via `execute()`
-/// 5. Results are automatically stored in CAS with time envelope refs
+/// 3. Optionally set isolation key via `with_isolation_key()` for session scoping
+/// 4. Register tool handlers via `register_handler()`
+/// 5. Execute tools via `execute()`
+/// 6. Results are automatically stored in CAS with time envelope refs
+///
+/// # Security (SEC-CTRL-FAC-0017)
+///
+/// When caching is enabled, the `isolation_key` MUST be set to prevent
+/// cross-session information leakage. The isolation key (typically the
+/// `EpisodeId`) scopes all cache keys to the current session.
 ///
 /// # Example
 ///
@@ -275,7 +282,9 @@ impl ExecutionContext {
 /// let cas = Arc::new(StubContentAddressedStore::new());
 /// let clock = Arc::new(HolonicClock::new(ClockConfig::default(), None)?);
 ///
-/// let mut executor = ToolExecutor::new(tracker, cas).with_clock(clock);
+/// let mut executor = ToolExecutor::new(tracker, cas)
+///     .with_clock(clock)
+///     .with_isolation_key("ep-session-123"); // SEC-CTRL-FAC-0017
 /// executor.register_handler(Box::new(ReadFileHandler))?;
 ///
 /// let args = ToolArgs::Read(ReadArgs { path: "/workspace/file.rs".into(), ... });
@@ -302,6 +311,12 @@ pub struct ToolExecutor {
 
     /// Optional tool output cache (TCK-00335).
     output_cache: Option<ToolOutputCache>,
+
+    /// Isolation key for session-scoped caching (SEC-CTRL-FAC-0017).
+    ///
+    /// When set, cache keys include this isolation key to prevent
+    /// cross-session information leakage. Typically set to the `EpisodeId`.
+    isolation_key: Option<String>,
 }
 
 impl ToolExecutor {
@@ -319,6 +334,7 @@ impl ToolExecutor {
             handlers: HashMap::new(),
             clock: None,
             output_cache: None,
+            isolation_key: None,
         }
     }
 
@@ -344,6 +360,28 @@ impl ToolExecutor {
     pub fn with_output_cache(mut self, cache: ToolOutputCache) -> Self {
         self.output_cache = Some(cache);
         self
+    }
+
+    /// Sets the isolation key for session-scoped caching (SEC-CTRL-FAC-0017).
+    ///
+    /// When caching is enabled, the isolation key ensures cache keys are scoped
+    /// to the current session/episode, preventing cross-session information
+    /// leakage. Typically set to the `EpisodeId`.
+    ///
+    /// # Security (SEC-CTRL-FAC-0017)
+    ///
+    /// This MUST be set when using caching in a multi-session context to ensure
+    /// isolation between sessions.
+    #[must_use]
+    pub fn with_isolation_key(mut self, key: impl Into<String>) -> Self {
+        self.isolation_key = Some(key.into());
+        self
+    }
+
+    /// Returns the isolation key, if configured.
+    #[must_use]
+    pub fn isolation_key(&self) -> Option<&str> {
+        self.isolation_key.as_deref()
     }
 
     /// Returns a reference to the holonic clock, if configured.
@@ -444,10 +482,11 @@ impl ToolExecutor {
         let start_time = Instant::now();
 
         // TCK-00335: Check cache for Read/Search
+        // SEC-CTRL-FAC-0017: Cache keys include isolation_key when set
         let cache_key = self
             .output_cache
             .as_ref()
-            .and_then(|_| Self::compute_cache_key(args));
+            .and_then(|_| self.compute_cache_key(args));
 
         if let Some(ref key) = cache_key {
             if let Some(cache) = &self.output_cache {
@@ -623,8 +662,14 @@ impl ToolExecutor {
     }
 
     /// Computes a cache key for the given arguments if cacheable.
-    fn compute_cache_key(args: &ToolArgs) -> Option<CacheKey> {
-        match args {
+    ///
+    /// # Security (SEC-CTRL-FAC-0017)
+    ///
+    /// When an isolation key is configured, cache keys include the isolation key
+    /// to prevent cross-session information leakage. The isolation key is
+    /// typically the `EpisodeId` to scope caches to the current session.
+    fn compute_cache_key(&self, args: &ToolArgs) -> Option<CacheKey> {
+        let base_key = match args {
             ToolArgs::Read(read_args) => {
                 let json = serde_json::to_vec(read_args).ok()?;
                 let hash = blake3::hash(&json);
@@ -636,6 +681,12 @@ impl ToolExecutor {
                 Some(CacheKey::new("Search", *hash.as_bytes()))
             },
             _ => None,
+        }?;
+
+        // SEC-CTRL-FAC-0017: Apply isolation key to prevent cross-session leakage
+        match &self.isolation_key {
+            Some(iso) => Some(base_key.with_isolation_key(iso.clone())),
+            None => Some(base_key),
         }
     }
 
@@ -1249,6 +1300,108 @@ mod tests {
         assert!(
             result.result_hash.is_none(),
             "Failed execution may not have result_hash"
+        );
+    }
+
+    // =========================================================================
+    // SEC-CTRL-FAC-0017: Isolation Key Tests
+    // =========================================================================
+
+    #[test]
+    fn test_executor_isolation_key_configuration() {
+        // SEC-CTRL-FAC-0017: Verify isolation key can be set and retrieved
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+
+        let executor = ToolExecutor::new(tracker, cas).with_isolation_key("ep-test-123");
+
+        assert_eq!(
+            executor.isolation_key(),
+            Some("ep-test-123"),
+            "isolation_key should be retrievable after setting"
+        );
+    }
+
+    #[test]
+    fn test_executor_compute_cache_key_without_isolation() {
+        // SEC-CTRL-FAC-0017: Verify cache key without isolation_key has no isolation
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let executor = ToolExecutor::new(tracker, cas);
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let key = executor.compute_cache_key(&args).unwrap();
+        assert!(
+            key.isolation_key.is_none(),
+            "cache key should have no isolation_key when executor has none"
+        );
+        assert!(!key.as_string().contains("ep-"));
+    }
+
+    #[test]
+    fn test_executor_compute_cache_key_with_isolation() {
+        // SEC-CTRL-FAC-0017: Verify cache key includes isolation_key when set
+        let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas = Arc::new(StubContentAddressedStore::new());
+        let executor = ToolExecutor::new(tracker, cas).with_isolation_key("ep-session-abc");
+
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let key = executor.compute_cache_key(&args).unwrap();
+        assert_eq!(
+            key.isolation_key,
+            Some("ep-session-abc".to_string()),
+            "cache key should include isolation_key from executor"
+        );
+        assert!(
+            key.as_string().contains("ep-session-abc"),
+            "cache key string should include isolation_key"
+        );
+    }
+
+    #[test]
+    fn test_executor_isolation_prevents_cross_session_cache_access() {
+        // SEC-CTRL-FAC-0017: Verify different isolation keys produce different cache keys
+        let tracker1 = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas1 = Arc::new(StubContentAddressedStore::new());
+        let executor1 = ToolExecutor::new(tracker1, cas1).with_isolation_key("ep-session-A");
+
+        let tracker2 = Arc::new(BudgetTracker::from_envelope(test_budget()));
+        let cas2 = Arc::new(StubContentAddressedStore::new());
+        let executor2 = ToolExecutor::new(tracker2, cas2).with_isolation_key("ep-session-B");
+
+        // Same tool args
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("workspace/file.rs"),
+            offset: None,
+            limit: None,
+        });
+
+        let key1 = executor1.compute_cache_key(&args).unwrap();
+        let key2 = executor2.compute_cache_key(&args).unwrap();
+
+        // Cache keys should have the same input_hash but different isolation_keys
+        assert_eq!(
+            key1.input_hash, key2.input_hash,
+            "input hashes should match for same args"
+        );
+        assert_ne!(
+            key1.isolation_key, key2.isolation_key,
+            "isolation keys should differ between sessions"
+        );
+        assert_ne!(
+            key1.as_string(),
+            key2.as_string(),
+            "full cache key strings should differ to prevent cross-session access"
         );
     }
 }
