@@ -332,17 +332,15 @@ impl DispatcherState {
                     Box::new(WriteFileHandler::with_root(root))
                 })
                 // ExecuteHandler - executes commands within workspace
-                // TCK-00338: Use fail-closed sandbox config by default.
-                // The ToolBroker's manifest system handles allowlist decisions,
-                // so we use default (empty allowlist = fail-closed) here.
-                // If the manifest grants Execute capability, it should also
-                // specify the shell_allowlist.
+                // TCK-00338: Env scrubbing + stall detection are always active.
+                // Shell allowlist uses permissive() because the ToolBroker already
+                // enforces shell allowlists via CapabilityManifest before the
+                // handler is invoked. The handler-level allowlist is defense-in-depth
+                // for non-brokered contexts only.
                 .with_rooted_handler_factory(|root| {
-                    // Production default: fail-closed (empty allowlist denies all)
-                    // Shell allowlist is managed by the ToolBroker via manifest.
                     Box::new(ExecuteHandler::with_root_and_sandbox(
                         root,
-                        SandboxConfig::default(),
+                        SandboxConfig::permissive(),
                     ))
                 })
                 // GitOperationHandler - git operations within workspace
@@ -499,11 +497,12 @@ impl DispatcherState {
                 Box::new(WriteFileHandler::with_root(root))
             })
             // ExecuteHandler - executes commands within workspace
-            // TCK-00338: Use fail-closed sandbox config by default.
+            // TCK-00338: Env scrubbing + stall detection always active.
+            // Shell allowlist permissive (ToolBroker enforces manifest allowlists).
             .with_rooted_handler_factory(|root| {
                 Box::new(ExecuteHandler::with_root_and_sandbox(
                     root,
-                    SandboxConfig::default(),
+                    SandboxConfig::permissive(),
                 ))
             })
             // GitOperationHandler - git operations within workspace
