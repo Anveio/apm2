@@ -634,7 +634,12 @@ impl ProjectionWorkerConfig {
 pub struct ProjectionWorker {
     config: ProjectionWorkerConfig,
     work_index: WorkIndex,
-    tailer: LedgerTailer,
+    /// Tailer for `changeset_published` events.
+    changeset_tailer: LedgerTailer,
+    /// Tailer for `work_pr_associated` events.
+    work_pr_tailer: LedgerTailer,
+    /// Tailer for `review_receipt_recorded` events.
+    review_tailer: LedgerTailer,
     adapter: Option<GitHubProjectionAdapter>,
     /// Shutdown flag.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -657,7 +662,18 @@ impl ProjectionWorker {
         config: ProjectionWorkerConfig,
     ) -> Result<Self, ProjectionWorkerError> {
         let work_index = WorkIndex::new(Arc::clone(&conn))?;
-        let tailer = LedgerTailer::new(Arc::clone(&conn));
+
+        // Create separate tailers for each event type to avoid watermark multiplexing.
+        // Each tailer has its own persistent watermark, ensuring events of one type
+        // don't skip events of another type due to shared timestamp tracking.
+        let changeset_tailer =
+            LedgerTailer::with_id(Arc::clone(&conn), "projection_worker:changeset_published");
+        let work_pr_tailer =
+            LedgerTailer::with_id(Arc::clone(&conn), "projection_worker:work_pr_associated");
+        let review_tailer = LedgerTailer::with_id(
+            Arc::clone(&conn),
+            "projection_worker:review_receipt_recorded",
+        );
 
         // Create GitHub adapter if configured
         let adapter = if config.github_enabled {
@@ -679,7 +695,9 @@ impl ProjectionWorker {
         Ok(Self {
             config,
             work_index,
-            tailer,
+            changeset_tailer,
+            work_pr_tailer,
+            review_tailer,
             adapter,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -740,7 +758,7 @@ impl ProjectionWorker {
     /// Processes `ChangeSetPublished` events to populate the work index.
     fn process_changeset_published(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
-            .tailer
+            .changeset_tailer
             .poll_events("changeset_published", self.config.batch_size)?;
 
         for event in events {
@@ -813,7 +831,7 @@ impl ProjectionWorker {
     /// handling)
     fn process_work_pr_associated(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
-            .tailer
+            .work_pr_tailer
             .poll_events("work_pr_associated", self.config.batch_size)?;
 
         for event in events {
@@ -893,7 +911,7 @@ impl ProjectionWorker {
     /// Processes `ReviewReceiptRecorded` events for projection.
     async fn process_review_receipts(&mut self) -> Result<(), ProjectionWorkerError> {
         let events = self
-            .tailer
+            .review_tailer
             .poll_events("review_receipt_recorded", self.config.batch_size)?;
 
         for event in events {
@@ -987,7 +1005,7 @@ impl ProjectionWorker {
                 .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
             // Get ledger head for idempotency key
-            let ledger_head = self.tailer.get_ledger_head()?.unwrap_or([0u8; 32]);
+            let ledger_head = self.review_tailer.get_ledger_head()?.unwrap_or([0u8; 32]);
 
             // Project status (uses parsed verdict, not hardcoded success)
             let projection_receipt = adapter
