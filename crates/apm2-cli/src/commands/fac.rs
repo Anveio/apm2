@@ -6,10 +6,13 @@
 //! # Commands
 //!
 //! - `apm2 fac work status <work_id>` - Show work status from ledger
-//! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool log index
+//! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool
+//!   log index
 //! - `apm2 fac receipt show <receipt_hash>` - Show receipt from CAS
-//! - `apm2 fac context rebuild <role> <episode_id>` - Rebuild role-scoped context
-//! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger anchor
+//! - `apm2 fac context rebuild <role> <episode_id>` - Rebuild role-scoped
+//!   context
+//! - `apm2 fac resume <work_id>` - Show crash-only resume helpers from ledger
+//!   anchor
 //!
 //! # Design
 //!
@@ -31,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use apm2_core::fac::{ToolLogIndexV1, TOOL_LOG_INDEX_V1_SCHEMA};
+use apm2_core::fac::{TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1};
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -92,7 +95,8 @@ pub enum FacSubcommand {
     /// Show receipt from CAS.
     ///
     /// Retrieves and displays a receipt artifact from content-addressed storage
-    /// by its hash. Supports gate receipts, review receipts, and summary receipts.
+    /// by its hash. Supports gate receipts, review receipts, and summary
+    /// receipts.
     Receipt(ReceiptArgs),
 
     /// Rebuild role-scoped context deterministically.
@@ -292,7 +296,8 @@ pub struct ToolLogSummary {
 pub struct ReceiptShowResponse {
     /// Receipt hash (hex-encoded).
     pub hash: String,
-    /// Receipt type (`gate_receipt`, `review_receipt`, `summary_receipt`, etc.).
+    /// Receipt type (`gate_receipt`, `review_receipt`, `summary_receipt`,
+    /// etc.).
     pub receipt_type: String,
     /// Receipt size in bytes.
     pub size_bytes: u64,
@@ -752,10 +757,7 @@ fn run_episode_inspect(
             println!();
             println!("Tool Log Summary");
             println!("  Total Executions:   {}", summary.total_executions);
-            println!(
-                "  Successful:         {}",
-                summary.successful_executions
-            );
+            println!("  Successful:         {}", summary.successful_executions);
             println!("  Failed:             {}", summary.failed_executions);
             println!("  Total Tokens:       {}", summary.total_tokens);
             println!("  Total I/O Bytes:    {}", summary.total_bytes_io);
@@ -766,10 +768,7 @@ fn run_episode_inspect(
             if let Some(index) = &response.tool_log_index {
                 println!();
                 println!("Tool Log Index (full)");
-                println!(
-                    "  Schema:             {}",
-                    index.schema
-                );
+                println!("  Schema:             {}", index.schema);
                 println!(
                     "  Receipt Count:      {}",
                     index.tool_execution_receipt_hashes.len()
@@ -798,7 +797,8 @@ struct EpisodeInfo {
     tool_log_index_hash: Option<Vec<u8>>,
 }
 
-/// Extracts episode-related information from an event if it matches the `episode_id`.
+/// Extracts episode-related information from an event if it matches the
+/// `episode_id`.
 fn extract_episode_info(event: &EventRecord, episode_id: &str) -> Option<EpisodeInfo> {
     // Check session_id first (episodes often use session_id == episode_id)
     if event.session_id == episode_id {
@@ -940,8 +940,8 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
     }
 
     // Try to parse as JSON and detect receipt type
-    let (receipt_type, parsed_content) =
-        serde_json::from_slice::<serde_json::Value>(&content).map_or_else(
+    let (receipt_type, parsed_content) = serde_json::from_slice::<serde_json::Value>(&content)
+        .map_or_else(
             |_| {
                 (
                     "binary".to_string(),
@@ -1371,10 +1371,7 @@ fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
         println!("Resume Analysis");
         println!("  Work ID:            {}", response.work_id);
         println!("  Last Anchor Seq:    {}", response.last_anchor_seq_id);
-        println!(
-            "  Last Anchor Type:   {}",
-            response.last_anchor_event_type
-        );
+        println!("  Last Anchor Type:   {}", response.last_anchor_event_type);
         println!("  Restart Action:     {}", response.restart_action);
         if let Some(episode) = &response.last_episode_id {
             println!("  Last Episode ID:    {episode}");
