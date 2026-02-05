@@ -836,25 +836,69 @@ struct CacheEntry {
 }
 
 /// Cache key for tool outputs.
+///
+/// # Security (SEC-CTRL-FAC-0017)
+///
+/// The `isolation_key` field provides session/episode isolation to prevent
+/// cross-session information leakage. When caching is used in a multi-tenant
+/// or multi-session context, callers MUST provide a unique isolation key
+/// (e.g., `EpisodeId`) to ensure cache entries are not shared between sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     /// Tool type.
     pub tool_type: String,
     /// Hash of the input parameters.
     pub input_hash: Hash,
+    /// Optional isolation key for session/episode isolation.
+    ///
+    /// When present, cache entries are scoped to this isolation key.
+    /// This prevents cross-session information leakage (SEC-CTRL-FAC-0017).
+    pub isolation_key: Option<String>,
 }
 
 impl CacheKey {
-    /// Creates a new cache key.
+    /// Creates a new cache key without isolation.
+    ///
+    /// # Security Warning
+    ///
+    /// This creates a cache key without session isolation. In multi-tenant or
+    /// multi-session contexts, use `with_isolation` to prevent cross-session
+    /// information leakage (SEC-CTRL-FAC-0017).
     #[must_use]
     pub fn new(tool_type: impl Into<String>, input_hash: Hash) -> Self {
         Self {
             tool_type: tool_type.into(),
             input_hash,
+            isolation_key: None,
+        }
+    }
+
+    /// Creates a new cache key with session isolation.
+    ///
+    /// # Security (SEC-CTRL-FAC-0017)
+    ///
+    /// The isolation key ensures cache entries are scoped to a specific session
+    /// or episode, preventing cross-session information leakage. Use the
+    /// `EpisodeId` or similar unique identifier as the isolation key.
+    #[must_use]
+    pub fn with_isolation(
+        tool_type: impl Into<String>,
+        input_hash: Hash,
+        isolation_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_type: tool_type.into(),
+            input_hash,
+            isolation_key: Some(isolation_key.into()),
         }
     }
 
     /// Creates a cache key for a `FileRead` operation.
+    ///
+    /// # Security Warning
+    ///
+    /// This creates a cache key without session isolation. In multi-tenant or
+    /// multi-session contexts, set the isolation key after creation.
     #[must_use]
     pub fn for_file_read(path: &str, content_hash: &Hash) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -864,10 +908,16 @@ impl CacheKey {
         Self {
             tool_type: "FileRead".to_string(),
             input_hash: *hasher.finalize().as_bytes(),
+            isolation_key: None,
         }
     }
 
     /// Creates a cache key for a Search operation.
+    ///
+    /// # Security Warning
+    ///
+    /// This creates a cache key without session isolation. In multi-tenant or
+    /// multi-session contexts, set the isolation key after creation.
     #[must_use]
     pub fn for_search(pattern: &str, path: &str, options_hash: &Hash) -> Self {
         let mut hasher = blake3::Hasher::new();
@@ -879,7 +929,19 @@ impl CacheKey {
         Self {
             tool_type: "Search".to_string(),
             input_hash: *hasher.finalize().as_bytes(),
+            isolation_key: None,
         }
+    }
+
+    /// Sets the isolation key for session scoping.
+    ///
+    /// # Security (SEC-CTRL-FAC-0017)
+    ///
+    /// Use this to add session isolation to a cache key.
+    #[must_use]
+    pub fn with_isolation_key(mut self, isolation_key: impl Into<String>) -> Self {
+        self.isolation_key = Some(isolation_key.into());
+        self
     }
 
     /// Returns the cache key as a string.

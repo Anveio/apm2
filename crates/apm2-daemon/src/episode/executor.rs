@@ -48,6 +48,7 @@ use super::runtime::Hash;
 use super::tool_class::ToolClass;
 use super::tool_handler::{MAX_HANDLERS, ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
 use crate::htf::{ClockError, HolonicClock};
+use apm2_core::fac::{CacheKey, ToolOutputCache};
 
 // =============================================================================
 // ExecutorError
@@ -284,6 +285,9 @@ pub struct ToolExecutor {
     /// When present, tool executions are stamped with a `TimeEnvelopeRef`
     /// for temporal ordering and causality tracking.
     clock: Option<Arc<HolonicClock>>,
+
+    /// Optional tool output cache (TCK-00335).
+    output_cache: Option<ToolOutputCache>,
 }
 
 impl ToolExecutor {
@@ -300,6 +304,7 @@ impl ToolExecutor {
             cas,
             handlers: HashMap::new(),
             clock: None,
+            output_cache: None,
         }
     }
 
@@ -317,6 +322,13 @@ impl ToolExecutor {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<HolonicClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Sets the tool output cache (TCK-00335).
+    #[must_use]
+    pub fn with_output_cache(mut self, cache: ToolOutputCache) -> Self {
+        self.output_cache = Some(cache);
         self
     }
 
@@ -417,6 +429,45 @@ impl ToolExecutor {
         let tool_class = args.tool_class();
         let start_time = Instant::now();
 
+        // TCK-00335: Check cache for Read/Search
+        let cache_key = if let Some(cache) = &self.output_cache {
+            Self::compute_cache_key(args)
+        } else {
+            None
+        };
+
+        if let Some(ref key) = cache_key {
+            if let Some(cache) = &self.output_cache {
+                if let Ok(cached_bytes) = cache.retrieve(key) {
+                    if let Ok(cached_data) = serde_json::from_slice::<ToolResultData>(&cached_bytes) {
+                        debug!(
+                            tool_class = %tool_class,
+                            "cache hit"
+                        );
+                        
+                        let cas_hash = self.cas.store(&cached_bytes); // Deduplicate
+
+                        let mut result = ToolResult::success(
+                            &ctx.request_id,
+                            cached_data.output,
+                            BudgetDelta::default(),
+                            Duration::from_millis(0),
+                            ctx.started_at_ns,
+                        )
+                        .with_result_hash(cas_hash);
+
+                        if let Some(ref clock) = self.clock {
+                            let notes = format!("tool.executed:{}", ctx.request_id);
+                            let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
+                            result = result.with_time_envelope(envelope, envelope_ref);
+                        }
+                        
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
         // Step 1: Get handler
         let handler = self
             .handlers
@@ -441,8 +492,6 @@ impl ToolExecutor {
             Ok(data) => data,
             Err(err) => {
                 warn!(error = %err, "handler execution failed");
-                // Return failure result with consumed budget (no reconciliation needed
-                // since we charged the estimate and execution failed)
                 return self
                     .build_failure_result_with_stamp(
                         ctx,
@@ -454,28 +503,21 @@ impl ToolExecutor {
             },
         };
 
-        // Step 5: Reconcile budget - adjust for actual vs estimated usage
-        // This is critical for security: prevents fail-open if actual > estimate
+        // Step 5: Reconcile budget
         if let Err(reconcile_err) = self
             .budget_tracker
             .reconcile(&estimated_delta, &result_data.budget_consumed)
         {
             warn!(
                 error = %reconcile_err,
-                estimated_tokens = estimated_delta.tokens,
-                actual_tokens = result_data.budget_consumed.tokens,
-                "budget reconciliation failed: actual exceeded estimate"
+                "budget reconciliation failed"
             );
-            // Fail-closed: return error result, budget remains at charged amount
             return Err(ExecutorError::BudgetExceeded(reconcile_err));
         }
 
         debug!(
             estimated_tokens = estimated_delta.tokens,
             actual_tokens = result_data.budget_consumed.tokens,
-            refund_tokens = estimated_delta
-                .tokens
-                .saturating_sub(result_data.budget_consumed.tokens),
             "budget reconciled"
         );
 
@@ -483,18 +525,22 @@ impl ToolExecutor {
         let cas_hash = self.store_result_data(&result_data)?;
         debug!(cas_hash = %hex::encode(&cas_hash[..8]), "result stored in CAS");
 
+        // TCK-00335: Update cache and invalidate
+        if let Some(cache) = &self.output_cache {
+            if let Some(key) = cache_key {
+                if let Ok(bytes) = serde_json::to_vec(&result_data) {
+                     let _ = cache.store(&key, &bytes);
+                }
+            }
+            self.invalidate_cache(args, cache);
+        }
+
         // Step 7: Build result
         let duration = start_time.elapsed();
-        // Safe truncation: durations > 585 years would overflow, which is impractical
         #[allow(clippy::cast_possible_truncation)]
         let duration_ns = duration.as_nanos() as u64;
         let completed_at_ns = ctx.started_at_ns.saturating_add(duration_ns);
 
-        // TCK-00320: Set CAS result hash for evidence integrity.
-        // The result_hash references the full ToolResultData (output, error_output,
-        // budget) so clients can retrieve complete execution data when inline
-        // results are size-limited. Per SEC-CTRL-FAC-0015, all success paths
-        // MUST populate this field.
         let mut result = ToolResult::success(
             &ctx.request_id,
             result_data.output,
@@ -504,8 +550,7 @@ impl ToolExecutor {
         )
         .with_result_hash(cas_hash);
 
-        // Step 8: Stamp time envelope (RFC-0016 HTF, TCK-00240)
-        // Per SEC-CTRL-FAC-0015, if clock is configured, stamping must succeed
+        // Step 8: Stamp time envelope
         if let Some(ref clock) = self.clock {
             let notes = format!("tool.executed:{}", ctx.request_id);
             let (envelope, envelope_ref) = clock.stamp_envelope(Some(notes)).await?;
@@ -560,6 +605,37 @@ impl ToolExecutor {
 
         let estimated = handler.estimate_budget(args);
         !estimated.would_exceed(self.budget_tracker.limits())
+    }
+
+    /// Computes a cache key for the given arguments if cacheable.
+    fn compute_cache_key(args: &ToolArgs) -> Option<CacheKey> {
+        match args {
+            ToolArgs::Read(read_args) => {
+                let json = serde_json::to_vec(read_args).ok()?;
+                let hash = blake3::hash(&json);
+                Some(CacheKey::new("Read", *hash.as_bytes()))
+            },
+            ToolArgs::Search(search_args) => {
+                let json = serde_json::to_vec(search_args).ok()?;
+                let hash = blake3::hash(&json);
+                Some(CacheKey::new("Search", *hash.as_bytes()))
+            },
+            _ => None,
+        }
+    }
+
+    /// Invalidates cache based on tool execution.
+    fn invalidate_cache(&self, args: &ToolArgs, cache: &ToolOutputCache) {
+        match args {
+            ToolArgs::Write(_) => {
+                cache.invalidate_tool_type("Read");
+                cache.invalidate_tool_type("Search");
+            },
+            ToolArgs::Git(_) | ToolArgs::Execute(_) => {
+                cache.clear();
+            },
+            _ => {},
+        }
     }
 
     // =========================================================================
