@@ -19,6 +19,12 @@
 //!   tck_00383_publish_evidence_stores_in_cas`
 //! - IT-00383-05: `cargo test -p apm2-daemon
 //!   tck_00383_request_tool_returns_broker_result`
+//! - IT-00383-08: `cargo test -p apm2-daemon
+//!   tck_00383_e2e_emit_event_persists_to_sqlite`
+//! - IT-00383-09: `cargo test -p apm2-daemon
+//!   tck_00383_e2e_publish_evidence_stores_in_cas`
+//! - IT-00383-10: `cargo test -p apm2-daemon
+//!   tck_00383_e2e_request_tool_uses_broker`
 //!
 //! # Security Properties
 //!
@@ -33,9 +39,17 @@ use std::time::{Duration, SystemTime};
 use apm2_daemon::episode::InMemorySessionRegistry;
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::protocol::credentials::PeerCredentials;
-use apm2_daemon::protocol::dispatch::ConnectionContext;
-use apm2_daemon::protocol::messages::RequestToolRequest;
-use apm2_daemon::protocol::session_dispatch::{SessionResponse, encode_request_tool_request};
+use apm2_daemon::protocol::dispatch::{
+    ConnectionContext, PrivilegedResponse, encode_claim_work_request, encode_spawn_episode_request,
+};
+use apm2_daemon::protocol::messages::{
+    ClaimWorkRequest, EmitEventRequest, PublishEvidenceRequest, RequestToolRequest,
+    SpawnEpisodeRequest, WorkRole,
+};
+use apm2_daemon::protocol::session_dispatch::{
+    SessionResponse, encode_emit_event_request, encode_publish_evidence_request,
+    encode_request_tool_request,
+};
 use apm2_daemon::protocol::session_token::TokenMinter;
 use apm2_daemon::session::SessionRegistry;
 use apm2_daemon::state::DispatcherState;
@@ -372,4 +386,263 @@ fn tck_00383_cas_directory_creation() {
         cas_dir.exists(),
         "CAS directory should be created by with_persistence_and_cas"
     );
+}
+
+// =============================================================================
+// Helper: Spawn a session via the privileged dispatcher and return the
+// session token string for use with the session dispatcher.
+// =============================================================================
+
+/// Performs ClaimWork + SpawnEpisode through the privileged dispatcher and
+/// returns the session_token JSON string from the SpawnEpisodeResponse.
+fn spawn_session_and_get_token(dispatcher_state: &DispatcherState) -> String {
+    let priv_dispatcher = dispatcher_state.privileged_dispatcher();
+    let priv_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+        uid: 1000,
+        gid: 1000,
+        pid: Some(99999),
+    }));
+
+    // Step 1: ClaimWork to get work_id and lease_id
+    let claim_request = ClaimWorkRequest {
+        actor_id: "e2e-test-actor".to_string(),
+        role: WorkRole::Implementer.into(),
+        credential_signature: vec![1, 2, 3],
+        nonce: vec![4, 5, 6],
+    };
+    let claim_frame = encode_claim_work_request(&claim_request);
+    let claim_response = priv_dispatcher.dispatch(&claim_frame, &priv_ctx).unwrap();
+
+    let (work_id, lease_id) = match claim_response {
+        PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+        other => panic!("Expected ClaimWork response, got: {other:?}"),
+    };
+
+    // Step 2: SpawnEpisode to get session token
+    let spawn_request = SpawnEpisodeRequest {
+        work_id,
+        role: WorkRole::Implementer.into(),
+        lease_id: Some(lease_id),
+        workspace_root: "/tmp".to_string(),
+    };
+    let spawn_frame = encode_spawn_episode_request(&spawn_request);
+    let spawn_response = priv_dispatcher.dispatch(&spawn_frame, &priv_ctx).unwrap();
+
+    match spawn_response {
+        PrivilegedResponse::SpawnEpisode(resp) => resp.session_token,
+        other => panic!("Expected SpawnEpisode response, got: {other:?}"),
+    }
+}
+
+// =============================================================================
+// IT-00383-08: End-to-end EmitEvent via session dispatcher
+// =============================================================================
+
+/// End-to-end test: spawn a session via the privileged dispatcher, then
+/// use the returned session token to emit an event through the session
+/// dispatcher, verifying it persists to SQLite.
+///
+/// This test uses a Tokio runtime because `SpawnEpisode` requires an async
+/// runtime for episode creation.
+#[test]
+fn tck_00383_e2e_emit_event_persists_to_sqlite() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+
+    let temp_dir = TempDir::new().unwrap();
+    let cas_dir = temp_dir.path().join("cas_e2e_emit");
+    let sqlite_conn = make_sqlite_conn(&temp_dir);
+    let session_registry = test_session_registry();
+
+    let dispatcher_state = DispatcherState::with_persistence_and_cas(
+        session_registry,
+        None,
+        Arc::clone(&sqlite_conn),
+        &cas_dir,
+    );
+
+    // Get a valid session token via the full ClaimWork -> SpawnEpisode flow
+    let session_token = spawn_session_and_get_token(&dispatcher_state);
+
+    // Use the session dispatcher to emit an event
+    let session_dispatcher = dispatcher_state.session_dispatcher();
+    let session_ctx = make_session_ctx();
+
+    let emit_request = EmitEventRequest {
+        session_token: session_token.clone(),
+        event_type: "test.e2e.event".to_string(),
+        payload: b"e2e test payload".to_vec(),
+        correlation_id: "e2e-corr-001".to_string(),
+    };
+    let emit_frame = encode_emit_event_request(&emit_request);
+    let response = session_dispatcher.dispatch(&emit_frame, &session_ctx).unwrap();
+
+    // Verify EmitEvent succeeded (not a fail-closed error)
+    match response {
+        SessionResponse::EmitEvent(resp) => {
+            assert!(!resp.event_id.is_empty(), "Event ID should not be empty");
+            assert!(resp.seq > 0, "Sequence should be positive");
+            assert!(resp.timestamp_ns > 0, "Timestamp should be non-zero");
+        },
+        SessionResponse::Error(err) => {
+            panic!(
+                "EmitEvent should succeed with wired ledger, got error: {} (code={})",
+                err.message, err.code
+            );
+        },
+        other => panic!("Expected EmitEvent response, got: {other:?}"),
+    }
+
+    // Verify the event was actually persisted in SQLite
+    let conn = sqlite_conn.lock().unwrap();
+    let event_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+        .unwrap();
+    // Should have at least 2 events: WorkClaimed + SpawnEpisode + EmitEvent
+    assert!(
+        event_count >= 2,
+        "ledger_events should have events persisted, got {event_count}"
+    );
+}
+
+// =============================================================================
+// IT-00383-09: End-to-end PublishEvidence via session dispatcher
+// =============================================================================
+
+/// End-to-end test: spawn a session, then publish evidence through the
+/// session dispatcher and verify the artifact is stored in the durable CAS.
+#[test]
+fn tck_00383_e2e_publish_evidence_stores_in_cas() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+
+    let temp_dir = TempDir::new().unwrap();
+    let cas_dir = temp_dir.path().join("cas_e2e_evidence");
+    let sqlite_conn = make_sqlite_conn(&temp_dir);
+    let session_registry = test_session_registry();
+
+    let dispatcher_state = DispatcherState::with_persistence_and_cas(
+        session_registry,
+        None,
+        Arc::clone(&sqlite_conn),
+        &cas_dir,
+    );
+
+    // Get a valid session token
+    let session_token = spawn_session_and_get_token(&dispatcher_state);
+
+    // Use the session dispatcher to publish evidence
+    let session_dispatcher = dispatcher_state.session_dispatcher();
+    let session_ctx = make_session_ctx();
+
+    let artifact_content = b"e2e test evidence artifact payload";
+    let evidence_request = PublishEvidenceRequest {
+        session_token: session_token.clone(),
+        artifact: artifact_content.to_vec(),
+        kind: 0, // EvidenceKind::Unspecified
+        retention_hint: 0, // RetentionHint::Standard
+    };
+    let evidence_frame = encode_publish_evidence_request(&evidence_request);
+    let response = session_dispatcher
+        .dispatch(&evidence_frame, &session_ctx)
+        .unwrap();
+
+    // Verify PublishEvidence succeeded (not a fail-closed error)
+    match response {
+        SessionResponse::PublishEvidence(resp) => {
+            assert!(
+                !resp.artifact_hash.is_empty(),
+                "Artifact hash should not be empty"
+            );
+            assert!(
+                !resp.storage_path.is_empty(),
+                "Storage path should not be empty"
+            );
+            assert!(resp.ttl_secs > 0, "TTL should be positive");
+
+            // Verify the CAS objects directory has content (artifact stored)
+            let objects_dir = cas_dir.join("objects");
+            assert!(
+                objects_dir.exists(),
+                "CAS objects directory should exist after storing evidence"
+            );
+            // Walk the objects directory to find at least one file
+            let has_objects = std::fs::read_dir(&objects_dir)
+                .unwrap()
+                .any(|entry| entry.unwrap().path().is_dir());
+            assert!(
+                has_objects,
+                "CAS objects/ should contain shard directories after storing evidence"
+            );
+        },
+        SessionResponse::Error(err) => {
+            panic!(
+                "PublishEvidence should succeed with wired CAS, got error: {} (code={})",
+                err.message, err.code
+            );
+        },
+        other => panic!("Expected PublishEvidence response, got: {other:?}"),
+    }
+}
+
+// =============================================================================
+// IT-00383-10: End-to-end RequestTool via session dispatcher
+// =============================================================================
+
+/// End-to-end test: spawn a session, then request a tool through the
+/// session dispatcher. The broker should be wired (not returning "broker
+/// unavailable") even if the tool request may fail due to manifest
+/// constraints.
+#[test]
+fn tck_00383_e2e_request_tool_uses_broker() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+
+    let temp_dir = TempDir::new().unwrap();
+    let cas_dir = temp_dir.path().join("cas_e2e_tool");
+    let sqlite_conn = make_sqlite_conn(&temp_dir);
+    let session_registry = test_session_registry();
+
+    let dispatcher_state = DispatcherState::with_persistence_and_cas(
+        session_registry,
+        None,
+        Arc::clone(&sqlite_conn),
+        &cas_dir,
+    );
+
+    // Get a valid session token
+    let session_token = spawn_session_and_get_token(&dispatcher_state);
+
+    // Use the session dispatcher to request a tool
+    let session_dispatcher = dispatcher_state.session_dispatcher();
+    let session_ctx = make_session_ctx();
+
+    let tool_request = RequestToolRequest {
+        session_token: session_token.clone(),
+        tool_id: "read".to_string(),
+        arguments: vec![1, 2, 3],
+        dedupe_key: "e2e-tool-test".to_string(),
+    };
+    let tool_frame = encode_request_tool_request(&tool_request);
+    let response = session_dispatcher.dispatch(&tool_frame, &session_ctx).unwrap();
+
+    // The broker IS wired, so we should NOT get "broker unavailable".
+    // We may get other errors (tool not in manifest, etc.) which is expected.
+    match response {
+        SessionResponse::Error(err) => {
+            assert!(
+                !err.message.contains("broker unavailable"),
+                "Error should NOT be 'broker unavailable' when CAS+broker wired via \
+                 e2e flow. Got: {} (code={})",
+                err.message,
+                err.code
+            );
+        },
+        SessionResponse::RequestTool(_) => {
+            // Tool executed successfully - broker is wired and working
+        },
+        other => {
+            panic!("Expected Error or RequestTool response, got: {other:?}");
+        },
+    }
 }

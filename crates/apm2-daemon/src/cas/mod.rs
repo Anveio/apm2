@@ -26,6 +26,10 @@
 //!
 //! # Security Properties
 //!
+//! - **Directory security**: CAS directories are created with mode 0700
+//!   (owner-only access). The base path must be absolute, free of symlink
+//!   components, and owned by the daemon UID. Existing directories are
+//!   verified to have no group/other permissions (fail-closed).
 //! - **Hash verification**: Content is verified against its BLAKE3 hash on both
 //!   store and retrieve operations
 //! - **Immutability**: Stored content cannot be modified; overwrite attempts
@@ -43,6 +47,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -289,28 +294,61 @@ impl DurableCas {
     /// This will create the necessary directory structure if it doesn't exist
     /// and recover the total size from persistent storage.
     ///
+    /// # Security
+    ///
+    /// The `base_path` is validated to enforce the following invariants:
+    /// - **Absolute path**: The path must be absolute (no relative paths that
+    ///   could resolve unexpectedly).
+    /// - **No symlinks**: No component of the path may be a symbolic link,
+    ///   preventing symlink redirection attacks.
+    /// - **Owner match**: If the path exists, it must be owned by the current
+    ///   effective UID (daemon UID).
+    /// - **Mode 0700**: Directories are created with mode 0700 (owner-only
+    ///   access). Existing directories are verified to have permissions no more
+    ///   permissive than 0700.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `base_path` is not absolute
+    /// - `base_path` contains symlink components
+    /// - Existing directories are not owned by the daemon UID
+    /// - Existing directories have permissions more permissive than 0700
     /// - Directory creation fails
     /// - Total size recovery fails
     pub fn new(config: DurableCasConfig) -> Result<Self, DurableCasError> {
+        // SEC-CAS-001: Validate base_path is absolute
+        if !config.base_path.is_absolute() {
+            return Err(DurableCasError::InitializationFailed {
+                message: format!(
+                    "CAS base_path must be absolute, got: {}",
+                    config.base_path.display()
+                ),
+            });
+        }
+
+        // SEC-CAS-002: Validate no symlink components in the path
+        // Check each existing ancestor for symlinks to prevent redirection.
+        validate_no_symlinks(&config.base_path)?;
+
+        // SEC-CAS-003: If the base directory exists, verify ownership and
+        // permissions
+        if config.base_path.exists() {
+            verify_directory_security(&config.base_path)?;
+        }
+
         let objects_path = config.base_path.join(OBJECTS_DIR);
         let metadata_path = config.base_path.join(METADATA_DIR);
 
-        // Create directory structure
-        fs::create_dir_all(&objects_path).map_err(|e| {
-            DurableCasError::io(
-                format!("create objects directory {}", objects_path.display()),
-                e,
-            )
-        })?;
-        fs::create_dir_all(&metadata_path).map_err(|e| {
-            DurableCasError::io(
-                format!("create metadata directory {}", metadata_path.display()),
-                e,
-            )
-        })?;
+        // Create directory structure with mode 0700 (owner-only access)
+        create_dir_secure(&config.base_path)?;
+        create_dir_secure(&objects_path)?;
+        create_dir_secure(&metadata_path)?;
+
+        // Verify permissions on all directories after creation (defense-in-depth)
+        for dir in [&config.base_path, &objects_path, &metadata_path] {
+            verify_directory_security(dir)?;
+        }
 
         let cas = Self {
             base_path: config.base_path,
@@ -403,10 +441,8 @@ impl DurableCas {
             });
         }
 
-        // Create shard directory if needed
-        fs::create_dir_all(&dir_path).map_err(|e| {
-            DurableCasError::io(format!("create shard directory {}", dir_path.display()), e)
-        })?;
+        // Create shard directory if needed (with 0700 permissions)
+        create_dir_secure(&dir_path)?;
 
         // Write atomically via temp file + rename
         let temp_path = file_path.with_extension("tmp");
@@ -677,6 +713,99 @@ fn hex_encode(hash: &Hash) -> String {
     )
 }
 
+/// Creates a directory with mode 0700 if it does not already exist.
+///
+/// Uses `DirBuilderExt::mode()` to set owner-only permissions. If the
+/// directory already exists, its permissions are not modified here (they
+/// are verified separately by `verify_directory_security`).
+fn create_dir_secure(path: &Path) -> Result<(), DurableCasError> {
+    if path.exists() {
+        return Ok(());
+    }
+    // Create parent directories recursively with 0700 mode
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(path).map_err(|e| {
+        DurableCasError::io(
+            format!("create directory with mode 0700: {}", path.display()),
+            e,
+        )
+    })
+}
+
+/// Validates that no component of the given path is a symbolic link.
+///
+/// This prevents symlink redirection attacks where an attacker creates a
+/// symlink pointing to a sensitive directory.
+fn validate_no_symlinks(path: &Path) -> Result<(), DurableCasError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        // Only check components that actually exist on the filesystem
+        if current.exists() && current.symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(DurableCasError::InitializationFailed {
+                message: format!(
+                    "CAS path contains symlink component: {}",
+                    current.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Verifies that an existing directory has secure ownership and permissions.
+///
+/// # Security checks
+///
+/// - Owner must match the current effective UID (daemon UID)
+/// - Permissions must not be more permissive than 0700 (no group/other access)
+fn verify_directory_security(path: &Path) -> Result<(), DurableCasError> {
+    let metadata = fs::metadata(path).map_err(|e| {
+        DurableCasError::io(format!("stat directory {}", path.display()), e)
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(DurableCasError::InitializationFailed {
+            message: format!(
+                "CAS path is not a directory: {}",
+                path.display()
+            ),
+        });
+    }
+
+    // SEC-CAS-003a: Verify owner matches daemon UID
+    let dir_uid = metadata.uid();
+    let daemon_uid = nix::unistd::geteuid().as_raw();
+    if dir_uid != daemon_uid {
+        return Err(DurableCasError::InitializationFailed {
+            message: format!(
+                "CAS directory {} is owned by UID {} but daemon runs as UID {}",
+                path.display(),
+                dir_uid,
+                daemon_uid
+            ),
+        });
+    }
+
+    // SEC-CAS-003b: Verify permissions are not more permissive than 0700
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(DurableCasError::InitializationFailed {
+            message: format!(
+                "CAS directory {} has permissions {:04o} (expected 0700 or stricter)",
+                path.display(),
+                mode
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Converts a hex string to a hash.
 ///
 /// # Errors
@@ -730,7 +859,10 @@ mod tests {
 
     fn create_test_cas() -> (DurableCas, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let config = DurableCasConfig::new(temp_dir.path());
+        // Use a subdirectory within the temp dir so DurableCas creates it
+        // with 0700 permissions (the temp dir itself may have 0775).
+        let cas_path = temp_dir.path().join("cas");
+        let config = DurableCasConfig::new(&cas_path);
         let cas = DurableCas::new(config).unwrap();
         (cas, temp_dir)
     }
@@ -781,7 +913,8 @@ mod tests {
     #[test]
     fn test_content_too_large() {
         let temp_dir = TempDir::new().unwrap();
-        let config = DurableCasConfig::new(temp_dir.path()).with_max_artifact_size(100);
+        let config =
+            DurableCasConfig::new(temp_dir.path().join("cas")).with_max_artifact_size(100);
         let cas = DurableCas::new(config).unwrap();
 
         let large_content = vec![0u8; 101];
@@ -853,7 +986,8 @@ mod tests {
     #[test]
     fn test_storage_full() {
         let temp_dir = TempDir::new().unwrap();
-        let config = DurableCasConfig::new(temp_dir.path()).with_max_total_size(100);
+        let config =
+            DurableCasConfig::new(temp_dir.path().join("cas")).with_max_total_size(100);
         let cas = DurableCas::new(config).unwrap();
 
         // Fill storage
@@ -868,12 +1002,13 @@ mod tests {
     #[test]
     fn test_persistence_across_instances() {
         let temp_dir = TempDir::new().unwrap();
+        let cas_path = temp_dir.path().join("cas");
         let content = b"persistent content";
         let hash;
 
         // First instance: store content
         {
-            let config = DurableCasConfig::new(temp_dir.path());
+            let config = DurableCasConfig::new(&cas_path);
             let cas = DurableCas::new(config).unwrap();
             let result = cas.store(content).unwrap();
             hash = result.hash;
@@ -882,7 +1017,7 @@ mod tests {
 
         // Second instance: retrieve content
         {
-            let config = DurableCasConfig::new(temp_dir.path());
+            let config = DurableCasConfig::new(&cas_path);
             let cas = DurableCas::new(config).unwrap();
             let retrieved = cas.retrieve(&hash).unwrap();
             assert_eq!(retrieved, content);
@@ -896,10 +1031,11 @@ mod tests {
     #[test]
     fn test_total_size_persistence() {
         let temp_dir = TempDir::new().unwrap();
+        let cas_path = temp_dir.path().join("cas");
 
         // First instance: store content
         {
-            let config = DurableCasConfig::new(temp_dir.path());
+            let config = DurableCasConfig::new(&cas_path);
             let cas = DurableCas::new(config).unwrap();
             cas.store(b"content 1").unwrap();
             cas.store(b"content 2").unwrap();
@@ -908,7 +1044,7 @@ mod tests {
 
         // Second instance: verify size is recovered
         {
-            let config = DurableCasConfig::new(temp_dir.path());
+            let config = DurableCasConfig::new(&cas_path);
             let cas = DurableCas::new(config).unwrap();
             assert!(cas.total_size() > 0);
         }
@@ -937,5 +1073,141 @@ mod tests {
         let encoded = hex_encode(&original);
         let decoded = hex_decode(&encoded).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    // =========================================================================
+    // Security tests: CAS directory invariants
+    // =========================================================================
+
+    /// SEC-CAS-001: Reject relative paths for CAS base_path.
+    #[test]
+    fn test_reject_relative_path() {
+        let config = DurableCasConfig::new("relative/cas/path");
+        let result = DurableCas::new(config);
+        assert!(
+            matches!(result, Err(DurableCasError::InitializationFailed { .. })),
+            "Expected InitializationFailed for relative path, got: {result:?}"
+        );
+        if let Err(DurableCasError::InitializationFailed { message }) = result {
+            assert!(
+                message.contains("absolute"),
+                "Error should mention 'absolute': {message}"
+            );
+        }
+    }
+
+    /// SEC-CAS-002: Reject paths containing symlink components.
+    #[test]
+    fn test_reject_symlink_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let real_dir = temp_dir.path().join("real_cas");
+        fs::create_dir_all(&real_dir).unwrap();
+
+        let symlink_path = temp_dir.path().join("symlink_cas");
+        std::os::unix::fs::symlink(&real_dir, &symlink_path).unwrap();
+
+        let config = DurableCasConfig::new(&symlink_path);
+        let result = DurableCas::new(config);
+        assert!(
+            matches!(result, Err(DurableCasError::InitializationFailed { .. })),
+            "Expected InitializationFailed for symlink path, got: {result:?}"
+        );
+        if let Err(DurableCasError::InitializationFailed { message }) = result {
+            assert!(
+                message.contains("symlink"),
+                "Error should mention 'symlink': {message}"
+            );
+        }
+    }
+
+    /// SEC-CAS-003: Directories are created with mode 0700.
+    #[test]
+    fn test_directories_created_with_0700() {
+        let temp_dir = TempDir::new().unwrap();
+        let cas_path = temp_dir.path().join("secure_cas");
+
+        let config = DurableCasConfig::new(&cas_path);
+        let _cas = DurableCas::new(config).unwrap();
+
+        // Verify base directory permissions
+        let base_mode = fs::metadata(&cas_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            base_mode, 0o700,
+            "Base directory should have mode 0700, got {:04o}",
+            base_mode
+        );
+
+        // Verify objects directory permissions
+        let objects_mode = fs::metadata(cas_path.join("objects"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            objects_mode, 0o700,
+            "Objects directory should have mode 0700, got {:04o}",
+            objects_mode
+        );
+
+        // Verify metadata directory permissions
+        let metadata_mode = fs::metadata(cas_path.join("metadata"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            metadata_mode, 0o700,
+            "Metadata directory should have mode 0700, got {:04o}",
+            metadata_mode
+        );
+    }
+
+    /// SEC-CAS-003b: Reject existing directories with group/other permissions.
+    #[test]
+    fn test_reject_permissive_existing_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let cas_path = temp_dir.path().join("permissive_cas");
+
+        // Create directory with permissive mode (0755)
+        fs::create_dir_all(&cas_path).unwrap();
+        fs::set_permissions(&cas_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = DurableCasConfig::new(&cas_path);
+        let result = DurableCas::new(config);
+        assert!(
+            matches!(result, Err(DurableCasError::InitializationFailed { .. })),
+            "Expected InitializationFailed for permissive directory, got: {result:?}"
+        );
+        if let Err(DurableCasError::InitializationFailed { message }) = result {
+            assert!(
+                message.contains("permissions"),
+                "Error should mention 'permissions': {message}"
+            );
+        }
+    }
+
+    /// SEC-CAS-004: Shard directories created during store also get 0700
+    /// permissions.
+    #[test]
+    fn test_shard_directory_permissions() {
+        let (cas, _temp_dir) = create_test_cas();
+        let content = b"test shard perms";
+
+        cas.store(content).unwrap();
+
+        // Find the shard directory that was created
+        let objects_path = cas.base_path.join("objects");
+        for entry in fs::read_dir(&objects_path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().is_dir() {
+                let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode, 0o700,
+                    "Shard directory {} should have mode 0700, got {:04o}",
+                    entry.path().display(),
+                    mode
+                );
+            }
+        }
     }
 }
