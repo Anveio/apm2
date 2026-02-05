@@ -3784,9 +3784,9 @@ mod tests {
     // TCK-00344: SessionStatus Integration Tests
     // ========================================================================
 
-    /// IT-00344-SS: SessionStatus handler tests.
+    /// IT-00344-SS: `SessionStatus` handler tests.
     ///
-    /// These tests verify that the SessionStatus endpoint correctly queries
+    /// These tests verify that the `SessionStatus` endpoint correctly queries
     /// the session registry and returns session state, or falls back to
     /// token-based status when the registry is not wired or the session
     /// is not yet registered.
@@ -3796,7 +3796,7 @@ mod tests {
         use crate::protocol::messages::WorkRole;
         use crate::session::SessionState;
 
-        /// IT-00344-SS-01: SessionStatus returns ACTIVE with full session data
+        /// IT-00344-SS-01: `SessionStatus` returns ACTIVE with full session data
         /// when session registry is wired and session is registered.
         #[test]
         fn test_session_status_returns_active_with_registry() {
@@ -3844,7 +3844,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-SS-02: SessionStatus returns ACTIVE with minimal data when
+        /// IT-00344-SS-02: `SessionStatus` returns ACTIVE with minimal data when
         /// session registry is not wired (falls back to token-based status).
         #[test]
         fn test_session_status_without_registry_falls_back_to_token() {
@@ -3873,7 +3873,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-SS-03: SessionStatus rejects invalid session token.
+        /// IT-00344-SS-03: `SessionStatus` rejects invalid session token.
         #[test]
         fn test_session_status_rejects_invalid_token() {
             let minter = test_minter();
@@ -3898,8 +3898,8 @@ mod tests {
             }
         }
 
-        /// IT-00344-SS-04: SessionStatus is denied from operator socket
-        /// (PERMISSION_DENIED).
+        /// IT-00344-SS-04: `SessionStatus` is denied from operator socket
+        /// (`PERMISSION_DENIED`).
         #[test]
         fn test_session_status_denied_from_operator_socket() {
             let minter = test_minter();
@@ -3926,7 +3926,7 @@ mod tests {
             }
         }
 
-        /// IT-00344-SS-05: SessionStatus encoding uses correct tag (tag 6).
+        /// IT-00344-SS-05: `SessionStatus` encoding uses correct tag (tag 6).
         #[test]
         fn test_session_status_encoding_tag() {
             let request = SessionStatusRequest {
