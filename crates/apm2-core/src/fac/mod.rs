@@ -401,6 +401,7 @@ pub use role_routing::{RoutingDecision, classify_changeset};
 /// for i in 0..20 {
 ///     let delta = ContextDeltaBuilder::new(i, i + 1)
 ///         .add_changed_file("/src/main.rs", [0x42; 32])
+///         .unwrap()
 ///         .tokens_consumed(1000)
 ///         .build()
 ///         .unwrap();

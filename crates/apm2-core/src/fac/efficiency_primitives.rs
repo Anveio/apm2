@@ -67,7 +67,9 @@
 //! // Build a context delta between iterations
 //! let delta = ContextDeltaBuilder::new(1, 2)
 //!     .add_changed_file("/src/main.rs", [0x42; 32])
+//!     .unwrap()
 //!     .add_finding("security", "Potential buffer overflow")
+//!     .unwrap()
 //!     .summary_receipt_hash([0xAB; 32])
 //!     .build();
 //!
@@ -257,6 +259,102 @@ where
     deserialize_bounded_vec(deserializer, MAX_ZOOM_SELECTORS, "zoom_selectors")
 }
 
+/// Deserialize a string with a maximum length bound to prevent OOM attacks.
+///
+/// Per SEC-CTRL-FAC-0016, all string fields deserialized from untrusted input
+/// must enforce length limits during parsing to prevent denial-of-service via
+/// memory exhaustion.
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.len() > max_len {
+        return Err(de::Error::custom(format!(
+            "string field '{}' exceeds maximum length ({} > {})",
+            field_name,
+            s.len(),
+            max_len
+        )));
+    }
+    Ok(s)
+}
+
+/// Deserialize an optional string with a maximum length bound.
+fn deserialize_bounded_option_string<'de, D>(
+    deserializer: D,
+    max_len: usize,
+    field_name: &'static str,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    if let Some(ref s) = opt {
+        if s.len() > max_len {
+            return Err(de::Error::custom(format!(
+                "string field '{}' exceeds maximum length ({} > {})",
+                field_name,
+                s.len(),
+                max_len
+            )));
+        }
+    }
+    Ok(opt)
+}
+
+/// Deserialize path with `MAX_PATH_LENGTH` bound.
+fn deserialize_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_PATH_LENGTH, "path")
+}
+
+/// Deserialize category with `MAX_CATEGORY_LENGTH` bound.
+fn deserialize_category<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_CATEGORY_LENGTH, "category")
+}
+
+/// Deserialize description with `MAX_FINDING_LENGTH` bound.
+fn deserialize_description<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_FINDING_LENGTH, "description")
+}
+
+/// Deserialize optional `file_path` with `MAX_PATH_LENGTH` bound.
+fn deserialize_optional_path<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_option_string(deserializer, MAX_PATH_LENGTH, "file_path")
+}
+
+/// Deserialize selector value with `MAX_SELECTOR_VALUE_LENGTH` bound.
+fn deserialize_selector_value<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_SELECTOR_VALUE_LENGTH, "value")
+}
+
+/// Deserialize `work_id` with `MAX_WORK_ID_LENGTH` bound.
+fn deserialize_work_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_string(deserializer, MAX_WORK_ID_LENGTH, "work_id")
+}
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -350,6 +448,9 @@ impl From<CasError> for EfficiencyError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
     /// File path.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_path")]
     pub path: String,
     /// BLAKE3 hash of the new content.
     pub content_hash: [u8; 32],
@@ -417,15 +518,27 @@ impl ChangedFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     /// Category of the finding (e.g., "security", "quality").
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_category")]
     pub category: String,
     /// Description of the finding.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_description")]
     pub description: String,
     /// Severity level (1=low, 5=critical).
     pub severity: u8,
     /// Whether this finding is actionable.
     pub actionable: bool,
     /// Optional file path associated with the finding.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_path"
+    )]
     pub file_path: Option<String>,
     /// Optional line number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -705,53 +818,91 @@ impl ContextDeltaBuilder {
     }
 
     /// Adds a changed file to the delta.
-    #[must_use]
-    pub fn add_changed_file(mut self, path: impl Into<String>, content_hash: [u8; 32]) -> Self {
-        if let Ok(cf) = ChangedFile::new(path, content_hash, ChangeType::Modified) {
-            self.changed_files.push(cf);
-        }
-        self
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the path exceeds `MAX_PATH_LENGTH`.
+    ///
+    /// # Data Integrity (SEC-CTRL-FAC-0016)
+    ///
+    /// Per security review, this method returns `Result` to ensure invariant
+    /// violations during construction are surfaced to callers, preventing
+    /// silent data loss.
+    pub fn add_changed_file(
+        mut self,
+        path: impl Into<String>,
+        content_hash: [u8; 32],
+    ) -> Result<Self, EfficiencyError> {
+        let cf = ChangedFile::new(path, content_hash, ChangeType::Modified)?;
+        self.changed_files.push(cf);
+        Ok(self)
     }
 
     /// Adds a changed file with type.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns error if the path exceeds `MAX_PATH_LENGTH`.
+    ///
+    /// # Data Integrity (SEC-CTRL-FAC-0016)
+    ///
+    /// Per security review, this method returns `Result` to ensure invariant
+    /// violations during construction are surfaced to callers, preventing
+    /// silent data loss.
     pub fn add_changed_file_with_type(
         mut self,
         path: impl Into<String>,
         content_hash: [u8; 32],
         change_type: ChangeType,
-    ) -> Self {
-        if let Ok(cf) = ChangedFile::new(path, content_hash, change_type) {
-            self.changed_files.push(cf);
-        }
-        self
+    ) -> Result<Self, EfficiencyError> {
+        let cf = ChangedFile::new(path, content_hash, change_type)?;
+        self.changed_files.push(cf);
+        Ok(self)
     }
 
     /// Adds a finding to the delta.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns error if category exceeds `MAX_CATEGORY_LENGTH` or description
+    /// exceeds `MAX_FINDING_LENGTH`.
+    ///
+    /// # Data Integrity (SEC-CTRL-FAC-0016)
+    ///
+    /// Per security review, this method returns `Result` to ensure invariant
+    /// violations during construction are surfaced to callers, preventing
+    /// silent data loss.
     pub fn add_finding(
         mut self,
         category: impl Into<String>,
         description: impl Into<String>,
-    ) -> Self {
-        if let Ok(f) = Finding::new(category, description, 3) {
-            self.findings.push(f);
-        }
-        self
+    ) -> Result<Self, EfficiencyError> {
+        let f = Finding::new(category, description, 3)?;
+        self.findings.push(f);
+        Ok(self)
     }
 
     /// Adds a finding with severity.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns error if category exceeds `MAX_CATEGORY_LENGTH` or description
+    /// exceeds `MAX_FINDING_LENGTH`.
+    ///
+    /// # Data Integrity (SEC-CTRL-FAC-0016)
+    ///
+    /// Per security review, this method returns `Result` to ensure invariant
+    /// violations during construction are surfaced to callers, preventing
+    /// silent data loss.
     pub fn add_finding_with_severity(
         mut self,
         category: impl Into<String>,
         description: impl Into<String>,
         severity: u8,
-    ) -> Self {
-        if let Ok(f) = Finding::new(category, description, severity) {
-            self.findings.push(f);
-        }
-        self
+    ) -> Result<Self, EfficiencyError> {
+        let f = Finding::new(category, description, severity)?;
+        self.findings.push(f);
+        Ok(self)
     }
 
     /// Adds a tool output reference.
@@ -1264,6 +1415,9 @@ pub struct ZoomSelector {
     /// Selector type (e.g., "file", "finding", "`tool_output`").
     pub selector_type: ZoomSelectorType,
     /// Selector value (e.g., file path, finding ID).
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_selector_value")]
     pub value: String,
     /// CAS hash of the detailed content.
     pub detail_hash: Option<[u8; 32]>,
@@ -1383,6 +1537,9 @@ impl ZoomSelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationContext {
     /// Work ID.
+    ///
+    /// Per SEC-CTRL-FAC-0016, bounded during deserialization to prevent OOM.
+    #[serde(deserialize_with = "deserialize_work_id")]
     pub work_id: String,
     /// Current iteration number.
     pub current_iteration: u64,
@@ -1741,7 +1898,9 @@ mod tests {
     fn test_context_delta_builder() {
         let delta = ContextDeltaBuilder::new(0, 1)
             .add_changed_file("/src/main.rs", [0x42; 32])
+            .unwrap()
             .add_finding("security", "Potential issue")
+            .unwrap()
             .summary_receipt_hash([0xAB; 32])
             .tokens_consumed(1000)
             .time_consumed_ms(500)
@@ -1768,11 +1927,13 @@ mod tests {
     fn test_context_delta_hash_deterministic() {
         let delta1 = ContextDeltaBuilder::new(0, 1)
             .add_changed_file("/src/main.rs", [0x42; 32])
+            .unwrap()
             .build()
             .unwrap();
 
         let delta2 = ContextDeltaBuilder::new(0, 1)
             .add_changed_file("/src/main.rs", [0x42; 32])
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1870,6 +2031,7 @@ mod tests {
     fn test_iteration_context_builder() {
         let delta = ContextDeltaBuilder::new(0, 1)
             .add_changed_file("/src/main.rs", [0x42; 32])
+            .unwrap()
             .tokens_consumed(1000)
             .build()
             .unwrap();
@@ -1895,6 +2057,7 @@ mod tests {
         for i in 0..10 {
             let delta = ContextDeltaBuilder::new(i, i + 1)
                 .add_changed_file(format!("/src/file{i}.rs"), [i as u8; 32])
+                .unwrap()
                 .build()
                 .unwrap();
             deltas.push(delta);
@@ -2024,13 +2187,16 @@ mod tests {
             // Add some changed files
             for j in 0..5 {
                 delta_builder = delta_builder
-                    .add_changed_file(format!("/src/file{j}.rs"), [((i * 5 + j) % 256) as u8; 32]);
+                    .add_changed_file(format!("/src/file{j}.rs"), [((i * 5 + j) % 256) as u8; 32])
+                    .unwrap();
             }
 
             // Add some findings
             delta_builder = delta_builder
                 .add_finding("quality", "Minor style issue")
-                .add_finding("security", "Potential vulnerability");
+                .unwrap()
+                .add_finding("security", "Potential vulnerability")
+                .unwrap();
 
             let delta = delta_builder.build().unwrap();
 

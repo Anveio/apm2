@@ -1119,7 +1119,11 @@ impl EpisodeRuntime {
             // Initialize tool executor if CAS is configured
             if let Some(ref cas) = self.cas {
                 let budget_tracker = Arc::new(BudgetTracker::from_envelope(self.default_budget));
-                let mut executor = ToolExecutor::new(budget_tracker, cas.clone());
+                let mut executor = ToolExecutor::new(budget_tracker, cas.clone())
+                    // SEC-CTRL-FAC-0017: Set isolation key to episode ID to prevent
+                    // cross-session cache leakage. This is REQUIRED for caching to
+                    // be enabled (fail-closed behavior in compute_cache_key).
+                    .with_isolation_key(episode_id.as_str());
 
                 if let Some(ref clock) = self.clock {
                     executor = executor.with_clock(clock.clone());

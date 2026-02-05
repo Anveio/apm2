@@ -679,12 +679,20 @@ impl ToolExecutor {
 
     /// Computes a cache key for the given arguments if cacheable.
     ///
-    /// # Security (SEC-CTRL-FAC-0017)
+    /// # Security (SEC-CTRL-FAC-0017 - Fail-Closed)
     ///
-    /// When an isolation key is configured, cache keys include the isolation
-    /// key to prevent cross-session information leakage. The isolation key
-    /// is typically the `EpisodeId` to scope caches to the current session.
+    /// This method implements FAIL-CLOSED behavior: if no isolation key is
+    /// configured, caching is DISABLED (returns `None`). This prevents
+    /// cross-session information leakage when the caller forgets to set
+    /// an isolation key.
+    ///
+    /// The isolation key (typically the `EpisodeId`) scopes all cache keys
+    /// to the current session. Without it, cache entries could leak between
+    /// unrelated sessions.
     fn compute_cache_key(&self, args: &ToolArgs) -> Option<CacheKey> {
+        // SEC-CTRL-FAC-0017: FAIL-CLOSED - No caching without isolation key
+        let isolation_key = self.isolation_key.as_ref()?;
+
         let base_key = match args {
             ToolArgs::Read(read_args) => {
                 let json = serde_json::to_vec(read_args).ok()?;
@@ -699,11 +707,8 @@ impl ToolExecutor {
             _ => None,
         }?;
 
-        // SEC-CTRL-FAC-0017: Apply isolation key to prevent cross-session leakage
-        match &self.isolation_key {
-            Some(iso) => Some(base_key.with_isolation_key(iso.clone())),
-            None => Some(base_key),
-        }
+        // Apply isolation key to prevent cross-session leakage
+        Some(base_key.with_isolation_key(isolation_key.clone()))
     }
 
     /// Invalidates cache based on tool execution.
@@ -1339,8 +1344,10 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_compute_cache_key_without_isolation() {
-        // SEC-CTRL-FAC-0017: Verify cache key without isolation_key has no isolation
+    fn test_executor_compute_cache_key_without_isolation_returns_none() {
+        // SEC-CTRL-FAC-0017: FAIL-CLOSED - No caching without isolation key
+        // When no isolation key is set, compute_cache_key returns None to
+        // disable caching entirely, preventing cross-session leakage.
         let tracker = Arc::new(BudgetTracker::from_envelope(test_budget()));
         let cas = Arc::new(StubContentAddressedStore::new());
         let executor = ToolExecutor::new(tracker, cas);
@@ -1351,12 +1358,11 @@ mod tests {
             limit: None,
         });
 
-        let key = executor.compute_cache_key(&args).unwrap();
+        // Without isolation key, caching is disabled (fail-closed)
         assert!(
-            key.isolation_key.is_none(),
-            "cache key should have no isolation_key when executor has none"
+            executor.compute_cache_key(&args).is_none(),
+            "compute_cache_key should return None when no isolation_key is set (fail-closed)"
         );
-        assert!(!key.as_string().contains("ep-"));
     }
 
     #[test]
