@@ -1747,7 +1747,7 @@ impl EpisodeRuntime {
     ///
     /// # Blocking I/O and Fail-Closed
     ///
-    /// Ledger emission involves blocking I/O (SQLite). This method spawns a
+    /// Ledger emission involves blocking I/O (`SQLite`). This method spawns a
     /// blocking task to avoid stalling the async runtime.
     ///
     /// If ledger emission fails, this method returns an error (Fail-Closed)
@@ -1794,14 +1794,14 @@ impl EpisodeRuntime {
                         event_type = %event_type,
                         "Episode event streamed to ledger"
                     );
-                }
+                },
                 Err(e) => {
                     // Fail-Closed: Propagate ledger errors (REQ-0005)
                     return Err(EpisodeError::LedgerFailure {
                         id: episode_id,
                         message: e.to_string(),
                     });
-                }
+                },
             }
         }
 
