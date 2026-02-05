@@ -433,6 +433,11 @@ pub fn security_reviewer_role() -> RoleSpecV1 {
 /// - `kernel.fs.edit`: Modify test logic
 /// - `kernel.shell.exec`: Run `cargo test`
 /// - `kernel.evidence.publish`: Publish fix
+///
+/// # Panics
+///
+/// Panics if the role spec fails to build due to invalid configuration.
+/// This should never happen with the hardcoded values.
 #[must_use]
 pub fn test_flake_fixer_role() -> RoleSpecV1 {
     let tool_allowlist = ToolAllowlist::empty()
@@ -481,6 +486,11 @@ pub fn test_flake_fixer_role() -> RoleSpecV1 {
 /// - Fixes Rust compilation errors
 /// - Interprets `cargo check` output
 /// - Applies syntax/type fixes
+///
+/// # Panics
+///
+/// Panics if the role spec fails to build due to invalid configuration.
+/// This should never happen with the hardcoded values.
 #[must_use]
 pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
     let tool_allowlist = ToolAllowlist::empty()
@@ -523,6 +533,11 @@ pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
 ///
 /// - Updates dependencies in `Cargo.toml`
 /// - Resolves version conflicts
+///
+/// # Panics
+///
+/// Panics if the role spec fails to build due to invalid configuration.
+/// This should never happen with the hardcoded values.
 #[must_use]
 pub fn dependency_updater_role() -> RoleSpecV1 {
     let tool_allowlist = ToolAllowlist::empty()

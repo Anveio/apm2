@@ -9,7 +9,7 @@ use crate::fac::builtin_roles::{
 use crate::fac::role_spec::RoleSpecV1;
 
 /// The decision made by the router.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoutingDecision {
     /// Route to a specialist role with narrowed scope.
     Specialist(RoleSpecV1),
@@ -19,10 +19,10 @@ pub enum RoutingDecision {
 
 impl RoutingDecision {
     /// Returns the selected role spec.
-    pub fn role_spec(&self) -> &RoleSpecV1 {
+    #[must_use]
+    pub const fn role_spec(&self) -> &RoleSpecV1 {
         match self {
-            Self::Specialist(role) => role,
-            Self::Generalist(role) => role,
+            Self::Specialist(role) | Self::Generalist(role) => role,
         }
     }
 }
@@ -34,6 +34,7 @@ impl RoutingDecision {
 /// * `diff_stats` - List of file paths changed (simplified diff analysis).
 /// * `issue_labels` - Labels associated with the work item.
 /// * `issue_title` - Title of the work item.
+#[must_use]
 pub fn classify_changeset(
     changed_files: &[String],
     issue_labels: &[String],
@@ -44,14 +45,14 @@ pub fn classify_changeset(
         match label.as_str() {
             "flaky-test" | "test-failure" => {
                 return RoutingDecision::Specialist(test_flake_fixer_role());
-            }
+            },
             "compile-error" | "build-failure" => {
                 return RoutingDecision::Specialist(rust_compile_error_fixer_role());
-            }
+            },
             "dependencies" | "deps" => {
                 return RoutingDecision::Specialist(dependency_updater_role());
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 
@@ -63,18 +64,22 @@ pub fn classify_changeset(
     if title_lower.contains("compile error") || title_lower.contains("build fail") {
         return RoutingDecision::Specialist(rust_compile_error_fixer_role());
     }
-    if title_lower.contains("bump ") || title_lower.contains("dependency") || title_lower.contains("update crate") {
+    if title_lower.contains("bump ")
+        || title_lower.contains("dependency")
+        || title_lower.contains("update crate")
+    {
         return RoutingDecision::Specialist(dependency_updater_role());
     }
 
     // 3. Analyze changed files (heuristic signal)
-    if !changed_files.is_empty() {
-        if changed_files.iter().all(|f| {
-            f.ends_with("Cargo.toml") || f.ends_with("Cargo.lock") || f.ends_with(".cargo/config.toml")
-        }) {
-            return RoutingDecision::Specialist(dependency_updater_role());
-        }
-
+    if !changed_files.is_empty()
+        && changed_files.iter().all(|f| {
+            f.ends_with("Cargo.toml")
+                || f.ends_with("Cargo.lock")
+                || f.ends_with(".cargo/config.toml")
+        })
+    {
+        return RoutingDecision::Specialist(dependency_updater_role());
         // If all changes are in test files, suggest test fixer?
         // Maybe, but implementer is also valid. Let's be conservative.
     }
