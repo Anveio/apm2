@@ -5102,10 +5102,7 @@ mod tests {
         // Arguments containing spaces must be quoted
         // Note: -c has no special chars, so it's not quoted
         let args = vec!["-c".to_string(), "rm -rf /".to_string()];
-        assert_eq!(
-            build_escaped_command_line("sh", &args),
-            "sh -c 'rm -rf /'"
-        );
+        assert_eq!(build_escaped_command_line("sh", &args), "sh -c 'rm -rf /'");
     }
 
     #[test]
@@ -5119,9 +5116,9 @@ mod tests {
         // The semicolon should be inside quotes, preventing command injection
         // Note: -c has no special chars, so it's not quoted, but the dangerous arg is
         assert_eq!(escaped, "sh -c 'echo hello; rm -rf /'");
-        // The key security property: "echo hello; rm -rf /" is a single quoted arg,
-        // not multiple shell commands. This prevents the allowlist from being bypassed
-        // via shell metacharacter injection.
+        // The key security property: "echo hello; rm -rf /" is a single quoted
+        // arg, not multiple shell commands. This prevents the allowlist
+        // from being bypassed via shell metacharacter injection.
     }
 
     #[test]
@@ -5136,7 +5133,8 @@ mod tests {
         let echo_cmd = build_escaped_command_line("echo", &["hello".to_string()]);
         assert!(config.is_command_allowed(&echo_cmd));
 
-        // sh -c with quoted argument should work - the allowlist sees "sh -c 'echo hello'"
+        // sh -c with quoted argument should work - the allowlist sees "sh -c 'echo
+        // hello'"
         let sh_cmd =
             build_escaped_command_line("sh", &["-c".to_string(), "echo hello".to_string()]);
         assert!(config.is_command_allowed(&sh_cmd));
