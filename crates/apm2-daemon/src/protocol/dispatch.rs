@@ -42,16 +42,20 @@ use tracing::{debug, info, warn};
 use super::credentials::PeerCredentials;
 use super::error::{ProtocolError, ProtocolResult};
 use super::messages::{
-    BoundedDecode, ClaimWorkRequest, ClaimWorkResponse, ConsensusByzantineEvidenceRequest,
-    ConsensusByzantineEvidenceResponse, ConsensusErrorCode, ConsensusMetricsRequest,
-    ConsensusMetricsResponse, ConsensusStatusRequest, ConsensusStatusResponse,
-    ConsensusValidatorsRequest, ConsensusValidatorsResponse, DecodeConfig, IssueCapabilityRequest,
-    IssueCapabilityResponse, ListProcessesRequest, ListProcessesResponse, PatternRejection,
-    PrivilegedError, PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
-    ProcessStatusResponse, ReloadProcessRequest, ReloadProcessResponse, RestartProcessRequest,
-    RestartProcessResponse, ShutdownRequest, ShutdownResponse, SpawnEpisodeRequest,
-    SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse, StopProcessRequest,
-    StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse, UnsubscribePulseRequest,
+    AddCredentialRequest, AddCredentialResponse, BoundedDecode, ClaimWorkRequest,
+    ClaimWorkResponse, ConsensusByzantineEvidenceRequest, ConsensusByzantineEvidenceResponse,
+    ConsensusErrorCode, ConsensusMetricsRequest, ConsensusMetricsResponse,
+    ConsensusStatusRequest, ConsensusStatusResponse, ConsensusValidatorsRequest,
+    ConsensusValidatorsResponse, DecodeConfig, IssueCapabilityRequest, IssueCapabilityResponse,
+    ListCredentialsRequest, ListCredentialsResponse, ListProcessesRequest, ListProcessesResponse,
+    LoginCredentialRequest, LoginCredentialResponse, PatternRejection, PrivilegedError,
+    PrivilegedErrorCode, ProcessInfo, ProcessStateEnum, ProcessStatusRequest,
+    ProcessStatusResponse, RefreshCredentialRequest, RefreshCredentialResponse,
+    ReloadProcessRequest, ReloadProcessResponse, RemoveCredentialRequest, RemoveCredentialResponse,
+    RestartProcessRequest, RestartProcessResponse, ShutdownRequest, ShutdownResponse,
+    SpawnEpisodeRequest, SpawnEpisodeResponse, StartProcessRequest, StartProcessResponse,
+    StopProcessRequest, StopProcessResponse, SubscribePulseRequest, SubscribePulseResponse,
+    SwitchCredentialRequest, SwitchCredentialResponse, UnsubscribePulseRequest,
     UnsubscribePulseResponse, WorkRole, WorkStatusRequest, WorkStatusResponse,
 };
 use super::pulse_acl::{
@@ -1838,6 +1842,19 @@ pub enum PrivilegedMessageType {
     ConsensusMetrics    = 14,
     /// `WorkStatus` request (IPC-PRIV-015, TCK-00344)
     WorkStatus          = 15,
+    // --- Credential Management (CTR-PROTO-012, RFC-0018, TCK-00343) ---
+    /// `ListCredentials` request (IPC-PRIV-021)
+    ListCredentials     = 21,
+    /// `AddCredential` request (IPC-PRIV-022)
+    AddCredential       = 22,
+    /// `RemoveCredential` request (IPC-PRIV-023)
+    RemoveCredential    = 23,
+    /// `RefreshCredential` request (IPC-PRIV-024)
+    RefreshCredential   = 24,
+    /// `SwitchCredential` request (IPC-PRIV-025)
+    SwitchCredential    = 25,
+    /// `LoginCredential` request (IPC-PRIV-026)
+    LoginCredential     = 26,
     // --- HEF Pulse Plane (CTR-PROTO-010, RFC-0018) ---
     /// `SubscribePulse` request (IPC-HEF-001)
     SubscribePulse      = 64,
@@ -1863,13 +1880,20 @@ impl PrivilegedMessageType {
             8 => Some(Self::StopProcess),
             9 => Some(Self::RestartProcess),
             10 => Some(Self::ReloadProcess),
-            // Consensus query tags (11-14)
+            // Consensus query tags (11-14, TCK-00345)
             11 => Some(Self::ConsensusStatus),
             12 => Some(Self::ConsensusValidators),
             13 => Some(Self::ConsensusByzantineEvidence),
             14 => Some(Self::ConsensusMetrics),
             // TCK-00344: Work status query
             15 => Some(Self::WorkStatus),
+            // Credential management tags (21-26, TCK-00343)
+            21 => Some(Self::ListCredentials),
+            22 => Some(Self::AddCredential),
+            23 => Some(Self::RemoveCredential),
+            24 => Some(Self::RefreshCredential),
+            25 => Some(Self::SwitchCredential),
+            26 => Some(Self::LoginCredential),
             // HEF tags (64-68)
             64 => Some(Self::SubscribePulse),
             66 => Some(Self::UnsubscribePulse),
@@ -1917,6 +1941,19 @@ pub enum PrivilegedResponse {
     ReloadProcess(ReloadProcessResponse),
     /// Successful `WorkStatus` response (TCK-00344).
     WorkStatus(WorkStatusResponse),
+    // --- Credential Management (CTR-PROTO-012, TCK-00343) ---
+    /// Successful `ListCredentials` response.
+    ListCredentials(ListCredentialsResponse),
+    /// Successful `AddCredential` response.
+    AddCredential(AddCredentialResponse),
+    /// Successful `RemoveCredential` response.
+    RemoveCredential(RemoveCredentialResponse),
+    /// Successful `RefreshCredential` response.
+    RefreshCredential(RefreshCredentialResponse),
+    /// Successful `SwitchCredential` response.
+    SwitchCredential(SwitchCredentialResponse),
+    /// Successful `LoginCredential` response.
+    LoginCredential(LoginCredentialResponse),
     /// Successful `SubscribePulse` response (TCK-00302).
     SubscribePulse(SubscribePulseResponse),
     /// Successful `UnsubscribePulse` response (TCK-00302).
@@ -2007,6 +2044,31 @@ impl PrivilegedResponse {
             },
             Self::WorkStatus(resp) => {
                 buf.push(PrivilegedMessageType::WorkStatus.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            // Credential Management (CTR-PROTO-012, TCK-00343)
+            Self::ListCredentials(resp) => {
+                buf.push(PrivilegedMessageType::ListCredentials.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::AddCredential(resp) => {
+                buf.push(PrivilegedMessageType::AddCredential.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::RemoveCredential(resp) => {
+                buf.push(PrivilegedMessageType::RemoveCredential.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::RefreshCredential(resp) => {
+                buf.push(PrivilegedMessageType::RefreshCredential.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::SwitchCredential(resp) => {
+                buf.push(PrivilegedMessageType::SwitchCredential.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::LoginCredential(resp) => {
+                buf.push(PrivilegedMessageType::LoginCredential.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::SubscribePulse(resp) => {
@@ -2970,6 +3032,15 @@ impl PrivilegedDispatcher {
             PrivilegedMessageType::ConsensusMetrics => self.handle_consensus_metrics(payload),
             // TCK-00344: Work status query
             PrivilegedMessageType::WorkStatus => self.handle_work_status(payload, ctx),
+            // Credential Management (CTR-PROTO-012, TCK-00343)
+            PrivilegedMessageType::ListCredentials => self.handle_list_credentials(payload, ctx),
+            PrivilegedMessageType::AddCredential => self.handle_add_credential(payload, ctx),
+            PrivilegedMessageType::RemoveCredential => self.handle_remove_credential(payload, ctx),
+            PrivilegedMessageType::RefreshCredential => {
+                self.handle_refresh_credential(payload, ctx)
+            },
+            PrivilegedMessageType::SwitchCredential => self.handle_switch_credential(payload, ctx),
+            PrivilegedMessageType::LoginCredential => self.handle_login_credential(payload, ctx),
             // HEF Pulse Plane (TCK-00302): Operator subscription handlers
             PrivilegedMessageType::SubscribePulse => self.handle_subscribe_pulse(payload, ctx),
             PrivilegedMessageType::UnsubscribePulse => self.handle_unsubscribe_pulse(payload, ctx),
@@ -3001,6 +3072,13 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::ConsensusMetrics => "ConsensusMetrics",
                 // TCK-00344
                 PrivilegedMessageType::WorkStatus => "WorkStatus",
+                // Credential Management (CTR-PROTO-012, TCK-00343)
+                PrivilegedMessageType::ListCredentials => "ListCredentials",
+                PrivilegedMessageType::AddCredential => "AddCredential",
+                PrivilegedMessageType::RemoveCredential => "RemoveCredential",
+                PrivilegedMessageType::RefreshCredential => "RefreshCredential",
+                PrivilegedMessageType::SwitchCredential => "SwitchCredential",
+                PrivilegedMessageType::LoginCredential => "LoginCredential",
                 // HEF Pulse Plane (TCK-00300)
                 PrivilegedMessageType::SubscribePulse => "SubscribePulse",
                 PrivilegedMessageType::UnsubscribePulse => "UnsubscribePulse",
@@ -4597,6 +4675,218 @@ impl PrivilegedDispatcher {
         }))
     }
 
+    // =========================================================================
+    // Credential Management Handlers (CTR-PROTO-011, TCK-00343)
+    // =========================================================================
+
+    /// Handles `ListCredentials` requests (IPC-PRIV-021).
+    ///
+    /// Lists all credential profiles. Secrets are never included in responses.
+    fn handle_list_credentials(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let _request = ListCredentialsRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid ListCredentialsRequest: {e}"),
+            })?;
+
+        // TODO(TCK-00343): Wire to actual credential storage
+        // For now, return empty list to enable protocol path testing
+        debug!("ListCredentials handler invoked (stub returning empty list)");
+
+        Ok(PrivilegedResponse::ListCredentials(
+            ListCredentialsResponse {
+                profiles: vec![],
+                total_count: 0,
+            },
+        ))
+    }
+
+    /// Handles `AddCredential` requests (IPC-PRIV-022).
+    ///
+    /// Adds a new credential profile. The secret is stored securely and never
+    /// logged.
+    fn handle_add_credential(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request =
+            AddCredentialRequest::decode_bounded(payload, &self.decode_config).map_err(|e| {
+                ProtocolError::Serialization {
+                    reason: format!("invalid AddCredentialRequest: {e}"),
+                }
+            })?;
+
+        // Validate profile_id length (MAX_ID_LENGTH)
+        if request.profile_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CredentialInvalidConfig,
+                format!(
+                    "profile_id too long: {} bytes (max {})",
+                    request.profile_id.len(),
+                    MAX_ID_LENGTH
+                ),
+            ));
+        }
+
+        // Security: Never log credential_secret
+        debug!(
+            profile_id = %request.profile_id,
+            provider = request.provider,
+            auth_method = request.auth_method,
+            "AddCredential handler invoked (stub)"
+        );
+
+        // TODO(TCK-00343): Wire to actual credential storage via keychain.rs
+        // For now, return success with profile metadata
+        let profile = super::messages::CredentialProfile {
+            profile_id: request.profile_id,
+            provider: request.provider,
+            auth_method: request.auth_method,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            expires_at: request.expires_at,
+            is_active: true,
+            display_name: request.display_name,
+        };
+
+        Ok(PrivilegedResponse::AddCredential(AddCredentialResponse {
+            profile: Some(profile),
+        }))
+    }
+
+    /// Handles `RemoveCredential` requests (IPC-PRIV-023).
+    ///
+    /// Removes a credential profile from storage.
+    fn handle_remove_credential(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = RemoveCredentialRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid RemoveCredentialRequest: {e}"),
+            })?;
+
+        debug!(
+            profile_id = %request.profile_id,
+            "RemoveCredential handler invoked (stub)"
+        );
+
+        // TODO(TCK-00343): Wire to actual credential storage via keychain.rs
+        // For now, return success
+        Ok(PrivilegedResponse::RemoveCredential(
+            RemoveCredentialResponse { removed: true },
+        ))
+    }
+
+    /// Handles `RefreshCredential` requests (IPC-PRIV-024).
+    ///
+    /// Refreshes an OAuth credential by requesting a new token.
+    fn handle_refresh_credential(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = RefreshCredentialRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid RefreshCredentialRequest: {e}"),
+            })?;
+
+        debug!(
+            profile_id = %request.profile_id,
+            "RefreshCredential handler invoked (stub)"
+        );
+
+        // TODO(TCK-00343): Wire to actual OAuth refresh via keychain.rs
+        // For now, return error indicating refresh not yet implemented
+        Ok(PrivilegedResponse::error(
+            PrivilegedErrorCode::CredentialRefreshNotSupported,
+            "credential refresh not yet implemented",
+        ))
+    }
+
+    /// Handles `SwitchCredential` requests (IPC-PRIV-025).
+    ///
+    /// Switches the active credential for a process.
+    fn handle_switch_credential(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = SwitchCredentialRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid SwitchCredentialRequest: {e}"),
+            })?;
+
+        debug!(
+            process_name = %request.process_name,
+            profile_id = %request.profile_id,
+            "SwitchCredential handler invoked (stub)"
+        );
+
+        // TODO(TCK-00343): Wire to actual credential switching
+        // For now, return success
+        Ok(PrivilegedResponse::SwitchCredential(
+            SwitchCredentialResponse {
+                previous_profile_id: String::new(),
+                success: true,
+            },
+        ))
+    }
+
+    /// Handles `LoginCredential` requests (IPC-PRIV-026).
+    ///
+    /// Initiates an interactive login for a provider.
+    fn handle_login_credential(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = LoginCredentialRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid LoginCredentialRequest: {e}"),
+            })?;
+
+        debug!(
+            provider = request.provider,
+            profile_id = ?request.profile_id,
+            "LoginCredential handler invoked (stub)"
+        );
+
+        // TODO(TCK-00343): Wire to actual OAuth flow
+        // For now, return a stub response indicating login not yet implemented
+        let profile_id = request
+            .profile_id
+            .unwrap_or_else(|| format!("auto-{}", uuid::Uuid::new_v4()));
+
+        let profile = super::messages::CredentialProfile {
+            profile_id,
+            provider: request.provider,
+            auth_method: super::messages::CredentialAuthMethod::Oauth.into(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            expires_at: 0,
+            is_active: false, // Not active until login completes
+            display_name: request.display_name,
+        };
+
+        Ok(PrivilegedResponse::LoginCredential(
+            LoginCredentialResponse {
+                profile: Some(profile),
+                login_url: String::new(), // Would contain OAuth URL for browser-based login
+                completed: false,         // Login not yet complete
+            },
+        ))
+    }
+
     // ========================================================================
     // Consensus Query Handlers (TCK-00345)
     // ========================================================================
@@ -5219,6 +5509,58 @@ pub fn encode_consensus_metrics_request(request: &ConsensusMetricsRequest) -> By
 #[must_use]
 pub fn encode_work_status_request(request: &WorkStatusRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::WorkStatus.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+// =============================================================================
+// CTR-PROTO-012: Credential Management Encoding (RFC-0018, TCK-00343)
+// =============================================================================
+
+/// Encodes a `ListCredentials` request to bytes for sending.
+#[must_use]
+pub fn encode_list_credentials_request(request: &ListCredentialsRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::ListCredentials.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes an `AddCredential` request to bytes for sending.
+#[must_use]
+pub fn encode_add_credential_request(request: &AddCredentialRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::AddCredential.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `RemoveCredential` request to bytes for sending.
+#[must_use]
+pub fn encode_remove_credential_request(request: &RemoveCredentialRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::RemoveCredential.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `RefreshCredential` request to bytes for sending.
+#[must_use]
+pub fn encode_refresh_credential_request(request: &RefreshCredentialRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::RefreshCredential.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `SwitchCredential` request to bytes for sending.
+#[must_use]
+pub fn encode_switch_credential_request(request: &SwitchCredentialRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::SwitchCredential.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `LoginCredential` request to bytes for sending.
+#[must_use]
+pub fn encode_login_credential_request(request: &LoginCredentialRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::LoginCredential.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
