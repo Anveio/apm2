@@ -558,8 +558,8 @@ mod tests {
             provider: "custom".to_string(),
             label: Some("Test".to_string()),
             auth_method: "api_key".to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
         }];
         let json = serde_json::to_string_pretty(&entries).unwrap();
         std::fs::write(&index_path, &json).unwrap();
