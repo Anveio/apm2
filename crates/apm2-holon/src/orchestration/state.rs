@@ -18,10 +18,11 @@ pub const MAX_ITERATIONS_LIMIT: u64 = 100;
 /// Minimum number of iterations (must be at least 1).
 pub const MIN_ITERATIONS: u64 = 1;
 
-/// Maximum length for reason strings in termination (reserved for future
-/// validation).
-#[allow(dead_code)]
+/// Maximum length for reason/error/description strings.
 pub const MAX_REASON_LENGTH: usize = 1024;
+
+/// Maximum length for role strings.
+pub const MAX_ROLE_LENGTH: usize = 256;
 
 /// Reason code for blocked termination.
 ///
@@ -63,6 +64,78 @@ pub enum BlockedReasonCode {
         /// Description of the reason.
         description: String,
     },
+}
+
+impl BlockedReasonCode {
+    /// Validates bounds on all string fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HolonError::InvalidInput` if any field exceeds limits.
+    pub fn validate(&self) -> Result<(), HolonError> {
+        match self {
+            Self::ReviewerBlocked {
+                reviewer_role,
+                finding_summary,
+            } => {
+                if reviewer_role.len() > MAX_ROLE_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "reviewer_role exceeds max length: {} > {MAX_ROLE_LENGTH}",
+                        reviewer_role.len()
+                    )));
+                }
+                if let Some(summary) = finding_summary {
+                    if summary.len() > MAX_REASON_LENGTH {
+                        return Err(HolonError::invalid_input(format!(
+                            "finding_summary exceeds max length: {} > {MAX_REASON_LENGTH}",
+                            summary.len()
+                        )));
+                    }
+                }
+            },
+            Self::ChangeSetApplyFailed { error } => {
+                if error.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "error exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        error.len()
+                    )));
+                }
+            },
+            Self::MissingDependency { dependency } => {
+                if dependency.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "dependency exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        dependency.len()
+                    )));
+                }
+            },
+            Self::PolicyViolation { policy } => {
+                if policy.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "policy exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        policy.len()
+                    )));
+                }
+            },
+            Self::ImplementerStalled { reason } => {
+                if reason.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "reason exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        reason.len()
+                    )));
+                }
+            },
+            Self::Other { description } => {
+                if description.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "description exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        description.len()
+                    )));
+                }
+            },
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for BlockedReasonCode {
@@ -236,6 +309,56 @@ impl TerminationReason {
             Self::OperatorStop { .. } => "operator_stop",
             Self::MaxIterationsReached { .. } => "max_iterations_reached",
             Self::Error { .. } => "error",
+        }
+    }
+
+    /// Validates bounds on all string fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HolonError::InvalidInput` if any field exceeds limits.
+    pub fn validate(&self) -> Result<(), HolonError> {
+        match self {
+            Self::Pass | Self::MaxIterationsReached { .. } => Ok(()),
+            Self::Blocked(code) => code.validate(),
+            Self::BudgetExhausted { resource, .. } => {
+                if resource.len() > MAX_ROLE_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "resource exceeds max length: {} > {MAX_ROLE_LENGTH}",
+                        resource.len()
+                    )));
+                }
+                Ok(())
+            },
+            Self::OperatorStop {
+                reason,
+                operator_id,
+            } => {
+                if reason.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "reason exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        reason.len()
+                    )));
+                }
+                if let Some(id) = operator_id {
+                    if id.len() > MAX_ROLE_LENGTH {
+                        return Err(HolonError::invalid_input(format!(
+                            "operator_id exceeds max length: {} > {MAX_ROLE_LENGTH}",
+                            id.len()
+                        )));
+                    }
+                }
+                Ok(())
+            },
+            Self::Error { error } => {
+                if error.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "error exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        error.len()
+                    )));
+                }
+                Ok(())
+            },
         }
     }
 }
@@ -818,7 +941,12 @@ impl OrchestrationDriver {
     ///
     /// # Errors
     ///
-    /// Returns `HolonError::InvalidState` if events are inconsistent.
+    /// Returns `HolonError::InvalidState` if events are inconsistent,
+    /// including:
+    /// - Events out of order (missing start, wrong iteration numbers)
+    /// - Non-monotonic timestamps
+    /// - Termination summary mismatches
+    /// - Invalid field values (exceeding limits)
     pub fn resume_from_events<'a, I>(
         &self,
         events: I,
@@ -827,19 +955,21 @@ impl OrchestrationDriver {
         I: IntoIterator<Item = &'a super::OrchestrationEvent>,
     {
         let mut state: Option<OrchestrationStateV1> = None;
+        let mut last_timestamp_ns: u64 = 0;
 
         for event in events {
             match event {
                 super::OrchestrationEvent::Started(started) => {
-                    // Initialize state from start event
-                    let mut new_state = OrchestrationStateV1::new(
+                    // Use validating constructor to fail hard on invalid data
+                    let mut new_state = OrchestrationStateV1::try_new(
                         started.work_id(),
                         started.orchestration_id(),
                         started.max_iterations(),
                         started.token_budget(),
                         started.time_budget_ms(),
-                    );
+                    )?;
                     new_state.set_started_at_ns(started.started_at_ns());
+                    last_timestamp_ns = started.started_at_ns();
                     state = Some(new_state);
                 },
                 super::OrchestrationEvent::IterationCompleted(completed) => {
@@ -850,6 +980,9 @@ impl OrchestrationDriver {
                         )
                     })?;
 
+                    // Validate event fields
+                    completed.validate()?;
+
                     // Verify iteration number matches
                     let expected_iteration = s.iteration_count + 1;
                     if completed.iteration_number() != expected_iteration {
@@ -858,6 +991,15 @@ impl OrchestrationDriver {
                             format!("iteration {}", completed.iteration_number()),
                         ));
                     }
+
+                    // Verify timestamp monotonicity
+                    if completed.completed_at_ns() < last_timestamp_ns {
+                        return Err(HolonError::invalid_state(
+                            format!("timestamp >= {last_timestamp_ns}"),
+                            format!("timestamp {}", completed.completed_at_ns()),
+                        ));
+                    }
+                    last_timestamp_ns = completed.completed_at_ns();
 
                     // Record the iteration
                     s.record_iteration(
@@ -875,6 +1017,43 @@ impl OrchestrationDriver {
                             "OrchestrationTerminated event without start",
                         )
                     })?;
+
+                    // Validate termination reason
+                    terminated.reason().validate()?;
+
+                    // Verify timestamp monotonicity
+                    if terminated.terminated_at_ns() < last_timestamp_ns {
+                        return Err(HolonError::invalid_state(
+                            format!("timestamp >= {last_timestamp_ns}"),
+                            format!("timestamp {}", terminated.terminated_at_ns()),
+                        ));
+                    }
+
+                    // Verify summary totals match reconstructed state (LAW-07)
+                    if terminated.total_iterations() != s.iteration_count {
+                        return Err(HolonError::invalid_state(
+                            format!("total_iterations = {}", s.iteration_count),
+                            format!("total_iterations = {}", terminated.total_iterations()),
+                        ));
+                    }
+                    if terminated.total_tokens_consumed() != s.tokens_consumed {
+                        return Err(HolonError::invalid_state(
+                            format!("total_tokens_consumed = {}", s.tokens_consumed),
+                            format!(
+                                "total_tokens_consumed = {}",
+                                terminated.total_tokens_consumed()
+                            ),
+                        ));
+                    }
+                    if terminated.total_time_consumed_ms() != s.time_consumed_ms {
+                        return Err(HolonError::invalid_state(
+                            format!("total_time_consumed_ms = {}", s.time_consumed_ms),
+                            format!(
+                                "total_time_consumed_ms = {}",
+                                terminated.total_time_consumed_ms()
+                            ),
+                        ));
+                    }
 
                     s.terminate(terminated.reason().clone());
                 },
@@ -1045,12 +1224,16 @@ mod tests {
 
         // Invalid: zero iterations (handled by with_max_iterations panic)
         // Invalid: zero budget
-        let mut config = OrchestrationConfig::default();
-        config.token_budget = 0;
+        let config = OrchestrationConfig {
+            token_budget: 0,
+            ..OrchestrationConfig::default()
+        };
         assert!(config.validate().is_err());
 
-        config.token_budget = 1000;
-        config.time_budget_ms = 0;
+        let config = OrchestrationConfig {
+            time_budget_ms: 0,
+            ..OrchestrationConfig::default()
+        };
         assert!(config.validate().is_err());
     }
 
@@ -1234,12 +1417,13 @@ mod tests {
 
     /// Test that state can run >= 20 iterations without human interaction.
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_twenty_plus_iterations() {
         let mut state =
             OrchestrationStateV1::new("work-123", "orch-001", 100, 10_000_000, 100_000_000);
 
         // Run 25 iterations
-        for i in 1..=25 {
+        for i in 1..=25_u64 {
             let result =
                 state.record_iteration(1000, 1000, i * 1_000_000_000, Some([i as u8; 32]), None);
             assert!(result.is_none(), "Should not terminate at iteration {i}");

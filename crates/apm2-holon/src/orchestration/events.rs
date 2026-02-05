@@ -84,6 +84,50 @@ impl IterationOutcome {
             Self::Error { .. } => "error",
         }
     }
+
+    /// Validates bounds on all string and vector fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HolonError::InvalidInput` if any field exceeds limits.
+    pub fn validate(&self) -> Result<(), HolonError> {
+        match self {
+            Self::ReviewsBlocked { blocked_by } => {
+                if blocked_by.len() > MAX_VECTOR_ENTRIES {
+                    return Err(HolonError::invalid_input(format!(
+                        "blocked_by exceeds max entries: {} > {MAX_VECTOR_ENTRIES}",
+                        blocked_by.len()
+                    )));
+                }
+                for role in blocked_by {
+                    if role.len() > MAX_ROLE_LENGTH {
+                        return Err(HolonError::invalid_input(format!(
+                            "blocked_by role exceeds max length: {} > {MAX_ROLE_LENGTH}",
+                            role.len()
+                        )));
+                    }
+                }
+            },
+            Self::ImplementerStalled { reason } => {
+                if reason.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "stall reason exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        reason.len()
+                    )));
+                }
+            },
+            Self::Error { error } => {
+                if error.len() > MAX_REASON_LENGTH {
+                    return Err(HolonError::invalid_input(format!(
+                        "error exceeds max length: {} > {MAX_REASON_LENGTH}",
+                        error.len()
+                    )));
+                }
+            },
+            Self::ChangeSetProduced | Self::AllReviewsPassed => {},
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for IterationOutcome {
@@ -454,6 +498,45 @@ impl IterationCompleted {
     pub fn with_reviewer_episode_id(mut self, id: impl Into<String>) -> Self {
         self.reviewer_episode_ids.push(id.into());
         self
+    }
+
+    /// Validates all fields in the event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HolonError::InvalidInput` if any field exceeds limits.
+    pub fn validate(&self) -> Result<(), HolonError> {
+        // Validate outcome
+        self.outcome.validate()?;
+
+        // Validate reviewer_episode_ids count
+        if self.reviewer_episode_ids.len() > MAX_VECTOR_ENTRIES {
+            return Err(HolonError::invalid_input(format!(
+                "reviewer_episode_ids exceeds max entries: {} > {MAX_VECTOR_ENTRIES}",
+                self.reviewer_episode_ids.len()
+            )));
+        }
+
+        // Validate episode ID lengths
+        if let Some(ref id) = self.implementer_episode_id {
+            if id.len() > MAX_ROLE_LENGTH {
+                return Err(HolonError::invalid_input(format!(
+                    "implementer_episode_id exceeds max length: {} > {MAX_ROLE_LENGTH}",
+                    id.len()
+                )));
+            }
+        }
+
+        for id in &self.reviewer_episode_ids {
+            if id.len() > MAX_ROLE_LENGTH {
+                return Err(HolonError::invalid_input(format!(
+                    "reviewer_episode_id exceeds max length: {} > {MAX_ROLE_LENGTH}",
+                    id.len()
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -1,9 +1,11 @@
 //! Integration tests for the orchestration module (TCK-00332).
 //!
 //! These tests verify:
-//! - A work_id can run >= 20 revision iterations without human interaction
+//! - A `work_id` can run >= 20 revision iterations without human interaction
 //! - Restart resumes orchestration deterministically from ledger state
 //! - Termination reasons are recorded as authoritative facts
+
+#![allow(clippy::cast_possible_truncation)]
 
 use apm2_holon::orchestration::{
     IterationCompleted, IterationOutcome, OrchestrationConfig, OrchestrationDriver,
@@ -496,7 +498,7 @@ fn test_budget_exhaustion_detection() {
     }
 }
 
-/// Test iteration binding to ChangeSetBundleV1 and reviewer receipts.
+/// Test iteration binding to `ChangeSetBundleV1` and reviewer receipts.
 #[test]
 fn test_iteration_binding_to_artifacts() {
     let mut state = OrchestrationStateV1::new(

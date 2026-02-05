@@ -58,10 +58,11 @@ mod events;
 mod state;
 
 pub use events::{
-    IterationCompleted, IterationOutcome, OrchestrationEvent, OrchestrationStarted,
-    OrchestrationTerminated,
+    IterationCompleted, IterationOutcome, MAX_REASON_LENGTH as EVENT_MAX_REASON_LENGTH,
+    MAX_ROLE_LENGTH as EVENT_MAX_ROLE_LENGTH, MAX_VECTOR_ENTRIES, OrchestrationEvent,
+    OrchestrationStarted, OrchestrationTerminated,
 };
 pub use state::{
-    BlockedReasonCode, OrchestrationConfig, OrchestrationDriver, OrchestrationStateV1,
-    TerminationReason,
+    BlockedReasonCode, MAX_ITERATIONS_LIMIT, MAX_REASON_LENGTH, MAX_ROLE_LENGTH, MIN_ITERATIONS,
+    OrchestrationConfig, OrchestrationDriver, OrchestrationStateV1, TerminationReason,
 };
