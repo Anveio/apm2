@@ -663,7 +663,7 @@ impl LedgerTailer {
     /// # At-Least-Once Delivery
     ///
     /// This method does NOT automatically advance the watermark. The caller
-    /// must explicitly call [`acknowledge`] after successfully processing
+    /// must explicitly call [`Self::acknowledge`] after successfully processing
     /// each event. This ensures at-least-once delivery semantics:
     /// - If the daemon crashes before acknowledgment, events are redelivered
     /// - Idempotency is achieved via `comment_receipts` and `IdempotencyCache`
