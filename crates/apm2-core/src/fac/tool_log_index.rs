@@ -536,6 +536,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_collection_too_large() {
         let hashes: Vec<[u8; 32]> = (0..=MAX_RECEIPT_HASHES_PER_INDEX)
             .map(|i| {
