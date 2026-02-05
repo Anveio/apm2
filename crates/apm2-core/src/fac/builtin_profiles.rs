@@ -878,8 +878,8 @@ mod tests {
     /// These tests verify that each profile:
     /// 1. Can be instantiated correctly
     /// 2. Has valid CAS hash (deterministic)
-    /// 3. Has proper permission_mode_map entries
-    /// 4. Has valid capability_map entries
+    /// 3. Has proper `permission_mode_map` entries
+    /// 4. Has valid `capability_map` entries
     /// 5. Supports non-interactive receipt production
     mod conformance {
         use super::*;
@@ -966,9 +966,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    "Capability '{}' must map to kernel tool class, got '{}'",
-                    key,
-                    value
+                    "Capability '{key}' must map to kernel tool class, got '{value}'"
                 );
             }
         }
@@ -1037,9 +1035,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    "Capability '{}' must map to kernel tool class, got '{}'",
-                    key,
-                    value
+                    Capability '{key}' must map to kernel tool class, got '{value}'
                 );
             }
         }
@@ -1119,9 +1115,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    "Capability '{}' must map to kernel tool class, got '{}'",
-                    key,
-                    value
+                    Capability '{key}' must map to kernel tool class, got '{value}'
                 );
             }
         }
@@ -1191,9 +1185,7 @@ mod tests {
             for (key, value) in &profile.capability_map {
                 assert!(
                     value.starts_with("kernel."),
-                    "Capability '{}' must map to kernel tool class, got '{}'",
-                    key,
-                    value
+                    Capability '{key}' must map to kernel tool class, got '{value}'
                 );
             }
         }
@@ -1229,14 +1221,16 @@ mod tests {
             }
         }
 
-        /// Conformance test: All profiles have tool_bridge with TI1 protocol.
+        /// Conformance test: All profiles have `tool_bridge` with TI1 protocol.
         #[test]
         fn conformance_all_profiles_tool_bridge() {
             for profile in all_builtin_profiles() {
-                let tb = profile.tool_bridge.as_ref().expect(&format!(
-                    "Profile '{}' should have tool_bridge",
-                    profile.profile_id
-                ));
+                let tb = profile.tool_bridge.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "Profile '{}' should have tool_bridge",
+                        profile.profile_id
+                    )
+                });
 
                 assert!(
                     tb.enabled,
@@ -1398,12 +1392,13 @@ mod tests {
             let cas = MemoryCas::new();
 
             for profile in all_builtin_profiles() {
-                let hash = profile
-                    .store_in_cas(&cas)
-                    .expect(&format!("Store '{}' should succeed", profile.profile_id));
+                let hash = profile.store_in_cas(&cas).unwrap_or_else(|_| {
+                    panic!("Store '{}' should succeed", profile.profile_id)
+                });
 
-                let loaded = AgentAdapterProfileV1::load_from_cas(&cas, &hash)
-                    .expect(&format!("Load '{}' should succeed", profile.profile_id));
+                let loaded = AgentAdapterProfileV1::load_from_cas(&cas, &hash).unwrap_or_else(|_| {
+                    panic!("Load '{}' should succeed", profile.profile_id)
+                });
 
                 // Field-by-field comparison
                 assert_eq!(
@@ -1509,9 +1504,9 @@ mod tests {
 
             for profile in all_builtin_profiles() {
                 // Store profile in CAS
-                let profile_hash = profile
-                    .store_in_cas(&cas)
-                    .expect(&format!("Store '{}' should succeed", profile.profile_id));
+                let profile_hash = profile.store_in_cas(&cas).unwrap_or_else(|_| {
+                    panic!("Store '{}' should succeed", profile.profile_id)
+                });
 
                 // Simulate non-interactive receipt production
                 // In real usage, this would be a ToolExecutionReceipt or similar
@@ -1523,7 +1518,7 @@ mod tests {
                     "profile_id": profile.profile_id,
                     "adapter_mode": profile.adapter_mode.to_string(),
                     "tool_bridge_protocol": profile.tool_bridge.as_ref().map(|tb| &tb.protocol_version),
-                    "timestamp_ns": 1704067200000000000u64,
+                    "timestamp_ns": 1_704_067_200_000_000_000_u64,
                 });
 
                 // Verify receipt contains profile hash attribution
@@ -1546,11 +1541,15 @@ mod tests {
                     .try_into()
                     .expect("Profile hash should be 32 bytes");
 
-                let recovered_profile = AgentAdapterProfileV1::load_from_cas(&cas, &recovered_hash)
-                    .expect(&format!(
-                        "Profile '{}' should be recoverable from receipt hash",
-                        profile.profile_id
-                    ));
+                let recovered_profile =
+                    AgentAdapterProfileV1::load_from_cas(&cas, &recovered_hash).unwrap_or_else(
+                        |_| {
+                            panic!(
+                                "Profile '{}' should be recoverable from receipt hash",
+                                profile.profile_id
+                            )
+                        },
+                    );
 
                 assert_eq!(
                     profile.profile_id, recovered_profile.profile_id,

@@ -2,8 +2,8 @@
 //! TCK-00330: Ledger attribution integration tests.
 //!
 //! This module tests:
-//! 1. `emit_episode_run_attributed` emits events with adapter_profile_hash
-//! 2. Ledger events can be queried by work_id
+//! 1. `emit_episode_run_attributed` emits events with `adapter_profile_hash`
+//! 2. Ledger events can be queried by `work_id`
 //! 3. Non-interactive receipt production works across all builtin profiles
 
 use apm2_core::evidence::MemoryCas;
@@ -12,13 +12,14 @@ use apm2_core::fac::{
     gemini_cli_profile, local_inference_profile,
 };
 use apm2_daemon::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
+use ed25519_dalek::{Signature, Verifier};
 
 // ============================================================================
 // Ledger Attribution Tests
 // ============================================================================
 
 /// Tests that `emit_episode_run_attributed` correctly emits ledger events
-/// with adapter_profile_hash attribution.
+/// with `adapter_profile_hash` attribution.
 #[test]
 fn test_emit_episode_run_attributed() {
     let emitter = StubLedgerEventEmitter::new();
@@ -58,7 +59,7 @@ fn test_emit_episode_run_attributed() {
     assert_eq!(payload["session_id"].as_str().unwrap(), session_id);
 }
 
-/// Tests that ledger events can be queried by work_id.
+/// Tests that ledger events can be queried by `work_id`.
 #[test]
 fn test_query_events_by_work_id() {
     let emitter = StubLedgerEventEmitter::new();
@@ -66,11 +67,11 @@ fn test_query_events_by_work_id() {
     let work_id = "work-001";
 
     // Emit multiple events for the same work_id
-    for i in 0..3 {
-        let episode_id = format!("episode-00{}", i);
-        let session_id = format!("session-00{}", i);
-        let adapter_profile_hash = [(i + 1) as u8; 32];
-        let timestamp_ns = 1_704_067_200_000_000_000u64 + (i as u64 * 1_000_000);
+    for i in 0u8..3 {
+        let episode_id = format!("episode-00{i}");
+        let session_id = format!("session-00{i}");
+        let adapter_profile_hash = [i + 1; 32];
+        let timestamp_ns = 1_704_067_200_000_000_000u64 + (u64::from(i) * 1_000_000);
 
         emitter
             .emit_episode_run_attributed(
@@ -94,7 +95,7 @@ fn test_query_events_by_work_id() {
     }
 }
 
-/// Tests that events for different work_ids are properly separated.
+/// Tests that events for different `work_ids` are properly separated.
 #[test]
 fn test_events_separated_by_work_id() {
     let emitter = StubLedgerEventEmitter::new();
@@ -271,8 +272,6 @@ fn test_event_signature_verification() {
     assert_eq!(event.signature.len(), 64);
 
     // Reconstruct and verify the signature
-    use ed25519_dalek::{Signature, Verifier};
-
     // Build canonical bytes (domain prefix + payload)
     let domain_prefix = b"apm2.event.episode_run_attributed:";
     let mut canonical_bytes = Vec::new();
@@ -315,8 +314,6 @@ fn test_tampered_payload_fails_verification() {
     }
 
     // Verify signature fails with tampered payload
-    use ed25519_dalek::{Signature, Verifier};
-
     let domain_prefix = b"apm2.event.episode_run_attributed:";
     let mut canonical_bytes = Vec::new();
     canonical_bytes.extend_from_slice(domain_prefix);
