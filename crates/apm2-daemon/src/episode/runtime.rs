@@ -695,7 +695,8 @@ impl EpisodeRuntime {
         self
     }
 
-    /// Sets the ledger emitter for durable episode event persistence (TCK-00321).
+    /// Sets the ledger emitter for durable episode event persistence
+    /// (TCK-00321).
     ///
     /// Per REQ-0005, when a ledger emitter is configured, episode events are
     /// streamed directly to the ledger as they occur. This enables:
@@ -1753,8 +1754,8 @@ impl EpisodeRuntime {
     /// buffer reaches capacity, the oldest events are evicted to make room
     /// for new events. This prevents unbounded memory growth.
     ///
-    /// In production, events should be streamed to ledger via `with_ledger_emitter`
-    /// to ensure durability.
+    /// In production, events should be streamed to ledger via
+    /// `with_ledger_emitter` to ensure durability.
     async fn emit_event(&self, event: EpisodeEvent) {
         // TCK-00321: Stream to ledger when emitter is configured
         if let Some(emitter) = &self.ledger_emitter {
@@ -1821,7 +1822,8 @@ impl EpisodeRuntime {
     /// ledger persistence. The format is designed to be:
     /// - Deterministic (stable field ordering via serde)
     /// - Backward-compatible (uses serde's default handling)
-    /// - Queryable (JSON fields can be indexed in SQLite)
+    /// - Queryable (JSON fields can be indexed in `SQLite`)
+    #[allow(clippy::unused_self)] // Method on instance for API consistency with emit_event
     fn serialize_episode_event(&self, event: &EpisodeEvent) -> Vec<u8> {
         use serde_json::json;
 
@@ -1920,6 +1922,8 @@ impl EpisodeRuntime {
     }
 
     /// Extracts the timestamp from an `EpisodeEvent`.
+    #[allow(clippy::unused_self)] // Method on instance for API consistency with emit_event
+    #[allow(clippy::missing_const_for_fn)] // Not const due to future extensibility
     fn extract_timestamp(&self, event: &EpisodeEvent) -> u64 {
         match event {
             EpisodeEvent::Created { created_at_ns, .. } => *created_at_ns,
@@ -1934,9 +1938,7 @@ impl EpisodeRuntime {
                 published_at_ns, ..
             } => *published_at_ns,
             EpisodeEvent::LeaseIssueDenied { denied_at_ns, .. } => *denied_at_ns,
-            EpisodeEvent::ToolExecuted {
-                executed_at_ns, ..
-            } => *executed_at_ns,
+            EpisodeEvent::ToolExecuted { executed_at_ns, .. } => *executed_at_ns,
         }
     }
 }

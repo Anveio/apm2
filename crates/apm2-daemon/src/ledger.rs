@@ -463,15 +463,17 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         payload: &[u8],
         timestamp_ns: u64,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
-        // TCK-00321: EPISODE_EVENT_DOMAIN_PREFIX imported from crate::protocol::dispatch
-        // to maintain single source of truth for domain prefixes.
+        // TCK-00321: EPISODE_EVENT_DOMAIN_PREFIX imported from
+        // crate::protocol::dispatch to maintain single source of truth for
+        // domain prefixes.
 
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with episode event metadata
-        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
-        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": event_type,
             "episode_id": episode_id,
@@ -557,8 +559,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with review receipt data
-        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
-        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,

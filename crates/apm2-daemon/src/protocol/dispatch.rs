@@ -306,9 +306,10 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// # Ledger Event vs Protocol Event
     ///
-    /// This produces a **ledger event** (JCS-canonicalized JSON) for persistence
-    /// and audit, which is distinct from the FAC protocol's `ReviewReceiptRecorded`
-    /// event (binary canonical format) defined in `apm2_core::fac::review_receipt`.
+    /// This produces a **ledger event** (JCS-canonicalized JSON) for
+    /// persistence and audit, which is distinct from the FAC protocol's
+    /// `ReviewReceiptRecorded` event (binary canonical format) defined in
+    /// `apm2_core::fac::review_receipt`.
     ///
     /// The ledger event format includes:
     /// - `event_type`: Event discriminant for querying
@@ -316,7 +317,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// - All required fields for audit trail reconstruction
     ///
     /// Both formats use the same domain prefix (`REVIEW_RECEIPT_RECORDED:`) to
-    /// ensure namespace consistency, but serve different purposes in the system.
+    /// ensure namespace consistency, but serve different purposes in the
+    /// system.
     ///
     /// # Arguments
     ///
@@ -333,7 +335,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `LedgerEventError` if signing, CAS validation, or persistence fails.
+    /// Returns `LedgerEventError` if signing, CAS validation, or persistence
+    /// fails.
     fn emit_review_receipt(
         &self,
         episode_id: &str,
@@ -868,8 +871,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
 
         // Build payload as JSON with episode event metadata
         // The payload is already JSON-serialized episode event data
-        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
-        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": event_type,
             "episode_id": episode_id,
@@ -961,8 +965,9 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Build payload as JSON with review receipt data
-        // SECURITY: timestamp_ns is included in signed payload to prevent temporal malleability
-        // per LAW-09 (Temporal Pinning & Freshness) and RS-40 (Time & Monotonicity)
+        // SECURITY: timestamp_ns is included in signed payload to prevent temporal
+        // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
+        // (Time & Monotonicity)
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,

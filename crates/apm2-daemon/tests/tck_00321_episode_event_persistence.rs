@@ -54,7 +54,8 @@ async fn test_episode_event_streams_to_ledger() {
     assert!(matches!(buffered[0], EpisodeEvent::Created { .. }));
 }
 
-/// Tests that episode lifecycle events (created, started, stopped) all stream to ledger.
+/// Tests that episode lifecycle events (created, started, stopped) all stream
+/// to ledger.
 #[tokio::test]
 async fn test_episode_lifecycle_events_stream_to_ledger() {
     let emitter = Arc::new(StubLedgerEventEmitter::new());
@@ -98,8 +99,8 @@ async fn test_episode_lifecycle_events_stream_to_ledger() {
     assert!(event_types.contains(&"episode.stopped"));
 }
 
-/// Tests that events are buffered locally even when ledger emitter is configured.
-/// This ensures backward compatibility with drain_events().
+/// Tests that events are buffered locally even when ledger emitter is
+/// configured. This ensures backward compatibility with drain_events().
 #[tokio::test]
 async fn test_events_buffered_with_ledger_emitter() {
     let emitter = Arc::new(StubLedgerEventEmitter::new());
