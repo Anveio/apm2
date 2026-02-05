@@ -520,6 +520,22 @@ impl RoleBudgets {
             default_tool_budget: ToolBudget::read_only(),
         }
     }
+
+    /// Creates budgets suitable for specialist roles.
+    ///
+    /// Specialists have narrower budgets than generalist implementers because
+    /// they are focused on specific, well-scoped tasks (e.g., fixing a single
+    /// compile error or test flake).
+    #[must_use]
+    pub fn specialist() -> Self {
+        Self {
+            max_total_tool_calls: 50,
+            max_tokens: 500_000,
+            max_wall_clock_ms: 1_800_000, // 30 minutes
+            max_evidence_bytes: 50 * 1024 * 1024,
+            default_tool_budget: ToolBudget::default(),
+        }
+    }
 }
 
 // =============================================================================
@@ -1142,6 +1158,10 @@ mod tests {
 
         let reviewer = RoleBudgets::reviewer();
         assert_eq!(reviewer.max_total_tool_calls, 100);
+
+        let specialist = RoleBudgets::specialist();
+        assert_eq!(specialist.max_total_tool_calls, 50);
+        assert_eq!(specialist.max_tokens, 500_000);
     }
 
     #[test]

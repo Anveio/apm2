@@ -460,7 +460,7 @@ pub fn test_flake_fixer_role() -> RoleSpecV1 {
              failures (flakes).",
         )
         .tool_allowlist(tool_allowlist)
-        .budgets(RoleBudgets::implementer()) // Needs similar budget to implementer
+        .budgets(RoleBudgets::specialist())
         .required_output_schema(RequiredOutputSchema::new(
             "apm2.changeset_published.v1",
             true,
@@ -519,7 +519,7 @@ pub fn rust_compile_error_fixer_role() -> RoleSpecV1 {
         .role_type(RoleType::RustCompileErrorFixer)
         .description("Specialist role for fixing Rust compilation errors.")
         .tool_allowlist(tool_allowlist)
-        .budgets(RoleBudgets::implementer())
+        .budgets(RoleBudgets::specialist())
         .required_output_schema(RequiredOutputSchema::new(
             "apm2.changeset_published.v1",
             true,
@@ -576,7 +576,7 @@ pub fn dependency_updater_role() -> RoleSpecV1 {
         .role_type(RoleType::DependencyUpdater)
         .description("Specialist role for updating project dependencies.")
         .tool_allowlist(tool_allowlist)
-        .budgets(RoleBudgets::implementer())
+        .budgets(RoleBudgets::specialist())
         .required_output_schema(RequiredOutputSchema::new(
             "apm2.changeset_published.v1",
             true,
@@ -724,6 +724,29 @@ mod tests {
             implementer.budgets.max_tokens > reviewer.budgets.max_tokens,
             "Implementer should have higher token budget"
         );
+    }
+
+    #[test]
+    fn test_specialist_roles_have_narrower_budgets_than_implementer() {
+        let implementer = implementer_role();
+        let specialists = [
+            test_flake_fixer_role(),
+            rust_compile_error_fixer_role(),
+            dependency_updater_role(),
+        ];
+
+        for specialist in specialists {
+            assert!(
+                specialist.budgets.max_total_tool_calls < implementer.budgets.max_total_tool_calls,
+                "{} should have fewer tool calls than implementer",
+                specialist.role_id
+            );
+            assert!(
+                specialist.budgets.max_tokens < implementer.budgets.max_tokens,
+                "{} should have lower token budget than implementer",
+                specialist.role_id
+            );
+        }
     }
 
     #[test]
