@@ -14,12 +14,12 @@ use apm2_daemon::episode::{
 use apm2_daemon::protocol::dispatch::{LedgerEventEmitter, StubLedgerEventEmitter};
 
 /// Test helper to create a test envelope hash.
-fn test_envelope_hash() -> Hash {
+const fn test_envelope_hash() -> Hash {
     [42u8; 32]
 }
 
 /// Test helper to create a test timestamp.
-fn test_timestamp() -> u64 {
+const fn test_timestamp() -> u64 {
     1_704_067_200_000_000_000 // 2024-01-01 00:00:00 UTC in nanoseconds
 }
 
@@ -100,7 +100,7 @@ async fn test_episode_lifecycle_events_stream_to_ledger() {
 }
 
 /// Tests that events are buffered locally even when ledger emitter is
-/// configured. This ensures backward compatibility with drain_events().
+/// configured. This ensures backward compatibility with `drain_events()`.
 #[tokio::test]
 async fn test_events_buffered_with_ledger_emitter() {
     let emitter = Arc::new(StubLedgerEventEmitter::new());
@@ -127,7 +127,7 @@ async fn test_events_buffered_with_ledger_emitter() {
     assert_eq!(buffered2.len(), 0, "buffer should be drained");
 }
 
-/// Tests emit_review_receipt method for atomic receipt emission.
+/// Tests `emit_review_receipt` method for atomic receipt emission.
 #[tokio::test]
 async fn test_atomic_receipt_emission() {
     let emitter = Arc::new(StubLedgerEventEmitter::new());
@@ -174,7 +174,7 @@ async fn test_atomic_receipt_emission() {
     );
 }
 
-/// Tests emit_episode_event method for episode event streaming.
+/// Tests `emit_episode_event` method for episode event streaming.
 #[tokio::test]
 async fn test_emit_episode_event() {
     let emitter = Arc::new(StubLedgerEventEmitter::new());
