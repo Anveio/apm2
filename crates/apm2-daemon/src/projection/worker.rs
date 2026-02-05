@@ -96,6 +96,29 @@ const WORK_INDEX_SCHEMA_SQL: &str = r"
     );
 
     CREATE INDEX IF NOT EXISTS idx_changeset_work_id ON changeset_work_index(work_id);
+
+    -- Tailer watermark persistence (fixes blocker: non-persistent LedgerTailer)
+    CREATE TABLE IF NOT EXISTS tailer_watermark (
+        tailer_id TEXT PRIMARY KEY,
+        last_processed_ns INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+    -- Commit SHA mapping for changeset digest -> git SHA
+    CREATE TABLE IF NOT EXISTS changeset_sha_index (
+        changeset_digest BLOB PRIMARY KEY,
+        commit_sha TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+
+    -- Comment idempotency tracking (blocker fix: duplicate comments)
+    CREATE TABLE IF NOT EXISTS comment_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        work_id TEXT NOT NULL,
+        pr_number INTEGER NOT NULL,
+        comment_type TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
 ";
 
 /// Work index for tracking changeset -> `work_id` -> PR associations.
@@ -119,9 +142,11 @@ impl WorkIndex {
                 ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
             })?;
 
-            conn_guard.execute_batch(WORK_INDEX_SCHEMA_SQL).map_err(|e| {
-                ProjectionWorkerError::DatabaseError(format!("schema init failed: {e}"))
-            })?;
+            conn_guard
+                .execute_batch(WORK_INDEX_SCHEMA_SQL)
+                .map_err(|e| {
+                    ProjectionWorkerError::DatabaseError(format!("schema init failed: {e}"))
+                })?;
         }
 
         Ok(Self { conn })
@@ -136,9 +161,10 @@ impl WorkIndex {
         changeset_digest: &[u8; 32],
         work_id: &str,
     ) -> Result<(), ProjectionWorkerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -174,9 +200,10 @@ impl WorkIndex {
         repo_name: &str,
         head_sha: &str,
     ) -> Result<(), ProjectionWorkerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -244,6 +271,113 @@ impl WorkIndex {
         .ok()
         .flatten()
     }
+
+    /// Registers a changeset -> commit SHA mapping.
+    ///
+    /// Required for GitHub status projection to know which commit to update.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn register_commit_sha(
+        &self,
+        changeset_digest: &[u8; 32],
+        commit_sha: &str,
+    ) -> Result<(), ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO changeset_sha_index
+             (changeset_digest, commit_sha, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![changeset_digest.as_slice(), commit_sha, now as i64],
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        debug!(
+            changeset = %hex::encode(changeset_digest),
+            commit_sha = %commit_sha,
+            "Registered changeset -> commit SHA"
+        );
+
+        Ok(())
+    }
+
+    /// Gets the commit SHA for a changeset digest.
+    pub fn get_commit_sha(&self, changeset_digest: &[u8; 32]) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+
+        conn.query_row(
+            "SELECT commit_sha FROM changeset_sha_index WHERE changeset_digest = ?1",
+            params![changeset_digest.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Checks if a comment has already been posted (idempotency check).
+    pub fn is_comment_posted(&self, receipt_id: &str) -> bool {
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+
+        conn.query_row(
+            "SELECT 1 FROM comment_receipts WHERE receipt_id = ?1",
+            params![receipt_id],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Records that a comment was posted (for idempotency).
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn record_comment_posted(
+        &self,
+        receipt_id: &str,
+        work_id: &str,
+        pr_number: u64,
+        comment_type: &str,
+    ) -> Result<(), ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO comment_receipts
+             (receipt_id, work_id, pr_number, comment_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                receipt_id,
+                work_id,
+                pr_number as i64,
+                comment_type,
+                now as i64
+            ],
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        debug!(
+            receipt_id = %receipt_id,
+            work_id = %work_id,
+            pr_number = pr_number,
+            "Recorded comment posted"
+        );
+
+        Ok(())
+    }
 }
 
 /// PR metadata for projection.
@@ -263,32 +397,95 @@ pub struct PrMetadata {
 // Ledger Tailer
 // =============================================================================
 
+/// Default tailer ID for the projection worker.
+const DEFAULT_TAILER_ID: &str = "projection_worker";
+
 /// Ledger tailer for watching events.
 ///
 /// Tracks the last processed event sequence and polls for new events.
+/// Persists the watermark to `SQLite` for crash recovery (fixes blocker:
+/// non-persistent tailer).
 pub struct LedgerTailer {
     conn: Arc<Mutex<Connection>>,
     /// Last processed event timestamp (for ordering).
     last_processed_ns: u64,
+    /// Tailer identifier for watermark persistence.
+    tailer_id: String,
 }
 
 impl LedgerTailer {
-    /// Creates a new ledger tailer.
-    #[must_use]
-    pub const fn new(conn: Arc<Mutex<Connection>>) -> Self {
+    /// Creates a new ledger tailer, loading persisted watermark if available.
+    ///
+    /// This ensures crash recovery: the tailer resumes from where it left off.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
+        Self::with_id(conn, DEFAULT_TAILER_ID)
+    }
+
+    /// Creates a new ledger tailer with a custom ID.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn with_id(conn: Arc<Mutex<Connection>>, tailer_id: &str) -> Self {
+        // Load persisted watermark if available
+        let last_processed_ns = conn.lock().map_or(0, |conn_guard| {
+            conn_guard
+                .query_row(
+                    "SELECT last_processed_ns FROM tailer_watermark WHERE tailer_id = ?1",
+                    params![tailer_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|ns| ns as u64)
+                .unwrap_or(0)
+        });
+
+        if last_processed_ns > 0 {
+            info!(
+                tailer_id = %tailer_id,
+                last_processed_ns = last_processed_ns,
+                "Resumed ledger tailer from persisted watermark"
+            );
+        }
+
         Self {
             conn,
-            last_processed_ns: 0,
+            last_processed_ns,
+            tailer_id: tailer_id.to_string(),
         }
     }
 
     /// Creates a ledger tailer starting from a specific timestamp.
     #[must_use]
-    pub const fn from_timestamp(conn: Arc<Mutex<Connection>>, timestamp_ns: u64) -> Self {
+    pub fn from_timestamp(conn: Arc<Mutex<Connection>>, timestamp_ns: u64) -> Self {
         Self {
             conn,
             last_processed_ns: timestamp_ns,
+            tailer_id: DEFAULT_TAILER_ID.to_string(),
         }
+    }
+
+    /// Persists the current watermark to `SQLite`.
+    ///
+    /// Called after processing events to ensure crash recovery.
+    #[allow(clippy::cast_possible_wrap)]
+    fn persist_watermark(&self) -> Result<(), ProjectionWorkerError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        conn.execute(
+            "INSERT OR REPLACE INTO tailer_watermark
+             (tailer_id, last_processed_ns, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![self.tailer_id, self.last_processed_ns as i64, now as i64],
+        )
+        .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Gets the next batch of unprocessed events of a given type.
@@ -301,22 +498,22 @@ impl LedgerTailer {
         event_type: &str,
         limit: usize,
     ) -> Result<Vec<SignedLedgerEvent>, ProjectionWorkerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
-        })?;
+        let events = {
+            let conn = self.conn.lock().map_err(|e| {
+                ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
+            })?;
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
-                 FROM ledger_events
-                 WHERE event_type = ?1 AND timestamp_ns > ?2
-                 ORDER BY timestamp_ns ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns
+                     FROM ledger_events
+                     WHERE event_type = ?1 AND timestamp_ns > ?2
+                     ORDER BY timestamp_ns ASC
+                     LIMIT ?3",
+                )
+                .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?;
 
-        let events = stmt
-            .query_map(
+            stmt.query_map(
                 params![event_type, self.last_processed_ns as i64, limit as i64],
                 |row| {
                     Ok(SignedLedgerEvent {
@@ -332,11 +529,16 @@ impl LedgerTailer {
             )
             .map_err(|e| ProjectionWorkerError::DatabaseError(e.to_string()))?
             .filter_map(Result::ok)
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+        }; // conn and stmt dropped here
 
-        // Update last processed timestamp
+        // Update last processed timestamp and persist watermark
         if let Some(last) = events.last() {
             self.last_processed_ns = last.timestamp_ns;
+            // Persist to SQLite for crash recovery
+            if let Err(e) = self.persist_watermark() {
+                warn!(error = %e, "Failed to persist tailer watermark");
+            }
         }
 
         Ok(events)
@@ -345,9 +547,10 @@ impl LedgerTailer {
     /// Gets the current ledger head (latest event timestamp).
     #[allow(clippy::cast_sign_loss)]
     pub fn get_ledger_head(&self) -> Result<Option<[u8; 32]>, ProjectionWorkerError> {
-        let conn = self.conn.lock().map_err(|e| {
-            ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ProjectionWorkerError::DatabaseError(format!("mutex poisoned: {e}")))?;
 
         // For now, compute a hash of the latest event_id as "ledger head"
         // In a full implementation, this would be the chain hash
@@ -510,13 +713,15 @@ impl ProjectionWorker {
             "Projection worker starting"
         );
 
-        while !self
-            .shutdown
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             // Process ChangeSetPublished events to build work index
             if let Err(e) = self.process_changeset_published() {
                 warn!(error = %e, "Error processing ChangeSetPublished events");
+            }
+
+            // Process WorkPrAssociated events to link work_id -> PR metadata
+            if let Err(e) = self.process_work_pr_associated() {
+                warn!(error = %e, "Error processing WorkPrAssociated events");
             }
 
             // Process ReviewReceiptRecorded events for projection
@@ -572,6 +777,9 @@ impl ProjectionWorker {
             .and_then(|v| v.as_str())
             .unwrap_or(&event.work_id);
 
+        // Extract commit SHA if present (for GitHub status projection)
+        let commit_sha = payload.get("commit_sha").and_then(|v| v.as_str());
+
         // Decode changeset digest
         let digest_bytes = hex::decode(changeset_digest_hex)
             .map_err(|e| ProjectionWorkerError::InvalidPayload(e.to_string()))?;
@@ -586,7 +794,98 @@ impl ProjectionWorker {
         changeset_digest.copy_from_slice(&digest_bytes);
 
         // Register in work index
-        self.work_index.register_changeset(&changeset_digest, work_id)?;
+        self.work_index
+            .register_changeset(&changeset_digest, work_id)?;
+
+        // Register commit SHA mapping if present (blocker fix: CommitShaNotFound)
+        if let Some(sha) = commit_sha {
+            self.work_index
+                .register_commit_sha(&changeset_digest, sha)?;
+        }
+
+        Ok(())
+    }
+
+    /// Processes `WorkPrAssociated` events to link `work_id` -> PR metadata.
+    ///
+    /// This is critical for projection: without PR metadata, we cannot post
+    /// status checks or comments. (Blocker fix: Missing `WorkPrAssociated`
+    /// handling)
+    fn process_work_pr_associated(&mut self) -> Result<(), ProjectionWorkerError> {
+        let events = self
+            .tailer
+            .poll_events("work_pr_associated", self.config.batch_size)?;
+
+        for event in events {
+            if let Err(e) = self.handle_work_pr_associated(&event) {
+                warn!(
+                    event_id = %event.event_id,
+                    error = %e,
+                    "Failed to process WorkPrAssociated event"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handles a single `WorkPrAssociated` event.
+    #[allow(clippy::cast_sign_loss)] // PR numbers are always positive
+    fn handle_work_pr_associated(
+        &self,
+        event: &SignedLedgerEvent,
+    ) -> Result<(), ProjectionWorkerError> {
+        // Parse payload to extract PR metadata
+        let payload: serde_json::Value = serde_json::from_slice(&event.payload)
+            .map_err(|e| ProjectionWorkerError::InvalidPayload(e.to_string()))?;
+
+        let work_id = payload
+            .get("work_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&event.work_id);
+
+        let pr_number = payload
+            .get("pr_number")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                ProjectionWorkerError::InvalidPayload("missing pr_number".to_string())
+            })?;
+
+        let repo_owner = payload
+            .get("repo_owner")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ProjectionWorkerError::InvalidPayload("missing repo_owner".to_string())
+            })?;
+
+        let repo_name = payload
+            .get("repo_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ProjectionWorkerError::InvalidPayload("missing repo_name".to_string())
+            })?;
+
+        let head_sha = payload
+            .get("head_sha")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ProjectionWorkerError::InvalidPayload("missing head_sha".to_string()))?;
+
+        // Register PR metadata
+        self.work_index
+            .register_pr(work_id, pr_number, repo_owner, repo_name, head_sha)?;
+
+        // Also register commit SHA for status projection if changeset_digest is present
+        if let Some(changeset_digest_hex) = payload.get("changeset_digest").and_then(|v| v.as_str())
+        {
+            if let Ok(digest_bytes) = hex::decode(changeset_digest_hex) {
+                if digest_bytes.len() == 32 {
+                    let mut changeset_digest = [0u8; 32];
+                    changeset_digest.copy_from_slice(&digest_bytes);
+                    self.work_index
+                        .register_commit_sha(&changeset_digest, head_sha)?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -655,38 +954,89 @@ impl ProjectionWorker {
             })?;
 
         // Look up PR metadata
-        let pr_metadata = self
-            .work_index
-            .get_pr_metadata(&work_id)
-            .ok_or_else(|| ProjectionWorkerError::NoPrAssociation {
+        let pr_metadata = self.work_index.get_pr_metadata(&work_id).ok_or_else(|| {
+            ProjectionWorkerError::NoPrAssociation {
                 work_id: work_id.clone(),
-            })?;
+            }
+        })?;
+
+        // Parse review verdict to determine status (Major fix: hardcoded success)
+        let verdict = payload
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("success");
+        let status = Self::parse_review_verdict(verdict);
+
+        // Extract summary if present
+        let summary = payload.get("summary").and_then(|v| v.as_str());
 
         info!(
             receipt_id = %receipt_id,
             work_id = %work_id,
             pr_number = pr_metadata.pr_number,
+            verdict = %verdict,
             "Processing review receipt for projection"
         );
 
         // Project to GitHub if adapter is configured
         if let Some(ref adapter) = self.adapter {
+            // Register commit SHA for status projection (in case it wasn't in changeset
+            // event)
+            adapter
+                .register_commit_sha(&changeset_digest, &pr_metadata.head_sha)
+                .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
+
             // Get ledger head for idempotency key
             let ledger_head = self.tailer.get_ledger_head()?.unwrap_or([0u8; 32]);
 
-            // Project status (success for now; in production would parse review
-            // verdict)
-            let receipt = adapter
-                .project_status(&work_id, changeset_digest, ledger_head, ProjectedStatus::Success)
+            // Project status (uses parsed verdict, not hardcoded success)
+            let projection_receipt = adapter
+                .project_status(&work_id, changeset_digest, ledger_head, status)
                 .await
                 .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
 
             info!(
-                receipt_id = %receipt.receipt_id,
+                receipt_id = %projection_receipt.receipt_id,
                 work_id = %work_id,
-                status = %receipt.projected_status,
+                status = %projection_receipt.projected_status,
                 "Projected status to GitHub"
             );
+
+            // Post PR comment (idempotent - check before posting)
+            // Blocker fix: Comment projection is now idempotent
+            let comment_receipt_id = format!("{receipt_id}-comment");
+            if self.work_index.is_comment_posted(&comment_receipt_id) {
+                debug!(
+                    receipt_id = %receipt_id,
+                    "Skipping comment post (already posted - idempotency)"
+                );
+            } else {
+                let comment_body = GitHubProjectionAdapter::<
+                    super::divergence_watchdog::SystemTimeSource,
+                >::format_review_comment(
+                    receipt_id, status, summary
+                );
+
+                adapter
+                    .post_comment(pr_metadata.pr_number, &comment_body)
+                    .await
+                    .map_err(|e| ProjectionWorkerError::ProjectionFailed(e.to_string()))?;
+
+                // Record that comment was posted for idempotency
+                self.work_index.record_comment_posted(
+                    &comment_receipt_id,
+                    &work_id,
+                    pr_metadata.pr_number,
+                    "review",
+                )?;
+
+                info!(
+                    receipt_id = %receipt_id,
+                    work_id = %work_id,
+                    pr_number = pr_metadata.pr_number,
+                    "Posted review comment to GitHub PR"
+                );
+            }
         } else {
             debug!(
                 work_id = %work_id,
@@ -695,6 +1045,23 @@ impl ProjectionWorker {
         }
 
         Ok(())
+    }
+
+    /// Parses a review verdict string into a `ProjectedStatus`.
+    ///
+    /// Major fix: Previously hardcoded to Success, now parses actual verdict.
+    fn parse_review_verdict(verdict: &str) -> ProjectedStatus {
+        match verdict.to_lowercase().as_str() {
+            "success" | "pass" | "approved" => ProjectedStatus::Success,
+            "failure" | "fail" | "rejected" => ProjectedStatus::Failure,
+            "pending" | "in_progress" => ProjectedStatus::Pending,
+            "error" | "errored" => ProjectedStatus::Error,
+            "cancelled" | "canceled" | "skipped" => ProjectedStatus::Cancelled,
+            _ => {
+                warn!(verdict = %verdict, "Unknown review verdict, defaulting to Pending");
+                ProjectedStatus::Pending
+            },
+        }
     }
 }
 
@@ -877,7 +1244,9 @@ mod tests {
         let work_id = "work-001";
 
         // Register changeset -> work_id
-        index.register_changeset(&changeset_digest, work_id).unwrap();
+        index
+            .register_changeset(&changeset_digest, work_id)
+            .unwrap();
 
         // Register work_id -> PR
         index

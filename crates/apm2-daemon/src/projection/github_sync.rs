@@ -1026,11 +1026,7 @@ impl GitHubClient {
     ///
     /// Per RFC-0019, the projection worker posts review comments to PRs.
     /// This enables automated code review feedback from the FAC.
-    async fn post_pr_comment(
-        &self,
-        pr_number: u64,
-        body: &str,
-    ) -> Result<(), ProjectionError> {
+    async fn post_pr_comment(&self, pr_number: u64, body: &str) -> Result<(), ProjectionError> {
         use bytes::Bytes;
         use http_body_util::Full;
         use hyper_rustls::HttpsConnectorBuilder;
@@ -1083,7 +1079,10 @@ impl GitHubClient {
             });
         }
 
-        debug!(pr_number = pr_number, "GitHub PR comment posted successfully");
+        debug!(
+            pr_number = pr_number,
+            "GitHub PR comment posted successfully"
+        );
         Ok(())
     }
 }
@@ -1774,8 +1773,8 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
     ///
     /// - **Write-only**: Comments are posted based on ledger state, not GitHub
     ///   reads
-    /// - **Idempotency**: Callers should track comment posting via ledger events
-    ///   to avoid duplicates
+    /// - **Idempotency**: Callers should track comment posting via ledger
+    ///   events to avoid duplicates
     ///
     /// # Arguments
     ///
@@ -1787,11 +1786,7 @@ impl<T: TimeSource> GitHubProjectionAdapter<T> {
     /// Returns [`ProjectionError::GitHubApiError`] if the API call fails.
     /// Returns [`ProjectionError::RateLimitExceeded`] if rate limited.
     /// Returns [`ProjectionError::AuthenticationError`] if auth fails.
-    pub async fn post_comment(
-        &self,
-        pr_number: u64,
-        body: &str,
-    ) -> Result<(), ProjectionError> {
+    pub async fn post_comment(&self, pr_number: u64, body: &str) -> Result<(), ProjectionError> {
         if self.mock_mode {
             debug!(pr_number = pr_number, "mock mode: skipping comment post");
             return Ok(());
