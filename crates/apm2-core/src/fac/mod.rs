@@ -331,3 +331,4 @@ pub use view_commitment::{
     MAX_WORK_ID_LENGTH as MAX_VIEW_COMMITMENT_WORK_ID_LENGTH, VIEW_COMMITMENT_V1_SCHEMA,
     ViewCommitmentError, ViewCommitmentV1, ViewCommitmentV1Builder,
 };
+pub mod role_routing;

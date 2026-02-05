@@ -202,6 +202,12 @@ pub enum RoleType {
     CodeQualityReviewer,
     /// Security reviewer role: detects unsafe patterns, policy violations.
     SecurityReviewer,
+    /// Test flake fixer: fixes test failures.
+    TestFlakeFixer,
+    /// Rust compile error fixer: fixes compilation errors.
+    RustCompileErrorFixer,
+    /// Dependency updater: updates dependencies.
+    DependencyUpdater,
     /// Custom role: user-defined role with explicit specification.
     Custom,
 }
@@ -213,6 +219,9 @@ impl std::fmt::Display for RoleType {
             Self::Implementer => write!(f, "implementer"),
             Self::CodeQualityReviewer => write!(f, "code_quality_reviewer"),
             Self::SecurityReviewer => write!(f, "security_reviewer"),
+            Self::TestFlakeFixer => write!(f, "test_flake_fixer"),
+            Self::RustCompileErrorFixer => write!(f, "rust_compile_error_fixer"),
+            Self::DependencyUpdater => write!(f, "dependency_updater"),
             Self::Custom => write!(f, "custom"),
         }
     }
@@ -227,6 +236,9 @@ impl FromStr for RoleType {
             "implementer" => Ok(Self::Implementer),
             "code_quality_reviewer" => Ok(Self::CodeQualityReviewer),
             "security_reviewer" => Ok(Self::SecurityReviewer),
+            "test_flake_fixer" => Ok(Self::TestFlakeFixer),
+            "rust_compile_error_fixer" => Ok(Self::RustCompileErrorFixer),
+            "dependency_updater" => Ok(Self::DependencyUpdater),
             "custom" => Ok(Self::Custom),
             _ => Err(RoleSpecError::InvalidRoleType(s.to_string())),
         }
