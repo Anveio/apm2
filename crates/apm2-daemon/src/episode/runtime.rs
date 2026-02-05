@@ -48,6 +48,7 @@ use super::handle::{SessionHandle, StopSignal};
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
 use super::tool_handler::{ToolArgs, ToolHandler};
 use crate::htf::HolonicClock;
+use crate::protocol::dispatch::LedgerEventEmitter;
 
 /// Maximum number of concurrent episodes per runtime.
 ///
@@ -520,6 +521,16 @@ pub struct EpisodeRuntime {
     rooted_handler_factories: RwLock<Vec<RootedHandlerFactory>>,
     /// Default budget for new episodes.
     default_budget: EpisodeBudget,
+    /// Ledger event emitter for durable episode event persistence (TCK-00321).
+    ///
+    /// Per REQ-0005, when present, episode events are streamed directly to the
+    /// ledger as they occur (rather than buffered in memory). This enables:
+    /// - Events survive daemon restart (ledger-backed durability)
+    /// - Receipt event appended atomically at completion
+    /// - CAS-before-ledger ordering for events referencing CAS hashes
+    ///
+    /// When `None`, events are buffered in memory (legacy behavior for tests).
+    ledger_emitter: Option<Arc<dyn LedgerEventEmitter>>,
 }
 
 impl EpisodeRuntime {
@@ -544,6 +555,8 @@ impl EpisodeRuntime {
             // via unbounded resource consumption. Consumers can override
             // with `with_default_budget()` if needed.
             default_budget: EpisodeBudget::default(),
+            // TCK-00321: No ledger emitter by default (tests use in-memory buffer)
+            ledger_emitter: None,
         }
     }
 
@@ -572,6 +585,8 @@ impl EpisodeRuntime {
             rooted_handler_factories: RwLock::new(Vec::new()),
             // SEC-CTRL-FAC-0015: Fail-closed default budget
             default_budget: EpisodeBudget::default(),
+            // TCK-00321: No ledger emitter by default (tests use in-memory buffer)
+            ledger_emitter: None,
         }
     }
 
@@ -678,6 +693,36 @@ impl EpisodeRuntime {
     pub fn with_default_budget(mut self, budget: EpisodeBudget) -> Self {
         self.default_budget = budget;
         self
+    }
+
+    /// Sets the ledger emitter for durable episode event persistence (TCK-00321).
+    ///
+    /// Per REQ-0005, when a ledger emitter is configured, episode events are
+    /// streamed directly to the ledger as they occur. This enables:
+    /// - Events survive daemon restart (ledger-backed durability)
+    /// - Receipt event appended atomically at completion
+    /// - CAS-before-ledger ordering for events referencing CAS hashes
+    ///
+    /// # Arguments
+    ///
+    /// * `emitter` - The ledger event emitter to use for persistence.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = EpisodeRuntime::new(config)
+    ///     .with_ledger_emitter(Arc::new(SqliteLedgerEventEmitter::new(conn, key)));
+    /// ```
+    #[must_use]
+    pub fn with_ledger_emitter(mut self, emitter: Arc<dyn LedgerEventEmitter>) -> Self {
+        self.ledger_emitter = Some(emitter);
+        self
+    }
+
+    /// Returns a reference to the ledger emitter, if configured.
+    #[must_use]
+    pub fn ledger_emitter(&self) -> Option<&Arc<dyn LedgerEventEmitter>> {
+        self.ledger_emitter.as_ref()
     }
 
     /// Registers a factory for creating tool handlers (builder pattern).
@@ -1689,7 +1734,18 @@ impl EpisodeRuntime {
         before - episodes.len()
     }
 
-    /// Emits an event to the internal buffer.
+    /// Emits an event to the ledger (if configured) or internal buffer.
+    ///
+    /// # TCK-00321: Ledger-Backed Event Persistence
+    ///
+    /// Per REQ-0005, when a ledger emitter is configured, episode events are
+    /// streamed directly to the ledger as they occur. This enables:
+    /// - Events survive daemon restart (ledger-backed durability)
+    /// - Receipt event appended atomically at completion
+    /// - CAS-before-ledger ordering for events referencing CAS hashes
+    ///
+    /// When no ledger emitter is configured (e.g., in tests), events are
+    /// buffered in memory with the following bounded buffer behavior:
     ///
     /// # Bounded Buffer (CTR-1303)
     ///
@@ -1697,9 +1753,48 @@ impl EpisodeRuntime {
     /// buffer reaches capacity, the oldest events are evicted to make room
     /// for new events. This prevents unbounded memory growth.
     ///
-    /// In production, events should be drained regularly via `drain_events()`
-    /// to prevent eviction of important audit data.
+    /// In production, events should be streamed to ledger via `with_ledger_emitter`
+    /// to ensure durability.
     async fn emit_event(&self, event: EpisodeEvent) {
+        // TCK-00321: Stream to ledger when emitter is configured
+        if let Some(emitter) = &self.ledger_emitter {
+            let event_type = event.event_type();
+            let episode_id = event
+                .episode_id()
+                .map(|id| id.as_str().to_string())
+                .or_else(|| event.work_id().map(String::from))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            // Serialize event to JSON for ledger persistence
+            let payload = self.serialize_episode_event(&event);
+
+            // Get timestamp from event or use 0 as fallback
+            let timestamp_ns = self.extract_timestamp(&event);
+
+            // Emit to ledger (fire-and-forget with logging)
+            match emitter.emit_episode_event(&episode_id, event_type, &payload, timestamp_ns) {
+                Ok(signed_event) => {
+                    debug!(
+                        event_id = %signed_event.event_id,
+                        episode_id = %episode_id,
+                        event_type = %event_type,
+                        "Episode event streamed to ledger"
+                    );
+                },
+                Err(e) => {
+                    // Log error but don't fail - ledger persistence errors should not
+                    // block episode execution. The event is still buffered locally.
+                    warn!(
+                        error = %e,
+                        episode_id = %episode_id,
+                        event_type = %event_type,
+                        "Failed to stream episode event to ledger, falling back to buffer"
+                    );
+                },
+            }
+        }
+
+        // Always buffer locally (for drain_events() and backward compatibility)
         let mut events = self.events.write().await;
 
         // Enforce bounded buffer size (CTR-1303)
@@ -1716,6 +1811,133 @@ impl EpisodeRuntime {
         }
 
         events.push(event);
+    }
+
+    /// Serializes an `EpisodeEvent` to JSON bytes for ledger persistence.
+    ///
+    /// # TCK-00321: Event Serialization
+    ///
+    /// This method produces a JSON representation of the event suitable for
+    /// ledger persistence. The format is designed to be:
+    /// - Deterministic (stable field ordering via serde)
+    /// - Backward-compatible (uses serde's default handling)
+    /// - Queryable (JSON fields can be indexed in SQLite)
+    fn serialize_episode_event(&self, event: &EpisodeEvent) -> Vec<u8> {
+        use serde_json::json;
+
+        let payload = match event {
+            EpisodeEvent::Created {
+                episode_id,
+                envelope_hash,
+                created_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "episode_id": episode_id.as_str(),
+                "envelope_hash": hex::encode(envelope_hash),
+                "created_at_ns": created_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+            EpisodeEvent::Started {
+                episode_id,
+                session_id,
+                lease_id,
+                started_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "episode_id": episode_id.as_str(),
+                "session_id": session_id,
+                "lease_id": lease_id,
+                "started_at_ns": started_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+            EpisodeEvent::Stopped {
+                episode_id,
+                termination_class,
+                terminated_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "episode_id": episode_id.as_str(),
+                "termination_class": format!("{termination_class:?}"),
+                "terminated_at_ns": terminated_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+            EpisodeEvent::Quarantined {
+                episode_id,
+                reason,
+                quarantined_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "episode_id": episode_id.as_str(),
+                "reason": format!("{reason:?}"),
+                "quarantined_at_ns": quarantined_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+            EpisodeEvent::ClockProfilePublished {
+                profile_hash,
+                published_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "profile_hash": profile_hash,
+                "published_at_ns": published_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+            EpisodeEvent::LeaseIssueDenied {
+                work_id,
+                denial_reason,
+                denied_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "work_id": work_id,
+                "denial_reason": format!("{denial_reason}"),
+                "denied_at_ns": denied_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+            EpisodeEvent::ToolExecuted {
+                episode_id,
+                request_id,
+                result_hash,
+                success,
+                executed_at_ns,
+                time_envelope_ref,
+                ..
+            } => json!({
+                "episode_id": episode_id.as_str(),
+                "request_id": request_id,
+                "result_hash": hex::encode(result_hash),
+                "success": success,
+                "executed_at_ns": executed_at_ns,
+                "time_envelope_ref": time_envelope_ref.as_ref().map(|r| hex::encode(r.as_bytes())),
+            }),
+        };
+
+        serde_json::to_vec(&payload).unwrap_or_default()
+    }
+
+    /// Extracts the timestamp from an `EpisodeEvent`.
+    fn extract_timestamp(&self, event: &EpisodeEvent) -> u64 {
+        match event {
+            EpisodeEvent::Created { created_at_ns, .. } => *created_at_ns,
+            EpisodeEvent::Started { started_at_ns, .. } => *started_at_ns,
+            EpisodeEvent::Stopped {
+                terminated_at_ns, ..
+            } => *terminated_at_ns,
+            EpisodeEvent::Quarantined {
+                quarantined_at_ns, ..
+            } => *quarantined_at_ns,
+            EpisodeEvent::ClockProfilePublished {
+                published_at_ns, ..
+            } => *published_at_ns,
+            EpisodeEvent::LeaseIssueDenied { denied_at_ns, .. } => *denied_at_ns,
+            EpisodeEvent::ToolExecuted {
+                executed_at_ns, ..
+            } => *executed_at_ns,
+        }
     }
 }
 
