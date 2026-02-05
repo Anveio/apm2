@@ -368,8 +368,7 @@ pub use server::{
 pub use session_dispatch::{
     SessionDispatcher, SessionMessageType, SessionResponse, encode_emit_event_request,
     encode_publish_evidence_request, encode_request_tool_request, encode_session_status_request,
-    encode_stream_logs_request,
-    encode_stream_telemetry_request,
+    encode_stream_logs_request, encode_stream_telemetry_request,
 };
 #[allow(unused_imports)]
 pub use session_token::{SessionToken, SessionTokenError, TokenMinter};

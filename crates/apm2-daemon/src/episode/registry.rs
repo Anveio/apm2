@@ -852,11 +852,7 @@ impl SessionRegistry for InMemorySessionRegistry {
 
     fn get_session_by_work_id(&self, work_id: &str) -> Option<SessionState> {
         let state = self.state.read().expect("lock poisoned");
-        state
-            .by_id
-            .values()
-            .find(|s| s.work_id == work_id)
-            .cloned()
+        state.by_id.values().find(|s| s.work_id == work_id).cloned()
     }
 }
 
