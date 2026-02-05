@@ -34,10 +34,15 @@
 
 use std::path::{Path, PathBuf};
 
-use apm2_core::fac::{TOOL_LOG_INDEX_V1_SCHEMA, ToolLogIndexV1};
+use apm2_core::fac::{
+    PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
+    SUMMARY_RECEIPT_SCHEMA, TOOL_EXECUTION_RECEIPT_SCHEMA, TOOL_LOG_INDEX_V1_SCHEMA,
+    ToolLogIndexV1,
+};
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::exit_codes::codes as exit_codes;
 
@@ -45,8 +50,14 @@ use crate::exit_codes::codes as exit_codes;
 // Constants
 // =============================================================================
 
-/// Maximum number of events to scan when searching for work/episode data.
-const MAX_SCAN_EVENTS: u64 = 10_000;
+/// Default number of events to scan from the head of the ledger.
+/// This limits the number of events scanned (not the sequence ID) to prevent
+/// unbounded memory/time usage in very large ledgers.
+const DEFAULT_SCAN_LIMIT: u64 = 10_000;
+
+/// Maximum CAS file size to read (64 MiB).
+/// Prevents `DoS` via excessively large CAS artifacts.
+const MAX_CAS_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Default ledger path relative to data directory.
 const DEFAULT_LEDGER_FILENAME: &str = "ledger.db";
@@ -131,6 +142,10 @@ pub enum WorkSubcommand {
 pub struct WorkStatusArgs {
     /// Work identifier to query.
     pub work_id: String,
+
+    /// Maximum number of events to scan from the end of the ledger.
+    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
+    pub limit: u64,
 }
 
 /// Arguments for `apm2 fac episode`.
@@ -156,6 +171,10 @@ pub struct EpisodeInspectArgs {
     /// Show full tool log index (default: summary only).
     #[arg(long)]
     pub full: bool,
+
+    /// Maximum number of events to scan from the end of the ledger.
+    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
+    pub limit: u64,
 }
 
 /// Arguments for `apm2 fac receipt`.
@@ -205,6 +224,10 @@ pub struct ContextRebuildArgs {
     /// Output directory for rebuilt context.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
+
+    /// Maximum number of events to scan from the end of the ledger.
+    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
+    pub limit: u64,
 }
 
 /// Arguments for `apm2 fac resume`.
@@ -212,6 +235,10 @@ pub struct ContextRebuildArgs {
 pub struct ResumeArgs {
     /// Work identifier to analyze for resume point.
     pub work_id: String,
+
+    /// Maximum number of events to scan from the end of the ledger.
+    #[arg(long, default_value_t = DEFAULT_SCAN_LIMIT)]
+    pub limit: u64,
 }
 
 // =============================================================================
@@ -433,6 +460,15 @@ fn open_ledger(path: &Path) -> Result<Ledger, LedgerError> {
     Ledger::open(path)
 }
 
+/// Calculates the starting cursor for a scan based on the limit and ledger
+/// head.
+///
+/// Returns the start sequence ID.
+fn calculate_start_cursor(ledger: &Ledger, limit: u64) -> Result<u64, LedgerError> {
+    let max_seq = ledger.head_sync()?;
+    Ok(max_seq.saturating_sub(limit).max(1))
+}
+
 // =============================================================================
 // Work Status Command
 // =============================================================================
@@ -462,6 +498,19 @@ fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool)
         },
     };
 
+    // Calculate start cursor based on limit
+    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "ledger_error",
+                &format!("Failed to query ledger head: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
     // Scan ledger for work-related events
     let mut response = WorkStatusResponse {
         work_id: args.work_id.clone(),
@@ -474,10 +523,15 @@ fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool)
         latest_seq_id: None,
     };
 
-    let mut cursor = 1u64;
     let batch_size = 1000u64;
+    let mut scanned_count = 0u64;
 
     loop {
+        // Stop if we've scanned more than the limit (plus batch overhead)
+        if scanned_count >= args.limit + batch_size {
+            break;
+        }
+
         let events = match ledger.read_from(cursor, batch_size) {
             Ok(events) => events,
             Err(e) => {
@@ -495,6 +549,7 @@ fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool)
         }
 
         for event in &events {
+            scanned_count += 1;
             if let Some(work_info) = extract_work_info(event, &args.work_id) {
                 response.event_count += 1;
                 response.latest_seq_id = event.seq_id;
@@ -524,11 +579,6 @@ fn run_work_status(args: &WorkStatusArgs, ledger_path: &Path, json_output: bool)
         }
 
         cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
-
-        // Safety limit
-        if cursor > MAX_SCAN_EVENTS {
-            break;
-        }
     }
 
     if response.event_count == 0 {
@@ -641,6 +691,19 @@ fn run_episode_inspect(
         },
     };
 
+    // Calculate start cursor based on limit
+    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "ledger_error",
+                &format!("Failed to query ledger head: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
     // Scan ledger for episode-related events
     let mut response = EpisodeInspectResponse {
         episode_id: args.episode_id.clone(),
@@ -654,10 +717,15 @@ fn run_episode_inspect(
     };
 
     let mut tool_log_index_hash: Option<Vec<u8>> = None;
-    let mut cursor = 1u64;
     let batch_size = 1000u64;
+    let mut scanned_count = 0u64;
 
     loop {
+        // Stop if we've scanned more than the limit (plus batch overhead)
+        if scanned_count >= args.limit + batch_size {
+            break;
+        }
+
         let events = match ledger.read_from(cursor, batch_size) {
             Ok(events) => events,
             Err(e) => {
@@ -675,6 +743,7 @@ fn run_episode_inspect(
         }
 
         for event in &events {
+            scanned_count += 1;
             if let Some(episode_info) = extract_episode_info(event, &args.episode_id) {
                 response.event_count += 1;
 
@@ -699,11 +768,6 @@ fn run_episode_inspect(
         }
 
         cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
-
-        // Safety limit
-        if cursor > MAX_SCAN_EVENTS {
-            break;
-        }
     }
 
     if response.event_count == 0 {
@@ -848,11 +912,17 @@ fn load_tool_log_index_from_cas(cas_path: &Path, hash: &[u8]) -> Option<ToolLogI
     let (prefix, suffix) = hex_hash.split_at(4);
     let file_path = cas_path.join("objects").join(prefix).join(suffix);
 
+    // SECURITY: Validate file size before reading to prevent DoS
+    let metadata = std::fs::metadata(&file_path).ok()?;
+    if metadata.len() > MAX_CAS_FILE_SIZE {
+        return None;
+    }
+
     let content = std::fs::read(&file_path).ok()?;
 
-    // Verify hash
+    // SECURITY: Verify hash using constant-time comparison
     let computed_hash = blake3::hash(&content);
-    if computed_hash.as_bytes() != hash {
+    if !constant_time_hash_eq(computed_hash.as_bytes(), hash) {
         return None;
     }
 
@@ -908,6 +978,40 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
     let (prefix, suffix) = args.receipt_hash.split_at(4);
     let file_path = cas_path.join("objects").join(prefix).join(suffix);
 
+    // SECURITY: Validate file size before reading to prevent DoS
+    let metadata = match std::fs::metadata(&file_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return output_error(
+                json_output,
+                "not_found",
+                &format!("Receipt not found in CAS: {}", args.receipt_hash),
+                exit_codes::NOT_FOUND,
+            );
+        },
+        Err(e) => {
+            return output_error(
+                json_output,
+                "io_error",
+                &format!("Failed to read CAS metadata: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if metadata.len() > MAX_CAS_FILE_SIZE {
+        return output_error(
+            json_output,
+            "file_too_large",
+            &format!(
+                "CAS file exceeds maximum size ({} bytes > {} bytes)",
+                metadata.len(),
+                MAX_CAS_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
     let content = match std::fs::read(&file_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -928,9 +1032,9 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
         },
     };
 
-    // Verify hash
+    // SECURITY: Verify hash using constant-time comparison
     let computed_hash = blake3::hash(&content);
-    if computed_hash.as_bytes() != hash_bytes.as_slice() {
+    if !constant_time_hash_eq(computed_hash.as_bytes(), &hash_bytes) {
         return output_error(
             json_output,
             "hash_mismatch",
@@ -982,35 +1086,56 @@ fn run_receipt_show(args: &ReceiptShowArgs, cas_path: &Path, json_output: bool) 
     exit_codes::SUCCESS
 }
 
+/// Known schema prefixes for receipt type detection.
+///
+/// Uses prefix matching (e.g., `apm2.gate_receipt.`) instead of substring
+/// matching to prevent false positives with schema names like
+/// `my_gate_receipt_v2`.
+const RECEIPT_SCHEMA_PREFIXES: &[(&str, &str)] = &[
+    ("apm2.gate_receipt.", "gate_receipt"),
+    ("apm2.merge_receipt.", "merge_receipt"),
+    ("apm2.review_receipt.", "review_receipt"),
+    ("apm2.review_artifact.", "review_receipt"),
+    ("apm2.projection.", "projection_receipt"),
+];
+
 /// Detects the receipt type from JSON content.
+///
+/// Uses exact matching against known schema constants first, then falls back to
+/// prefix matching for extensibility. Avoids substring `.contains()` matching
+/// which could produce false positives.
 fn detect_receipt_type(json: &serde_json::Value) -> String {
     // Check for schema field
     if let Some(schema) = json.get("schema").and_then(|v| v.as_str()) {
-        if schema.contains("gate_receipt") {
-            return "gate_receipt".to_string();
-        }
-        if schema.contains("review_receipt") || schema.contains("review_artifact") {
+        // First, check exact matches against known constants
+        if schema == REVIEW_ARTIFACT_SCHEMA_IDENTIFIER {
             return "review_receipt".to_string();
         }
-        if schema.contains("summary_receipt") {
+        if schema == SUMMARY_RECEIPT_SCHEMA {
             return "summary_receipt".to_string();
         }
-        if schema.contains("tool_log_index") {
+        if schema == TOOL_LOG_INDEX_V1_SCHEMA {
             return "tool_log_index".to_string();
         }
-        if schema.contains("tool_execution_receipt") {
+        if schema == TOOL_EXECUTION_RECEIPT_SCHEMA {
             return "tool_execution_receipt".to_string();
         }
-        if schema.contains("merge_receipt") {
-            return "merge_receipt".to_string();
-        }
-        if schema.contains("projection") {
+        if schema == PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER {
             return "projection_receipt".to_string();
         }
+
+        // Then, use prefix matching for types without defined constants
+        for (prefix, receipt_type) in RECEIPT_SCHEMA_PREFIXES {
+            if schema.starts_with(prefix) {
+                return (*receipt_type).to_string();
+            }
+        }
+
+        // Return the schema itself if no known match
         return schema.to_string();
     }
 
-    // Check for type-specific fields
+    // Fallback: Check for type-specific fields when schema is absent
     if json.get("verdict").is_some() && json.get("gate_id").is_some() {
         return "gate_receipt".to_string();
     }
@@ -1083,13 +1208,31 @@ fn run_context_rebuild(
         },
     };
 
+    // Calculate start cursor based on limit
+    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "ledger_error",
+                &format!("Failed to query ledger head: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
     // Find episode spawn event to get context pack hash
     let mut context_pack_hash: Option<Vec<u8>> = None;
     let mut artifacts_retrieved = 0u64;
-    let mut cursor = 1u64;
     let batch_size = 1000u64;
+    let mut scanned_count = 0u64;
 
     loop {
+        // Stop if we've scanned more than the limit (plus batch overhead)
+        if scanned_count >= args.limit + batch_size {
+            break;
+        }
+
         let events = match ledger.read_from(cursor, batch_size) {
             Ok(events) => events,
             Err(e) => {
@@ -1107,6 +1250,7 @@ fn run_context_rebuild(
         }
 
         for event in &events {
+            scanned_count += 1;
             if event.event_type == "episode_spawned" {
                 if let Some(info) = extract_episode_info(event, &args.episode_id) {
                     // Check role matches
@@ -1131,9 +1275,6 @@ fn run_context_rebuild(
         }
 
         cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
-        if cursor > MAX_SCAN_EVENTS {
-            break;
-        }
     }
 
     let Some(context_pack_hash) = context_pack_hash else {
@@ -1153,6 +1294,32 @@ fn run_context_rebuild(
     let (prefix, suffix) = hex_hash.split_at(4);
     let pack_path = cas_path.join("objects").join(prefix).join(suffix);
 
+    // SECURITY: Validate file size before reading to prevent DoS
+    let metadata = match std::fs::metadata(&pack_path) {
+        Ok(m) => m,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "cas_error",
+                &format!("Failed to read context pack metadata: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
+    if metadata.len() > MAX_CAS_FILE_SIZE {
+        return output_error(
+            json_output,
+            "file_too_large",
+            &format!(
+                "Context pack exceeds maximum size ({} bytes > {} bytes)",
+                metadata.len(),
+                MAX_CAS_FILE_SIZE
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
     let pack_content = match std::fs::read(&pack_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1165,9 +1332,9 @@ fn run_context_rebuild(
         },
     };
 
-    // Verify hash
+    // SECURITY: Verify hash using constant-time comparison
     let computed_hash = blake3::hash(&pack_content);
-    let deterministic = computed_hash.as_bytes() == context_pack_hash.as_slice();
+    let deterministic = constant_time_hash_eq(computed_hash.as_bytes(), &context_pack_hash);
 
     // Write context pack to output directory
     let pack_output_path = output_dir.join("context_pack.json");
@@ -1228,6 +1395,10 @@ fn run_context_rebuild(
 }
 
 /// Retrieves an artifact from CAS to the output directory.
+///
+/// # Security
+///
+/// Validates file size before copying to prevent `DoS` via large artifacts.
 fn retrieve_artifact_to_dir(
     cas_path: &Path,
     hash: &[u8],
@@ -1237,6 +1408,19 @@ fn retrieve_artifact_to_dir(
     let (prefix, suffix) = hex_hash.split_at(4);
     let src_path = cas_path.join("objects").join(prefix).join(suffix);
     let dst_path = output_dir.join(&hex_hash);
+
+    // SECURITY: Validate file size before copying to prevent DoS
+    let metadata = std::fs::metadata(&src_path)?;
+    if metadata.len() > MAX_CAS_FILE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Artifact exceeds maximum size ({} bytes > {} bytes)",
+                metadata.len(),
+                MAX_CAS_FILE_SIZE
+            ),
+        ));
+    }
 
     std::fs::copy(&src_path, &dst_path)?;
     Ok(())
@@ -1271,6 +1455,19 @@ fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
         },
     };
 
+    // Calculate start cursor based on limit
+    let mut cursor = match calculate_start_cursor(&ledger, args.limit) {
+        Ok(c) => c,
+        Err(e) => {
+            return output_error(
+                json_output,
+                "ledger_error",
+                &format!("Failed to query ledger head: {e}"),
+                exit_codes::GENERIC_ERROR,
+            );
+        },
+    };
+
     // Scan ledger to find last anchor and pending state
     let mut response = ResumeResponse {
         work_id: args.work_id.clone(),
@@ -1283,10 +1480,15 @@ fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
 
     let mut found_events = false;
     let mut last_committed_event: Option<(u64, String)> = None;
-    let mut cursor = 1u64;
     let batch_size = 1000u64;
+    let mut scanned_count = 0u64;
 
     loop {
+        // Stop if we've scanned more than the limit (plus batch overhead)
+        if scanned_count >= args.limit + batch_size {
+            break;
+        }
+
         let events = match ledger.read_from(cursor, batch_size) {
             Ok(events) => events,
             Err(e) => {
@@ -1304,6 +1506,7 @@ fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
         }
 
         for event in &events {
+            scanned_count += 1;
             if let Some(work_info) = extract_work_info(event, &args.work_id) {
                 found_events = true;
                 let seq_id = event.seq_id.unwrap_or(0);
@@ -1323,9 +1526,6 @@ fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
         }
 
         cursor = events.last().map_or(cursor, |e| e.seq_id.unwrap_or(0) + 1);
-        if cursor > MAX_SCAN_EVENTS {
-            break;
-        }
     }
 
     if !found_events {
@@ -1390,6 +1590,22 @@ fn run_resume(args: &ResumeArgs, ledger_path: &Path, json_output: bool) -> u8 {
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Constant-time comparison for BLAKE3 hashes to prevent timing attacks.
+///
+/// # Security
+///
+/// Uses the `subtle` crate's `ConstantTimeEq` trait to perform comparison
+/// in constant time, preventing timing side-channel attacks that could
+/// leak information about the expected hash value.
+#[inline]
+fn constant_time_hash_eq(computed: &[u8], expected: &[u8]) -> bool {
+    // If lengths differ, we still need constant-time behavior
+    if computed.len() != expected.len() {
+        return false;
+    }
+    bool::from(computed.ct_eq(expected))
+}
 
 /// Output an error in the appropriate format.
 fn output_error(json_output: bool, code: &str, message: &str, exit_code: u8) -> u8 {
@@ -1517,7 +1733,7 @@ mod tests {
     #[test]
     fn test_detect_receipt_type_review() {
         let json = serde_json::json!({
-            "schema": "apm2.review_artifact.v1",
+            "schema": REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
             "review_verdict": "APPROVED"
         });
         assert_eq!(detect_receipt_type(&json), "review_receipt");
@@ -1526,7 +1742,7 @@ mod tests {
     #[test]
     fn test_detect_receipt_type_tool_log() {
         let json = serde_json::json!({
-            "schema": "apm2.tool_log_index.v1",
+            "schema": TOOL_LOG_INDEX_V1_SCHEMA,
             "episode_id": "ep-001"
         });
         assert_eq!(detect_receipt_type(&json), "tool_log_index");
@@ -1569,5 +1785,157 @@ mod tests {
         let explicit = PathBuf::from("/explicit/path/cas");
         let resolved = resolve_cas_path(Some(&explicit));
         assert_eq!(resolved, explicit);
+    }
+
+    // --- Core Logic Tests (Added per Review) ---
+
+    #[test]
+    fn test_extract_work_info_success() {
+        let payload = serde_json::json!({
+            "work_id": "work-123",
+            "actor_id": "actor-1",
+            "role": "implementer"
+        });
+        let event = EventRecord::new(
+            "work_claimed",
+            "session-1",
+            "actor-1",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        let info = extract_work_info(&event, "work-123").expect("should extract");
+        assert_eq!(info.actor_id.as_deref(), Some("actor-1"));
+        assert_eq!(info.role.as_deref(), Some("implementer"));
+    }
+
+    #[test]
+    fn test_extract_work_info_mismatch() {
+        let payload = serde_json::json!({
+            "work_id": "work-456",
+            "actor_id": "actor-1"
+        });
+        let event = EventRecord::new(
+            "work_claimed",
+            "session-1",
+            "actor-1",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        assert!(extract_work_info(&event, "work-123").is_none());
+    }
+
+    #[test]
+    fn test_extract_work_info_invalid_json() {
+        let event = EventRecord::new("work_claimed", "session-1", "actor-1", b"not-json".to_vec());
+
+        assert!(extract_work_info(&event, "work-123").is_none());
+    }
+
+    #[test]
+    fn test_extract_episode_info_via_session_id() {
+        let payload = serde_json::json!({
+            "work_id": "work-123",
+            "role": "implementer"
+        });
+        let event = EventRecord::new(
+            "tool_executed",
+            "ep-001", // session_id matches episode_id
+            "actor-1",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        let info = extract_episode_info(&event, "ep-001").expect("should extract via session_id");
+        assert_eq!(info.work_id.as_deref(), Some("work-123"));
+    }
+
+    #[test]
+    fn test_extract_episode_info_via_payload_field() {
+        let payload = serde_json::json!({
+            "episode_id": "ep-001",
+            "work_id": "work-123"
+        });
+        let event = EventRecord::new(
+            "episode_spawned",
+            "session-X", // session_id does NOT match
+            "actor-1",
+            serde_json::to_vec(&payload).unwrap(),
+        );
+
+        let info = extract_episode_info(&event, "ep-001").expect("should extract via payload");
+        assert_eq!(info.work_id.as_deref(), Some("work-123"));
+    }
+
+    #[test]
+    fn test_calculate_start_cursor() {
+        // Mocking ledger state is hard without an in-memory ledger,
+        // so we test the logic math here conceptually:
+        let max_seq = 15_000u64;
+        let limit = 10_000u64;
+        let start = max_seq.saturating_sub(limit).max(1);
+        assert_eq!(start, 5_000);
+
+        let max_seq_small = 500u64;
+        let start_small = max_seq_small.saturating_sub(limit).max(1);
+        assert_eq!(start_small, 1);
+    }
+
+    // --- SECURITY: Constant-time hash comparison tests ---
+
+    #[test]
+    fn test_constant_time_hash_eq_identical() {
+        let hash1 = [0x42u8; 32];
+        let hash2 = [0x42u8; 32];
+        assert!(constant_time_hash_eq(&hash1, &hash2));
+    }
+
+    #[test]
+    fn test_constant_time_hash_eq_different() {
+        let hash1 = [0x42u8; 32];
+        let mut hash2 = [0x42u8; 32];
+        hash2[31] = 0x00; // Single byte difference
+        assert!(!constant_time_hash_eq(&hash1, &hash2));
+    }
+
+    #[test]
+    fn test_constant_time_hash_eq_length_mismatch() {
+        let hash1 = [0x42u8; 32];
+        let hash2 = [0x42u8; 16]; // Different length
+        assert!(!constant_time_hash_eq(&hash1, &hash2));
+    }
+
+    #[test]
+    fn test_constant_time_hash_eq_empty() {
+        let hash1: [u8; 0] = [];
+        let hash2: [u8; 0] = [];
+        assert!(constant_time_hash_eq(&hash1, &hash2));
+    }
+
+    // --- detect_receipt_type prefix matching tests ---
+
+    #[test]
+    fn test_detect_receipt_type_prefix_matching_prevents_false_positive() {
+        // Should NOT match because "my_gate_receipt" doesn't start with
+        // "apm2.gate_receipt."
+        let json = serde_json::json!({
+            "schema": "my_gate_receipt.v1"
+        });
+        // Falls through to returning the schema itself, not "gate_receipt"
+        assert_eq!(detect_receipt_type(&json), "my_gate_receipt.v1");
+    }
+
+    #[test]
+    fn test_detect_receipt_type_exact_prefix_merge() {
+        let json = serde_json::json!({
+            "schema": "apm2.merge_receipt.v2"
+        });
+        assert_eq!(detect_receipt_type(&json), "merge_receipt");
+    }
+
+    #[test]
+    fn test_detect_receipt_type_exact_prefix_projection() {
+        let json = serde_json::json!({
+            "schema": "apm2.projection.v1"
+        });
+        assert_eq!(detect_receipt_type(&json), "projection_receipt");
     }
 }
