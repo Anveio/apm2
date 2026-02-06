@@ -983,7 +983,11 @@ async fn test_perform_handshake_integration() {
     let config = SocketManagerConfig::new(&operator_path, &session_path);
     let manager = Arc::new(apm2_daemon::protocol::SocketManager::bind(config).unwrap());
 
-    let hs_config = HandshakeConfig::default();
+    // Use Tier1 (waive mismatch) for basic handshake integration test.
+    // Production default is Tier2 (deny), tested separately in
+    // connection_handler::tests.
+    let hs_config =
+        HandshakeConfig::default().with_risk_tier(apm2_daemon::hsi_contract::RiskTier::Tier1);
 
     // Spawn server using perform_handshake from the library
     let manager_clone = manager.clone();

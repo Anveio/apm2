@@ -2092,8 +2092,11 @@ async fn handle_dual_socket_connection(
     };
 
     // TCK-00287: Wire up tag-based ProtocolServer dispatchers
-    // Create connection context based on socket type
-    let ctx = match socket_type {
+    // Create connection context based on socket type.
+    // TCK-00348: Attach contract binding to connection context so it is
+    // threaded into SessionStarted events during SpawnEpisode (authoritative
+    // record with real session_id, not a surrogate connection_id).
+    let mut ctx = match socket_type {
         protocol::socket_manager::SocketType::Operator => {
             ConnectionContext::privileged(connection.peer_credentials().cloned())
         },
@@ -2101,17 +2104,16 @@ async fn handle_dual_socket_connection(
             ConnectionContext::session(connection.peer_credentials().cloned(), None)
         },
     };
+    ctx.set_contract_binding(contract_binding.clone());
 
-    // TCK-00348 BLOCKER 1: Persist contract binding evidence via ledger.
-    // Use the connection ID as session_id since formal session IDs are
-    // assigned later during SpawnEpisode. The connection-level binding
-    // record establishes which contract state was active when this
-    // connection was admitted.
+    // TCK-00348: Persist connection-level contract binding as an additional
+    // audit trail event. The authoritative record is in SessionStarted
+    // (via emit_spawn_lifecycle), but we also persist at connection time
+    // for belt-and-suspenders audit. Fail-closed: persistence failure
+    // terminates the connection.
     {
         let emitter = dispatcher_state.event_emitter();
         let connection_id_for_binding = ctx.connection_id().to_string();
-        // Use a best-effort timestamp. In production, the emitter's
-        // persistence timestamp is the authoritative audit record.
         #[allow(clippy::cast_possible_truncation)]
         let timestamp_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2122,10 +2124,13 @@ async fn handle_dual_socket_connection(
             &contract_binding,
             timestamp_ns,
         ) {
-            warn!(
+            error!(
                 error = %e,
-                "Failed to persist contract binding event (non-fatal)"
+                "Failed to persist contract binding event - closing connection (fail-closed)"
             );
+            return Err(anyhow::anyhow!(
+                "contract binding persistence failed (fail-closed): {e}"
+            ));
         }
     }
 

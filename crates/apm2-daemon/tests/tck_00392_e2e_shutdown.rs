@@ -88,8 +88,11 @@ fn spawn_server_loop(
                 let conn_state = state.clone();
                 let conn_ds = Arc::clone(&dispatcher_state);
                 tokio::spawn(async move {
-                    // Perform handshake
-                    let hs_cfg = HandshakeConfig::default();
+                    // Perform handshake.
+                    // Use Tier1 for test backward compat; production default
+                    // is Tier2 (deny) per TCK-00348.
+                    let hs_cfg = HandshakeConfig::default()
+                        .with_risk_tier(apm2_daemon::hsi_contract::RiskTier::Tier1);
                     if perform_handshake(&mut connection, &hs_cfg).await.is_err() {
                         return;
                     }

@@ -90,8 +90,15 @@ pub struct HandshakeConfig {
 }
 
 impl Default for HandshakeConfig {
-    /// Returns a default config with Tier1 risk, the daemon's standard
-    /// canonicalizer, and no metrics.
+    /// Returns a default config with Tier2 risk (fail-closed), the daemon's
+    /// standard canonicalizer, and no metrics.
+    ///
+    /// # Fail-Closed Default
+    ///
+    /// Per RFC-0020 section 4, the default risk tier is Tier2 so that
+    /// contract mismatches are **denied** in production unless an operator
+    /// explicitly relaxes the tier. This ensures unknown or unconfigured
+    /// deployments default to the safe (deny) behaviour.
     ///
     /// The server contract hash is computed lazily from `build_manifest()`
     /// on first use via [`HandshakeConfig::from_manifest`].
@@ -102,7 +109,7 @@ impl Default for HandshakeConfig {
                 id: DAEMON_CANONICALIZER_ID.to_string(),
                 version: DAEMON_CANONICALIZER_VERSION,
             }],
-            risk_tier: RiskTier::Tier1,
+            risk_tier: RiskTier::Tier2,
             metrics: None,
             manifest_unavailable: false,
         }
@@ -113,9 +120,12 @@ impl HandshakeConfig {
     /// Builds a `HandshakeConfig` from the current HSI contract manifest.
     ///
     /// Computes the server contract hash from the dispatch registry
-    /// manifest. On build failure, logs a warning and marks the config
-    /// as `manifest_unavailable` so that Tier2+ sessions are denied
-    /// (fail-closed per RFC-0020 section 4).
+    /// manifest. On success the risk tier defaults to Tier2 (deny on
+    /// mismatch). On build failure the tier escalates to Tier3
+    /// (fail-closed: unknown state must deny).
+    ///
+    /// Operators can relax the tier afterwards via
+    /// [`with_risk_tier`](Self::with_risk_tier).
     #[must_use]
     pub fn from_manifest() -> Self {
         let cli_version = crate::hsi_contract::CliVersion {
@@ -123,7 +133,7 @@ impl HandshakeConfig {
             build_hash: String::new(),
         };
 
-        let (server_contract_hash, manifest_unavailable) =
+        let (server_contract_hash, manifest_unavailable, risk_tier) =
             match crate::hsi_contract::build_manifest(cli_version) {
                 Ok(manifest) => {
                     let hash = manifest.content_hash().unwrap_or_default();
@@ -131,22 +141,28 @@ impl HandshakeConfig {
                     if unavailable {
                         tracing::warn!(
                             "HSI contract manifest content_hash() returned empty \
-                             (Tier2+ sessions will be denied)"
+                             (escalating to Tier3 fail-closed)"
                         );
                     }
-                    (hash, unavailable)
+                    let tier = if unavailable {
+                        RiskTier::Tier3
+                    } else {
+                        RiskTier::Tier2
+                    };
+                    (hash, unavailable, tier)
                 },
                 Err(e) => {
                     tracing::warn!(
                         "Failed to build HSI contract manifest for handshake: {e} \
-                         (Tier2+ sessions will be denied)"
+                         (escalating to Tier3 fail-closed)"
                     );
-                    (String::new(), true)
+                    (String::new(), true, RiskTier::Tier3)
                 },
             };
 
         Self {
             server_contract_hash,
+            risk_tier,
             manifest_unavailable,
             ..Self::default()
         }
@@ -226,13 +242,15 @@ impl HandshakeResult {
 ///     perform_handshake, HandshakeConfig, HandshakeResult,
 /// };
 ///
-/// let config = HandshakeConfig::from_manifest().with_risk_tier(RiskTier::Tier1);
+/// // Default is Tier2 (fail-closed: deny on contract mismatch).
+/// // Operators can relax to Tier1 if needed.
+/// let config = HandshakeConfig::from_manifest();
 /// let (mut connection, _permit, socket_type) = socket_manager.accept().await?;
 ///
 /// match perform_handshake(&mut connection, &config).await? {
 ///     HandshakeResult::Success { contract_binding } => {
-///         // Connection is ready for protobuf message exchange
-///         // contract_binding can be persisted in SessionStarted events
+///         // Connection is ready for protobuf message exchange.
+///         // contract_binding MUST be persisted in SessionStarted events.
 ///         handle_protobuf_messages(&mut connection, socket_type).await?;
 ///     }
 ///     HandshakeResult::Failed | HandshakeResult::ConnectionClosed => {
@@ -360,9 +378,11 @@ mod tests {
         serialize_handshake_message,
     };
 
-    /// Helper: default test handshake config (Tier0 for backward compat).
+    /// Helper: test handshake config with Tier1 (waive mismatch) for
+    /// backward-compatible basic handshake tests. Production default is
+    /// Tier2 (deny), but most unit tests need the lenient tier.
     fn test_config() -> HandshakeConfig {
-        HandshakeConfig::default()
+        HandshakeConfig::default().with_risk_tier(RiskTier::Tier1)
     }
 
     /// Test that handshake succeeds with a valid Hello message.
@@ -541,6 +561,91 @@ mod tests {
             .expect("handshake error");
 
         assert!(matches!(result, HandshakeResult::Failed));
+    }
+
+    /// TCK-00348: Test that the DEFAULT config (Tier2) denies contract
+    /// mismatch without any manual tier override. This proves the
+    /// fail-closed default is reachable in production.
+    #[tokio::test]
+    async fn test_perform_handshake_default_config_denies_mismatch() {
+        use crate::protocol::handshake::{HandshakeErrorCode, Hello};
+
+        let tmp = TempDir::new().unwrap();
+        let operator_path = tmp.path().join("operator.sock");
+        let session_path = tmp.path().join("session.sock");
+
+        let config = SocketManagerConfig::new(&operator_path, &session_path);
+        let manager = std::sync::Arc::new(
+            crate::protocol::socket_manager::SocketManager::bind(config).unwrap(),
+        );
+
+        // Use the DEFAULT config -- no with_risk_tier() override.
+        // The default is now Tier2, which MUST deny mismatches.
+        let hs_config = HandshakeConfig {
+            server_contract_hash: "blake3:server_production_hash".to_string(),
+            server_canonicalizers: vec![CanonicalizerInfo {
+                id: DAEMON_CANONICALIZER_ID.to_string(),
+                version: DAEMON_CANONICALIZER_VERSION,
+            }],
+            metrics: None,
+            // All other fields from default (risk_tier = Tier2)
+            ..HandshakeConfig::default()
+        };
+
+        assert_eq!(
+            hs_config.risk_tier,
+            RiskTier::Tier2,
+            "Default risk tier must be Tier2 (fail-closed)"
+        );
+
+        let hs_config_clone = hs_config.clone();
+        let manager_clone = manager.clone();
+        let server_handle = tokio::spawn(async move {
+            let (mut conn, _permit, _socket_type) = manager_clone.accept().await.unwrap();
+            perform_handshake(&mut conn, &hs_config_clone).await
+        });
+
+        // Client sends Hello with DIFFERENT contract hash
+        let stream = tokio::net::UnixStream::connect(&operator_path)
+            .await
+            .unwrap();
+        let mut client_conn = Connection::new_with_credentials(stream, None);
+
+        let hello = Hello::new("test-client/1.0")
+            .with_contract_hash("blake3:client_different_hash")
+            .with_canonicalizers(vec![CanonicalizerInfo {
+                id: DAEMON_CANONICALIZER_ID.to_string(),
+                version: DAEMON_CANONICALIZER_VERSION,
+            }]);
+        let hello_msg = HandshakeMessage::Hello(hello);
+        let hello_bytes = serialize_handshake_message(&hello_msg).unwrap();
+        client_conn.framed().send(hello_bytes).await.unwrap();
+
+        // Should receive HelloNack with ContractMismatch
+        let response_frame = client_conn.framed().next().await.unwrap().unwrap();
+        let response = parse_handshake_message(&response_frame).unwrap();
+
+        if let HandshakeMessage::HelloNack(nack) = response {
+            assert_eq!(
+                nack.error_code,
+                HandshakeErrorCode::ContractMismatch,
+                "Default Tier2 mismatch must return ContractMismatch"
+            );
+        } else {
+            panic!("Expected HelloNack for default Tier2 contract mismatch, got HelloAck");
+        }
+
+        // Server should report Failed
+        let result = timeout(Duration::from_secs(1), server_handle)
+            .await
+            .expect("server timed out")
+            .expect("server task panicked")
+            .expect("handshake error");
+
+        assert!(
+            matches!(result, HandshakeResult::Failed),
+            "Default Tier2 config must deny contract mismatch"
+        );
     }
 
     /// TCK-00348: Test that successful handshake returns contract binding.

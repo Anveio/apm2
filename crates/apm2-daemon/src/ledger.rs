@@ -231,6 +231,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Domain prefix for session events (must be at function start per clippy)
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
@@ -238,14 +239,34 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // Generate unique event ID
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
-        // Build payload as JSON
-        let payload = serde_json::json!({
+        // Build payload as JSON.
+        // TCK-00348: Include contract binding fields when available.
+        let mut payload = serde_json::json!({
             "event_type": "session_started",
             "session_id": session_id,
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
         });
+        if let Some(binding) = contract_binding {
+            let obj = payload.as_object_mut().expect("payload is object");
+            obj.insert(
+                "cli_contract_hash".to_string(),
+                serde_json::Value::String(binding.cli_contract_hash.clone()),
+            );
+            obj.insert(
+                "server_contract_hash".to_string(),
+                serde_json::Value::String(binding.server_contract_hash.clone()),
+            );
+            obj.insert(
+                "mismatch_waived".to_string(),
+                serde_json::Value::Bool(binding.mismatch_waived),
+            );
+            obj.insert(
+                "risk_tier".to_string(),
+                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
+            );
+        }
 
         // TCK-00289 BLOCKER 2: Use JCS (RFC 8785) canonicalization for signing.
         // This ensures deterministic JSON representation per RFC-0016.
@@ -1209,8 +1230,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
     /// TCK-00395 MAJOR 2: Transactional override for `emit_spawn_lifecycle`.
     ///
-    /// Wraps `SessionStarted` + `WorkTransitioned(Claimed->InProgress)` in a
-    /// single `SQLite` transaction to guarantee atomicity.
+    /// Wraps `SessionStarted` (with optional contract binding) +
+    /// `WorkTransitioned(Claimed->InProgress)` in a single `SQLite`
+    /// transaction to guarantee atomicity.
     fn emit_spawn_lifecycle(
         &self,
         session_id: &str,
@@ -1218,6 +1240,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         lease_id: &str,
         actor_id: &str,
         timestamp_ns: u64,
+        contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         const SESSION_STARTED_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_started:";
 
@@ -1236,13 +1259,33 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
 
         // --- Event 1: SessionStarted ---
         let session_event_id = format!("EVT-{}", uuid::Uuid::new_v4());
-        let session_payload = serde_json::json!({
+        // TCK-00348: Include contract binding in SessionStarted payload
+        let mut session_payload = serde_json::json!({
             "event_type": "session_started",
             "session_id": session_id,
             "work_id": work_id,
             "lease_id": lease_id,
             "actor_id": actor_id,
         });
+        if let Some(binding) = contract_binding {
+            let obj = session_payload.as_object_mut().expect("payload is object");
+            obj.insert(
+                "cli_contract_hash".to_string(),
+                serde_json::Value::String(binding.cli_contract_hash.clone()),
+            );
+            obj.insert(
+                "server_contract_hash".to_string(),
+                serde_json::Value::String(binding.server_contract_hash.clone()),
+            );
+            obj.insert(
+                "mismatch_waived".to_string(),
+                serde_json::Value::Bool(binding.mismatch_waived),
+            );
+            obj.insert(
+                "risk_tier".to_string(),
+                serde_json::to_value(binding.risk_tier).expect("RiskTier serializes"),
+            );
+        }
         let session_payload_json = session_payload.to_string();
         let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
             let _ = conn.execute("ROLLBACK", []);
@@ -1852,7 +1895,14 @@ mod tests {
             .unwrap();
 
         emitter
-            .emit_session_started("SESS-SQL-001", "W-ORDER-SQL-001", "L-001", "uid:1000", ts)
+            .emit_session_started(
+                "SESS-SQL-001",
+                "W-ORDER-SQL-001",
+                "L-001",
+                "uid:1000",
+                ts,
+                None,
+            )
             .unwrap();
 
         // Query events - must be in insertion order
@@ -2030,6 +2080,7 @@ mod tests {
             "L-001",
             "uid:1000",
             2_000_000_000,
+            None,
         );
         assert!(result.is_ok(), "emit_spawn_lifecycle should succeed");
 
@@ -2125,6 +2176,7 @@ mod tests {
             "L-001",
             "uid:1000",
             1_000,
+            None,
         );
         assert!(result.is_ok());
         let events = emitter.get_events_by_work_id("W-ROLLBACK-003");
@@ -2145,6 +2197,7 @@ mod tests {
             "L-002",
             "uid:1000",
             2_000,
+            None,
         );
         assert!(result2.is_err(), "Should fail when table is dropped");
     }
