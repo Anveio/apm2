@@ -11406,5 +11406,105 @@ mod tests {
                 "No termination events should be emitted when episode_id is malformed"
             );
         }
+
+        /// BLOCKER 1 (v2): `stop_all_running` stops all running episodes
+        /// and emits `SessionTerminated` events for each.
+        #[tokio::test]
+        async fn stop_all_running_emits_session_terminated_for_all() {
+            use crate::episode::registry::InMemorySessionRegistry;
+
+            let emitter = Arc::new(StubLedgerEventEmitter::new());
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let config = EpisodeRuntimeConfig {
+                emit_events: true,
+                ..EpisodeRuntimeConfig::default()
+            };
+
+            let runtime =
+                EpisodeRuntime::new(config)
+                    .with_ledger_emitter(emitter.clone())
+                    .with_session_registry(
+                        registry.clone() as Arc<dyn crate::session::SessionRegistry>
+                    );
+
+            // Create and start two episodes
+            let ep1 = runtime.create([10u8; 32], 1_000_000_000).await.unwrap();
+            let h1 = runtime
+                .start_with_workspace(
+                    &ep1,
+                    "lease-001",
+                    1_000_001_000,
+                    std::path::Path::new("/tmp"),
+                )
+                .await
+                .unwrap();
+            let sid1 = h1.session_id().to_string();
+
+            let ep2 = runtime.create([20u8; 32], 1_000_000_000).await.unwrap();
+            let h2 = runtime
+                .start_with_workspace(
+                    &ep2,
+                    "lease-002",
+                    1_000_001_000,
+                    std::path::Path::new("/tmp"),
+                )
+                .await
+                .unwrap();
+            let sid2 = h2.session_id().to_string();
+
+            // Register sessions with known work IDs
+            let s1 = crate::session::SessionState {
+                session_id: sid1.clone(),
+                work_id: "W-ALL-001".to_string(),
+                role: 1,
+                ephemeral_handle: "h1".to_string(),
+                lease_id: "lease-001".to_string(),
+                policy_resolved_ref: "pol-001".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: Some(ep1.as_str().to_string()),
+            };
+            registry.register_session(s1).unwrap();
+
+            let s2 = crate::session::SessionState {
+                session_id: sid2.clone(),
+                work_id: "W-ALL-002".to_string(),
+                role: 1,
+                ephemeral_handle: "h2".to_string(),
+                lease_id: "lease-002".to_string(),
+                policy_resolved_ref: "pol-002".to_string(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: Some(ep2.as_str().to_string()),
+            };
+            registry.register_session(s2).unwrap();
+
+            assert_eq!(runtime.active_count().await, 2);
+
+            // Stop all running
+            let stopped = runtime
+                .stop_all_running(2_000_000_000, crate::episode::TerminationClass::Cancelled)
+                .await;
+            assert_eq!(stopped, 2, "Should have stopped 2 episodes");
+            assert_eq!(runtime.active_count().await, 0);
+
+            // Verify SessionTerminated events for both work IDs
+            let ev1 = emitter.get_events_by_work_id("W-ALL-001");
+            assert!(
+                ev1.iter().any(|e| e.event_type == "session_terminated"),
+                "W-ALL-001 should have session_terminated event"
+            );
+            let ev2 = emitter.get_events_by_work_id("W-ALL-002");
+            assert!(
+                ev2.iter().any(|e| e.event_type == "session_terminated"),
+                "W-ALL-002 should have session_terminated event"
+            );
+
+            // Verify actor_id is daemon:shutdown
+            let t1: Vec<_> = ev1
+                .iter()
+                .filter(|e| e.event_type == "session_terminated")
+                .collect();
+            let p1: serde_json::Value = serde_json::from_slice(&t1[0].payload).unwrap();
+            assert_eq!(p1["actor_id"], "daemon:shutdown");
+        }
     }
 }
