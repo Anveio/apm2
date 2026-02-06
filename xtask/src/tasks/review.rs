@@ -9,7 +9,7 @@
 //! 1. Reads the appropriate review prompt
 //! 2. Runs the review (via AI tool or manual)
 //! 3. Posts a PR comment with findings
-//! 4. Updates the status check to success/failure
+//! 4. Logs status check intent (GitHub status writes removed per TCK-00297)
 
 use std::path::Path;
 
@@ -17,7 +17,6 @@ use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{ReviewerSpawner, select_review_model};
-use crate::util::print_non_authoritative_banner;
 
 /// Review type determines which prompt and status check to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,21 +316,15 @@ fn run_ai_review(
         .with_prompt_content(&prompt)
         .with_model(select_review_model());
 
-    let status_context = review_type.status_context();
     match spawner.spawn_sync() {
         Ok(result) if result.status.success() => {
             println!(
                 "  Codex {} review completed.",
                 review_type.display_name().to_lowercase()
             );
-            println!("\n  Note: Codex should have posted a comment and updated the status.");
-            println!("  If not, you may need to update the status manually:");
-            println!("    gh api --method POST /repos/{owner_repo}/statuses/{head_sha} \\");
-            println!("      -f state=success -f context={status_context} \\");
-            println!(
-                "      -f description=\"{} review passed\"",
-                review_type.display_name()
-            );
+            println!("\n  Note: Codex should have posted a comment with its findings.");
+            println!("  [TCK-00297] Direct GitHub status writes have been removed from xtask.");
+            println!("  Status updates are now handled by the daemon's projection system.");
         },
         Ok(result) => {
             println!("  Warning: Codex exited with status: {}", result.status);
@@ -399,15 +392,16 @@ fn get_pr_head_sha(sh: &Shell, owner_repo: &str, pr_number: u32) -> Result<Strin
     Ok(sha)
 }
 
-/// Update the status check for a review.
+/// Log that a review status check would have been updated (writes are removed).
 ///
-/// # NON-AUTHORITATIVE OUTPUT
+/// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
-/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
-/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
-/// the HEF evidence pipeline.
+/// Per RFC-0018, direct GitHub status writes from xtask have been removed.
+/// This function logs what the status would have been for diagnostic purposes
+/// and returns `Ok(())`. The `_sh` parameter is retained for call-site
+/// compatibility.
 fn update_status(
-    sh: &Shell,
+    _sh: &Shell,
     owner_repo: &str,
     head_sha: &str,
     review_type: ReviewType,
@@ -417,43 +411,40 @@ fn update_status(
     use crate::util::{StatusWriteDecision, check_status_write_allowed};
 
     let context = review_type.status_context();
+    let state = if success { "success" } else { "failure" };
 
-    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
+    // TCK-00297 (Stage X3): Status writes are permanently removed.
     match check_status_write_allowed() {
+        StatusWriteDecision::Removed => {
+            println!(
+                "  [TCK-00297] GitHub status write removed. Would have set on {owner_repo}@{head_sha}:"
+            );
+            println!("    context: {context}");
+            println!("    state:   {state}");
+            println!("    desc:    {description}");
+            crate::util::print_status_writes_removed_notice();
+            Ok(())
+        },
+        // Legacy variants preserved for backwards compatibility but never returned.
         StatusWriteDecision::SkipHefProjection => {
             println!("  [HEF] Skipping direct GitHub status write (USE_HEF_PROJECTION=true)");
             println!("  [HEF] Status would be: {context} = {success} - {description}");
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(
                 "Status writes blocked in strict mode.\n\
-                 Set XTASK_ALLOW_STATUS_WRITES=true to allow.\n\
                  Status would be: {context} = {success} - {description}"
             );
         },
         StatusWriteDecision::Proceed => {
-            // TCK-00296: Print non-strict mode warning
-            crate::util::print_non_strict_mode_warning();
+            // TCK-00297: Even if somehow reached, do not write.
+            println!(
+                "  [TCK-00297] GitHub status writes removed. Status would be: {context} = {state} - {description}"
+            );
+            Ok(())
         },
     }
-
-    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
-    print_non_authoritative_banner();
-
-    let state = if success { "success" } else { "failure" };
-    let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
-
-    cmd!(
-        sh,
-        "gh api --method POST {endpoint} -f state={state} -f context={context} -f description={description}"
-    )
-    .run()
-    .context("Failed to update status check")?;
-
-    println!("  Updated status: {context} = {state}");
-
-    Ok(())
 }
 
 #[cfg(test)]

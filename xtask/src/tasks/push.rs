@@ -14,10 +14,7 @@ use anyhow::{Context, Result, bail};
 use xshell::{Shell, cmd};
 
 use crate::reviewer_state::{ReviewerSpawner, select_review_model};
-use crate::util::{
-    current_branch, main_worktree, print_non_authoritative_banner, ticket_yaml_path,
-    validate_ticket_branch,
-};
+use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_ticket_branch};
 
 /// Push branch and create PR.
 ///
@@ -353,89 +350,36 @@ fn parse_owner_repo(remote_url: &str) -> &str {
     }
 }
 
-/// Create pending status checks for AI reviews.
+/// Log that pending status checks would have been created (writes are removed).
 ///
-/// # NON-AUTHORITATIVE OUTPUT
+/// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
-/// This function writes GitHub status checks as DEVELOPMENT SCAFFOLDING only.
-/// Per RFC-0018 REQ-HEF-0001, these statuses are NOT the source of truth for
-/// the HEF evidence pipeline.
-fn create_pending_statuses(sh: &Shell, owner_repo: &str, head_sha: &str) {
+/// Per RFC-0018, direct GitHub status writes from xtask have been removed.
+/// This function logs what statuses would have been created for diagnostic
+/// purposes. The `_sh` parameter is retained for call-site compatibility.
+fn create_pending_statuses(_sh: &Shell, owner_repo: &str, head_sha: &str) {
     use crate::util::{StatusWriteDecision, check_status_write_allowed};
 
-    // TCK-00296: Check status write gating (includes TCK-00309 HEF projection)
+    // TCK-00297 (Stage X3): Status writes are permanently removed.
     match check_status_write_allowed() {
+        StatusWriteDecision::Removed => {
+            println!(
+                "    [TCK-00297] GitHub status writes removed. Would have created pending statuses on {owner_repo}@{head_sha}:"
+            );
+            println!("      - ai-review/security  = pending (Waiting for security review)");
+            println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
+            crate::util::print_status_writes_removed_notice();
+        },
+        // Legacy variants preserved for backwards compatibility but never returned.
         StatusWriteDecision::SkipHefProjection => {
             println!("    [HEF] Skipping pending status creation (USE_HEF_PROJECTION=true)");
-            return;
         },
         StatusWriteDecision::BlockStrictMode => {
-            println!(
-                "    [STRICT] Status writes blocked. Set XTASK_ALLOW_STATUS_WRITES=true to allow."
-            );
-            return;
+            println!("    [STRICT] Status writes blocked.");
         },
         StatusWriteDecision::Proceed => {
-            // TCK-00296: Print non-strict mode warning
-            crate::util::print_non_strict_mode_warning();
-        },
-    }
-
-    // TCK-00294: Print NON-AUTHORITATIVE banner before status writes
-    print_non_authoritative_banner();
-
-    let endpoint = format!("/repos/{owner_repo}/statuses/{head_sha}");
-    let state = "pending";
-
-    // Security review status
-    let security_context = "ai-review/security";
-    let security_description = "Waiting for security review";
-    let security_result = cmd!(
-        sh,
-        "gh api --method POST {endpoint} -f state={state} -f context={security_context} -f description={security_description}"
-    )
-    .ignore_status()
-    .output();
-
-    match security_result {
-        Ok(output) if output.status.success() => {
-            println!("    Created pending status: ai-review/security");
-        },
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            println!(
-                "    Warning: Failed to create security status: {}",
-                stderr.trim()
-            );
-        },
-        Err(e) => {
-            println!("    Warning: Failed to create security status: {e}");
-        },
-    }
-
-    // Code quality review status
-    let quality_context = "ai-review/code-quality";
-    let quality_description = "Waiting for code quality review";
-    let quality_result = cmd!(
-        sh,
-        "gh api --method POST {endpoint} -f state={state} -f context={quality_context} -f description={quality_description}"
-    )
-    .ignore_status()
-    .output();
-
-    match quality_result {
-        Ok(output) if output.status.success() => {
-            println!("    Created pending status: ai-review/code-quality");
-        },
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            println!(
-                "    Warning: Failed to create code quality status: {}",
-                stderr.trim()
-            );
-        },
-        Err(e) => {
-            println!("    Warning: Failed to create code quality status: {e}");
+            // TCK-00297: Even if somehow reached, do not write.
+            println!("    [TCK-00297] GitHub status writes removed. Pending statuses not created.");
         },
     }
 }

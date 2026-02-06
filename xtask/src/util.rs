@@ -242,24 +242,32 @@ pub enum StatusWriteDecision {
     SkipHefProjection,
     /// Block the status write (strict mode without allow flag).
     BlockStrictMode,
+    /// Status writes permanently removed (TCK-00297, Stage X3).
+    ///
+    /// Per RFC-0018, direct GitHub status writes from xtask have been removed.
+    /// Replacement paths (daemon projection, FAC v0 harness) are now live.
+    /// Callers must log what the status would have been and return Ok(()).
+    Removed,
 }
 
 /// Determines whether a GitHub status write should proceed.
 ///
-/// Per TCK-00296 and TCK-00309, this function implements the decision logic for
-/// GitHub status writes:
+/// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
-/// 1. If `USE_HEF_PROJECTION=true`: Skip (daemon handles projection).
-/// 2. If `XTASK_STRICT_MODE=true` and `XTASK_ALLOW_STATUS_WRITES!=true`: Block.
-/// 3. Otherwise: Proceed (non-strict mode preserves existing behavior).
+/// As of TCK-00297, direct GitHub status writes from xtask are **permanently
+/// disabled**. This function always returns `StatusWriteDecision::Removed`.
+///
+/// Replacement paths (daemon projection via HEF, FAC v0 harness) are now the
+/// authoritative mechanisms for status management. Per RFC-0018, xtask is
+/// non-authoritative development scaffolding and must not write GitHub
+/// statuses.
+///
+/// The previous gating logic (TCK-00296 strict mode, TCK-00309 HEF projection)
+/// is superseded by this unconditional removal.
 ///
 /// # Returns
 ///
-/// - `StatusWriteDecision::SkipHefProjection` - Status write should be skipped
-///   (HEF projection is enabled).
-/// - `StatusWriteDecision::BlockStrictMode` - Status write is blocked (strict
-///   mode without explicit allow).
-/// - `StatusWriteDecision::Proceed` - Status write may proceed.
+/// Always returns `StatusWriteDecision::Removed`.
 ///
 /// # Example
 ///
@@ -267,101 +275,76 @@ pub enum StatusWriteDecision {
 /// use crate::util::{check_status_write_allowed, StatusWriteDecision};
 ///
 /// match check_status_write_allowed() {
-///     StatusWriteDecision::SkipHefProjection => {
-///         println!("[HEF] Skipping status write");
+///     StatusWriteDecision::Removed => {
+///         println!("[TCK-00297] Status writes removed. Would have been: {state}");
 ///         return Ok(());
 ///     }
-///     StatusWriteDecision::BlockStrictMode => {
-///         return Err(anyhow::anyhow!(
-///             "Status writes blocked in strict mode. Set XTASK_ALLOW_STATUS_WRITES=true to allow."
-///         ));
-///     }
-///     StatusWriteDecision::Proceed => {
-///         // Continue with status write
-///     }
+///     // Legacy variants preserved for backwards compatibility but never returned.
+///     _ => unreachable!("TCK-00297: status writes are permanently removed"),
 /// }
 /// ```
-pub fn check_status_write_allowed() -> StatusWriteDecision {
-    // TCK-00309: HEF projection takes precedence
-    if use_hef_projection() {
-        return StatusWriteDecision::SkipHefProjection;
-    }
-
-    // TCK-00296: Strict mode blocks without explicit allow
-    if is_strict_mode() && !allow_status_writes() {
-        return StatusWriteDecision::BlockStrictMode;
-    }
-
-    StatusWriteDecision::Proceed
+pub const fn check_status_write_allowed() -> StatusWriteDecision {
+    // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
+    // Replacement paths (daemon projection, FAC v0 harness) are live.
+    // All previous gating logic (strict mode, HEF projection flag) is superseded.
+    StatusWriteDecision::Removed
 }
 
-/// Warning message printed in non-strict mode before status writes.
+/// Warning message printed when status writes are attempted.
 ///
-/// Per TCK-00296, non-strict mode preserves existing behavior but prints a
-/// warning to remind operators that status writes are development scaffolding.
-pub const NON_STRICT_MODE_WARNING: &str = r"
-  [WARNING] Status writes enabled in non-strict mode.
-  For fail-closed behavior, set XTASK_STRICT_MODE=true.
-  Then, explicitly allow writes with XTASK_ALLOW_STATUS_WRITES=true.
+/// Per TCK-00297 (Stage X3), direct GitHub status writes are permanently
+/// removed. This message replaces the previous non-strict mode warning
+/// from TCK-00296.
+pub const STATUS_WRITES_REMOVED_NOTICE: &str = r"
+  [TCK-00297] Direct GitHub status writes have been permanently removed.
+  Replacement paths: daemon projection (HEF), FAC v0 harness.
+  The previous XTASK_STRICT_MODE / XTASK_ALLOW_STATUS_WRITES flags are no longer used.
 ";
 
-/// Prints warning message for non-strict mode status writes.
+/// Prints notice that status writes have been removed.
 ///
-/// Per TCK-00296, this function prints a warning to stderr when status writes
-/// proceed in non-strict mode. This reminds operators that:
-/// - Status writes are development scaffolding
-/// - Strict mode provides fail-closed security
-/// - Explicit opt-in is available via `XTASK_ALLOW_STATUS_WRITES`
-pub fn print_non_strict_mode_warning() {
-    // Only print warning if NOT in strict mode (strict mode has explicit allow)
-    if !is_strict_mode() {
-        eprintln!("{NON_STRICT_MODE_WARNING}");
-    }
+/// Per TCK-00297 (Stage X3), direct GitHub status writes from xtask are
+/// permanently disabled. This function replaces the previous
+/// `print_non_strict_mode_warning()` and informs operators that replacement
+/// paths are now live.
+pub fn print_status_writes_removed_notice() {
+    eprintln!("{STATUS_WRITES_REMOVED_NOTICE}");
 }
 
 // =============================================================================
 // Non-Authoritative Banner
 // =============================================================================
 
-/// NON-AUTHORITATIVE banner text for xtask status-writing operations.
+/// NON-AUTHORITATIVE banner text for xtask operations.
 ///
-/// This banner must be printed before any GitHub status check writes to make
-/// clear that xtask outputs are development scaffolding, NOT the source of
-/// truth for the HEF (Holonic Evidence Framework) pipeline.
+/// Per RFC-0018 REQ-HEF-0001: "Pulse plane is non-authoritative" - xtask
+/// outputs are development scaffolding hints only and must never be used as
+/// authoritative admission, gate, lease, or secret-backed decision signals.
 ///
-/// Per RFC-0018 REQ-HEF-0001: "Pulse plane is non-authoritative" - status
-/// writes from xtask are hints only and must never be used as authoritative
-/// admission, gate, lease, or secret-backed decision signals.
+/// As of TCK-00297 (Stage X3), direct GitHub status writes from xtask have been
+/// permanently removed. This banner is retained for any remaining xtask output
+/// that might be consumed by operators or automation.
 ///
-/// See: TCK-00294 (Stage X0 of xtask authority reduction)
+/// See: TCK-00294 (Stage X0), TCK-00297 (Stage X3)
 pub const NON_AUTHORITATIVE_BANNER: &str = r"
 ================================================================================
                           NON-AUTHORITATIVE OUTPUT
 ================================================================================
-  This xtask command writes GitHub status checks as DEVELOPMENT SCAFFOLDING.
-  These statuses are NOT the source of truth for the HEF evidence pipeline.
+  This xtask command is DEVELOPMENT SCAFFOLDING only.
+  Per TCK-00297 (Stage X3): Direct GitHub status writes have been REMOVED.
 
   Per RFC-0018: Pulse-plane signals are lossy hints only. Consumers must verify
   via ledger+CAS before acting on any gate, admission, or authorization decision.
 
-  For authoritative evidence, use the daemon's projection system (when available).
+  For authoritative evidence, use the daemon's projection system.
 ================================================================================
 ";
 
-/// Print the NON-AUTHORITATIVE banner to stdout.
+/// Print the NON-AUTHORITATIVE banner to stderr.
 ///
-/// Call this function before any GitHub status check API writes to ensure
-/// operators understand that xtask outputs are non-authoritative scaffolding.
-///
-/// # Example
-///
-/// ```ignore
-/// use crate::util::print_non_authoritative_banner;
-///
-/// // Before writing status checks
-/// print_non_authoritative_banner();
-/// set_status_check(&sh, &pr_info, &sha, "success", "All checks passed", None)?;
-/// ```
+/// Per TCK-00297 (Stage X3), this banner now reflects that direct GitHub
+/// status writes have been removed. It is printed when xtask operations
+/// produce output that operators or automation might consume.
 pub fn print_non_authoritative_banner() {
     eprintln!("{NON_AUTHORITATIVE_BANNER}");
 }
@@ -744,127 +727,86 @@ mod tests {
         unsafe { std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV) };
     }
 
+    // =============================================================================
+    // Status Write Removal Tests (TCK-00297, Stage X3)
+    // =============================================================================
+
+    /// IT-00297-01: Verify that direct GitHub status writes are removed.
+    ///
+    /// Per TCK-00297 (Stage X3), `check_status_write_allowed()` must
+    /// unconditionally return `StatusWriteDecision::Removed`, regardless of
+    /// any environment variable configuration. This test verifies that status
+    /// writes cannot be re-enabled by any combination of flags.
     #[test]
     #[serial]
     #[allow(unsafe_code)]
-    fn test_check_status_write_allowed_hef_projection() {
-        // HEF projection takes precedence over all other flags
-        unsafe {
-            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
-            std::env::set_var(XTASK_STRICT_MODE_ENV, "false");
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
-        }
-
-        assert_eq!(
-            check_status_write_allowed(),
-            StatusWriteDecision::SkipHefProjection,
-            "HEF projection should skip status writes"
-        );
-
-        // Even with strict mode enabled, HEF projection takes precedence
-        unsafe {
-            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
-            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
-        }
-        assert_eq!(
-            check_status_write_allowed(),
-            StatusWriteDecision::SkipHefProjection,
-            "HEF projection should take precedence over strict mode"
-        );
-
-        // Cleanup
+    fn xtask_status_removed() {
+        // 1. Default (no env vars set) -> Removed
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
             std::env::remove_var(XTASK_STRICT_MODE_ENV);
             std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
         }
-    }
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Removed,
+            "Default state must return Removed (TCK-00297)"
+        );
 
-    #[test]
-    #[serial]
-    #[allow(unsafe_code)]
-    fn test_check_status_write_allowed_strict_mode_blocked() {
-        // Strict mode without allow flag should block
+        // 2. HEF projection enabled -> still Removed (not SkipHefProjection)
+        unsafe {
+            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
+        }
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Removed,
+            "HEF projection flag must not override Removed (TCK-00297)"
+        );
+
+        // 3. Strict mode enabled -> still Removed (not BlockStrictMode)
         unsafe {
             std::env::remove_var(USE_HEF_PROJECTION_ENV);
             std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
             std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
         }
-
         assert_eq!(
             check_status_write_allowed(),
-            StatusWriteDecision::BlockStrictMode,
-            "Strict mode without allow flag should block"
+            StatusWriteDecision::Removed,
+            "Strict mode must not override Removed (TCK-00297)"
         );
 
-        // Strict mode with allow flag explicitly false should still block
+        // 4. Strict mode + allow flag -> still Removed (not Proceed)
         unsafe {
-            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "false");
-        }
-        assert_eq!(
-            check_status_write_allowed(),
-            StatusWriteDecision::BlockStrictMode,
-            "Strict mode with allow=false should block"
-        );
-
-        // Cleanup
-        unsafe {
-            std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
-        }
-    }
-
-    #[test]
-    #[serial]
-    #[allow(unsafe_code)]
-    fn test_check_status_write_allowed_strict_mode_with_allow() {
-        // Strict mode with allow flag should proceed
-        unsafe {
-            std::env::remove_var(USE_HEF_PROJECTION_ENV);
             std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
             std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
         }
-
         assert_eq!(
             check_status_write_allowed(),
-            StatusWriteDecision::Proceed,
-            "Strict mode with allow flag should proceed"
+            StatusWriteDecision::Removed,
+            "Strict mode + allow flag must not override Removed (TCK-00297)"
         );
 
-        // Cleanup
-        unsafe {
-            std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
-        }
-    }
-
-    #[test]
-    #[serial]
-    #[allow(unsafe_code)]
-    fn test_check_status_write_allowed_non_strict_mode() {
-        // Non-strict mode (default) should always proceed
-        unsafe {
-            std::env::remove_var(USE_HEF_PROJECTION_ENV);
-            std::env::remove_var(XTASK_STRICT_MODE_ENV);
-            std::env::remove_var(XTASK_ALLOW_STATUS_WRITES_ENV);
-        }
-
-        assert_eq!(
-            check_status_write_allowed(),
-            StatusWriteDecision::Proceed,
-            "Non-strict mode should proceed"
-        );
-
-        // Non-strict mode should proceed even without allow flag
+        // 5. Non-strict mode + allow flag -> still Removed (not Proceed)
         unsafe {
             std::env::set_var(XTASK_STRICT_MODE_ENV, "false");
+            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
         }
         assert_eq!(
             check_status_write_allowed(),
-            StatusWriteDecision::Proceed,
-            "Explicit non-strict mode should proceed"
+            StatusWriteDecision::Removed,
+            "Non-strict mode + allow must not override Removed (TCK-00297)"
+        );
+
+        // 6. All flags set -> still Removed
+        unsafe {
+            std::env::set_var(USE_HEF_PROJECTION_ENV, "true");
+            std::env::set_var(XTASK_STRICT_MODE_ENV, "true");
+            std::env::set_var(XTASK_ALLOW_STATUS_WRITES_ENV, "true");
+        }
+        assert_eq!(
+            check_status_write_allowed(),
+            StatusWriteDecision::Removed,
+            "All flags set must still return Removed (TCK-00297)"
         );
 
         // Cleanup
@@ -876,19 +818,19 @@ mod tests {
     }
 
     #[test]
-    fn test_non_strict_mode_warning_contains_key_phrases() {
-        // Verify the warning contains all required guidance
+    fn test_status_writes_removed_notice_contains_key_phrases() {
+        // Verify the removal notice contains all required guidance
         assert!(
-            NON_STRICT_MODE_WARNING.contains("XTASK_STRICT_MODE"),
-            "Warning must mention XTASK_STRICT_MODE"
+            STATUS_WRITES_REMOVED_NOTICE.contains("TCK-00297"),
+            "Notice must reference TCK-00297"
         );
         assert!(
-            NON_STRICT_MODE_WARNING.contains("XTASK_ALLOW_STATUS_WRITES"),
-            "Warning must mention XTASK_ALLOW_STATUS_WRITES"
+            STATUS_WRITES_REMOVED_NOTICE.contains("permanently removed"),
+            "Notice must state writes are permanently removed"
         );
         assert!(
-            NON_STRICT_MODE_WARNING.contains("fail-closed"),
-            "Warning must mention fail-closed behavior"
+            STATUS_WRITES_REMOVED_NOTICE.contains("daemon projection"),
+            "Notice must mention daemon projection as replacement"
         );
     }
 
@@ -992,6 +934,15 @@ mod tests {
         assert!(
             NON_AUTHORITATIVE_BANNER.contains("ledger+CAS"),
             "Banner must mention ledger+CAS verification"
+        );
+        // TCK-00297: Banner must mention status write removal
+        assert!(
+            NON_AUTHORITATIVE_BANNER.contains("TCK-00297"),
+            "Banner must reference TCK-00297 status write removal"
+        );
+        assert!(
+            NON_AUTHORITATIVE_BANNER.contains("REMOVED"),
+            "Banner must state status writes are REMOVED"
         );
     }
 
