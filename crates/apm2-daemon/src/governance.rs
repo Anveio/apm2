@@ -433,7 +433,7 @@ impl GovernanceFreshnessMonitor {
 
     /// Returns a reference to the last-success timestamp for testing.
     #[must_use]
-    pub fn last_success_ms(&self) -> &std::sync::Arc<std::sync::atomic::AtomicU64> {
+    pub const fn last_success_ms(&self) -> &std::sync::Arc<std::sync::atomic::AtomicU64> {
         &self.last_success_ms
     }
 }
@@ -442,6 +442,7 @@ impl std::fmt::Debug for GovernanceFreshnessMonitor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GovernanceFreshnessMonitor")
             .field("config", &self.config)
+            .field("stop_authority", &"<StopAuthority>")
             .field(
                 "last_success_ms",
                 &self

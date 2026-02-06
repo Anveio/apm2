@@ -336,6 +336,13 @@ pub struct SessionTelemetry {
     pub tool_calls: AtomicU64,
     /// Number of `EmitEvent` calls dispatched for this session.
     pub events_emitted: AtomicU64,
+    /// Number of episodes spawned for this session (TCK-00351 MAJOR 1 FIX).
+    ///
+    /// This counter tracks the number of `SpawnEpisode` invocations for
+    /// the session, which is semantically distinct from `tool_calls`.
+    /// The pre-actuation gate uses this to enforce `max_episodes` stop
+    /// conditions.
+    pub episode_count: AtomicU64,
     /// Timestamp (nanoseconds since epoch) when the session was spawned.
     /// Used for display/audit metadata only; NOT for elapsed time computation.
     pub started_at_ns: u64,
@@ -352,6 +359,7 @@ impl SessionTelemetry {
         Self {
             tool_calls: AtomicU64::new(0),
             events_emitted: AtomicU64::new(0),
+            episode_count: AtomicU64::new(0),
             started_at_ns,
             started_at: Instant::now(),
         }
@@ -366,6 +374,7 @@ impl SessionTelemetry {
         Self {
             tool_calls: AtomicU64::new(0),
             events_emitted: AtomicU64::new(0),
+            episode_count: AtomicU64::new(0),
             started_at_ns,
             started_at,
         }
@@ -400,6 +409,25 @@ impl SessionTelemetry {
     pub fn get_events_emitted(&self) -> u64 {
         self.events_emitted.load(Ordering::Relaxed)
     }
+
+    /// Increments the episode count and returns the new value (TCK-00351
+    /// MAJOR 1 FIX).
+    ///
+    /// Called during `SpawnEpisode` to track how many episodes have been
+    /// created for this session.  The pre-actuation gate reads this counter
+    /// to enforce `max_episodes` stop conditions.
+    pub fn increment_episode_count(&self) -> u64 {
+        self.episode_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Returns the current episode count (TCK-00351 MAJOR 1 FIX).
+    ///
+    /// Semantically distinct from `get_tool_calls()`: episodes are
+    /// lifecycle units (one per `SpawnEpisode`), while tool calls count
+    /// individual `RequestTool` invocations within an episode.
+    pub fn get_episode_count(&self) -> u64 {
+        self.episode_count.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for SessionTelemetry {
@@ -410,6 +438,7 @@ impl std::fmt::Debug for SessionTelemetry {
                 "events_emitted",
                 &self.events_emitted.load(Ordering::Relaxed),
             )
+            .field("episode_count", &self.episode_count.load(Ordering::Relaxed))
             .field("started_at_ns", &self.started_at_ns)
             .field("started_at", &self.started_at)
             .field("elapsed_ms", &self.elapsed_ms())
@@ -427,6 +456,8 @@ pub struct TelemetrySnapshot {
     pub tool_calls: u64,
     /// Number of events emitted.
     pub events_emitted: u64,
+    /// Number of episodes spawned (TCK-00351 MAJOR 1 FIX).
+    pub episode_count: u64,
     /// Session start timestamp (nanoseconds since epoch).
     /// Wall-clock metadata for display/audit only.
     pub started_at_ns: u64,
@@ -539,6 +570,7 @@ impl SessionTelemetryStore {
         entries.get(session_id).map(|t| TelemetrySnapshot {
             tool_calls: t.get_tool_calls(),
             events_emitted: t.get_events_emitted(),
+            episode_count: t.get_episode_count(),
             started_at_ns: t.started_at_ns,
             duration_ms: t.elapsed_ms(),
         })
@@ -783,11 +815,13 @@ mod telemetry_tests {
         let snap = TelemetrySnapshot {
             tool_calls: 5,
             events_emitted: 3,
+            episode_count: 1,
             started_at_ns: 1_000_000_000,
             duration_ms: 42,
         };
         assert_eq!(snap.tool_calls, 5);
         assert_eq!(snap.events_emitted, 3);
+        assert_eq!(snap.episode_count, 1);
         assert_eq!(snap.started_at_ns, 1_000_000_000);
         assert_eq!(snap.duration_ms, 42);
     }
@@ -797,6 +831,7 @@ mod telemetry_tests {
         let snap1 = TelemetrySnapshot {
             tool_calls: 5,
             events_emitted: 3,
+            episode_count: 0,
             started_at_ns: 1_000_000_000,
             duration_ms: 0,
         };

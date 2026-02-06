@@ -4107,6 +4107,15 @@ pub struct PrivilegedDispatcher {
     /// the handler returns an error indicating the orchestrator is not
     /// configured.
     gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
+
+    /// Per-session stop conditions store for pre-actuation gate enforcement
+    /// (TCK-00351 v4).
+    ///
+    /// When present, `SpawnEpisode` registers stop conditions (from the
+    /// episode envelope) for the new session. The `SessionDispatcher` holds
+    /// a clone of the same `Arc` and reads conditions in the pre-actuation
+    /// gate to enforce `max_episodes` / `escalation_predicate`.
+    stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4183,6 +4192,7 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -4242,6 +4252,7 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -4320,6 +4331,7 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -4375,6 +4387,7 @@ impl PrivilegedDispatcher {
             cas: None,
             v1_manifest_store: None,
             gate_orchestrator: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -4451,6 +4464,20 @@ impl PrivilegedDispatcher {
         orchestrator: Arc<crate::gate::GateOrchestrator>,
     ) -> Self {
         self.gate_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Sets the per-session stop conditions store (TCK-00351 v4).
+    ///
+    /// When set, `SpawnEpisode` registers stop conditions from the episode
+    /// envelope for each new session. The `SessionDispatcher` holds a clone
+    /// of the same `Arc` and reads conditions in the pre-actuation gate.
+    #[must_use]
+    pub fn with_stop_conditions_store(
+        mut self,
+        store: Arc<crate::session::SessionStopConditionsStore>,
+    ) -> Self {
+        self.stop_conditions_store = Some(store);
         self
     }
 
@@ -5117,6 +5144,13 @@ impl PrivilegedDispatcher {
             v1_store.remove(session_id);
         }
 
+        // 3a-ii. TCK-00351 v4: Remove stop conditions on rollback.
+        // Prevents a stale stop conditions entry from persisting for a
+        // session that was never fully spawned.
+        if let Some(ref store) = self.stop_conditions_store {
+            store.remove(session_id);
+        }
+
         // 3b. Restore evicted manifests so capacity is not permanently lost.
         for (sid, manifest) in evicted_manifests {
             self.manifest_store
@@ -5707,6 +5741,46 @@ impl PrivilegedDispatcher {
                     || format!("telemetry store at capacity: {e}"),
                     |rw| {
                         format!("telemetry store at capacity: {e} (rollback partial failure: {rw})")
+                    },
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    msg,
+                ));
+            }
+            // TCK-00351 MAJOR 1 FIX: Increment episode count for this session.
+            // This tracks the number of episodes spawned (semantically distinct
+            // from tool_calls). The pre-actuation gate uses episode_count to
+            // enforce max_episodes stop conditions.
+            if let Some(t) = store.get(&session_id) {
+                t.increment_episode_count();
+            }
+        }
+
+        // Step 3b: Register stop conditions for the session (TCK-00351 v4).
+        // The pre-actuation gate reads from this store to enforce
+        // max_episodes / escalation_predicate limits.  Default conditions
+        // (unlimited) are registered when no envelope-specific limits are
+        // available, ensuring the store always has an entry for the gate.
+        if let Some(ref store) = self.stop_conditions_store {
+            let conditions = crate::episode::envelope::StopConditions::default();
+            if let Err(e) = store.register(&session_id, conditions) {
+                // Rollback session, telemetry, and restore evicted entries.
+                let rollback_warn = self.rollback_spawn(
+                    &session_id,
+                    &evicted_sessions,
+                    &evicted_telemetry,
+                    &evicted_manifests,
+                    false,
+                );
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during stop conditions error recovery");
+                }
+                warn!(error = %e, "Stop conditions registration rejected (store at capacity)");
+                let msg = rollback_warn.map_or_else(
+                    || format!("stop conditions store at capacity: {e}"),
+                    |rw| {
+                        format!("stop conditions store at capacity: {e} (rollback partial failure: {rw})")
                     },
                 );
                 return Ok(PrivilegedResponse::error(

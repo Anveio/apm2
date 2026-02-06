@@ -1026,6 +1026,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         store: Arc<crate::session::SessionStopConditionsStore>,
     ) -> Self {
         self.stop_conditions_store = Some(store);
+        self
+    }
+
     /// Sets the shared V1 manifest store for TCK-00352 scope enforcement.
     ///
     /// Per TCK-00352 Security Review MAJOR 2, this store is shared with
@@ -1468,7 +1471,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 .as_ref()
                 .and_then(|store| store.get(&token.session_id));
             let (elapsed_ms, current_episode_count) = if let Some(t) = telemetry {
-                (t.elapsed_ms(), t.get_tool_calls())
+                (t.elapsed_ms(), t.get_episode_count())
             } else {
                 // Fail-closed: no telemetry for this session means we
                 // cannot verify elapsed time or episode count.
