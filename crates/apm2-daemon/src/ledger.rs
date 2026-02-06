@@ -1763,6 +1763,38 @@ impl LeaseValidator for SqliteLeaseValidator {
         serde_json::from_value::<apm2_core::fac::GateLease>(full_lease.clone()).ok()
     }
 
+    /// Registers a full gate lease as a synthetic `gate_lease_issued` event.
+    ///
+    /// # Trust Model (v6 Finding 2)
+    ///
+    /// This method inserts **synthetic events** into the ledger with a
+    /// zero-filled signature (`[0u8; 64]`) and `actor_id = "system"`. These
+    /// events are trusted because:
+    ///
+    /// 1. **Same-process trust boundary**: The daemon writes these events
+    ///    within its own process. The `SQLite` event store is not externally
+    ///    writable — all mutations go through the daemon's authenticated IPC
+    ///    handlers which enforce admission checks before reaching this method.
+    ///
+    /// 2. **Read-path validation**: The `resolve_full_lease_from_events` reader
+    ///    deserializes the `full_lease` JSON and validates it via `GateLease`'s
+    ///    deserialization invariants. The lease's own `issuer_signature`
+    ///    (Ed25519 over canonical bytes) is preserved in the serialized
+    ///    `full_lease` field and can be verified by any downstream consumer
+    ///    that needs cryptographic proof of issuance.
+    ///
+    /// 3. **Synthetic event markers**: The zero-filled signature and `"system"`
+    ///    `actor_id` distinguish these events from cryptographically-signed
+    ///    operator events. Consumers MUST NOT treat the event-level signature
+    ///    as proof of issuance — the `full_lease.issuer_signature` field
+    ///    provides that guarantee.
+    ///
+    /// # TODO
+    ///
+    /// TODO(RFC-0019): Replace synthetic events with fully authenticated-fact
+    /// persistence where each ledger row carries a valid daemon-issued
+    /// signature over the canonical event bytes. This would allow external
+    /// auditors to verify event integrity without trusting the daemon process.
     fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
         // Store the full lease as a gate_lease_issued event with the complete
         // lease object embedded in the payload for later retrieval.
@@ -1778,6 +1810,9 @@ impl LeaseValidator for SqliteLeaseValidator {
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
 
         if let Ok(conn) = self.conn.lock() {
+            // NOTE: The zero-filled signature is intentional — see trust model
+            // documentation above. The real cryptographic proof lives inside
+            // `full_lease.issuer_signature`.
             let _ = conn.execute(
                 "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

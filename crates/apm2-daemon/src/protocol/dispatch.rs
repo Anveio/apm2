@@ -6312,10 +6312,29 @@ impl PrivilegedDispatcher {
                 reason: format!("invalid IngestReviewReceiptRequest: {e}"),
             })?;
 
+        // ---- Phase -1 (v6 Finding 1): Bind reviewer identity to authenticated caller
+        // ----
+        //
+        // SECURITY: The reviewer identity MUST be derived from peer credentials,
+        // not trusted from the caller-supplied `reviewer_actor_id`. Without this
+        // binding, any operator-socket process could submit receipts as any
+        // reviewer. The authenticated identity is used for:
+        //   - Reviewer-vs-executor comparison (Phase 1)
+        //   - Attestation signer identity (Phase 1b)
+        //   - Event actor attribution (Phase 4)
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::PermissionDenied,
+                "peer credentials required for review receipt ingestion",
+            ));
+        };
+        let authenticated_reviewer_id = derive_actor_id(peer_creds);
+
         info!(
             lease_id = %request.lease_id,
             receipt_id = %request.receipt_id,
-            reviewer_actor_id = %request.reviewer_actor_id,
+            claimed_reviewer_actor_id = %request.reviewer_actor_id,
+            authenticated_reviewer_id = %authenticated_reviewer_id,
             verdict = %request.verdict,
             peer_pid = ?ctx.peer_credentials().map(|c| c.pid),
             "IngestReviewReceipt request received"
@@ -6430,22 +6449,29 @@ impl PrivilegedDispatcher {
 
         // SEC-TIMING-001: Constant-time comparison to prevent timing
         // side-channel attacks on reviewer identity.
-        let identity_matches = expected_actor_id.len() == request.reviewer_actor_id.len()
+        //
+        // SECURITY (v6 Finding 1): Compare the AUTHENTICATED reviewer identity
+        // (derived from peer credentials) against the lease executor — NOT the
+        // caller-supplied `request.reviewer_actor_id`. This prevents any
+        // operator-socket process from submitting receipts as an arbitrary
+        // reviewer.
+        let identity_matches = expected_actor_id.len() == authenticated_reviewer_id.len()
             && bool::from(
                 expected_actor_id
                     .as_bytes()
-                    .ct_eq(request.reviewer_actor_id.as_bytes()),
+                    .ct_eq(authenticated_reviewer_id.as_bytes()),
             );
 
         if !identity_matches {
             warn!(
                 lease_id = %request.lease_id,
+                authenticated_reviewer = %authenticated_reviewer_id,
                 claimed_reviewer = %request.reviewer_actor_id,
-                "Reviewer identity mismatch - rejecting review receipt"
+                "Authenticated reviewer identity mismatch - rejecting review receipt"
             );
             return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                "reviewer_actor_id does not match gate lease executor",
+                PrivilegedErrorCode::PermissionDenied,
+                "authenticated caller identity does not match gate lease executor",
             ));
         }
 
@@ -6524,11 +6550,13 @@ impl PrivilegedDispatcher {
                 ));
             }
 
+            // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+            // for attestation signer, not the caller-supplied value.
             let attestation = ReceiptAttestation {
                 kind: ReceiptKind::Review,
                 level: AttestationLevel::SelfSigned,
                 policy_hash: resolved_policy_hash,
-                signer_identity: request.reviewer_actor_id.clone(),
+                signer_identity: authenticated_reviewer_id.clone(),
                 counter_signer_identity: None,
                 threshold_signer_count: None,
             };
@@ -6598,6 +6626,8 @@ impl PrivilegedDispatcher {
                     .try_into()
                     .expect("validated to be 32 bytes above");
 
+                // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+                // for event actor attribution, not the caller-supplied value.
                 let event = self
                     .event_emitter
                     .emit_review_receipt(
@@ -6605,7 +6635,7 @@ impl PrivilegedDispatcher {
                         &request.receipt_id,
                         &changeset_digest,
                         &artifact_bundle_hash,
-                        &request.reviewer_actor_id,
+                        &authenticated_reviewer_id,
                         timestamp_ns,
                     )
                     .map_err(|e| ProtocolError::Serialization {
@@ -6621,13 +6651,15 @@ impl PrivilegedDispatcher {
                     .try_into()
                     .expect("validated to be 32 bytes above");
 
+                // SECURITY (v6 Finding 1): Use authenticated reviewer identity
+                // for event actor attribution, not the caller-supplied value.
                 let event = self
                     .event_emitter
                     .emit_review_blocked_receipt(
                         &request.receipt_id,
                         request.blocked_reason_code,
                         &blocked_log_hash,
-                        &request.reviewer_actor_id,
+                        &authenticated_reviewer_id,
                         timestamp_ns,
                     )
                     .map_err(|e| ProtocolError::Serialization {
@@ -6649,7 +6681,7 @@ impl PrivilegedDispatcher {
             receipt_id = %request.receipt_id,
             event_type = %event_type,
             event_id = %signed_event.event_id,
-            reviewer = %request.reviewer_actor_id,
+            reviewer = %authenticated_reviewer_id,
             "Review receipt ingested successfully"
         );
 
@@ -7582,10 +7614,31 @@ impl PrivilegedDispatcher {
             // Compare executor_actor_id of existing sublease against the
             // requested delegatee — these are intentionally different field
             // names (the sublease's executor IS the delegatee).
+            //
+            // SECURITY (v6 Finding 3): The idempotent equality check MUST
+            // cover the FULL request tuple, not just (work_id, gate_id,
+            // delegatee). Omitting parent_lease_id or requested_expiry_ns
+            // would allow a request with a different parent lineage or
+            // different expiry to silently receive the cached sublease.
+            //
+            // Since GateLease does not store parent_lease_id directly, we
+            // verify parent lineage by comparing the sublease's inherited
+            // changeset_digest and policy_hash against the current parent
+            // lease's values. A different parent_lease_id will have different
+            // policy/changeset hashes (or fail the v5 revalidation below).
+            //
+            // For requested_expiry_ns, convert to ms and compare against
+            // the existing sublease's expires_at (which is stored in ms).
             let delegatee_matches = existing.executor_actor_id == request.delegatee_actor_id;
+            let expiry_ms = request.requested_expiry_ns / 1_000_000;
+            let expiry_matches = existing.expires_at == expiry_ms;
+            let lineage_matches = existing.changeset_digest == parent_lease.changeset_digest
+                && existing.policy_hash == parent_lease.policy_hash;
             if existing.work_id == parent_lease.work_id
                 && existing.gate_id == parent_lease.gate_id
                 && delegatee_matches
+                && expiry_matches
+                && lineage_matches
             {
                 // SECURITY (v5 Finding 1): Revalidate the existing sublease
                 // against the PROVIDED parent lease. A stale sublease issued
@@ -15546,40 +15599,62 @@ mod tests {
     mod ingest_review_receipt {
         use super::*;
 
+        /// Standard peer credentials used by all `IngestReviewReceipt` tests.
+        fn test_peer_credentials() -> PeerCredentials {
+            PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }
+        }
+
         /// Creates a dispatcher with a registered lease and Tier0 work claim
         /// for testing. The work claim is registered so risk-tier
         /// resolution can succeed (fail-closed semantics mean missing
         /// claims -> Tier4 rejection).
+        ///
+        /// SECURITY (v6 Finding 1): The `executor_actor_id` is derived from the
+        /// test peer credentials, ensuring the authenticated caller identity
+        /// matches the lease executor. The `_executor_hint` parameter is
+        /// ignored — it exists only for backward compatibility with test
+        /// call sites that previously passed an arbitrary reviewer name.
         fn setup_dispatcher_with_lease(
             lease_id: &str,
             work_id: &str,
             gate_id: &str,
-            executor_actor_id: &str,
+            _executor_hint: &str,
         ) -> (PrivilegedDispatcher, ConnectionContext) {
-            setup_dispatcher_with_lease_and_tier(lease_id, work_id, gate_id, executor_actor_id, 0)
+            setup_dispatcher_with_lease_and_tier(lease_id, work_id, gate_id, "", 0)
         }
 
         /// Creates a dispatcher with a registered lease and a work claim at the
         /// specified risk tier. Used to test attestation ratcheting behavior.
+        ///
+        /// SECURITY (v6 Finding 1): Registers the lease executor as the
+        /// identity derived from `test_peer_credentials()`, binding the test
+        /// lease to the same identity the handler will derive from the
+        /// `ConnectionContext`.
         fn setup_dispatcher_with_lease_and_tier(
             lease_id: &str,
             work_id: &str,
             gate_id: &str,
-            executor_actor_id: &str,
+            _executor_hint: &str,
             risk_tier: u8,
         ) -> (PrivilegedDispatcher, ConnectionContext) {
+            let peer_creds = test_peer_credentials();
+            let executor_actor_id = derive_actor_id(&peer_creds);
             let dispatcher = PrivilegedDispatcher::new();
             dispatcher.lease_validator.register_lease_with_executor(
                 lease_id,
                 work_id,
                 gate_id,
-                executor_actor_id,
+                &executor_actor_id,
             );
             // Register work claim so risk-tier resolution succeeds
             let claim = WorkClaim {
                 work_id: work_id.to_string(),
                 lease_id: lease_id.to_string(),
-                actor_id: executor_actor_id.to_string(),
+                actor_id: executor_actor_id,
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
@@ -15592,11 +15667,7 @@ mod tests {
                 author_custody_domains: vec![],
             };
             dispatcher.work_registry.register_claim(claim).unwrap();
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            let ctx = ConnectionContext::privileged(Some(peer_creds));
             (dispatcher, ctx)
         }
 
@@ -15662,15 +15733,27 @@ mod tests {
             }
         }
 
+        /// v6 Finding 1: Reviewer identity is now derived from peer
+        /// credentials, not from the request's `reviewer_actor_id`. To
+        /// trigger a mismatch, the caller must have DIFFERENT peer
+        /// credentials than the lease executor.
         #[test]
         fn test_ingest_review_receipt_reviewer_identity_mismatch() {
-            let (dispatcher, ctx) =
+            let (dispatcher, _ctx) =
                 setup_dispatcher_with_lease("lease-003", "W-003", "gate-003", "reviewer-gamma");
+
+            // Create a context with DIFFERENT peer credentials (uid=9999)
+            // so the authenticated identity won't match the lease executor.
+            let wrong_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 9999,
+                gid: 9999,
+                pid: Some(99999),
+            }));
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-003".to_string(),
                 receipt_id: "RR-002".to_string(),
-                reviewer_actor_id: "impersonator".to_string(), // Wrong reviewer
+                reviewer_actor_id: "does-not-matter".to_string(), // Ignored by handler
                 changeset_digest: vec![0x42; 32],
                 artifact_bundle_hash: vec![0x33; 32],
                 verdict: ReviewReceiptVerdict::Approve.into(),
@@ -15679,7 +15762,7 @@ mod tests {
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
-            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let response = dispatcher.dispatch(&frame, &wrong_ctx).unwrap();
             match response {
                 PrivilegedResponse::Error(err) => {
                     assert!(
@@ -15689,6 +15772,85 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        /// v6 Finding 1 negative test: caller with wrong peer credentials is
+        /// rejected even if they supply the correct `reviewer_actor_id` in the
+        /// request payload. The handler must ignore the request field and
+        /// use the authenticated identity.
+        #[test]
+        fn test_ingest_review_receipt_wrong_peer_creds_correct_request_field_rejected() {
+            // Register lease with the derived identity from standard test creds
+            let (dispatcher, _ctx) =
+                setup_dispatcher_with_lease("lease-neg", "W-NEG", "gate-neg", "unused");
+
+            // The correct executor_actor_id as registered on the lease
+            let correct_actor_id = derive_actor_id(&test_peer_credentials());
+
+            // Caller supplies the correct reviewer_actor_id in the request,
+            // but connects with DIFFERENT peer credentials.
+            let wrong_ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 7777,
+                gid: 7777,
+                pid: Some(77777),
+            }));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-neg".to_string(),
+                receipt_id: "RR-NEG".to_string(),
+                reviewer_actor_id: correct_actor_id, // Correct value, but ignored
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &wrong_ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("does not match gate lease executor"),
+                        "Should reject despite correct request field, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected rejection for wrong peer creds, got {other:?}"),
+            }
+        }
+
+        /// v6 Finding 1: missing peer credentials must be rejected.
+        #[test]
+        fn test_ingest_review_receipt_missing_peer_credentials_rejected() {
+            let (dispatcher, _ctx) =
+                setup_dispatcher_with_lease("lease-no-creds", "W-NC", "gate-nc", "unused");
+
+            let ctx_no_creds = ConnectionContext::privileged(None);
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-no-creds".to_string(),
+                receipt_id: "RR-NC".to_string(),
+                reviewer_actor_id: "any".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx_no_creds).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("peer credentials required"),
+                        "Expected peer credentials error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing creds, got {other:?}"),
             }
         }
 
@@ -15960,6 +16122,11 @@ mod tests {
             let (dispatcher, ctx) =
                 setup_dispatcher_with_lease("lease-010", "W-010", "gate-010", "reviewer-zeta");
 
+            // v6 Finding 1: reviewer_actor_id in request is now ignored by
+            // the handler — the authenticated identity from peer credentials
+            // is used instead.
+            let expected_actor_id = derive_actor_id(&test_peer_credentials());
+
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-010".to_string(),
                 receipt_id: "RR-010".to_string(),
@@ -15986,7 +16153,9 @@ mod tests {
             );
             let event = stored_event.unwrap();
             assert_eq!(event.event_type, "review_receipt_recorded");
-            assert_eq!(event.actor_id, "reviewer-zeta");
+            // v6 Finding 1: actor_id must be the authenticated identity,
+            // not the caller-supplied reviewer_actor_id.
+            assert_eq!(event.actor_id, expected_actor_id);
             assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
         }
 
@@ -16382,24 +16551,26 @@ mod tests {
             // When work_id can be resolved from the lease but no work claim
             // exists in the registry, the risk tier is unresolvable.
             // FAIL-CLOSED: must default to Tier4 and reject SelfSigned.
+            let peer_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let executor_actor_id = derive_actor_id(&peer_creds);
             let dispatcher = PrivilegedDispatcher::new();
             // Register lease but do NOT register a work claim
             dispatcher.lease_validator.register_lease_with_executor(
                 "lease-no-claim",
                 "W-NO-CLAIM",
                 "gate-001",
-                "reviewer-no-claim",
+                &executor_actor_id,
             );
-            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
-                uid: 1000,
-                gid: 1000,
-                pid: Some(12345),
-            }));
+            let ctx = ConnectionContext::privileged(Some(peer_creds));
 
             let request = IngestReviewReceiptRequest {
                 lease_id: "lease-no-claim".to_string(),
                 receipt_id: "RR-NO-CLAIM".to_string(),
-                reviewer_actor_id: "reviewer-no-claim".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
                 changeset_digest: vec![0x42; 32],
                 artifact_bundle_hash: vec![0x33; 32],
                 verdict: ReviewReceiptVerdict::Approve.into(),
@@ -17114,6 +17285,55 @@ mod tests {
                 other => panic!("Expected conflict rejection, got {other:?}"),
             }
         }
+
+        /// v6 Finding 3: Same `sublease_id`, same work/gate/delegatee, but a
+        /// different `requested_expiry_ns` must NOT be treated as idempotent.
+        /// The full request tuple (including expiry) must match for
+        /// idempotent return.
+        #[test]
+        fn test_delegate_sublease_different_expiry_rejected_as_conflict() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-exp",
+                "W-DS-EXP",
+                "gate-quality",
+                "executor-exp",
+            );
+
+            // First request with expiry = 1_900_000_000_000 ns
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-exp".to_string(),
+                delegatee_actor_id: "child-exp".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-exp-001".to_string(),
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "First sublease should succeed"
+            );
+
+            // Second request with DIFFERENT expiry but same sublease_id
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-exp".to_string(),
+                delegatee_actor_id: "child-exp".to_string(),
+                requested_expiry_ns: 1_800_000_000_000, // Different expiry
+                sublease_id: "sublease-exp-001".to_string(),
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("already exists with different parameters"),
+                        "Different expiry should be rejected as conflict, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected conflict rejection for different expiry, got {other:?}"),
+            }
+        }
     }
 
     // ========================================================================
@@ -17233,19 +17453,27 @@ mod tests {
         fn test_ingest_review_receipt_sqlite_tier0_passes() {
             let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
 
+            // v6 Finding 1: Derive executor_actor_id from peer credentials
+            // to match what the handler will derive.
+            let executor_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
             // Register lease via SqliteLeaseValidator (production path)
             dispatcher.lease_validator.register_lease_with_executor(
                 "sqlite-lease-001",
                 "W-SQL-001",
                 "gate-sql",
-                "reviewer-sql",
+                &executor_actor_id,
             );
 
             // Register work claim via SqliteWorkRegistry (production path)
             let claim = WorkClaim {
                 work_id: "W-SQL-001".to_string(),
                 lease_id: "sqlite-lease-001".to_string(),
-                actor_id: "reviewer-sql".to_string(),
+                actor_id: executor_actor_id,
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-001".to_string(),
@@ -17262,7 +17490,7 @@ mod tests {
             let request = IngestReviewReceiptRequest {
                 lease_id: "sqlite-lease-001".to_string(),
                 receipt_id: "RR-SQL-001".to_string(),
-                reviewer_actor_id: "reviewer-sql".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
                 changeset_digest: vec![0x42; 32],
                 artifact_bundle_hash: vec![0x33; 32],
                 verdict: ReviewReceiptVerdict::Approve.into(),
@@ -17298,19 +17526,26 @@ mod tests {
         fn test_ingest_review_receipt_sqlite_higher_tier_rejected() {
             let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
 
+            // v6 Finding 1: Derive executor_actor_id from peer credentials
+            let executor_actor_id = derive_actor_id(&PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            });
+
             // Register lease via SqliteLeaseValidator
             dispatcher.lease_validator.register_lease_with_executor(
                 "sqlite-lease-t2",
                 "W-SQL-T2",
                 "gate-sql",
-                "reviewer-sql-t2",
+                &executor_actor_id,
             );
 
             // Register work claim at Tier2 (should be rejected)
             let claim = WorkClaim {
                 work_id: "W-SQL-T2".to_string(),
                 lease_id: "sqlite-lease-t2".to_string(),
-                actor_id: "reviewer-sql-t2".to_string(),
+                actor_id: executor_actor_id,
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-T2".to_string(),
@@ -17327,7 +17562,7 @@ mod tests {
             let request = IngestReviewReceiptRequest {
                 lease_id: "sqlite-lease-t2".to_string(),
                 receipt_id: "RR-SQL-T2".to_string(),
-                reviewer_actor_id: "reviewer-sql-t2".to_string(),
+                reviewer_actor_id: "ignored-by-handler".to_string(),
                 changeset_digest: vec![0x42; 32],
                 artifact_bundle_hash: vec![0x33; 32],
                 verdict: ReviewReceiptVerdict::Approve.into(),
@@ -17560,7 +17795,11 @@ mod tests {
             }
 
             // Also exercise IngestReviewReceipt through production wiring
-            // to verify get_lease_work_id works with SqliteLeaseValidator
+            // to verify get_lease_work_id works with SqliteLeaseValidator.
+            //
+            // v6 Finding 1: The lease executor must be the derived actor_id
+            // from peer credentials, since the handler now authenticates the
+            // reviewer identity via peer credentials (not the request field).
             state
                 .privileged_dispatcher()
                 .lease_validator
@@ -17568,13 +17807,13 @@ mod tests {
                     "review-lease-prod",
                     "W-REVIEW-001",
                     "gate-review",
-                    "reviewer-prod",
+                    &caller_actor,
                 );
 
             let claim = WorkClaim {
                 work_id: "W-REVIEW-001".to_string(),
                 lease_id: "review-lease-prod".to_string(),
-                actor_id: "reviewer-prod".to_string(),
+                actor_id: caller_actor,
                 role: WorkRole::Reviewer,
                 policy_resolution: PolicyResolution {
                     policy_resolved_ref: "PolicyResolvedForChangeSet:W-REVIEW-001".to_string(),

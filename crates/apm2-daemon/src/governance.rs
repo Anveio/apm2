@@ -69,8 +69,16 @@ impl PolicyResolver for GovernancePolicyResolver {
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
             context_pack_hash,
-            // TODO(RFC-0019): Resolve from governance policy. Tier0 default for now.
-            resolved_risk_tier: 0,
+            // TODO(RFC-0019): Resolve from real governance policy evaluation.
+            //
+            // SECURITY (v6 Finding 4): Default to Tier4 (fail-closed) rather
+            // than Tier0. Hardcoding Tier0 makes the risk-tier ratchet
+            // non-functional — governance-resolved claims would bypass all
+            // attestation requirements. Tier4 (most restrictive) ensures that
+            // until real governance policy resolution is implemented, all
+            // claims require the strongest attestation level, preventing
+            // privilege escalation through the governance path.
+            resolved_risk_tier: 4,
         })
     }
 }
