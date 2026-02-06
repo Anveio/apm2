@@ -42,6 +42,7 @@ use apm2_daemon::gate::{
     GateOrchestrator, GateOrchestratorConfig, GateOrchestratorError, GateOrchestratorEvent,
     GateType, SessionTerminatedInfo,
 };
+use apm2_daemon::state::DispatcherState;
 
 /// Helper: creates a test `SessionTerminatedInfo`.
 fn test_session_info(work_id: &str) -> SessionTerminatedInfo {
@@ -64,7 +65,7 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
     // Step 1: Session terminates via daemon entry point
-    let (gate_types, setup_events) = orch
+    let (gate_types, executor_signers, setup_events) = orch
         .on_session_terminated(test_session_info("work-integ-01"))
         .await
         .unwrap();
@@ -89,10 +90,11 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
         ));
     }
 
-    // Step 3: Record receipts for each gate
+    // Step 3: Record receipts for each gate (signed with executor signers)
     let mut all_events = Vec::new();
     for gt in GateType::all() {
         let lease = orch.gate_lease("work-integ-01", gt).await.unwrap();
+        let exec_signer = &executor_signers[&gt];
         let receipt = GateReceiptBuilder::new(
             format!("receipt-{}", gt.as_gate_id()),
             gt.as_gate_id(),
@@ -105,10 +107,10 @@ async fn tck_00388_full_lifecycle_through_daemon_entry_point() {
         .payload_schema_version(1)
         .payload_hash([0xBB; 32])
         .evidence_bundle_hash([0xCC; 32])
-        .build_and_sign(&signer);
+        .build_and_sign(exec_signer);
 
         let (outcomes, events) = orch
-            .record_gate_receipt("work-integ-01", gt, receipt, true)
+            .record_gate_receipt("work-integ-01", gt, receipt)
             .await
             .unwrap();
         all_events.extend(events);
@@ -144,7 +146,7 @@ async fn tck_00388_event_ordering_invariant() {
     let signer = Arc::new(Signer::generate());
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
-    let (_gate_types, events) = orch
+    let (_gate_types, _signers, events) = orch
         .on_session_terminated(test_session_info("work-integ-02"))
         .await
         .unwrap();
@@ -174,7 +176,8 @@ async fn tck_00388_receipt_signature_verified() {
     let signer = Arc::new(Signer::generate());
     let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
 
-    orch.on_session_terminated(test_session_info("work-integ-03"))
+    let (_gate_types, executor_signers, _events) = orch
+        .on_session_terminated(test_session_info("work-integ-03"))
         .await
         .unwrap();
 
@@ -196,7 +199,7 @@ async fn tck_00388_receipt_signature_verified() {
         .build_and_sign(&wrong_signer);
 
     let err = orch
-        .record_gate_receipt("work-integ-03", GateType::Quality, bad_receipt, true)
+        .record_gate_receipt("work-integ-03", GateType::Quality, bad_receipt)
         .await
         .unwrap_err();
 
@@ -205,7 +208,8 @@ async fn tck_00388_receipt_signature_verified() {
         "Expected signature verification failure, got: {err:?}"
     );
 
-    // Sign with correct key -> should succeed
+    // Sign with correct executor-bound key -> should succeed
+    let exec_signer = &executor_signers[&GateType::Quality];
     let good_receipt = GateReceiptBuilder::new("receipt-good", "gate-quality", &lease.lease_id)
         .changeset_digest([0x42; 32])
         .executor_actor_id(&lease.executor_actor_id)
@@ -214,10 +218,10 @@ async fn tck_00388_receipt_signature_verified() {
         .payload_schema_version(1)
         .payload_hash([0xBB; 32])
         .evidence_bundle_hash([0xCC; 32])
-        .build_and_sign(&signer);
+        .build_and_sign(exec_signer);
 
     let result = orch
-        .record_gate_receipt("work-integ-03", GateType::Quality, good_receipt, true)
+        .record_gate_receipt("work-integ-03", GateType::Quality, good_receipt)
         .await;
     assert!(result.is_ok(), "Correctly signed receipt should succeed");
 }
@@ -236,17 +240,18 @@ async fn tck_00388_admission_check_before_events() {
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
     // First orchestration succeeds
-    let (_gate_types, events) = orch
+    let (_gate_types, _signers, events) = orch
         .on_session_terminated(test_session_info("work-integ-04a"))
         .await
         .unwrap();
     assert!(!events.is_empty(), "First orchestration should emit events");
 
     // Second orchestration fails due to capacity - no events should leak
-    let err = orch
+    let result = orch
         .on_session_terminated(test_session_info("work-integ-04b"))
-        .await
-        .unwrap_err();
+        .await;
+    assert!(result.is_err(), "Expected capacity error");
+    let err = result.err().unwrap();
     assert!(
         matches!(err, GateOrchestratorError::MaxOrchestrationsExceeded { .. }),
         "Expected capacity error"
@@ -265,10 +270,11 @@ async fn tck_00388_admission_check_before_events() {
         .await
         .unwrap();
 
-    let err = orch2
+    let result = orch2
         .on_session_terminated(test_session_info("work-integ-04c"))
-        .await
-        .unwrap_err();
+        .await;
+    assert!(result.is_err(), "Expected duplicate error");
+    let err = result.err().unwrap();
     assert!(
         matches!(err, GateOrchestratorError::DuplicateOrchestration { .. }),
         "Expected duplicate error"
@@ -288,7 +294,7 @@ async fn tck_00388_fail_closed_timeout_semantics() {
     };
     let orch = GateOrchestrator::new(config, Arc::clone(&signer));
 
-    let (gate_types, events) = orch
+    let (gate_types, _signers, events) = orch
         .on_session_terminated(test_session_info("work-integ-05"))
         .await
         .unwrap();
@@ -318,5 +324,59 @@ async fn tck_00388_fail_closed_timeout_semantics() {
     assert_eq!(
         completed_count, 1,
         "Should have AllGatesCompleted with all_passed=false"
+    );
+}
+
+// =========================================================================
+// IT-00388-06: DispatcherState wiring (Quality BLOCKER 4 fix)
+// =========================================================================
+
+#[tokio::test]
+async fn tck_00388_dispatcher_state_wiring() {
+    let signer = Arc::new(Signer::generate());
+    let config = GateOrchestratorConfig::default();
+    let orch = Arc::new(GateOrchestrator::new(config, signer));
+
+    // Wire the orchestrator into DispatcherState
+    let dispatcher = DispatcherState::new(None).with_gate_orchestrator(Arc::clone(&orch));
+
+    // Verify the orchestrator is accessible
+    assert!(
+        dispatcher.gate_orchestrator().is_some(),
+        "gate_orchestrator should be present after with_gate_orchestrator"
+    );
+
+    // Call notify_session_terminated through the dispatcher
+    let info = test_session_info("work-wiring");
+    let result = dispatcher.notify_session_terminated(info).await;
+
+    // Should return Some(Ok(events))
+    let events = result
+        .expect("should return Some when orchestrator is wired")
+        .expect("should succeed for valid session info");
+
+    // Should have PolicyResolved + 3 GateLeaseIssued = 4 events
+    assert_eq!(events.len(), 4, "1 PolicyResolved + 3 GateLeaseIssued");
+    assert!(matches!(
+        events[0],
+        GateOrchestratorEvent::PolicyResolved { .. }
+    ));
+}
+
+#[tokio::test]
+async fn tck_00388_dispatcher_state_without_orchestrator() {
+    // Without gate orchestrator, notify_session_terminated returns None
+    let dispatcher = DispatcherState::new(None);
+
+    assert!(
+        dispatcher.gate_orchestrator().is_none(),
+        "gate_orchestrator should be None by default"
+    );
+
+    let info = test_session_info("work-no-orch");
+    let result = dispatcher.notify_session_terminated(info).await;
+    assert!(
+        result.is_none(),
+        "should return None when no orchestrator is wired"
     );
 }

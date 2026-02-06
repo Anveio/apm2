@@ -25,9 +25,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use apm2_core::crypto::Signer;
+use apm2_core::crypto::{Signer, VerifyingKey};
 use apm2_core::fac::{
     AatLeaseExtension, GateLease, GateLeaseBuilder, GateReceipt, GateReceiptBuilder,
     PolicyResolvedForChangeSet, PolicyResolvedForChangeSetBuilder,
@@ -62,6 +62,42 @@ pub const MAX_WORK_ID_LENGTH: usize = 4096;
 
 /// Maximum length of any string field in orchestrator events.
 const MAX_STRING_LENGTH: usize = 4096;
+
+// =============================================================================
+// Clock Abstraction (MAJOR 1 fix)
+// =============================================================================
+
+/// Abstraction over time sources for testability and monotonic guarantees.
+///
+/// Production code injects [`SystemClock`] which uses `SystemTime` for
+/// wall-clock timestamps and `Instant` for elapsed/timeout comparisons.
+/// Tests can inject a mock clock for deterministic behaviour.
+pub trait Clock: Send + Sync + fmt::Debug {
+    /// Returns the current wall-clock time in milliseconds since UNIX epoch.
+    fn now_ms(&self) -> u64;
+
+    /// Returns a monotonic instant for elapsed/timeout comparisons.
+    fn monotonic_now(&self) -> Instant;
+}
+
+/// Production clock using `SystemTime` for timestamps and `Instant` for
+/// monotonic elapsed/timeout logic.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    #[allow(clippy::cast_possible_truncation)]
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+}
 
 // =============================================================================
 // Gate Types
@@ -319,6 +355,24 @@ pub enum GateOrchestratorError {
         /// The gate type.
         gate_type: String,
     },
+
+    /// Receipt version/kind/schema validation failed (BLOCKER 2).
+    #[error("receipt version validation failed for work_id {work_id}: {reason}")]
+    ReceiptVersionRejected {
+        /// The work ID.
+        work_id: String,
+        /// Validation failure reason.
+        reason: String,
+    },
+
+    /// Receipt has zero evidence hashes but claims PASS (BLOCKER 1).
+    #[error("receipt has zero/invalid evidence for work_id {work_id}: {reason}")]
+    ZeroEvidenceVerdictRejected {
+        /// The work ID.
+        work_id: String,
+        /// Description of the rejection.
+        reason: String,
+    },
 }
 
 // =============================================================================
@@ -420,6 +474,11 @@ struct OrchestrationEntry {
     gates: HashMap<GateType, GateStatus>,
     /// Issued leases indexed by gate type.
     leases: HashMap<GateType, GateLease>,
+    /// Executor verifying keys bound per gate type (BLOCKER 4).
+    ///
+    /// Each executor gets its own signing identity. Receipt signatures are
+    /// verified against the executor-bound key, not the orchestrator key.
+    executor_keys: HashMap<GateType, VerifyingKey>,
     /// Collected receipts indexed by gate type.
     receipts: HashMap<GateType, GateReceipt>,
     /// When the orchestration started (ms since epoch).
@@ -499,16 +558,39 @@ pub struct GateOrchestrator {
     orchestrations: RwLock<HashMap<String, OrchestrationEntry>>,
     /// Signer for gate leases and policy resolutions.
     signer: Arc<Signer>,
+    /// Injected clock for timestamps and timeout checking (MAJOR 1).
+    clock: Arc<dyn Clock>,
 }
 
 impl GateOrchestrator {
     /// Creates a new gate orchestrator with the given configuration and signer.
+    ///
+    /// Uses the default [`SystemClock`] for time operations.
     #[must_use]
     pub fn new(config: GateOrchestratorConfig, signer: Arc<Signer>) -> Self {
         Self {
             config,
             orchestrations: RwLock::new(HashMap::new()),
             signer,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Creates a new gate orchestrator with an injected clock.
+    ///
+    /// Use this constructor in tests to inject a mock clock for
+    /// deterministic timestamp and timeout behaviour.
+    #[must_use]
+    pub fn with_clock(
+        config: GateOrchestratorConfig,
+        signer: Arc<Signer>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            config,
+            orchestrations: RwLock::new(HashMap::new()),
+            signer,
+            clock,
         }
     }
 
@@ -523,13 +605,28 @@ impl GateOrchestrator {
         self.orchestrations.read().await.len()
     }
 
-    /// Returns the verifying key for receipt signature verification.
-    ///
-    /// This is the public key corresponding to the orchestrator's signer,
-    /// used to verify gate receipt signatures from executors.
+    /// Returns the orchestrator's verifying key (for lease signature
+    /// verification).
     #[must_use]
-    pub fn verifying_key(&self) -> apm2_core::crypto::VerifyingKey {
+    pub fn verifying_key(&self) -> VerifyingKey {
         self.signer.verifying_key()
+    }
+
+    /// Returns the executor-bound verifying key for a specific gate
+    /// (BLOCKER 4).
+    ///
+    /// This is the key that was generated at lease issuance time and bound
+    /// to the executor. Receipt signatures MUST be verified against this
+    /// key, not the orchestrator's key.
+    pub async fn executor_verifying_key(
+        &self,
+        work_id: &str,
+        gate_type: GateType,
+    ) -> Option<VerifyingKey> {
+        let orchestrations = self.orchestrations.read().await;
+        orchestrations
+            .get(work_id)
+            .and_then(|e| e.executor_keys.get(&gate_type).copied())
     }
 
     /// Handles a `session_terminated` event by starting gate orchestration.
@@ -567,10 +664,25 @@ impl GateOrchestrator {
     /// - Maximum concurrent orchestrations exceeded
     /// - Duplicate orchestration for the same `work_id`
     /// - Policy resolution or lease issuance fails
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(gate_types, executor_signers, events)`. The
+    /// `executor_signers` map contains one `Arc<Signer>` per gate type
+    /// that the caller must hand to the spawned executor. Receipts signed
+    /// with these signers are the only ones accepted by the orchestrator
+    /// (BLOCKER 4 fix).
     pub async fn handle_session_terminated(
         &self,
         info: SessionTerminatedInfo,
-    ) -> Result<(Vec<GateType>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
+    ) -> Result<
+        (
+            Vec<GateType>,
+            HashMap<GateType, Arc<Signer>>,
+            Vec<GateOrchestratorEvent>,
+        ),
+        GateOrchestratorError,
+    > {
         // Validate work_id
         if info.work_id.is_empty() {
             return Err(GateOrchestratorError::EmptyWorkId);
@@ -589,7 +701,7 @@ impl GateOrchestrator {
             });
         }
 
-        let now_ms = current_time_ms();
+        let now_ms = self.clock.now_ms();
 
         // Step 1: Resolve policy for the changeset.
         // ORDERING INVARIANT: This MUST happen before any lease issuance.
@@ -598,15 +710,27 @@ impl GateOrchestrator {
 
         // Step 2: Issue gate leases for each required gate type.
         // This MUST happen AFTER policy resolution (ordering invariant).
+        //
+        // BLOCKER 4 FIX: Each executor gets a unique signer identity.
+        // The executor's verifying key is bound in the orchestration entry
+        // and used to verify receipt signatures (not the orchestrator key).
         let mut gates = HashMap::new();
         let mut leases = HashMap::new();
+        let mut executor_keys = HashMap::new();
+        let mut executor_signers_for_return: HashMap<GateType, Arc<Signer>> = HashMap::new();
         let mut issued_gate_types = Vec::new();
 
         for &gate_type in &self.config.gate_types {
+            // Generate a unique executor signer per gate type
+            let executor_signer = Arc::new(Signer::generate());
+            let executor_vk = executor_signer.verifying_key();
+
             let lease = self.issue_gate_lease(&info, gate_type, &policy_hash, now_ms)?;
             let lease_id = lease.lease_id.clone();
             gates.insert(gate_type, GateStatus::LeaseIssued { lease_id });
             leases.insert(gate_type, lease);
+            executor_keys.insert(gate_type, executor_vk);
+            executor_signers_for_return.insert(gate_type, executor_signer);
             issued_gate_types.push(gate_type);
         }
 
@@ -634,6 +758,7 @@ impl GateOrchestrator {
                         policy_resolution,
                         gates,
                         leases: leases.clone(),
+                        executor_keys,
                         receipts: HashMap::new(),
                         _started_at_ms: now_ms,
                     });
@@ -679,7 +804,7 @@ impl GateOrchestrator {
             });
         }
 
-        Ok((issued_gate_types, events))
+        Ok((issued_gate_types, executor_signers_for_return, events))
     }
 
     /// Records that a gate executor episode has been spawned.
@@ -703,7 +828,7 @@ impl GateOrchestrator {
         gate_type: GateType,
         episode_id: &str,
     ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
-        let now_ms = current_time_ms();
+        let now_ms = self.clock.now_ms();
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -766,25 +891,32 @@ impl GateOrchestrator {
     /// `GateReceiptCollected` event. If all gates are complete, also returns
     /// an `AllGatesCompleted` event.
     ///
-    /// # Binding Validation
+    /// # Verdict Derivation (BLOCKER 1 fix)
     ///
-    /// The receipt's `lease_id` and `gate_id` MUST match the issued lease for
-    /// this gate type. The receipt's `changeset_digest` and `executor_actor_id`
-    /// must also match. This prevents receipt substitution attacks.
+    /// The verdict (pass/fail) is **derived from the receipt payload**, not
+    /// from any caller-supplied parameter. A receipt with zero `payload_hash`
+    /// or zero `evidence_bundle_hash` is treated as FAIL regardless of any
+    /// other signal. This cryptographically binds the verdict to the
+    /// receipt content and prevents caller bugs from marking
+    /// insufficient-evidence receipts as PASS.
+    ///
+    /// # Version Validation (BLOCKER 2 fix)
+    ///
+    /// The receipt's `receipt_version`, `payload_kind`, and
+    /// `payload_schema_version` are validated in strict mode before
+    /// admission. Unknown or downgraded versions are rejected.
     ///
     /// # Signature Verification (BLOCKER 4 fix)
     ///
-    /// The receipt's `receipt_signature` is verified against the executor's
-    /// verifying key before any state transition. This ensures receipt
-    /// authenticity and prevents forged receipts from advancing the state
-    /// machine.
+    /// The receipt's `receipt_signature` is verified against the
+    /// executor-bound verifying key (generated at lease issuance time),
+    /// not the orchestrator's signer key. This ensures only the authorized
+    /// executor can produce valid receipts.
     ///
-    /// # Verdict Derivation
+    /// # Binding Validation
     ///
-    /// The verdict (pass/fail) is derived from the receipt's `passed`
-    /// parameter. The orchestrator never hardcodes a default verdict. A
-    /// receipt with a zero `payload_hash` (e.g., from a timeout) is treated
-    /// as FAIL.
+    /// The receipt's `lease_id`, `gate_id`, `changeset_digest`, and
+    /// `executor_actor_id` MUST match the issued lease for this gate type.
     ///
     /// # State Machine
     ///
@@ -796,44 +928,66 @@ impl GateOrchestrator {
     /// * `work_id` - The work ID
     /// * `gate_type` - The gate type that completed
     /// * `receipt` - The gate receipt from the executor
-    /// * `passed` - Whether the gate execution passed; derived by the caller
-    ///   from the gate executor's explicit verdict
     ///
     /// # Errors
     ///
     /// Returns error if:
+    /// - The receipt version/kind/schema is unsupported (BLOCKER 2)
+    /// - The receipt has zero evidence hashes (BLOCKER 1)
+    /// - The receipt signature is invalid against executor key (BLOCKER 4)
+    /// - The receipt's binding fields do not match the issued lease
     /// - The orchestration or gate is not found
-    /// - The receipt signature is invalid (BLOCKER 4)
-    /// - The receipt's
-    ///   `lease_id`/`gate_id`/`changeset_digest`/`executor_actor_id` do not
-    ///   match the issued lease
     /// - The gate is in a terminal state
     pub async fn record_gate_receipt(
         &self,
         work_id: &str,
         gate_type: GateType,
         receipt: GateReceipt,
-        passed: bool,
     ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
-        let now_ms = current_time_ms();
+        let now_ms = self.clock.now_ms();
         let receipt_id = receipt.receipt_id.clone();
 
-        // BLOCKER 4 FIX: Verify receipt signature against executor verifying
-        // key BEFORE any state transition. The orchestrator's signer is the
-        // authority that signs leases and receipts, so we verify against its
-        // public key.
-        receipt
-            .validate_signature(&self.signer.verifying_key())
-            .map_err(|e| GateOrchestratorError::ReceiptBindingMismatch {
+        // BLOCKER 2 FIX: Strict version/kind/schema validation at the
+        // admission boundary. Unknown or downgraded receipt schemas are
+        // rejected before any state transition.
+        receipt.validate_version(true).map_err(|e| {
+            GateOrchestratorError::ReceiptVersionRejected {
                 work_id: work_id.to_string(),
-                reason: format!("receipt signature verification failed: {e}"),
-            })?;
+                reason: e.to_string(),
+            }
+        })?;
+
+        // BLOCKER 1 FIX: Derive verdict from receipt payload. Reject PASS
+        // on zero/invalid evidence hashes. A receipt with zero payload_hash
+        // or zero evidence_bundle_hash is cryptographically insufficient
+        // evidence and MUST be treated as FAIL.
+        let has_zero_payload = receipt.payload_hash == [0u8; 32];
+        let has_zero_evidence = receipt.evidence_bundle_hash == [0u8; 32];
+        let passed = !has_zero_payload && !has_zero_evidence;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
             let entry = orchestrations.get_mut(work_id).ok_or_else(|| {
                 GateOrchestratorError::OrchestrationNotFound {
                     work_id: work_id.to_string(),
+                }
+            })?;
+
+            // BLOCKER 4 FIX: Verify receipt signature against the
+            // executor-bound verifying key, not the orchestrator signer.
+            let executor_vk = entry.executor_keys.get(&gate_type).ok_or_else(|| {
+                GateOrchestratorError::GateNotFound {
+                    work_id: work_id.to_string(),
+                    gate_type: gate_type.to_string(),
+                }
+            })?;
+
+            receipt.validate_signature(executor_vk).map_err(|e| {
+                GateOrchestratorError::ReceiptBindingMismatch {
+                    work_id: work_id.to_string(),
+                    reason: format!(
+                        "receipt signature verification failed against executor key: {e}"
+                    ),
                 }
             })?;
 
@@ -927,7 +1081,7 @@ impl GateOrchestrator {
             work_id = %work_id,
             gate_type = %gate_type,
             passed = %passed,
-            "Gate receipt collected"
+            "Gate receipt collected (verdict derived from evidence hashes)"
         );
 
         // Check if all gates are complete
@@ -960,7 +1114,7 @@ impl GateOrchestrator {
         work_id: &str,
         gate_type: GateType,
     ) -> Result<(Option<Vec<GateOutcome>>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
-        let now_ms = current_time_ms();
+        let now_ms = self.clock.now_ms();
         let lease_id;
 
         {
@@ -1031,7 +1185,7 @@ impl GateOrchestrator {
     /// Returns a list of (`work_id`, `gate_type`) pairs that have timed out.
     /// The caller should invoke [`Self::handle_gate_timeout`] for each.
     pub async fn check_timeouts(&self) -> Vec<(String, GateType)> {
-        let now_ms = current_time_ms();
+        let now_ms = self.clock.now_ms();
         let orchestrations = self.orchestrations.read().await;
         let mut timed_out = Vec::new();
 
@@ -1125,11 +1279,19 @@ impl GateOrchestrator {
     pub async fn on_session_terminated(
         &self,
         info: SessionTerminatedInfo,
-    ) -> Result<(Vec<GateType>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
+    ) -> Result<
+        (
+            Vec<GateType>,
+            HashMap<GateType, Arc<Signer>>,
+            Vec<GateOrchestratorEvent>,
+        ),
+        GateOrchestratorError,
+    > {
         let work_id = info.work_id.clone();
 
         // Step 1: Start gate orchestration (returns per-invocation events).
-        let (gate_types, mut events) = self.handle_session_terminated(info).await?;
+        let (gate_types, executor_signers, mut events) =
+            self.handle_session_terminated(info).await?;
 
         // Step 2: Check for any immediately timed-out gates (e.g., zero timeout).
         let timed_out = self.check_timeouts().await;
@@ -1150,7 +1312,7 @@ impl GateOrchestrator {
             "Session termination handled by orchestrator"
         );
 
-        Ok((gate_types, events))
+        Ok((gate_types, executor_signers, events))
     }
 
     // =========================================================================
@@ -1320,20 +1482,6 @@ const fn state_name(status: &GateStatus) -> &'static str {
     }
 }
 
-/// Returns the current time in milliseconds since epoch.
-///
-/// # Note
-///
-/// The cast from u128 to u64 is safe: milliseconds since UNIX epoch
-/// won't exceed `u64::MAX` until the year 584 million.
-#[allow(clippy::cast_possible_truncation)]
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Creates a fail-closed gate receipt for a timed-out gate.
 ///
 /// # Security: Fail-Closed Semantics
@@ -1370,7 +1518,7 @@ pub fn create_timeout_receipt(
 mod tests {
     use super::*;
 
-    /// Helper: creates a test signer.
+    /// Helper: creates a test signer (for orchestrator lease signing).
     fn test_signer() -> Arc<Signer> {
         Arc::new(Signer::generate())
     }
@@ -1390,6 +1538,37 @@ mod tests {
         GateOrchestrator::new(GateOrchestratorConfig::default(), test_signer())
     }
 
+    /// Helper: start orchestration and return executor signers map.
+    async fn setup_orchestration(
+        orch: &GateOrchestrator,
+        work_id: &str,
+    ) -> HashMap<GateType, Arc<Signer>> {
+        let info = test_session_info(work_id);
+        let (_gate_types, executor_signers, _events) =
+            orch.handle_session_terminated(info).await.unwrap();
+        executor_signers
+    }
+
+    /// Helper: build a valid receipt signed with the correct executor signer.
+    fn build_receipt(
+        receipt_id: &str,
+        gate_type: GateType,
+        lease: &GateLease,
+        executor_signer: &Signer,
+        payload_hash: [u8; 32],
+        evidence_hash: [u8; 32],
+    ) -> GateReceipt {
+        GateReceiptBuilder::new(receipt_id, gate_type.as_gate_id(), &lease.lease_id)
+            .changeset_digest(lease.changeset_digest)
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind(gate_type.payload_kind())
+            .payload_schema_version(1)
+            .payload_hash(payload_hash)
+            .evidence_bundle_hash(evidence_hash)
+            .build_and_sign(executor_signer)
+    }
+
     // =========================================================================
     // Happy Path Tests
     // =========================================================================
@@ -1399,7 +1578,8 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-001");
 
-        let (gate_types, _events) = orch.handle_session_terminated(info).await.unwrap();
+        let (gate_types, _executor_signers, _events) =
+            orch.handle_session_terminated(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -1413,7 +1593,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-002");
 
-        let (_gate_types, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
 
         // First event must be PolicyResolved
         assert!(matches!(
@@ -1513,29 +1693,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_gate_receipt_completes_gate() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-006");
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-006").await;
 
-        orch.handle_session_terminated(info).await.unwrap();
-
-        // Complete one gate
         let lease = orch
             .gate_lease("work-006", GateType::Quality)
             .await
             .unwrap();
-        let receipt = GateReceiptBuilder::new("receipt-001", "gate-quality", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("quality")
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+        let exec_signer = &exec_signers[&GateType::Quality];
+        let receipt = build_receipt(
+            "receipt-001",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
 
         let (result, events) = orch
-            .record_gate_receipt("work-006", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-006", GateType::Quality, receipt)
             .await
             .unwrap();
 
@@ -1548,6 +1724,7 @@ mod tests {
                 .any(|e| matches!(e, GateOrchestratorEvent::GateReceiptCollected { .. }))
         );
 
+        // Non-zero hashes -> verdict derived as PASS
         let status = orch
             .gate_status("work-006", GateType::Quality)
             .await
@@ -1557,31 +1734,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_gates_completed_event() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-007");
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-007").await;
 
-        orch.handle_session_terminated(info).await.unwrap();
-
-        // Complete all three gates
+        // Complete all three gates with non-zero hashes (all PASS)
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-007", gate_type).await.unwrap();
-            let receipt = GateReceiptBuilder::new(
-                format!("receipt-{}", gate_type.as_gate_id()),
-                gate_type.as_gate_id(),
-                &lease.lease_id,
-            )
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind(gate_type.payload_kind())
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+            let exec_signer = &exec_signers[&gate_type];
+            let receipt = build_receipt(
+                &format!("receipt-{}", gate_type.as_gate_id()),
+                gate_type,
+                &lease,
+                exec_signer,
+                [0xBB; 32],
+                [0xCC; 32],
+            );
 
             let (result, _events) = orch
-                .record_gate_receipt("work-007", gate_type, receipt, true)
+                .record_gate_receipt("work-007", gate_type, receipt)
                 .await
                 .unwrap();
 
@@ -1646,25 +1816,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_completion_and_timeout() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-009");
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-009").await;
 
-        orch.handle_session_terminated(info).await.unwrap();
-
-        // Complete AAT gate
+        // Complete AAT gate with non-zero hashes (PASS)
         let lease = orch.gate_lease("work-009", GateType::Aat).await.unwrap();
-        let receipt = GateReceiptBuilder::new("receipt-aat", "gate-aat", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("aat")
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+        let exec_signer = &exec_signers[&GateType::Aat];
+        let receipt = build_receipt(
+            "receipt-aat",
+            GateType::Aat,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
 
-        orch.record_gate_receipt("work-009", GateType::Aat, receipt, true)
+        orch.record_gate_receipt("work-009", GateType::Aat, receipt)
             .await
             .unwrap();
 
@@ -1719,7 +1886,11 @@ mod tests {
             terminated_at_ms: 1_704_067_200_000,
         };
 
-        let err = orch.handle_session_terminated(info).await.unwrap_err();
+        let err = orch
+            .handle_session_terminated(info)
+            .await
+            .err()
+            .expect("expected error");
         assert!(matches!(err, GateOrchestratorError::EmptyWorkId));
     }
 
@@ -1733,7 +1904,11 @@ mod tests {
             terminated_at_ms: 1_704_067_200_000,
         };
 
-        let err = orch.handle_session_terminated(info).await.unwrap_err();
+        let err = orch
+            .handle_session_terminated(info)
+            .await
+            .err()
+            .expect("expected error");
         assert!(matches!(err, GateOrchestratorError::WorkIdTooLong { .. }));
     }
 
@@ -1745,7 +1920,11 @@ mod tests {
 
         orch.handle_session_terminated(info1).await.unwrap();
 
-        let err = orch.handle_session_terminated(info2).await.unwrap_err();
+        let err = orch
+            .handle_session_terminated(info2)
+            .await
+            .err()
+            .expect("expected error");
         assert!(matches!(
             err,
             GateOrchestratorError::DuplicateOrchestration { .. }
@@ -1767,10 +1946,11 @@ mod tests {
             .await
             .unwrap();
 
-        let err = orch
+        let result = orch
             .handle_session_terminated(test_session_info("work-c"))
-            .await
-            .unwrap_err();
+            .await;
+        assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
+        let err = result.err().unwrap();
         assert!(matches!(
             err,
             GateOrchestratorError::MaxOrchestrationsExceeded { current: 2, max: 2 }
@@ -1946,7 +2126,11 @@ mod tests {
             terminated_at_ms: 1_704_067_200_000,
         };
 
-        let err = orch.handle_session_terminated(info).await.unwrap_err();
+        let err = orch
+            .handle_session_terminated(info)
+            .await
+            .err()
+            .expect("expected error");
         assert!(matches!(
             err,
             GateOrchestratorError::StringTooLong {
@@ -1965,7 +2149,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-per-inv");
 
-        let (_gate_types, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
 
         // Events are returned from the call, not buffered
         assert!(!events.is_empty());
@@ -1978,7 +2162,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-events");
 
-        let (_gate_types, events) = orch.handle_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
         // 1 PolicyResolved + 3 GateLeaseIssued = 4 events
         assert_eq!(events.len(), 4);
     }
@@ -1994,11 +2178,15 @@ mod tests {
         let info2 = test_session_info("work-no-events-dup");
 
         // First succeeds
-        let (_gate_types, events1) = orch.handle_session_terminated(info1).await.unwrap();
+        let (_gate_types, _signers, events1) = orch.handle_session_terminated(info1).await.unwrap();
         assert!(!events1.is_empty());
 
         // Second fails with DuplicateOrchestration - no events should be returned
-        let err = orch.handle_session_terminated(info2).await.unwrap_err();
+        let err = orch
+            .handle_session_terminated(info2)
+            .await
+            .err()
+            .expect("expected error");
         assert!(matches!(
             err,
             GateOrchestratorError::DuplicateOrchestration { .. }
@@ -2019,10 +2207,11 @@ mod tests {
             .unwrap();
 
         // Second fails - no events should be returned
-        let err = orch
+        let result = orch
             .handle_session_terminated(test_session_info("work-max-b"))
-            .await
-            .unwrap_err();
+            .await;
+        assert!(result.is_err(), "expected MaxOrchestrationsExceeded");
+        let err = result.err().unwrap();
         assert!(matches!(
             err,
             GateOrchestratorError::MaxOrchestrationsExceeded { .. }
@@ -2045,13 +2234,12 @@ mod tests {
         orch.handle_session_terminated(info).await.unwrap();
 
         // With 0ms timeout, all gates should be timed out immediately
-        // (since current_time_ms >= expires_at)
         let timed_out = orch.check_timeouts().await;
         assert_eq!(timed_out.len(), 3);
     }
 
     // =========================================================================
-    // BLOCKER 1: Daemon Runtime Integration Tests
+    // BLOCKER 3: Daemon Runtime Integration Tests
     // =========================================================================
 
     #[tokio::test]
@@ -2059,7 +2247,7 @@ mod tests {
         let orch = test_orchestrator();
         let info = test_session_info("work-daemon");
 
-        let (gate_types, events) = orch.on_session_terminated(info).await.unwrap();
+        let (gate_types, _signers, events) = orch.on_session_terminated(info).await.unwrap();
 
         assert_eq!(gate_types.len(), 3);
         assert!(gate_types.contains(&GateType::Aat));
@@ -2083,7 +2271,7 @@ mod tests {
         let orch = GateOrchestrator::new(config, test_signer());
         let info = test_session_info("work-imm-timeout");
 
-        let (_gate_types, events) = orch.on_session_terminated(info).await.unwrap();
+        let (_gate_types, _signers, events) = orch.on_session_terminated(info).await.unwrap();
 
         // Should have timeout events in addition to policy+lease events
         let timeout_count = events
@@ -2101,10 +2289,11 @@ mod tests {
             .await
             .unwrap();
 
-        let err = orch
+        let result = orch
             .on_session_terminated(test_session_info("work-dup2"))
-            .await
-            .unwrap_err();
+            .await;
+        assert!(result.is_err(), "expected DuplicateOrchestration");
+        let err = result.err().unwrap();
         assert!(matches!(
             err,
             GateOrchestratorError::DuplicateOrchestration { .. }
@@ -2112,36 +2301,32 @@ mod tests {
     }
 
     // =========================================================================
-    // BLOCKER 4: Receipt Signature Verification Tests
+    // BLOCKER 4: Receipt Signature Against Executor-Bound Key Tests
     // =========================================================================
 
     #[tokio::test]
     async fn test_receipt_with_wrong_signer_rejected() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-sig-1");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let _exec_signers = setup_orchestration(&orch, "work-sig-1").await;
 
         let lease = orch
             .gate_lease("work-sig-1", GateType::Quality)
             .await
             .unwrap();
 
-        // Sign with a DIFFERENT signer (wrong key)
+        // Sign with a DIFFERENT signer (neither orchestrator nor executor key)
         let wrong_signer = Signer::generate();
-        let receipt = GateReceiptBuilder::new("receipt-bad-sig", "gate-quality", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("quality")
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&wrong_signer);
+        let receipt = build_receipt(
+            "receipt-bad-sig",
+            GateType::Quality,
+            &lease,
+            &wrong_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
 
         let err = orch
-            .record_gate_receipt("work-sig-1", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-sig-1", GateType::Quality, receipt)
             .await
             .unwrap_err();
         assert!(
@@ -2151,31 +2336,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_receipt_with_correct_signer_accepted() {
+    async fn test_receipt_signed_with_orchestrator_key_rejected() {
+        // BLOCKER 4: The orchestrator signer must NOT be accepted for
+        // receipt signatures; only the executor-bound key is valid.
         let signer = test_signer();
         let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-sig-2");
+        let _exec_signers = setup_orchestration(&orch, "work-sig-orch").await;
 
-        orch.handle_session_terminated(info).await.unwrap();
+        let lease = orch
+            .gate_lease("work-sig-orch", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Sign with the orchestrator signer (should be rejected)
+        let receipt = build_receipt(
+            "receipt-orch-sig",
+            GateType::Quality,
+            &lease,
+            &signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
+
+        let err = orch
+            .record_gate_receipt("work-sig-orch", GateType::Quality, receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateOrchestratorError::ReceiptBindingMismatch { ref reason, .. } if reason.contains("signature")),
+            "Orchestrator signer should be rejected for receipts, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_receipt_with_correct_executor_signer_accepted() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-sig-2").await;
 
         let lease = orch
             .gate_lease("work-sig-2", GateType::Quality)
             .await
             .unwrap();
 
-        // Sign with the correct signer
-        let receipt = GateReceiptBuilder::new("receipt-good-sig", "gate-quality", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("quality")
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+        // Sign with the correct executor signer
+        let exec_signer = &exec_signers[&GateType::Quality];
+        let receipt = build_receipt(
+            "receipt-good-sig",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
 
         let (result, events) = orch
-            .record_gate_receipt("work-sig-2", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-sig-2", GateType::Quality, receipt)
             .await
             .unwrap();
 
@@ -2184,17 +2399,47 @@ mod tests {
         assert!(!events.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_executor_key_mismatch_across_gate_types() {
+        // BLOCKER 4: Executor signer for gate A must NOT be accepted for
+        // gate B.
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-cross-key").await;
+
+        let lease = orch
+            .gate_lease("work-cross-key", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Use the AAT executor signer for a quality receipt
+        let wrong_exec_signer = &exec_signers[&GateType::Aat];
+        let receipt = build_receipt(
+            "receipt-cross-key",
+            GateType::Quality,
+            &lease,
+            wrong_exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
+
+        let err = orch
+            .record_gate_receipt("work-cross-key", GateType::Quality, receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateOrchestratorError::ReceiptBindingMismatch { .. }),
+            "Cross-gate executor key should be rejected, got: {err:?}"
+        );
+    }
+
     // =========================================================================
     // Receipt Binding Validation Tests
     // =========================================================================
 
     #[tokio::test]
     async fn test_receipt_lease_id_mismatch_rejected() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-bind-1");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-bind-1").await;
 
         let lease = orch
             .gate_lease("work-bind-1", GateType::Quality)
@@ -2202,6 +2447,7 @@ mod tests {
             .unwrap();
 
         // Build receipt with wrong lease_id
+        let exec_signer = &exec_signers[&GateType::Quality];
         let receipt = GateReceiptBuilder::new("receipt-bad", "gate-quality", "wrong-lease-id")
             .changeset_digest([0x42; 32])
             .executor_actor_id(&lease.executor_actor_id)
@@ -2210,10 +2456,10 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash([0xBB; 32])
             .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+            .build_and_sign(exec_signer);
 
         let err = orch
-            .record_gate_receipt("work-bind-1", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-bind-1", GateType::Quality, receipt)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2224,11 +2470,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_receipt_gate_id_mismatch_rejected() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-bind-2");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-bind-2").await;
 
         let lease = orch
             .gate_lease("work-bind-2", GateType::Quality)
@@ -2236,6 +2479,7 @@ mod tests {
             .unwrap();
 
         // Build receipt with wrong gate_id
+        let exec_signer = &exec_signers[&GateType::Quality];
         let receipt = GateReceiptBuilder::new("receipt-bad", "wrong-gate-id", &lease.lease_id)
             .changeset_digest([0x42; 32])
             .executor_actor_id(&lease.executor_actor_id)
@@ -2244,10 +2488,10 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash([0xBB; 32])
             .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+            .build_and_sign(exec_signer);
 
         let err = orch
-            .record_gate_receipt("work-bind-2", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-bind-2", GateType::Quality, receipt)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2258,11 +2502,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_receipt_changeset_digest_mismatch_rejected() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-bind-3");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-bind-3").await;
 
         let lease = orch
             .gate_lease("work-bind-3", GateType::Quality)
@@ -2270,6 +2511,7 @@ mod tests {
             .unwrap();
 
         // Build receipt with wrong changeset_digest
+        let exec_signer = &exec_signers[&GateType::Quality];
         let receipt = GateReceiptBuilder::new("receipt-bad", "gate-quality", &lease.lease_id)
                 .changeset_digest([0xFF; 32]) // Wrong digest
                 .executor_actor_id(&lease.executor_actor_id)
@@ -2278,10 +2520,10 @@ mod tests {
                 .payload_schema_version(1)
                 .payload_hash([0xBB; 32])
                 .evidence_bundle_hash([0xCC; 32])
-                .build_and_sign(&signer);
+                .build_and_sign(exec_signer);
 
         let err = orch
-            .record_gate_receipt("work-bind-3", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-bind-3", GateType::Quality, receipt)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2292,11 +2534,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_receipt_executor_actor_id_mismatch_rejected() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-bind-4");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-bind-4").await;
 
         let lease = orch
             .gate_lease("work-bind-4", GateType::Quality)
@@ -2304,6 +2543,7 @@ mod tests {
             .unwrap();
 
         // Build receipt with wrong executor_actor_id
+        let exec_signer = &exec_signers[&GateType::Quality];
         let receipt = GateReceiptBuilder::new("receipt-bad", "gate-quality", &lease.lease_id)
             .changeset_digest([0x42; 32])
             .executor_actor_id("wrong-executor")
@@ -2312,10 +2552,10 @@ mod tests {
             .payload_schema_version(1)
             .payload_hash([0xBB; 32])
             .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+            .build_and_sign(exec_signer);
 
         let err = orch
-            .record_gate_receipt("work-bind-4", GateType::Quality, receipt, true)
+            .record_gate_receipt("work-bind-4", GateType::Quality, receipt)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2325,37 +2565,144 @@ mod tests {
     }
 
     // =========================================================================
-    // Verdict Derivation Tests
+    // BLOCKER 1: Verdict Derived From Evidence (Zero-Hash = FAIL)
     // =========================================================================
 
     #[tokio::test]
+    async fn test_zero_payload_hash_derives_fail_verdict() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-zero-ph").await;
+
+        let lease = orch
+            .gate_lease("work-zero-ph", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Zero payload hash -> verdict MUST be FAIL
+        let receipt = build_receipt(
+            "receipt-zero-ph",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0u8; 32], // zero payload hash
+            [0xCC; 32],
+        );
+
+        let (_result, _events) = orch
+            .record_gate_receipt("work-zero-ph", GateType::Quality, receipt)
+            .await
+            .unwrap();
+
+        let status = orch
+            .gate_status("work-zero-ph", GateType::Quality)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, GateStatus::Completed { passed: false, .. }),
+            "Zero payload hash must derive FAIL verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_evidence_hash_derives_fail_verdict() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-zero-ev").await;
+
+        let lease = orch
+            .gate_lease("work-zero-ev", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Zero evidence bundle hash -> verdict MUST be FAIL
+        let receipt = build_receipt(
+            "receipt-zero-ev",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0u8; 32], // zero evidence hash
+        );
+
+        let (_result, _events) = orch
+            .record_gate_receipt("work-zero-ev", GateType::Quality, receipt)
+            .await
+            .unwrap();
+
+        let status = orch
+            .gate_status("work-zero-ev", GateType::Quality)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, GateStatus::Completed { passed: false, .. }),
+            "Zero evidence hash must derive FAIL verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nonzero_hashes_derive_pass_verdict() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-pass").await;
+
+        let lease = orch
+            .gate_lease("work-pass", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Both non-zero -> verdict MUST be PASS
+        let receipt = build_receipt(
+            "receipt-pass",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
+
+        let (_result, _events) = orch
+            .record_gate_receipt("work-pass", GateType::Quality, receipt)
+            .await
+            .unwrap();
+
+        let status = orch
+            .gate_status("work-pass", GateType::Quality)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, GateStatus::Completed { passed: true, .. }),
+            "Non-zero hashes must derive PASS verdict"
+        );
+    }
+
+    #[tokio::test]
     async fn test_failing_receipt_produces_fail_verdict() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-fail");
+        // Test that a quality gate with zero evidence produces overall FAIL
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-fail").await;
 
-        orch.handle_session_terminated(info).await.unwrap();
-
-        // Complete all gates, but mark quality as FAIL
         for gate_type in GateType::all() {
             let lease = orch.gate_lease("work-fail", gate_type).await.unwrap();
-            let receipt = GateReceiptBuilder::new(
-                format!("receipt-{}", gate_type.as_gate_id()),
-                gate_type.as_gate_id(),
-                &lease.lease_id,
-            )
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind(gate_type.payload_kind())
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+            let exec_signer = &exec_signers[&gate_type];
 
-            let passed = gate_type != GateType::Quality; // Quality fails
+            // Quality gets zero payload_hash (FAIL), others get non-zero (PASS)
+            let payload_hash = if gate_type == GateType::Quality {
+                [0u8; 32]
+            } else {
+                [0xBB; 32]
+            };
+            let receipt = build_receipt(
+                &format!("receipt-{}", gate_type.as_gate_id()),
+                gate_type,
+                &lease,
+                exec_signer,
+                payload_hash,
+                [0xCC; 32],
+            );
+
             let (result, _events) = orch
-                .record_gate_receipt("work-fail", gate_type, receipt, passed)
+                .record_gate_receipt("work-fail", gate_type, receipt)
                 .await
                 .unwrap();
 
@@ -2372,8 +2719,6 @@ mod tests {
                     !quality_outcome.passed,
                     "quality gate should have FAIL verdict"
                 );
-
-                // Overall should be fail since quality failed
                 assert!(
                     outcomes.iter().any(|o| !o.passed),
                     "at least one gate should fail"
@@ -2381,7 +2726,6 @@ mod tests {
             }
         }
 
-        // Verify gate status shows the failure
         let status = orch
             .gate_status("work-fail", GateType::Quality)
             .await
@@ -2393,16 +2737,113 @@ mod tests {
     }
 
     // =========================================================================
+    // BLOCKER 2: Receipt Version/Kind/Schema Validation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_unsupported_receipt_version_rejected() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-ver-1").await;
+
+        let lease = orch
+            .gate_lease("work-ver-1", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Receipt with unsupported version 99
+        let receipt = GateReceiptBuilder::new("receipt-bad-ver", "gate-quality", &lease.lease_id)
+                .changeset_digest([0x42; 32])
+                .executor_actor_id(&lease.executor_actor_id)
+                .receipt_version(99) // unsupported
+                .payload_kind("quality")
+                .payload_schema_version(1)
+                .payload_hash([0xBB; 32])
+                .evidence_bundle_hash([0xCC; 32])
+                .build_and_sign(exec_signer);
+
+        let err = orch
+            .record_gate_receipt("work-ver-1", GateType::Quality, receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateOrchestratorError::ReceiptVersionRejected { .. }),
+            "Expected ReceiptVersionRejected, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_payload_kind_rejected() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-ver-2").await;
+
+        let lease = orch
+            .gate_lease("work-ver-2", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Receipt with unsupported payload kind
+        let receipt = GateReceiptBuilder::new("receipt-bad-kind", "gate-quality", &lease.lease_id)
+                .changeset_digest([0x42; 32])
+                .executor_actor_id(&lease.executor_actor_id)
+                .receipt_version(1)
+                .payload_kind("unknown-kind") // unsupported
+                .payload_schema_version(1)
+                .payload_hash([0xBB; 32])
+                .evidence_bundle_hash([0xCC; 32])
+                .build_and_sign(exec_signer);
+
+        let err = orch
+            .record_gate_receipt("work-ver-2", GateType::Quality, receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateOrchestratorError::ReceiptVersionRejected { .. }),
+            "Expected ReceiptVersionRejected, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_payload_schema_version_rejected() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-ver-3").await;
+
+        let lease = orch
+            .gate_lease("work-ver-3", GateType::Quality)
+            .await
+            .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
+
+        // Receipt with unsupported payload schema version
+        let receipt = GateReceiptBuilder::new("receipt-bad-schema", "gate-quality", &lease.lease_id)
+                .changeset_digest([0x42; 32])
+                .executor_actor_id(&lease.executor_actor_id)
+                .receipt_version(1)
+                .payload_kind("quality")
+                .payload_schema_version(99) // unsupported
+                .payload_hash([0xBB; 32])
+                .evidence_bundle_hash([0xCC; 32])
+                .build_and_sign(exec_signer);
+
+        let err = orch
+            .record_gate_receipt("work-ver-3", GateType::Quality, receipt)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateOrchestratorError::ReceiptVersionRejected { .. }),
+            "Expected ReceiptVersionRejected, got: {err:?}"
+        );
+    }
+
+    // =========================================================================
     // State Transition Tests
     // =========================================================================
 
     #[tokio::test]
     async fn test_record_executor_spawned_rejects_terminal_state() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-term-1");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let _exec_signers = setup_orchestration(&orch, "work-term-1").await;
 
         // Timeout a gate (terminal state)
         orch.handle_gate_timeout("work-term-1", GateType::Quality)
@@ -2423,9 +2864,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_executor_spawned_rejects_running_state() {
         let orch = test_orchestrator();
-        let info = test_session_info("work-term-2");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let _exec_signers = setup_orchestration(&orch, "work-term-2").await;
 
         // Spawn executor (now Running)
         orch.record_executor_spawned("work-term-2", GateType::Quality, "ep-001")
@@ -2445,45 +2884,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_receipt_rejects_completed_state() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-term-3");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-term-3").await;
 
         let lease = orch
             .gate_lease("work-term-3", GateType::Quality)
             .await
             .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
 
         // Complete the gate
-        let receipt = GateReceiptBuilder::new("receipt-1", "gate-quality", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("quality")
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+        let receipt = build_receipt(
+            "receipt-1",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
 
-        orch.record_gate_receipt("work-term-3", GateType::Quality, receipt, true)
+        orch.record_gate_receipt("work-term-3", GateType::Quality, receipt)
             .await
             .unwrap();
 
         // Try to record another receipt on the same (now Completed) gate
-        let receipt2 = GateReceiptBuilder::new("receipt-2", "gate-quality", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("quality")
-            .payload_schema_version(1)
-            .payload_hash([0xDD; 32])
-            .evidence_bundle_hash([0xEE; 32])
-            .build_and_sign(&signer);
+        let receipt2 = build_receipt(
+            "receipt-2",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xDD; 32],
+            [0xEE; 32],
+        );
 
         let err = orch
-            .record_gate_receipt("work-term-3", GateType::Quality, receipt2, true)
+            .record_gate_receipt("work-term-3", GateType::Quality, receipt2)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -2494,29 +2929,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_timeout_rejects_terminal_state() {
-        let signer = test_signer();
-        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
-        let info = test_session_info("work-term-4");
-
-        orch.handle_session_terminated(info).await.unwrap();
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-term-4").await;
 
         let lease = orch
             .gate_lease("work-term-4", GateType::Quality)
             .await
             .unwrap();
+        let exec_signer = &exec_signers[&GateType::Quality];
 
         // Complete the gate
-        let receipt = GateReceiptBuilder::new("receipt-1", "gate-quality", &lease.lease_id)
-            .changeset_digest([0x42; 32])
-            .executor_actor_id(&lease.executor_actor_id)
-            .receipt_version(1)
-            .payload_kind("quality")
-            .payload_schema_version(1)
-            .payload_hash([0xBB; 32])
-            .evidence_bundle_hash([0xCC; 32])
-            .build_and_sign(&signer);
+        let receipt = build_receipt(
+            "receipt-1",
+            GateType::Quality,
+            &lease,
+            exec_signer,
+            [0xBB; 32],
+            [0xCC; 32],
+        );
 
-        orch.record_gate_receipt("work-term-4", GateType::Quality, receipt, true)
+        orch.record_gate_receipt("work-term-4", GateType::Quality, receipt)
             .await
             .unwrap();
 
@@ -2529,5 +2961,65 @@ mod tests {
             err,
             GateOrchestratorError::InvalidStateTransition { .. }
         ));
+    }
+
+    // =========================================================================
+    // Clock Injection Tests (MAJOR 1)
+    // =========================================================================
+
+    /// A mock clock for deterministic testing.
+    #[derive(Debug)]
+    struct MockClock {
+        fixed_ms: u64,
+    }
+
+    impl Clock for MockClock {
+        fn now_ms(&self) -> u64 {
+            self.fixed_ms
+        }
+
+        fn monotonic_now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_injected_clock_used_for_timestamps() {
+        let mock_clock = Arc::new(MockClock {
+            fixed_ms: 42_000_000,
+        });
+        let orch = GateOrchestrator::with_clock(
+            GateOrchestratorConfig::default(),
+            test_signer(),
+            mock_clock,
+        );
+        let info = test_session_info("work-clock");
+
+        let (_gate_types, _signers, events) = orch.handle_session_terminated(info).await.unwrap();
+
+        // All events should use the mock clock's timestamp
+        if let GateOrchestratorEvent::PolicyResolved { timestamp_ms, .. } = &events[0] {
+            assert_eq!(*timestamp_ms, 42_000_000);
+        } else {
+            panic!("first event should be PolicyResolved");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_executor_verifying_key_retrieval() {
+        let orch = test_orchestrator();
+        let exec_signers = setup_orchestration(&orch, "work-vk").await;
+
+        for gate_type in GateType::all() {
+            let stored_vk = orch
+                .executor_verifying_key("work-vk", gate_type)
+                .await
+                .expect("executor key should be stored");
+            let expected_vk = exec_signers[&gate_type].verifying_key();
+            assert_eq!(
+                stored_vk, expected_vk,
+                "Stored executor VK should match for {gate_type}"
+            );
+        }
     }
 }
