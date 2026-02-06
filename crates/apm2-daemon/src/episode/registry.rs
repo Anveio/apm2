@@ -1882,12 +1882,167 @@ impl PersistentSessionRegistry {
     /// This makes crash recovery idempotent: after clearing, a second startup
     /// will load an empty state file and find no sessions to recover.
     ///
+    /// # Fail-Closed Ordering (Security Review v4 BLOCKER 1)
+    ///
+    /// Persists the empty state to disk BEFORE clearing in-memory state.
+    /// If persist fails, in-memory state is left intact so that a subsequent
+    /// startup reload from the (unchanged) state file will re-discover the
+    /// sessions for retry. This prevents the hazard where in-memory state is
+    /// cleared but the disk still holds old sessions, causing repeated
+    /// recovery side-effects on restart.
+    ///
     /// # Errors
     ///
     /// Returns `PersistentRegistryError` if persisting the cleared state fails.
+    /// In-memory state is NOT cleared on persist failure (fail-closed).
     pub fn clear_and_persist(&self) -> Result<(), PersistentRegistryError> {
+        // Persist the empty state file FIRST (fail-closed ordering).
+        // We temporarily build the empty state file content while still
+        // holding the old in-memory state, then write it. Only after a
+        // successful persist do we clear in-memory state.
+        self.persist_empty_state()?;
         self.inner.clear();
-        self.persist()
+        Ok(())
+    }
+
+    /// Persists an empty state file to disk without modifying in-memory state.
+    ///
+    /// Used by [`clear_and_persist`] to ensure fail-closed ordering: the disk
+    /// state is updated before the in-memory state is cleared.
+    fn persist_empty_state(&self) -> Result<(), PersistentRegistryError> {
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: Vec::new(),
+        };
+
+        let json = serde_json::to_string_pretty(&state_file)?;
+
+        // Write to temp file in same directory (for atomic rename)
+        let temp_path = self.state_file_path.with_extension("tmp");
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.state_file_path.parent() {
+            #[cfg(unix)]
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+
+            #[cfg(not(unix))]
+            fs::create_dir_all(parent)?;
+        }
+
+        // Write to temp file with secure permissions
+        {
+            #[cfg(unix)]
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp_path)?;
+
+            #[cfg(not(unix))]
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+
+            let mut file = file;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+
+        // Atomic rename
+        fs::rename(&temp_path, &self.state_file_path)?;
+
+        // Durability: fsync the parent directory
+        if let Some(parent) = self.state_file_path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+
+        Ok(())
+    }
+
+    /// Persists the current state minus the given session IDs to disk,
+    /// without modifying in-memory state.
+    ///
+    /// Used by [`clear_sessions_by_ids`] to ensure fail-closed ordering: the
+    /// disk state is updated before the in-memory state is modified.
+    fn persist_without_sessions(
+        &self,
+        session_ids_to_remove: &[String],
+    ) -> Result<(), PersistentRegistryError> {
+        let state = self.inner.state.read().expect("lock poisoned");
+
+        // Build state file excluding the sessions to be removed
+        let ids_to_remove: std::collections::HashSet<&str> = session_ids_to_remove
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: state
+                .by_id
+                .iter()
+                .filter(|(id, _)| !ids_to_remove.contains(id.as_str()))
+                .map(|(_, v)| PersistableSessionState::from(v))
+                .collect(),
+        };
+        drop(state);
+
+        let json = serde_json::to_string_pretty(&state_file)?;
+
+        // Write to temp file in same directory (for atomic rename)
+        let temp_path = self.state_file_path.with_extension("tmp");
+
+        // Ensure parent directory exists
+        if let Some(parent) = self.state_file_path.parent() {
+            #[cfg(unix)]
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+
+            #[cfg(not(unix))]
+            fs::create_dir_all(parent)?;
+        }
+
+        // Write to temp file with secure permissions
+        {
+            #[cfg(unix)]
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp_path)?;
+
+            #[cfg(not(unix))]
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+
+            let mut file = file;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+
+        // Atomic rename
+        fs::rename(&temp_path, &self.state_file_path)?;
+
+        // Durability: fsync the parent directory
+        if let Some(parent) = self.state_file_path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1990,14 +2145,27 @@ impl SessionRegistry for PersistentSessionRegistry {
     ///
     /// Used after partial/truncated recovery so only the recovered subset is
     /// removed, preserving any sessions that were not yet processed.
+    ///
+    /// # Fail-Closed Ordering (Security Review v4 BLOCKER 1)
+    ///
+    /// Computes the post-removal state and persists it to disk BEFORE
+    /// removing sessions from in-memory state. If persist fails, in-memory
+    /// state is left intact so that the on-disk state file (unchanged) will
+    /// re-discover the sessions for retry on next startup.
     fn clear_sessions_by_ids(&self, session_ids: &[String]) -> Result<(), SessionRegistryError> {
+        // Persist the projected state (with sessions removed) FIRST.
+        // We read the current in-memory state, compute what it would look
+        // like after removal, persist that, then actually remove in-memory.
+        self.persist_without_sessions(session_ids)
+            .map_err(|e| SessionRegistryError::RegistrationFailed {
+                message: format!("Failed to persist after partial clear: {e}"),
+            })?;
+
+        // Persist succeeded -- now safe to clear in-memory state.
         for id in session_ids {
             self.inner.remove_session(id);
         }
-        self.persist()
-            .map_err(|e| SessionRegistryError::RegistrationFailed {
-                message: format!("Failed to persist after partial clear: {e}"),
-            })
+        Ok(())
     }
 }
 

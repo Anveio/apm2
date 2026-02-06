@@ -196,7 +196,9 @@ pub fn collect_sessions(registry: &Arc<dyn SessionRegistry>) -> CollectedSession
 /// For each stale session:
 /// 1. Emits a `LEASE_REVOKED` event to the ledger (if emitter is available)
 /// 2. Deletes the work claim from the `work_claims` table (if `SQLite` conn is
-///    available) so the work becomes re-claimable
+///    available) so the work becomes re-claimable. Per security review v4
+///    MAJOR 1, work claim cleanup is causally gated on successful ledger
+///    emission -- if ledger emission fails, the work claim is NOT released.
 ///
 /// # Arguments
 ///
@@ -205,6 +207,9 @@ pub fn collect_sessions(registry: &Arc<dyn SessionRegistry>) -> CollectedSession
 ///   events
 /// * `sqlite_conn` - Optional `SQLite` connection for cleaning up work claims
 /// * `timeout` - Maximum duration for recovery
+/// * `htf_clock` - The daemon's shared HTF clock for RFC-0016 compliant
+///   timestamps. Must not be `None` -- fail-closed per security review v4
+///   BLOCKER 2.
 ///
 /// # Returns
 ///
@@ -219,7 +224,7 @@ pub fn recover_stale_sessions(
     emitter: Option<&SqliteLedgerEventEmitter>,
     sqlite_conn: Option<&Arc<Mutex<Connection>>>,
     timeout: Duration,
-    htf_clock: Option<&HolonicClock>,
+    htf_clock: &HolonicClock,
 ) -> Result<CrashRecoveryOutcome, CrashRecoveryError> {
     let start = Instant::now();
     let deadline = start + timeout;
@@ -253,6 +258,7 @@ pub fn recover_stale_sessions(
         let mut session_failed = false;
 
         // Step 1: Emit LEASE_REVOKED event to ledger
+        let mut ledger_emit_succeeded = false;
         if let Some(emitter) = emitter {
             match emit_lease_revoked_event(emitter, session, htf_clock) {
                 Ok(event_id) => {
@@ -263,6 +269,7 @@ pub fn recover_stale_sessions(
                         "Emitted LEASE_REVOKED event for stale session"
                     );
                     lease_revoked_events_emitted += 1;
+                    ledger_emit_succeeded = true;
                 },
                 Err(e) => {
                     // Critical failure: ledger event not persisted. Mark session
@@ -276,36 +283,47 @@ pub fn recover_stale_sessions(
                 },
             }
         } else {
+            // No ledger configured: treat as vacuously succeeded for causal
+            // gating purposes (there is nothing to gate on).
             info!(
                 session_id = %session.session_id,
                 work_id = %session.work_id,
                 "LEASE_REVOKED (no ledger configured, event not persisted)"
             );
+            ledger_emit_succeeded = true;
         }
 
-        // Step 2: Release work claim so work becomes re-claimable
-        if let Some(conn) = sqlite_conn {
-            match release_work_claim(conn, &session.work_id) {
-                Ok(released) => {
-                    if released {
-                        info!(
+        // Step 2: Release work claim so work becomes re-claimable.
+        //
+        // Security Review v4 MAJOR 1 fix: Only release work claims after
+        // successful ledger emission for this session. If the LEASE_REVOKED
+        // event was not persisted, we must NOT release the work claim --
+        // both operations must succeed or neither should proceed, ensuring
+        // causal ordering of side effects.
+        if ledger_emit_succeeded {
+            if let Some(conn) = sqlite_conn {
+                match release_work_claim(conn, &session.work_id) {
+                    Ok(released) => {
+                        if released {
+                            info!(
+                                work_id = %session.work_id,
+                                session_id = %session.session_id,
+                                "Released work claim for stale session"
+                            );
+                            work_claims_released += 1;
+                        }
+                    },
+                    Err(e) => {
+                        // Critical failure: work claim not released. Mark session
+                        // as failed so it is preserved in the registry for retry.
+                        warn!(
                             work_id = %session.work_id,
-                            session_id = %session.session_id,
-                            "Released work claim for stale session"
+                            error = %e,
+                            "Failed to release work claim; session will be preserved for retry"
                         );
-                        work_claims_released += 1;
-                    }
-                },
-                Err(e) => {
-                    // Critical failure: work claim not released. Mark session
-                    // as failed so it is preserved in the registry for retry.
-                    warn!(
-                        work_id = %session.work_id,
-                        error = %e,
-                        "Failed to release work claim; session will be preserved for retry"
-                    );
-                    session_failed = true;
-                },
+                        session_failed = true;
+                    },
+                }
             }
         }
 
@@ -444,45 +462,24 @@ pub fn clear_session_registry(
 ///
 /// # Timestamp Source
 ///
-/// Per RFC-0016 and the security review, timestamps MUST come from the HTF
-/// `HolonicClock` (same clock contract used by dispatch flows) rather than
-/// raw `SystemTime::now()`. When `htf_clock` is `Some`, the HLC wall time
-/// is used. When `None` (e.g., in tests without a full clock setup), the
-/// function falls back to `SystemTime` but logs a warning.
+/// Per RFC-0016 and the security review (v4 BLOCKER 2), timestamps MUST
+/// come from the HTF `HolonicClock` (same clock contract used by dispatch
+/// flows). The `SystemTime` fallback has been removed -- if the HTF clock
+/// is unavailable, recovery must fail-closed rather than silently using an
+/// unauthorized time source.
 fn emit_lease_revoked_event(
     emitter: &SqliteLedgerEventEmitter,
     session: &SessionState,
-    htf_clock: Option<&HolonicClock>,
+    htf_clock: &HolonicClock,
 ) -> Result<String, CrashRecoveryError> {
-    // SECURITY MAJOR 1 v3 fix: Source recovery timestamps from the same HTF
-    // clock contract used by dispatch flows (RFC-0016 compliance).
-    let timestamp_ns = if let Some(clock) = htf_clock {
-        clock
-            .now_hlc()
-            .map(|hlc| hlc.wall_ns)
-            .map_err(|e| CrashRecoveryError::TimestampFailed {
-                message: format!("HTF clock error for session {}: {e}", session.session_id),
-            })?
-    } else {
-        // Fallback for tests or environments where HolonicClock is not available.
-        // Log a warning since this does not meet RFC-0016 HTF compliance.
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        warn!(
-            session_id = %session.session_id,
-            "Using SystemTime fallback for recovery timestamp (no HTF clock available)"
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .map_err(|e| CrashRecoveryError::TimestampFailed {
-                message: format!(
-                    "system clock before UNIX epoch for session {}: {e}",
-                    session.session_id
-                ),
-            })?
-    };
+    // Security Review v4 BLOCKER 2: All timestamps come from the shared HTF
+    // clock. No SystemTime fallback -- fail-closed if HTF is unavailable.
+    let timestamp_ns = htf_clock
+        .now_hlc()
+        .map(|hlc| hlc.wall_ns)
+        .map_err(|e| CrashRecoveryError::TimestampFailed {
+            message: format!("HTF clock error for session {}: {e}", session.session_id),
+        })?;
 
     // Build the LEASE_REVOKED payload
     let payload = serde_json::json!({
@@ -577,6 +574,12 @@ mod tests {
         Arc::new(Mutex::new(conn))
     }
 
+    /// Creates an HTF clock for tests.
+    fn make_clock() -> HolonicClock {
+        use crate::htf::ClockConfig;
+        HolonicClock::new(ClockConfig::default(), None).expect("clock creation should succeed")
+    }
+
     /// Creates a `SqliteLedgerEventEmitter` with a fresh signing key.
     fn make_emitter(conn: &Arc<Mutex<Connection>>) -> SqliteLedgerEventEmitter {
         use rand::rngs::OsRng;
@@ -610,7 +613,8 @@ mod tests {
 
     #[test]
     fn test_recover_empty_sessions() {
-        let result = recover_stale_sessions(&[], None, None, Duration::from_secs(5), None)
+        let clock = make_clock();
+        let result = recover_stale_sessions(&[], None, None, Duration::from_secs(5), &clock)
             .expect("recovery should succeed");
 
         assert_eq!(result.sessions_recovered, 0);
@@ -623,6 +627,7 @@ mod tests {
     fn test_recover_sessions_emits_lease_revoked_events() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
         let sessions = vec![
             make_session("sess-1", "work-1"),
             make_session("sess-2", "work-2"),
@@ -634,7 +639,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -657,6 +662,7 @@ mod tests {
     fn test_recover_sessions_releases_work_claims() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         // Register work claims
         register_claim(&conn, "work-1");
@@ -673,7 +679,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -692,6 +698,7 @@ mod tests {
     fn test_recover_sessions_completes_within_timeout() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         // Create 100 sessions
         let sessions: Vec<SessionState> = (0..100)
@@ -704,7 +711,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -725,6 +732,7 @@ mod tests {
     fn test_recovery_is_idempotent() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         register_claim(&conn, "work-1");
 
@@ -736,7 +744,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None,
+            &clock,
         )
         .expect("first recovery should succeed");
 
@@ -750,7 +758,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None,
+            &clock,
         )
         .expect("second recovery should succeed");
 
@@ -801,6 +809,7 @@ mod tests {
     #[test]
     fn test_recovery_without_ledger_succeeds() {
         // No ledger configured -- events not persisted but recovery succeeds
+        let clock = make_clock();
         let sessions = vec![
             make_session("sess-1", "work-1"),
             make_session("sess-2", "work-2"),
@@ -811,7 +820,7 @@ mod tests {
             None, // No emitter
             None, // No sqlite conn
             Duration::from_secs(5),
-            None, // No htf_clock
+            &clock,
         )
         .expect("recovery should succeed without ledger");
 
@@ -824,6 +833,7 @@ mod tests {
     fn test_recovery_timeout() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         // Create enough sessions with a very short timeout
         let sessions: Vec<SessionState> = (0..1000)
@@ -836,7 +846,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_millis(0),
-            None,
+            &clock,
         );
 
         assert!(result.is_err());
@@ -920,12 +930,13 @@ mod tests {
 
         // Phase 3: Perform crash recovery
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
         let result = recover_stale_sessions(
             &collected.sessions,
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -970,6 +981,7 @@ mod tests {
     fn test_lease_revoked_event_payload_content() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
         let session = make_session("sess-1", "work-1");
 
         let result = recover_stale_sessions(
@@ -977,7 +989,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -1029,6 +1041,7 @@ mod tests {
 
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         // Force timeout by using 0ms timeout
         let result = recover_stale_sessions(
@@ -1036,7 +1049,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_millis(0),
-            None,
+            &clock,
         );
 
         // Recovery should fail with timeout
@@ -1192,12 +1205,13 @@ mod tests {
 
         // Now the mutex is poisoned. Recovery should fail for work claim release
         // but the function should track per-session failures.
+        let clock = make_clock();
         let result = recover_stale_sessions(
             &collected.sessions,
             Some(&emitter), // Emitter also uses the same poisoned conn
             None,           // No sqlite_conn for claims (ledger will fail)
             Duration::from_secs(5),
-            None,
+            &clock,
         );
 
         // With the poisoned connection, emit_lease_revoked_event will fail
@@ -1300,12 +1314,13 @@ mod tests {
         // Use a 0ms timeout. recover_stale_sessions checks the deadline
         // before each session AND after all sessions (post-operation check).
         // With 0ms timeout, it must return Timeout before success.
+        let clock = make_clock();
         let result = recover_stale_sessions(
             &collected.sessions,
             None,
             None,
             Duration::from_millis(0),
-            None,
+            &clock,
         );
 
         // Must be a Timeout error
@@ -1356,6 +1371,7 @@ mod tests {
     fn test_lease_revoked_event_has_valid_timestamp() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
         let session = make_session("sess-ts", "work-ts");
 
         let result = recover_stale_sessions(
@@ -1363,7 +1379,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -1399,6 +1415,7 @@ mod tests {
         let state_path = temp_dir.path().join("state.json");
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         let registry = PersistentSessionRegistry::new(&state_path);
         registry
@@ -1419,7 +1436,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            None, // htf_clock: uses SystemTime fallback in tests
+            &clock,
         )
         .expect("recovery should succeed");
 
@@ -1446,6 +1463,7 @@ mod tests {
     fn test_timeout_returns_partial_progress() {
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
+        let clock = make_clock();
 
         // Create 1000 sessions with a very short timeout. Some will complete
         // before the deadline is hit.
@@ -1461,7 +1479,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_millis(0),
-            None,
+            &clock,
         );
 
         match result {
@@ -1546,22 +1564,19 @@ mod tests {
     /// timestamps come from the HLC (not raw `SystemTime`).
     #[test]
     fn test_htf_clock_used_for_recovery_timestamps() {
-        use crate::htf::{ClockConfig, HolonicClock};
-
         let conn = setup_sqlite();
         let emitter = make_emitter(&conn);
         let session = make_session("sess-htf", "work-htf");
 
         // Create an HTF clock
-        let clock =
-            HolonicClock::new(ClockConfig::default(), None).expect("clock creation should succeed");
+        let clock = make_clock();
 
         let result = recover_stale_sessions(
             &[session],
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
-            Some(&clock), // Pass the HTF clock
+            &clock,
         )
         .expect("recovery should succeed");
 

@@ -1360,20 +1360,17 @@ async fn perform_crash_recovery(
         SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
     });
 
-    // SECURITY MAJOR 1 v3 fix: Create an HTF clock for recovery timestamps.
-    // Per RFC-0016, all ledger event timestamps must come from the HolonicClock
-    // rather than raw SystemTime. We create a dedicated clock instance for
-    // crash recovery since the full dispatcher is not yet initialized.
-    let htf_clock = match apm2_daemon::htf::HolonicClock::new(
+    // Security Review v4 BLOCKER 2: Create the daemon's shared HTF clock for
+    // recovery timestamps. Per RFC-0016, all ledger event timestamps must come
+    // from the HolonicClock. If clock creation fails, recovery must fail-closed
+    // rather than falling back to SystemTime.
+    let htf_clock = apm2_daemon::htf::HolonicClock::new(
         apm2_daemon::htf::ClockConfig::default(),
         None,
-    ) {
-        Ok(clock) => Some(clock),
-        Err(e) => {
-            warn!(error = %e, "Failed to create HTF clock for crash recovery; using SystemTime fallback");
-            None
-        },
-    };
+    )
+    .map_err(|e| anyhow::anyhow!(
+        "Failed to create HTF clock for crash recovery (fail-closed per RFC-0016): {e}"
+    ))?;
 
     // TCK-00387: Perform crash recovery -- emit LEASE_REVOKED events and clean
     // up work claims for each stale session.
@@ -1382,7 +1379,7 @@ async fn perform_crash_recovery(
         emitter.as_ref(),
         sqlite_conn,
         timeout,
-        htf_clock.as_ref(),
+        &htf_clock,
     );
 
     match result {
@@ -1397,18 +1394,18 @@ async fn perform_crash_recovery(
 
             // Only clear successfully recovered sessions. Pass the succeeded
             // IDs so failed sessions are preserved for retry.
-            // SECURITY MAJOR 2 v3 fix: propagate clear/persist failures.
-            if let Err(e) = apm2_daemon::episode::crash_recovery::clear_session_registry(
+            // Security Review v4 BLOCKER 1: treat clear/persist failure as
+            // recovery failure (not warning-only) to prevent repeated
+            // recovery side-effects on restart.
+            apm2_daemon::episode::crash_recovery::clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
-            ) {
-                warn!(
-                    error = %e,
-                    "Registry clear/persist failed after successful recovery; \
-                     sessions may be replayed on next startup"
-                );
-            }
+            )
+            .map_err(|e| anyhow::anyhow!(
+                "Registry clear/persist failed after successful recovery \
+                 (fail-closed to prevent repeated side-effects): {e}"
+            ))?;
         },
         Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::Timeout {
             elapsed_ms,
@@ -1423,17 +1420,18 @@ async fn perform_crash_recovery(
                 sessions_completed = outcome.sessions_recovered,
                 "Crash recovery timed out; checkpointing partial progress"
             );
+            // Security Review v4 BLOCKER 1: treat clear/persist failure as
+            // recovery failure (not warning-only).
             if !outcome.succeeded_session_ids.is_empty() {
-                if let Err(e) = apm2_daemon::episode::crash_recovery::clear_session_registry(
+                apm2_daemon::episode::crash_recovery::clear_session_registry(
                     session_registry,
                     &collected,
                     Some(&outcome.succeeded_session_ids),
-                ) {
-                    warn!(
-                        error = %e,
-                        "Registry clear/persist failed after timeout partial recovery"
-                    );
-                }
+                )
+                .map_err(|e| anyhow::anyhow!(
+                    "Registry clear/persist failed after timeout partial recovery \
+                     (fail-closed to prevent repeated side-effects): {e}"
+                ))?;
             }
         },
         Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::PartialRecovery {
@@ -1450,16 +1448,17 @@ async fn perform_crash_recovery(
                 succeeded = outcome.succeeded_session_ids.len(),
                 "Partial crash recovery; clearing only succeeded sessions"
             );
-            if let Err(e) = apm2_daemon::episode::crash_recovery::clear_session_registry(
+            // Security Review v4 BLOCKER 1: treat clear/persist failure as
+            // recovery failure (not warning-only).
+            apm2_daemon::episode::crash_recovery::clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
-            ) {
-                warn!(
-                    error = %e,
-                    "Registry clear/persist failed after partial recovery"
-                );
-            }
+            )
+            .map_err(|e| anyhow::anyhow!(
+                "Registry clear/persist failed after partial recovery \
+                 (fail-closed to prevent repeated side-effects): {e}"
+            ))?;
         },
         Err(e) => {
             // Registry is NOT cleared on error -- unrecovered sessions are
