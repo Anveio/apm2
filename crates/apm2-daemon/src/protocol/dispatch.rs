@@ -4121,9 +4121,10 @@ impl PrivilegedDispatcher {
     /// the shutdown sequence: stop all processes, clean up sockets, remove
     /// the PID file.
     ///
-    /// The response is returned to the CLI caller **before** the shutdown
-    /// flag takes effect, so the client receives acknowledgment before the
-    /// daemon begins shutting down.
+    /// The shutdown flag is set first, then the response is constructed and
+    /// returned. Because the main event loop runs on a separate task, the
+    /// caller still receives acknowledgment before the daemon acts on the
+    /// flag.
     ///
     /// If `daemon_state` is `None` (test/stub mode), logs a warning and
     /// returns a stub response without triggering shutdown.

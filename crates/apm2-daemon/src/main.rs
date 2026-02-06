@@ -330,30 +330,38 @@ fn init_supervisor(config: &EcosystemConfig) -> Supervisor {
     supervisor
 }
 
+/// Collect all running process instances from the supervisor.
+async fn collect_running_processes(state: &SharedState) -> Vec<(String, u32)> {
+    let inner = state.read().await;
+    inner
+        .supervisor
+        .specs()
+        .flat_map(|spec| {
+            (0..spec.instances)
+                .filter(|i| {
+                    inner
+                        .supervisor
+                        .get_handle(&spec.name, *i)
+                        .is_some_and(|h| h.state.is_running())
+                })
+                .map(|i| (spec.name.clone(), i))
+        })
+        .collect()
+}
+
 /// Graceful shutdown: stop all running processes.
+///
+/// This function attempts a graceful stop for each process. If the outer
+/// timeout fires (see `force_kill_all_processes`), this function may be
+/// cancelled mid-loop. The caller MUST follow up with
+/// `force_kill_all_processes` to guarantee no child process survives daemon
+/// exit.
 async fn shutdown_all_processes(state: &SharedState) {
     info!("Stopping all running processes...");
 
-    let timeout = Duration::from_secs(10);
+    let per_process_timeout = Duration::from_secs(10);
 
-    // Collect all running processes
-    let processes_to_stop: Vec<(String, u32)> = {
-        let inner = state.read().await;
-        inner
-            .supervisor
-            .specs()
-            .flat_map(|spec| {
-                (0..spec.instances)
-                    .filter(|i| {
-                        inner
-                            .supervisor
-                            .get_handle(&spec.name, *i)
-                            .is_some_and(|h| h.state.is_running())
-                    })
-                    .map(|i| (spec.name.clone(), i))
-            })
-            .collect()
-    };
+    let processes_to_stop = collect_running_processes(state).await;
 
     if processes_to_stop.is_empty() {
         info!("No running processes to stop");
@@ -362,7 +370,7 @@ async fn shutdown_all_processes(state: &SharedState) {
 
     info!("Stopping {} process instance(s)", processes_to_stop.len());
 
-    // Stop each process
+    // Stop each process gracefully
     for (name, instance) in processes_to_stop {
         // Take the runner out
         let runner = {
@@ -374,7 +382,7 @@ async fn shutdown_all_processes(state: &SharedState) {
         if let Some(mut runner) = runner {
             if runner.state().is_running() {
                 info!("Stopping {}-{}", name, instance);
-                if let Err(e) = runner.stop(timeout).await {
+                if let Err(e) = runner.stop(per_process_timeout).await {
                     warn!("Error stopping {}-{}: {}", name, instance, e);
                 }
             }
@@ -392,7 +400,58 @@ async fn shutdown_all_processes(state: &SharedState) {
         }
     }
 
-    info!("All processes stopped");
+    info!("All processes stopped gracefully");
+}
+
+/// Force-kill any child processes that are still running.
+///
+/// **Containment invariant**: This function MUST NOT be wrapped in a
+/// cancellable timeout. It runs unconditionally after the graceful shutdown
+/// phase (whether that phase completed or was cancelled by timeout) to
+/// guarantee that no managed child process survives daemon exit.
+async fn force_kill_all_processes(state: &SharedState) {
+    let still_running = collect_running_processes(state).await;
+
+    if still_running.is_empty() {
+        return;
+    }
+
+    warn!(
+        count = still_running.len(),
+        "Force-killing remaining child processes after graceful shutdown timeout"
+    );
+
+    for (name, instance) in still_running {
+        let runner = {
+            let mut inner = state.write().await;
+            let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
+            spec_id.and_then(|id| inner.remove_runner(id, instance))
+        };
+
+        if let Some(mut runner) = runner {
+            if runner.state().is_running() {
+                warn!("Force-killing {}-{}", name, instance);
+                // runner.stop with a zero-second timeout will send SIGTERM
+                // then immediately SIGKILL.
+                if let Err(e) = runner.stop(Duration::ZERO).await {
+                    warn!("Error force-killing {}-{}: {}", name, instance, e);
+                }
+            }
+        }
+
+        // Update supervisor state
+        {
+            let mut inner = state.write().await;
+            inner.supervisor.update_state(
+                &name,
+                instance,
+                ProcessState::Stopped { exit_code: None },
+            );
+            inner.supervisor.update_pid(&name, instance, None);
+        }
+    }
+
+    info!("Force-kill of remaining processes complete");
 }
 
 /// Perform daemonization via double-fork pattern.
@@ -1020,9 +1079,12 @@ async fn async_main(args: Args) -> Result<()> {
 
     // Graceful shutdown with 30-second timeout (TCK-00392).
     //
-    // The timeout ensures the daemon does not hang indefinitely if a process
-    // refuses to stop. After the timeout, remaining cleanup (socket removal,
-    // PID file removal) proceeds regardless.
+    // Phase 1 (cancellable): Attempt graceful shutdown of all processes.
+    // The timeout ensures we do not hang indefinitely waiting for SIGTERM.
+    //
+    // Phase 2 (uncancellable): Force-kill any processes that survived the
+    // graceful phase. This runs unconditionally to uphold the containment
+    // invariant: no child process may survive daemon exit.
     info!("Shutting down daemon...");
     let shutdown_timeout = Duration::from_secs(30);
     match tokio::time::timeout(shutdown_timeout, shutdown_all_processes(&state)).await {
@@ -1032,10 +1094,15 @@ async fn async_main(args: Args) -> Result<()> {
         Err(_) => {
             warn!(
                 timeout_secs = 30,
-                "Graceful shutdown timed out — proceeding with cleanup"
+                "Graceful shutdown timed out — force-killing remaining processes"
             );
         },
     }
+
+    // Phase 2: Force-kill any survivors. This is NOT wrapped in a timeout
+    // because the containment invariant requires that every managed child
+    // process is terminated before the daemon exits.
+    force_kill_all_processes(&state).await;
 
     // Cleanup sockets (SocketManager handles this in Drop, but explicit cleanup is
     // safer)
