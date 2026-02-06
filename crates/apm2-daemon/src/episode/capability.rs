@@ -2801,7 +2801,7 @@ impl CapabilityManifestV1 {
 /// because an attacker can substitute unauthorized entries while keeping
 /// the count within bounds. This struct carries the normalized baseline
 /// sets that the manifest entries must be strict subsets of.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScopeBaseline {
     /// Baseline tool classes permitted by policy.
     pub tools: Vec<ToolClass>,
@@ -5866,5 +5866,113 @@ mod manifest_v1_tests {
             .with_network("api.trusted.com", 443);
         let decision = v1.validate_request_scoped(&request, &clock_at(1500));
         assert!(decision.is_allowed(), "authorized host should be allowed");
+    }
+
+    // ========================================================================
+    // MAJOR 1 v3: Scope baseline MUST be independent of candidate manifest
+    // ========================================================================
+
+    /// MAJOR 1 v3: A manifest with wider scope than the policy baseline is
+    /// rejected. This proves that building the baseline from the manifest
+    /// itself (tautological check) is no longer the behavior.
+    #[test]
+    fn subset_rejects_manifest_with_wider_scope_than_policy_baseline() {
+        // Policy baseline only allows Read
+        let policy_baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read],
+            write_paths: vec![PathBuf::from("/workspace")],
+            shell_patterns: vec![],
+        };
+
+        // Candidate manifest tries to also include Write and Execute
+        let wider_manifest = CapabilityManifest::builder("wider-scope")
+            .delegator("attacker")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute])
+            .write_allowlist(vec![PathBuf::from("/workspace"), PathBuf::from("/etc")])
+            .shell_allowlist(vec!["rm -rf /".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&wider_manifest, &policy_baseline);
+        assert!(
+            result.is_err(),
+            "manifest with wider scope than policy baseline must be rejected"
+        );
+        let err = result.unwrap_err();
+        match err {
+            ManifestV1Error::OverbroadScope { reason } => {
+                // The error should indicate the tool allowlist exceeds baseline
+                assert!(
+                    reason.contains("tool") || reason.contains("write") || reason.contains("shell"),
+                    "error reason should indicate which scope dimension exceeded: {reason}"
+                );
+            },
+            other => panic!("expected OverbroadScope error, got: {other:?}"),
+        }
+    }
+
+    /// MAJOR 1 v3: A manifest that matches the baseline exactly is accepted.
+    /// This is the happy path when policy resolver provides the correct
+    /// baseline.
+    #[test]
+    fn subset_accepts_manifest_matching_policy_baseline_exactly() {
+        let policy_baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Git],
+            write_paths: vec![],
+            shell_patterns: vec![],
+        };
+
+        let manifest = CapabilityManifest::builder("exact-match")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Git])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &policy_baseline);
+        assert!(
+            result.is_ok(),
+            "manifest matching policy baseline exactly should be accepted: {result:?}"
+        );
+    }
+
+    /// MAJOR 1 v3: Substitution attack (same cardinality but different tools)
+    /// is detected by strict-subset check against an independent baseline.
+    #[test]
+    fn subset_rejects_substitution_attack_with_independent_baseline() {
+        // Policy baseline allows Read and Git
+        let policy_baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Git],
+            write_paths: vec![],
+            shell_patterns: vec![],
+        };
+
+        // Attacker substitutes Git -> Execute (same cardinality of 2)
+        let substituted_manifest = CapabilityManifest::builder("substitution")
+            .delegator("attacker")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&substituted_manifest, &policy_baseline);
+        assert!(
+            result.is_err(),
+            "substitution attack (Read+Execute vs policy Read+Git) must be rejected"
+        );
+        let err = result.unwrap_err();
+        match err {
+            ManifestV1Error::OverbroadScope { reason } => {
+                assert!(
+                    reason.contains("Execute"),
+                    "error should identify the substituted tool class: {reason}"
+                );
+            },
+            other => panic!("expected OverbroadScope error for substitution, got: {other:?}"),
+        }
     }
 }

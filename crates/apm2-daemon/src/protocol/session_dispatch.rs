@@ -1374,27 +1374,74 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     }
 
                     // Extract network target for Network operations (host from URL).
-                    // Parse scheme://host[:port] without requiring the `url` crate.
+                    // SECURITY (BLOCKER 1 v3 fix): Use the `url` crate for
+                    // RFC-3986-compliant parsing. Ad-hoc string splitting is
+                    // vulnerable to authority confusion attacks where a URL like
+                    // `https://trusted.com:443@evil.com/steal` tricks naive
+                    // parsers into extracting "trusted.com" as the host while
+                    // the actual network destination is "evil.com".
+                    //
+                    // The `url` crate correctly parses the authority component
+                    // and separates userinfo from the actual host. We also
+                    // hard-deny URLs that contain userinfo (username/password)
+                    // since legitimate tool URLs never include credentials in
+                    // the URL itself and their presence strongly indicates an
+                    // authority confusion attack vector.
                     if let Some(url_str) = args_value.get("url").and_then(|v| v.as_str()) {
-                        if let Some((scheme, rest)) = url_str.split_once("://") {
-                            // Strip path/query from authority
-                            let authority = rest.split('/').next().unwrap_or(rest);
-                            // Split host:port
-                            let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
-                                (
-                                    h,
-                                    p.parse::<u16>().unwrap_or(if scheme == "https" {
-                                        443
-                                    } else {
-                                        80
-                                    }),
-                                )
-                            } else {
-                                (authority, if scheme == "https" { 443 } else { 80 })
-                            };
-                            if !host.is_empty() {
-                                v1_request = v1_request.with_network(host, port);
-                            }
+                        match url::Url::parse(url_str) {
+                            Ok(parsed_url) => {
+                                // SECURITY: Reject URLs with userinfo (username
+                                // or password). Userinfo in URLs is the primary
+                                // vector for authority confusion attacks.
+                                if !parsed_url.username().is_empty()
+                                    || parsed_url.password().is_some()
+                                {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        "RequestTool denied: URL contains userinfo (authority confusion)"
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        "URL contains userinfo component; rejected for authority confusion risk".to_string(),
+                                    ));
+                                }
+                                if let Some(host) = parsed_url.host_str() {
+                                    let port =
+                                        parsed_url.port_or_known_default().unwrap_or_else(|| {
+                                            if parsed_url.scheme() == "https" {
+                                                443
+                                            } else {
+                                                80
+                                            }
+                                        });
+                                    v1_request = v1_request.with_network(host, port);
+                                }
+                                // If host_str() is None (e.g. data: URLs), the
+                                // request proceeds without a network target and
+                                // the V1 scope check will deny Network tool
+                                // class if host restrictions are configured
+                                // (fail-closed via empty host restrictions).
+                            },
+                            Err(_) => {
+                                // SECURITY: Fail-closed on unparseable URLs.
+                                // If we cannot reliably determine the host, we
+                                // must deny Network tool class to prevent
+                                // bypass via malformed URLs.
+                                if tool_class == ToolClass::Network {
+                                    warn!(
+                                        session_id = %token.session_id,
+                                        "RequestTool denied: URL parse failed for Network tool (fail-closed)"
+                                    );
+                                    return Ok(SessionResponse::error(
+                                        SessionErrorCode::SessionErrorToolNotAllowed,
+                                        "URL parse failed; Network tool denied (fail-closed)"
+                                            .to_string(),
+                                    ));
+                                }
+                                // For non-Network tool classes, unparseable URL
+                                // is not security-relevant; proceed without
+                                // network target.
+                            },
                         }
                     }
 
@@ -6163,6 +6210,177 @@ mod tests {
                     );
                 },
                 other => panic!("Expected V1 denial for disallowed tool class, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 v3: Authority confusion attack via userinfo
+        /// in URL. A URL like `https://trusted.com:443@evil.com/steal` must
+        /// be rejected because the actual network destination is `evil.com`,
+        /// not `trusted.com`. The `url` crate correctly parses the authority
+        /// and we deny any URL containing userinfo.
+        #[test]
+        fn v1_denies_url_with_userinfo_authority_confusion() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.com".to_string()],
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.com".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Authority confusion: "trusted.com:443" looks like host:port
+            // but is actually the userinfo component. The real host is evil.com.
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "https://trusted.com:443@evil.com/steal",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for authority confusion URL"
+                    );
+                    assert!(
+                        err.message.contains("userinfo"),
+                        "Error should mention userinfo rejection: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected denial for authority confusion URL, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 v3: URL with username-only userinfo must
+        /// also be rejected. Even without a password, the presence of
+        /// userinfo indicates potential authority confusion.
+        #[test]
+        fn v1_denies_url_with_username_only_userinfo() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.com".to_string()],
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.com".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Username-only userinfo: user@ before the host
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "https://admin@evil.com/path",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for username-only userinfo URL"
+                    );
+                    assert!(
+                        err.message.contains("userinfo"),
+                        "Error should mention userinfo rejection: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected denial for username-only userinfo URL, got: {other:?}"),
+            }
+        }
+
+        /// TCK-00352 BLOCKER 1 v3: Unparseable URL must be denied for
+        /// Network tool class (fail-closed). If we cannot reliably determine
+        /// the host, we must not allow the request through.
+        #[test]
+        fn v1_denies_unparseable_url_for_network_tool() {
+            let (dispatcher, minter) = setup_v1_dispatcher(
+                vec!["*.trusted.com".to_string()],
+                &[ToolClass::Network],
+                vec![
+                    Capability::builder("net-cap", ToolClass::Network)
+                        .scope(CapabilityScope {
+                            root_paths: Vec::new(),
+                            allowed_patterns: Vec::new(),
+                            size_limits: SizeLimits::default_limits(),
+                            network_policy: Some(crate::episode::scope::NetworkPolicy {
+                                allowed_hosts: vec!["*.trusted.com".to_string()],
+                                allowed_ports: vec![443],
+                                require_tls: true,
+                            }),
+                        })
+                        .risk_tier(RiskTier::Tier1)
+                        .build()
+                        .unwrap(),
+                ],
+            );
+            let ctx = make_session_ctx();
+
+            // Relative URL path: the `url` crate rejects URLs without a
+            // valid scheme (relative references are not valid absolute URLs).
+            let frame = make_tool_request(
+                &minter,
+                "network",
+                &serde_json::json!({
+                    "url": "/relative/path/no/scheme",
+                    "method": "GET"
+                }),
+            );
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        SessionErrorCode::SessionErrorToolNotAllowed as i32,
+                        "Expected TOOL_NOT_ALLOWED for unparseable URL"
+                    );
+                    assert!(
+                        err.message.contains("URL parse failed"),
+                        "Error should mention URL parse failure: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected denial for unparseable URL on Network tool, got: {other:?}")
+                },
             }
         }
 

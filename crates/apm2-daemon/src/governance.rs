@@ -175,12 +175,38 @@ impl PolicyResolver for GovernancePolicyResolver {
         // this role-based heuristic.
         let resolved_risk_tier = transitional_risk_tier(role);
 
+        // MAJOR 1 v3 fix: The scope baseline MUST come from the policy
+        // resolver (authoritative source), NOT from the candidate manifest.
+        //
+        // Phase 1 (transitional): For Reviewer, derive from the canonical
+        // reviewer manifest. For other roles, provide an empty baseline
+        // (which matches the empty fallback manifest). An empty baseline
+        // is NOT fail-open: it means no tools/paths/patterns are permitted,
+        // so any manifest with non-empty allowlists would be rejected.
+        //
+        // Phase 2 (future): Real governance policy will provide baselines.
+        let resolved_scope_baseline = {
+            use crate::episode::capability::ScopeBaseline;
+
+            match role {
+                WorkRole::Reviewer => {
+                    let reviewer = crate::episode::reviewer_manifest::reviewer_v0_manifest();
+                    Some(ScopeBaseline {
+                        tools: reviewer.tool_allowlist.clone(),
+                        write_paths: reviewer.write_allowlist.clone(),
+                        shell_patterns: reviewer.shell_allowlist.clone(),
+                    })
+                },
+                _ => Some(ScopeBaseline::default()),
+            }
+        };
         Ok(PolicyResolution {
             policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
             context_pack_hash,
             resolved_risk_tier,
+            resolved_scope_baseline,
         })
     }
 }
