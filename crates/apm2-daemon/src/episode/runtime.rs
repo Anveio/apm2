@@ -3519,6 +3519,13 @@ mod tests {
         fn get_session_by_work_id(&self, _work_id: &str) -> Option<crate::session::SessionState> {
             None
         }
+        fn remove_session(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<crate::session::SessionState>, crate::session::SessionRegistryError>
+        {
+            Ok(None)
+        }
         fn mark_terminated(
             &self,
             _session_id: &str,
