@@ -953,13 +953,12 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "context_pack_hash": hex::encode(claim.policy_resolution.context_pack_hash),
         });
         let claimed_payload_json = claimed_payload.to_string();
-        let claimed_canonical = canonicalize_json(&claimed_payload_json)
-            .map_err(|e| {
-                let _ = conn.execute("ROLLBACK", []);
-                LedgerEventError::SigningFailed {
-                    message: format!("JCS canonicalization failed: {e}"),
-                }
-            })?;
+        let claimed_canonical = canonicalize_json(&claimed_payload_json).map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            }
+        })?;
         let claimed_payload_bytes = claimed_canonical.as_bytes().to_vec();
         let mut claimed_canonical_bytes =
             Vec::with_capacity(WORK_CLAIMED_DOMAIN_PREFIX.len() + claimed_payload_bytes.len());
@@ -1020,16 +1019,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "timestamp_ns": timestamp_ns,
         });
         let transition_payload_json = transition_payload.to_string();
-        let transition_canonical = canonicalize_json(&transition_payload_json)
-            .map_err(|e| {
-                let _ = conn.execute("ROLLBACK", []);
-                LedgerEventError::SigningFailed {
-                    message: format!("JCS canonicalization failed: {e}"),
-                }
-            })?;
+        let transition_canonical = canonicalize_json(&transition_payload_json).map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            }
+        })?;
         let transition_payload_bytes = transition_canonical.as_bytes().to_vec();
-        let mut transition_canonical_bytes =
-            Vec::with_capacity(WORK_TRANSITIONED_DOMAIN_PREFIX.len() + transition_payload_bytes.len());
+        let mut transition_canonical_bytes = Vec::with_capacity(
+            WORK_TRANSITIONED_DOMAIN_PREFIX.len() + transition_payload_bytes.len(),
+        );
         transition_canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
         transition_canonical_bytes.extend_from_slice(&transition_payload_bytes);
         let transition_signature = self.signing_key.sign(&transition_canonical_bytes);
@@ -1105,13 +1104,12 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "actor_id": actor_id,
         });
         let session_payload_json = session_payload.to_string();
-        let session_canonical = canonicalize_json(&session_payload_json)
-            .map_err(|e| {
-                let _ = conn.execute("ROLLBACK", []);
-                LedgerEventError::SigningFailed {
-                    message: format!("JCS canonicalization failed: {e}"),
-                }
-            })?;
+        let session_canonical = canonicalize_json(&session_payload_json).map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            }
+        })?;
         let session_payload_bytes = session_canonical.as_bytes().to_vec();
         let mut session_canonical_bytes =
             Vec::with_capacity(SESSION_STARTED_DOMAIN_PREFIX.len() + session_payload_bytes.len());
@@ -1171,16 +1169,16 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "timestamp_ns": timestamp_ns,
         });
         let transition_payload_json = transition_payload.to_string();
-        let transition_canonical = canonicalize_json(&transition_payload_json)
-            .map_err(|e| {
-                let _ = conn.execute("ROLLBACK", []);
-                LedgerEventError::SigningFailed {
-                    message: format!("JCS canonicalization failed: {e}"),
-                }
-            })?;
+        let transition_canonical = canonicalize_json(&transition_payload_json).map_err(|e| {
+            let _ = conn.execute("ROLLBACK", []);
+            LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            }
+        })?;
         let transition_payload_bytes = transition_canonical.as_bytes().to_vec();
-        let mut transition_canonical_bytes =
-            Vec::with_capacity(WORK_TRANSITIONED_DOMAIN_PREFIX.len() + transition_payload_bytes.len());
+        let mut transition_canonical_bytes = Vec::with_capacity(
+            WORK_TRANSITIONED_DOMAIN_PREFIX.len() + transition_payload_bytes.len(),
+        );
         transition_canonical_bytes.extend_from_slice(WORK_TRANSITIONED_DOMAIN_PREFIX);
         transition_canonical_bytes.extend_from_slice(&transition_payload_bytes);
         let transition_signature = self.signing_key.sign(&transition_canonical_bytes);
@@ -1627,7 +1625,11 @@ mod tests {
         assert!(result.is_ok(), "emit_claim_lifecycle should succeed");
 
         let events = emitter.get_events_by_work_id("W-ATOMIC-SQL-001");
-        assert_eq!(events.len(), 2, "Expected 2 events (claimed + transitioned)");
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected 2 events (claimed + transitioned)"
+        );
         assert_eq!(events[0].event_type, "work_claimed");
         assert_eq!(events[1].event_type, "work_transitioned");
 
@@ -1739,10 +1741,7 @@ mod tests {
             author_custody_domains: vec![],
         };
         let result2 = emitter.emit_claim_lifecycle(&claim2, "uid:1000", 2_000);
-        assert!(
-            result2.is_err(),
-            "Should fail when table is dropped"
-        );
+        assert!(result2.is_err(), "Should fail when table is dropped");
     }
 
     /// Failure injection: If the second insert fails in
@@ -1765,7 +1764,11 @@ mod tests {
         );
         assert!(result.is_ok());
         let events = emitter.get_events_by_work_id("W-ROLLBACK-003");
-        assert_eq!(events.len(), 2, "Successful spawn lifecycle produces 2 events");
+        assert_eq!(
+            events.len(),
+            2,
+            "Successful spawn lifecycle produces 2 events"
+        );
 
         // Drop the table to force failure
         {

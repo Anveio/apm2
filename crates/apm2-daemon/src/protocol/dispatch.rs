@@ -4871,8 +4871,7 @@ impl PrivilegedDispatcher {
                 let ts = timestamp_ns;
                 // Use tokio runtime handle to call async from sync context
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let _ =
-                        handle.block_on(rt.stop(&episode_id_parsed, termination_class, ts));
+                    let _ = handle.block_on(rt.stop(&episode_id_parsed, termination_class, ts));
                 }
             }
         }
@@ -10548,8 +10547,13 @@ mod tests {
                     actor_id: &str,
                     timestamp_ns: u64,
                 ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner
-                        .emit_session_started(session_id, work_id, lease_id, actor_id, timestamp_ns)
+                    self.inner.emit_session_started(
+                        session_id,
+                        work_id,
+                        lease_id,
+                        actor_id,
+                        timestamp_ns,
+                    )
                 }
                 fn emit_session_event(
                     &self,
@@ -10559,8 +10563,13 @@ mod tests {
                     actor_id: &str,
                     timestamp_ns: u64,
                 ) -> Result<SignedLedgerEvent, LedgerEventError> {
-                    self.inner
-                        .emit_session_event(session_id, event_type, payload, actor_id, timestamp_ns)
+                    self.inner.emit_session_event(
+                        session_id,
+                        event_type,
+                        payload,
+                        actor_id,
+                        timestamp_ns,
+                    )
                 }
                 fn emit_defect_recorded(
                     &self,
@@ -10746,10 +10755,7 @@ mod tests {
             let runtime = EpisodeRuntime::new(config).with_ledger_emitter(emitter.clone());
 
             // Create and start an episode
-            let episode_id = runtime
-                .create([0u8; 32], 1_000_000_000)
-                .await
-                .unwrap();
+            let episode_id = runtime.create([0u8; 32], 1_000_000_000).await.unwrap();
             let _handle = runtime
                 .start_with_workspace(
                     &episode_id,
@@ -10847,7 +10853,10 @@ mod tests {
 
             // Verify: session removed from registry
             assert!(
-                dispatcher.session_registry().get_session(&session_id).is_none(),
+                dispatcher
+                    .session_registry()
+                    .get_session(&session_id)
+                    .is_none(),
                 "Session should be removed from registry"
             );
 
@@ -10867,10 +10876,7 @@ mod tests {
                     p["to_state"] == "Completed"
                 })
                 .count();
-            assert_eq!(
-                completed_count, 1,
-                "Expected WorkTransitioned to Completed"
-            );
+            assert_eq!(completed_count, 1, "Expected WorkTransitioned to Completed");
 
             // Verify: repeated EndSession is rejected
             let end_frame2 = encode_end_session_request(&end_request);
