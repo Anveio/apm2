@@ -1391,10 +1391,10 @@ mod tests {
                 Ok(result) => {
                     assert!(result.is_new);
                     successes += 1;
-                }
+                },
                 Err(DurableCasError::StorageFull { .. }) => {
                     storage_full_count += 1;
-                }
+                },
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
