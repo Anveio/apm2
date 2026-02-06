@@ -541,6 +541,57 @@ impl ManifestStore for InMemoryManifestStore {
 }
 
 // ============================================================================
+// TCK-00352: V1 Manifest Store (Security Review MAJOR 2)
+// ============================================================================
+
+/// Thread-safe store for V1 capability manifests keyed by session ID.
+///
+/// Per TCK-00352 Security Review MAJOR 2, V1 manifests must be wired into
+/// the production actuation path. This store is shared between the
+/// `PrivilegedDispatcher` (which mints and registers V1 manifests during
+/// `SpawnEpisode`) and the `SessionDispatcher` (which enforces V1 scope
+/// checks during `RequestTool`).
+#[derive(Debug, Default)]
+pub struct V1ManifestStore {
+    manifests:
+        std::sync::RwLock<std::collections::HashMap<String, crate::episode::CapabilityManifestV1>>,
+}
+
+impl V1ManifestStore {
+    /// Creates a new empty V1 manifest store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a V1 manifest for a session.
+    pub fn register(
+        &self,
+        session_id: impl Into<String>,
+        manifest: crate::episode::CapabilityManifestV1,
+    ) {
+        let mut store = self.manifests.write().expect("lock poisoned");
+        store.insert(session_id.into(), manifest);
+    }
+
+    /// Looks up the V1 manifest for a session.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<crate::episode::CapabilityManifestV1> {
+        let store = self.manifests.read().expect("lock poisoned");
+        store.get(session_id).cloned()
+    }
+
+    /// Removes a V1 manifest for a session.
+    pub fn remove(&self, session_id: &str) {
+        let mut store = self.manifests.write().expect("lock poisoned");
+        store.remove(session_id);
+    }
+}
+
+/// Shared reference to a [`V1ManifestStore`].
+pub type SharedV1ManifestStore = Arc<V1ManifestStore>;
+
+// ============================================================================
 // Dispatcher
 // ============================================================================
 
@@ -636,6 +687,18 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// are persisted to the ledger through the session dispatcher's
     /// `ledger` emitter.
     gate_orchestrator: Option<Arc<GateOrchestrator>>,
+    /// Shared V1 manifest store for broker scope enforcement
+    /// (TCK-00352 Security Review MAJOR 2).
+    ///
+    /// When a session has a V1 manifest registered, the `handle_request_tool`
+    /// path enforces V1 scope checks (risk tier ceiling, host restrictions,
+    /// envelope-manifest hash binding) before dispatching to the broker.
+    /// Sessions without a V1 manifest fall through to the existing broker
+    /// path (backwards compatible).
+    ///
+    /// This store is shared with `PrivilegedDispatcher` via `DispatcherState`
+    /// so that `SpawnEpisode` can mint and register V1 manifests.
+    v1_manifest_store: Option<SharedV1ManifestStore>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -664,6 +727,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -684,6 +748,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 }
@@ -709,6 +774,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -734,6 +800,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -775,6 +842,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             session_registry: None,
             telemetry_store: None,
             gate_orchestrator: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -874,6 +942,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// the orchestrator after the session dispatcher has been built.
     pub fn set_gate_orchestrator(&mut self, orchestrator: Arc<GateOrchestrator>) {
         self.gate_orchestrator = Some(orchestrator);
+    }
+
+    /// Sets the shared V1 manifest store for TCK-00352 scope enforcement.
+    ///
+    /// Per TCK-00352 Security Review MAJOR 2, this store is shared with
+    /// `PrivilegedDispatcher` so that V1 manifests minted during
+    /// `SpawnEpisode` are visible for scope enforcement in
+    /// `handle_request_tool`.
+    #[must_use]
+    pub fn with_v1_manifest_store(mut self, store: SharedV1ManifestStore) -> Self {
+        self.v1_manifest_store = Some(store);
+        self
     }
 
     fn emit_htf_regression_defect(&self, current: u64, previous: u64) {
@@ -1251,6 +1331,82 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 format!("unknown tool class: {}", request.tool_id),
             ));
         };
+
+        // TCK-00352 Security Review MAJOR 2: V1 scope enforcement gate.
+        // If the session has a V1 manifest registered, enforce V1 checks
+        // (risk tier ceiling, host restrictions, expiry) BEFORE dispatching
+        // to the broker. Deny if V1 validation fails.
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            if let Some(v1_manifest) = v1_store.get(&token.session_id) {
+                // Build a V1-compatible ToolRequest for scope validation.
+                let v1_request = {
+                    let mut tr = crate::episode::ToolRequest::new(tool_class, RiskTier::Tier0);
+                    // Extract risk tier from manifest capabilities for this tool class.
+                    // Use the capability's declared risk tier, not Tier0.
+                    if let Some(ref manifest_store_arc) = self.manifest_store {
+                        if let Some(manifest) = manifest_store_arc.get_manifest(&token.session_id) {
+                            if let Some(cap) = manifest.find_by_tool_class(tool_class).next() {
+                                tr = crate::episode::ToolRequest::new(
+                                    tool_class,
+                                    cap.risk_tier_required,
+                                );
+                            }
+                        }
+                    }
+                    tr
+                };
+
+                // Get clock for expiry checks (use HTF clock if available,
+                // otherwise use system clock as fallback).
+                let clock: Box<dyn crate::episode::capability::Clock> =
+                    if let Some(ref htf_clock) = self.clock {
+                        match htf_clock.now_hlc() {
+                            Ok(hlc) => Box::new(crate::episode::capability::FixedClock::new(
+                                hlc.wall_ns / 1_000_000_000,
+                            )),
+                            Err(_) => Box::new(crate::episode::capability::SystemClock),
+                        }
+                    } else {
+                        Box::new(crate::episode::capability::SystemClock)
+                    };
+
+                let decision = v1_manifest.validate_request_scoped(&v1_request, clock.as_ref());
+                if decision.is_denied() {
+                    warn!(
+                        session_id = %token.session_id,
+                        tool_class = ?tool_class,
+                        "RequestTool denied by V1 scope enforcement"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorToolNotAllowed,
+                        format!("V1 scope enforcement denied: {decision:?}"),
+                    ));
+                }
+
+                // TCK-00352: Verify envelope-manifest hash binding.
+                // Look up the session's envelope manifest hash and verify it
+                // matches the V1 manifest digest.
+                if let Some(ref registry) = self.session_registry {
+                    if let Some(session_state) = registry.get_session(&token.session_id) {
+                        if !session_state.capability_manifest_hash.is_empty() {
+                            if let Err(e) = v1_manifest
+                                .verify_envelope_binding(&session_state.capability_manifest_hash)
+                            {
+                                warn!(
+                                    session_id = %token.session_id,
+                                    error = %e,
+                                    "RequestTool denied: envelope-manifest hash mismatch"
+                                );
+                                return Ok(SessionResponse::error(
+                                    SessionErrorCode::SessionErrorToolNotAllowed,
+                                    format!("envelope-manifest binding failed: {e}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"

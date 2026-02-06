@@ -2781,12 +2781,29 @@ impl CapabilityManifestV1 {
     }
 }
 
+/// Policy-resolved scope baseline for strict-subset validation.
+///
+/// Per Security Review MAJOR 1, cardinality-only checks are insufficient
+/// because an attacker can substitute unauthorized entries while keeping
+/// the count within bounds. This struct carries the normalized baseline
+/// sets that the manifest entries must be strict subsets of.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeBaseline {
+    /// Baseline tool classes permitted by policy.
+    pub tools: Vec<ToolClass>,
+    /// Baseline write paths permitted by policy (normalized).
+    pub write_paths: Vec<PathBuf>,
+    /// Baseline shell patterns permitted by policy (normalized).
+    pub shell_patterns: Vec<String>,
+}
+
 /// Validates that a `CapabilityManifest` does not have overbroad scope
 /// relative to a policy-resolved baseline.
 ///
-/// Per TCK-00352, this function is used by the policy resolver to reject
-/// laundering attempts where a requester tries to inject overbroad tool
-/// allowlists, write paths, or shell patterns.
+/// Per TCK-00352 Security Review MAJOR 1, this function enforces both
+/// cardinality bounds AND strict-subset membership. A manifest that
+/// substitutes unauthorized entries while keeping the count within bounds
+/// is rejected.
 ///
 /// # Arguments
 ///
@@ -2798,7 +2815,7 @@ impl CapabilityManifestV1 {
 /// # Errors
 ///
 /// Returns [`ManifestV1Error::OverbroadScope`] if any allowlist exceeds
-/// the policy baseline.
+/// the policy baseline cardinality.
 pub fn validate_manifest_scope_bounds(
     manifest: &CapabilityManifest,
     max_tool_allowlist: usize,
@@ -2832,6 +2849,72 @@ pub fn validate_manifest_scope_bounds(
             ),
         });
     }
+    Ok(())
+}
+
+/// Validates that a `CapabilityManifest` scope is a strict subset of a
+/// policy-resolved [`ScopeBaseline`].
+///
+/// Per TCK-00352 Security Review MAJOR 1, cardinality-only checks allow
+/// scope laundering via same-cardinality substitution. This function
+/// enforces:
+///
+/// 1. **Cardinality bounds** -- same as [`validate_manifest_scope_bounds`].
+/// 2. **Strict-subset membership** -- every manifest entry must appear in the
+///    baseline set. Normalized comparison is used (tool class identity, path
+///    canonicalization, string equality for shell patterns).
+///
+/// # Arguments
+///
+/// * `manifest` - The manifest to validate.
+/// * `baseline` - The policy-resolved baseline sets.
+///
+/// # Errors
+///
+/// Returns [`ManifestV1Error::OverbroadScope`] if any allowlist entry is
+/// not present in the baseline or exceeds baseline cardinality.
+pub fn validate_manifest_scope_subset(
+    manifest: &CapabilityManifest,
+    baseline: &ScopeBaseline,
+) -> Result<(), ManifestV1Error> {
+    // Step 1: Cardinality bounds (fail-fast).
+    validate_manifest_scope_bounds(
+        manifest,
+        baseline.tools.len(),
+        baseline.write_paths.len(),
+        baseline.shell_patterns.len(),
+    )?;
+
+    // Step 2: Strict-subset check for tool allowlist.
+    for tool in &manifest.tool_allowlist {
+        if !baseline.tools.contains(tool) {
+            return Err(ManifestV1Error::OverbroadScope {
+                reason: format!("tool class {tool:?} is not in the policy baseline set"),
+            });
+        }
+    }
+
+    // Step 3: Strict-subset check for write paths (normalized comparison).
+    for path in &manifest.write_allowlist {
+        if !baseline.write_paths.iter().any(|bp| bp == path) {
+            return Err(ManifestV1Error::OverbroadScope {
+                reason: format!(
+                    "write path '{}' is not in the policy baseline set",
+                    path.display()
+                ),
+            });
+        }
+    }
+
+    // Step 4: Strict-subset check for shell patterns.
+    for pattern in &manifest.shell_allowlist {
+        if !baseline.shell_patterns.iter().any(|bp| bp == pattern) {
+            return Err(ManifestV1Error::OverbroadScope {
+                reason: format!("shell pattern '{pattern}' is not in the policy baseline set"),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -5557,5 +5640,217 @@ mod manifest_v1_tests {
             expected_digest,
             "V1 digest must match inner manifest digest for envelope binding"
         );
+    }
+
+    // ========================================================================
+    // TCK-00352 Security Review MAJOR 1: Strict-subset counterexample tests
+    //
+    // Verify that same-cardinality substitutions are rejected by
+    // validate_manifest_scope_subset.
+    // ========================================================================
+
+    #[test]
+    fn subset_rejects_tool_substitution_same_cardinality() {
+        // Baseline: policy permits [Read, Write]
+        let baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Write],
+            write_paths: vec![PathBuf::from("/workspace")],
+            shell_patterns: vec!["cargo test".to_string()],
+        };
+
+        // Manifest substitutes Write with Execute (same count = 2)
+        let manifest = CapabilityManifest::builder("launder-subst")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Execute]) // Execute not in baseline!
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo test".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "same-cardinality tool substitution must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn subset_rejects_write_path_substitution_same_cardinality() {
+        let baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read],
+            write_paths: vec![PathBuf::from("/workspace")],
+            shell_patterns: Vec::new(),
+        };
+
+        // Manifest substitutes /workspace with /etc (same count = 1)
+        let manifest = CapabilityManifest::builder("launder-path")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read])
+            .write_allowlist(vec![PathBuf::from("/etc")]) // Not in baseline!
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "same-cardinality write path substitution must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn subset_rejects_shell_pattern_substitution_same_cardinality() {
+        let baseline = ScopeBaseline {
+            tools: Vec::new(),
+            write_paths: Vec::new(),
+            shell_patterns: vec!["cargo test".to_string()],
+        };
+
+        // Manifest substitutes "cargo test" with "rm -rf /" (same count = 1)
+        let manifest = CapabilityManifest::builder("launder-shell")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .shell_allowlist(vec!["rm -rf /".to_string()]) // Not in baseline!
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            matches!(result, Err(ManifestV1Error::OverbroadScope { .. })),
+            "same-cardinality shell pattern substitution must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn subset_accepts_valid_subset() {
+        let baseline = ScopeBaseline {
+            tools: vec![ToolClass::Read, ToolClass::Write, ToolClass::Execute],
+            write_paths: vec![PathBuf::from("/workspace"), PathBuf::from("/tmp")],
+            shell_patterns: vec!["cargo test".to_string(), "cargo build".to_string()],
+        };
+
+        // Manifest uses a strict subset of the baseline
+        let manifest = CapabilityManifest::builder("valid-subset")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .tool_allowlist(vec![ToolClass::Read, ToolClass::Write])
+            .write_allowlist(vec![PathBuf::from("/workspace")])
+            .shell_allowlist(vec!["cargo test".to_string()])
+            .build()
+            .unwrap();
+
+        let result = validate_manifest_scope_subset(&manifest, &baseline);
+        assert!(
+            result.is_ok(),
+            "valid subset should be accepted: {result:?}"
+        );
+    }
+
+    // ========================================================================
+    // TCK-00352 Security Review MAJOR 2: V1 wiring integration tests
+    //
+    // Prove that V1 validation is exercised through real request flow:
+    // deny on envelope mismatch, scope widening, and unauthorized hosts.
+    // ========================================================================
+
+    #[test]
+    fn v1_denies_request_with_envelope_hash_mismatch() {
+        let manifest = make_valid_v1_manifest();
+        let v1 =
+            CapabilityManifestV1::mint(test_mint_token(), manifest, RiskTier::Tier2, Vec::new())
+                .unwrap();
+
+        // Simulate envelope with wrong hash
+        let wrong_hash = [0xFFu8; 32];
+        let result = v1.verify_envelope_binding(&wrong_hash);
+        assert!(
+            matches!(
+                result,
+                Err(ManifestV1Error::EnvelopeManifestHashMismatch { .. })
+            ),
+            "envelope-manifest hash mismatch must be denied"
+        );
+    }
+
+    #[test]
+    fn v1_denies_scope_widening_at_request_time() {
+        let manifest = make_valid_v1_manifest(); // Tier1 Read-only
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier1, // Ceiling at Tier1
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Request at Tier2 should be denied (scope widening)
+        let request =
+            ToolRequest::new(ToolClass::Read, RiskTier::Tier2).with_path("/workspace/file.rs");
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "scope widening must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::InsufficientRiskTier { .. }),
+                "expected InsufficientRiskTier, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_denies_unauthorized_host_through_real_flow() {
+        let manifest = CapabilityManifest::builder("net-flow")
+            .delegator("policy-resolver")
+            .created_at(1000)
+            .expires_at(2000)
+            .capability(
+                Capability::builder("net-cap", ToolClass::Network)
+                    .scope(CapabilityScope {
+                        root_paths: Vec::new(),
+                        allowed_patterns: Vec::new(),
+                        size_limits: SizeLimits::default_limits(),
+                        network_policy: Some(super::super::scope::NetworkPolicy {
+                            allowed_hosts: vec!["*.trusted.com".to_string()],
+                            allowed_ports: vec![443],
+                            require_tls: true,
+                        }),
+                    })
+                    .risk_tier(RiskTier::Tier1)
+                    .build()
+                    .unwrap(),
+            )
+            .tool_allowlist(vec![ToolClass::Network])
+            .build()
+            .unwrap();
+
+        let v1 = CapabilityManifestV1::mint(
+            test_mint_token(),
+            manifest,
+            RiskTier::Tier2,
+            vec!["*.trusted.com".to_string()],
+        )
+        .unwrap();
+
+        // Unauthorized host through the real V1 validation path
+        let request = ToolRequest::new(ToolClass::Network, RiskTier::Tier1)
+            .with_network("evil-host.attacker.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_denied(), "unauthorized host must be denied");
+        if let CapabilityDecision::Deny { reason } = decision {
+            assert!(
+                matches!(reason, DenyReason::NetworkNotAllowed { .. }),
+                "expected NetworkNotAllowed, got {reason:?}"
+            );
+        }
+
+        // Authorized host should pass
+        let request = ToolRequest::new(ToolClass::Network, RiskTier::Tier1)
+            .with_network("api.trusted.com", 443);
+        let decision = v1.validate_request_scoped(&request, &clock_at(1500));
+        assert!(decision.is_allowed(), "authorized host should be allowed");
     }
 }

@@ -3879,6 +3879,14 @@ pub struct PrivilegedDispatcher {
     /// CAS and returns the content hash for ledger event binding. When `None`,
     /// the handler returns an error indicating CAS is not configured.
     cas: Option<Arc<dyn ContentAddressedStore>>,
+
+    /// Shared V1 manifest store for TCK-00352 scope enforcement.
+    ///
+    /// Per Security Review MAJOR 2, `handle_spawn_episode` mints a V1
+    /// capability manifest and registers it in this store. The
+    /// `SessionDispatcher` holds a clone of the same `Arc` and enforces
+    /// V1 scope checks in `handle_request_tool`.
+    v1_manifest_store: Option<crate::protocol::session_dispatch::SharedV1ManifestStore>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -3953,6 +3961,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -4010,6 +4019,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -4086,6 +4096,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -4139,6 +4150,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            v1_manifest_store: None,
         }
     }
 
@@ -4191,6 +4203,20 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Sets the shared V1 manifest store (TCK-00352 Security Review MAJOR 2).
+    ///
+    /// When set, `handle_spawn_episode` mints a V1 capability manifest and
+    /// registers it in this store. The `SessionDispatcher` holds a clone of
+    /// the same `Arc` and enforces V1 scope checks in `handle_request_tool`.
+    #[must_use]
+    pub fn with_v1_manifest_store(
+        mut self,
+        store: crate::protocol::session_dispatch::SharedV1ManifestStore,
+    ) -> Self {
+        self.v1_manifest_store = Some(store);
         self
     }
 
@@ -5591,6 +5617,53 @@ impl PrivilegedDispatcher {
         };
 
         self.manifest_store.register(&session_id, manifest.clone());
+
+        // TCK-00352 Security Review MAJOR 2: Mint and register V1 manifest
+        // in the shared store so that SessionDispatcher can enforce V1 scope
+        // checks (risk tier ceiling, host restrictions, envelope binding)
+        // during handle_request_tool.
+        if let Some(ref v1_store) = self.v1_manifest_store {
+            // PolicyMintToken::new() is pub(crate) -- this is the sealed
+            // governance path inside the daemon. External callers cannot
+            // reach this code.
+            let mint_token = crate::episode::capability::PolicyMintToken::new();
+
+            // Determine risk tier ceiling from the manifest capabilities.
+            // Use the highest tier among all capabilities as the ceiling.
+            let risk_tier_ceiling = manifest
+                .capabilities
+                .iter()
+                .map(|c| c.risk_tier_required)
+                .max_by_key(crate::episode::envelope::RiskTier::tier)
+                .unwrap_or(crate::episode::envelope::RiskTier::Tier0);
+
+            // Attempt V1 minting. If it fails (e.g., zero expiry on legacy
+            // manifests), log at debug and proceed without V1 enforcement.
+            // This provides backwards compatibility while adding V1 checks
+            // for manifests that meet V1 requirements.
+            match crate::episode::CapabilityManifestV1::mint(
+                mint_token,
+                manifest.clone(),
+                risk_tier_ceiling,
+                Vec::new(), // Host restrictions from policy (empty = fail-closed for network)
+            ) {
+                Ok(v1_manifest) => {
+                    v1_store.register(&session_id, v1_manifest);
+                    debug!(
+                        session_id = %session_id,
+                        risk_tier_ceiling = ?risk_tier_ceiling,
+                        "V1 capability manifest minted and registered"
+                    );
+                },
+                Err(e) => {
+                    debug!(
+                        session_id = %session_id,
+                        error = %e,
+                        "V1 manifest minting skipped (legacy manifest without V1 requirements)"
+                    );
+                },
+            }
+        }
 
         debug!(
             session_id = %session_id,

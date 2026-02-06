@@ -30,13 +30,25 @@ use crate::protocol::messages::WorkRole;
 /// to construct
 /// [`CapabilityManifestV1`](crate::episode::CapabilityManifestV1) instances.
 /// The token cannot be obtained from requester surfaces.
+///
+/// # Security
+///
+/// Both `new()` and `mint_token()` are `pub(crate)` to prevent external
+/// crates from constructing a resolver and obtaining mint tokens. Only
+/// daemon-internal production wiring (in `state.rs`) should create instances.
 #[derive(Debug, Clone, Default)]
 pub struct GovernancePolicyResolver;
 
 impl GovernancePolicyResolver {
     /// Creates a new policy resolver.
+    ///
+    /// # Security
+    ///
+    /// This is `pub(crate)` to restrict construction to daemon-internal code.
+    /// External crates cannot instantiate the resolver and thus cannot reach
+    /// `mint_token()`.
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self
     }
 
@@ -50,10 +62,13 @@ impl GovernancePolicyResolver {
     ///
     /// # Security
     ///
-    /// `PolicyMintToken::new()` is `pub(crate)`, so this method is the
-    /// only way for production code to obtain a token.
+    /// Both `PolicyMintToken::new()` and this method are `pub(crate)`, so
+    /// external crates and requester surfaces cannot obtain a mint token.
+    /// Minting is restricted to the sealed governance path inside the daemon.
     #[must_use]
-    pub const fn mint_token(&self) -> PolicyMintToken {
+    #[allow(dead_code)] // Used in tests and reserved for future governance holon integration
+    #[allow(clippy::unused_self)] // Takes &self to enforce resolver-only access pattern
+    pub(crate) const fn mint_token(&self) -> PolicyMintToken {
         PolicyMintToken::new()
     }
 }
