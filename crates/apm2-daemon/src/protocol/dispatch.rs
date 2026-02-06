@@ -3761,7 +3761,7 @@ impl PrivilegedDispatcher {
             episode_id: None, // Will be set when episode starts in async context
         };
 
-        let evicted_ids = match self.session_registry.register_session(session_state) {
+        let evicted_sessions = match self.session_registry.register_session(session_state) {
             Ok(evicted) => evicted,
             Err(e) => {
                 warn!(error = %e, "Session registration failed");
@@ -3775,8 +3775,8 @@ impl PrivilegedDispatcher {
         // Step 2: Clean up telemetry for evicted sessions to prevent
         // orphaned entries and free capacity (policy convergence fix).
         if let Some(ref store) = self.telemetry_store {
-            for evicted_id in &evicted_ids {
-                store.remove(evicted_id);
+            for evicted in &evicted_sessions {
+                store.remove(&evicted.session_id);
             }
         }
 
@@ -3794,8 +3794,12 @@ impl PrivilegedDispatcher {
                 })
                 .unwrap_or(0);
             if let Err(e) = store.register(&session_id, started_at_ns) {
-                // Rollback session on telemetry failure.
+                // Rollback session on telemetry failure and restore evicted
+                // sessions so capacity is not permanently lost.
                 self.session_registry.remove_session(&session_id);
+                for evicted in &evicted_sessions {
+                    let _ = self.session_registry.register_session(evicted.clone());
+                }
                 warn!(error = %e, "Telemetry registration rejected (store at capacity)");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -3826,10 +3830,14 @@ impl PrivilegedDispatcher {
             {
                 Ok(token) => token,
                 Err(e) => {
-                    // Rollback both session and telemetry on token failure.
+                    // Rollback both session and telemetry on token failure,
+                    // and restore evicted sessions so capacity is not lost.
                     self.session_registry.remove_session(&session_id);
                     if let Some(ref store) = self.telemetry_store {
                         store.remove(&session_id);
+                    }
+                    for evicted in &evicted_sessions {
+                        let _ = self.session_registry.register_session(evicted.clone());
                     }
                     warn!(error = %e, "Session token minting failed");
                     return Ok(PrivilegedResponse::error(
@@ -3843,10 +3851,15 @@ impl PrivilegedDispatcher {
         let session_token_json = match serde_json::to_string(&session_token) {
             Ok(json) => json,
             Err(e) => {
-                // Rollback both session and telemetry on serialization failure.
+                // Rollback both session and telemetry on serialization
+                // failure, and restore evicted sessions so capacity is not
+                // lost.
                 self.session_registry.remove_session(&session_id);
                 if let Some(ref store) = self.telemetry_store {
                     store.remove(&session_id);
+                }
+                for evicted in &evicted_sessions {
+                    let _ = self.session_registry.register_session(evicted.clone());
                 }
                 warn!(error = %e, "Session token serialization failed");
                 return Ok(PrivilegedResponse::error(
@@ -3879,6 +3892,16 @@ impl PrivilegedDispatcher {
                 // For other roles, fall back to minimal manifest until their
                 // manifests are stored in CAS.
                 if request_role == WorkRole::Reviewer {
+                    // TCK-00384 security fix: rollback session + telemetry on
+                    // manifest-load failure so bounded capacity is not leaked.
+                    // Restore evicted sessions so capacity is not lost.
+                    self.session_registry.remove_session(&session_id);
+                    if let Some(ref store) = self.telemetry_store {
+                        store.remove(&session_id);
+                    }
+                    for evicted in &evicted_sessions {
+                        let _ = self.session_registry.register_session(evicted.clone());
+                    }
                     warn!(
                         work_id = %request.work_id,
                         manifest_hash = %hex::encode(manifest_hash),
@@ -3931,6 +3954,16 @@ impl PrivilegedDispatcher {
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
             Err(e) => {
+                // TCK-00384 security fix: rollback session + telemetry on
+                // timestamp failure so bounded capacity is not leaked.
+                // Restore evicted sessions so capacity is not lost.
+                self.session_registry.remove_session(&session_id);
+                if let Some(ref store) = self.telemetry_store {
+                    store.remove(&session_id);
+                }
+                for evicted in &evicted_sessions {
+                    let _ = self.session_registry.register_session(evicted.clone());
+                }
                 // TCK-00289: Fail-closed - do not proceed without valid timestamp
                 warn!(error = %e, "HTF timestamp generation failed for SessionStarted - failing closed");
                 return Ok(PrivilegedResponse::error(
@@ -3977,6 +4010,17 @@ impl PrivilegedDispatcher {
             }) {
                 Ok(id) => Some(id),
                 Err(e) => {
+                    // TCK-00384 security fix: rollback session + telemetry on
+                    // episode creation failure so bounded capacity is not
+                    // leaked. Restore evicted sessions so capacity is not
+                    // lost.
+                    self.session_registry.remove_session(&session_id);
+                    if let Some(ref store) = self.telemetry_store {
+                        store.remove(&session_id);
+                    }
+                    for evicted in &evicted_sessions {
+                        let _ = self.session_registry.register_session(evicted.clone());
+                    }
                     warn!(
                         work_id = %request.work_id,
                         error = %e,
@@ -4003,6 +4047,16 @@ impl PrivilegedDispatcher {
             }
             #[cfg(not(test))]
             {
+                // TCK-00384 security fix: rollback session + telemetry when
+                // no runtime is available so bounded capacity is not leaked.
+                // Restore evicted sessions so capacity is not lost.
+                self.session_registry.remove_session(&session_id);
+                if let Some(ref store) = self.telemetry_store {
+                    store.remove(&session_id);
+                }
+                for evicted in &evicted_sessions {
+                    let _ = self.session_registry.register_session(evicted.clone());
+                }
                 warn!("No Tokio runtime available for episode creation");
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -4032,6 +4086,16 @@ impl PrivilegedDispatcher {
             &actor_id,
             timestamp_ns,
         ) {
+            // TCK-00384 security fix: rollback session + telemetry on
+            // event emission failure so bounded capacity is not leaked.
+            // Restore evicted sessions so capacity is not lost.
+            self.session_registry.remove_session(&session_id);
+            if let Some(ref store) = self.telemetry_store {
+                store.remove(&session_id);
+            }
+            for evicted in &evicted_sessions {
+                let _ = self.session_registry.register_session(evicted.clone());
+            }
             warn!(error = %e, "SessionStarted event emission failed");
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
@@ -9054,7 +9118,7 @@ mod tests {
             (dispatcher, store)
         }
 
-        /// Helper: claim work and spawn, returning the session_id from the
+        /// Helper: claim work and spawn, returning the `session_id` from the
         /// spawn response.
         #[allow(clippy::result_large_err)] // Test helper; PrivilegedResponse is large but acceptable in tests
         fn claim_and_spawn(
@@ -9315,7 +9379,125 @@ mod tests {
             };
             let evicted = registry.register_session(new_session).unwrap();
             assert_eq!(evicted.len(), 1, "Exactly one session should be evicted");
-            assert_eq!(evicted[0], "S-0", "Oldest session should be evicted");
+            assert_eq!(
+                evicted[0].session_id, "S-0",
+                "Oldest session should be evicted"
+            );
+        }
+
+        /// TCK-00384 Security BLOCKER: Verify that a failed spawn after
+        /// session + telemetry registration leaves no leaked state.
+        ///
+        /// This test simulates the rollback path: register a session and
+        /// telemetry, then manually perform rollback (as the error paths do)
+        /// and verify that both stores are clean.
+        #[test]
+        fn test_failed_spawn_leaves_no_leaked_state() {
+            use crate::episode::registry::InMemorySessionRegistry;
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+
+            // Step 1: Register session (simulates dispatch.rs step 1)
+            let session = SessionState {
+                session_id: "S-FAIL-001".to_string(),
+                work_id: "W-FAIL".to_string(),
+                role: 1,
+                ephemeral_handle: "H-FAIL".to_string(),
+                lease_id: "L-FAIL".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            let evicted = registry.register_session(session).unwrap();
+            assert!(evicted.is_empty());
+
+            // Step 2: Register telemetry (simulates dispatch.rs step 3)
+            store.register("S-FAIL-001", 42).unwrap();
+
+            // Verify both stores have the session
+            assert!(registry.get_session("S-FAIL-001").is_some());
+            assert!(store.get("S-FAIL-001").is_some());
+
+            // Step 3: Simulate spawn failure - perform rollback
+            registry.remove_session("S-FAIL-001");
+            store.remove("S-FAIL-001");
+
+            // Verify NO leaked state remains
+            assert!(
+                registry.get_session("S-FAIL-001").is_none(),
+                "Session must be removed from registry after rollback"
+            );
+            assert!(
+                store.get("S-FAIL-001").is_none(),
+                "Telemetry must be removed from store after rollback"
+            );
+        }
+
+        /// TCK-00384 Quality BLOCKER: Verify that rollback after spawn
+        /// failure restores evicted sessions so capacity is not permanently
+        /// lost.
+        #[test]
+        fn test_failed_spawn_restores_evicted_sessions() {
+            use crate::episode::registry::{InMemorySessionRegistry, MAX_SESSIONS};
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+
+            // Fill to capacity
+            for i in 0..MAX_SESSIONS {
+                let session = SessionState {
+                    session_id: format!("S-{i}"),
+                    work_id: format!("W-{i}"),
+                    role: 1,
+                    ephemeral_handle: format!("H-{i}"),
+                    lease_id: format!("L-{i}"),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                };
+                registry.register_session(session).unwrap();
+                store.register(&format!("S-{i}"), i as u64).unwrap();
+            }
+
+            // Register a new session -- this evicts S-0
+            let new_session = SessionState {
+                session_id: "S-NEW".to_string(),
+                work_id: "W-NEW".to_string(),
+                role: 1,
+                ephemeral_handle: "H-NEW".to_string(),
+                lease_id: "L-NEW".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: None,
+            };
+            let evicted = registry.register_session(new_session).unwrap();
+            assert_eq!(evicted.len(), 1);
+            assert_eq!(evicted[0].session_id, "S-0");
+
+            // Clean up telemetry for evicted session (as dispatch.rs does)
+            for e in &evicted {
+                store.remove(&e.session_id);
+            }
+
+            // Simulate spawn failure: rollback new session + restore evicted
+            registry.remove_session("S-NEW");
+            store.remove("S-NEW");
+            for e in &evicted {
+                let _ = registry.register_session(e.clone());
+            }
+
+            // The evicted session should be restored
+            assert!(
+                registry.get_session("S-0").is_some(),
+                "Evicted session must be restored after rollback"
+            );
+            assert!(
+                registry.get_session("S-NEW").is_none(),
+                "Failed session must not exist after rollback"
+            );
         }
     }
 }

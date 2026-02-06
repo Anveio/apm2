@@ -35,6 +35,12 @@
 //! - [`session`]: Session handling with context firewall integration
 //! - [`telemetry`]: Cgroup-based resource telemetry collection
 
+// Macro-expanded protobuf types (e.g., PrivilegedResponse) exceed the
+// default 16 KiB stack-array threshold when constructed in test helpers.
+// The lint fires inside derive/encode macro expansions without a source
+// location, so we allow it crate-wide for the test cfg only.
+#![cfg_attr(test, allow(clippy::large_stack_arrays))]
+
 pub mod cas;
 pub mod episode;
 pub mod evidence;

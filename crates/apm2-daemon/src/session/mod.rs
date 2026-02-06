@@ -138,11 +138,17 @@ impl std::fmt::Debug for SessionState {
 pub trait SessionRegistry: Send + Sync {
     /// Registers a new session.
     ///
-    /// Returns a list of session IDs that were evicted to make room for the
-    /// new session (may be empty if no eviction was necessary). Callers
-    /// MUST clean up telemetry for evicted sessions to prevent orphaned
-    /// entries (TCK-00384 security fix).
-    fn register_session(&self, session: SessionState) -> Result<Vec<String>, SessionRegistryError>;
+    /// Returns the full [`SessionState`] of any sessions that were evicted to
+    /// make room for the new session (may be empty if no eviction was
+    /// necessary). Callers MUST clean up telemetry for evicted sessions to
+    /// prevent orphaned entries (TCK-00384 security fix). Returning full
+    /// state (rather than just IDs) enables callers to restore evicted
+    /// sessions on transactional rollback, preventing capacity loss when a
+    /// spawn fails after eviction (TCK-00384 quality fix).
+    fn register_session(
+        &self,
+        session: SessionState,
+    ) -> Result<Vec<SessionState>, SessionRegistryError>;
 
     /// Removes a session by ID.
     ///
@@ -377,7 +383,7 @@ pub enum TelemetryStoreError {
 /// The store enforces a hard cap of [`MAX_TELEMETRY_SESSIONS`] entries.
 /// When the limit is reached, new registrations are rejected (fail-closed)
 /// rather than silently evicting existing entries. Callers must wire
-/// session lifecycle events (e.g., termination) to call [`remove`] and
+/// session lifecycle events (e.g., termination) to call [`Self::remove`] and
 /// free capacity.
 ///
 /// # Thread Safety
