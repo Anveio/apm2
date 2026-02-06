@@ -561,7 +561,7 @@ fn update_status(
                 &correlation_id,
             )?;
             println!("  [CUTOVER] Status update receipt emitted: {context} = {state}");
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(

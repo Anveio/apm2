@@ -347,7 +347,8 @@ pub enum StatusWriteDecision {
 pub const fn check_status_write_allowed() -> StatusWriteDecision {
     // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
     // Replacement paths (daemon projection, FAC v0 harness) are live.
-    // All previous gating logic (strict mode, HEF projection flag, cutover) is superseded.
+    // All previous gating logic (strict mode, HEF projection flag, cutover) is
+    // superseded.
     StatusWriteDecision::Removed
 }
 
@@ -355,25 +356,28 @@ pub const fn check_status_write_allowed() -> StatusWriteDecision {
 ///
 /// # TCK-00297 (Stage X3): Status writes permanently removed
 ///
-/// As of TCK-00297, this function always returns `StatusWriteDecision::Removed`,
-/// regardless of CLI flags. The `emit_receipt_only_flag` and
-/// `allow_github_write_flag` parameters are retained for call-site compatibility
-/// with TCK-00324 callers but are ignored.
+/// As of TCK-00297, this function always returns
+/// `StatusWriteDecision::Removed`, regardless of CLI flags. The
+/// `emit_receipt_only_flag` and `allow_github_write_flag` parameters are
+/// retained for call-site compatibility with TCK-00324 callers but are ignored.
 ///
 /// # Arguments
 ///
-/// * `_emit_receipt_only_flag` - CLI --emit-receipt-only flag (ignored, TCK-00297)
-/// * `_allow_github_write_flag` - CLI --allow-github-write flag (ignored, TCK-00297)
+/// * `_emit_receipt_only_flag` - CLI --emit-receipt-only flag (ignored,
+///   TCK-00297)
+/// * `_allow_github_write_flag` - CLI --allow-github-write flag (ignored,
+///   TCK-00297)
 ///
 /// # Returns
 ///
 /// Always returns `StatusWriteDecision::Removed`.
-pub fn check_status_write_with_flags(
+pub const fn check_status_write_with_flags(
     _emit_receipt_only_flag: bool,
     _allow_github_write_flag: bool,
 ) -> StatusWriteDecision {
     // TCK-00297 (Stage X3): Direct GitHub status writes are permanently removed.
-    // All previous gating logic (HEF projection, cutover, strict mode) is superseded.
+    // All previous gating logic (HEF projection, cutover, strict mode) is
+    // superseded.
     StatusWriteDecision::Removed
 }
 
@@ -1184,7 +1188,8 @@ mod tests {
         unsafe { std::env::remove_var(XTASK_ALLOW_GITHUB_WRITE_ENV) };
     }
 
-    /// IT-00297-02: Verify that TCK-00324 cutover flags do not override removal.
+    /// IT-00297-02: Verify that TCK-00324 cutover flags do not override
+    /// removal.
     ///
     /// Per TCK-00297 (Stage X3), `check_status_write_allowed()` and
     /// `check_status_write_with_flags()` must unconditionally return

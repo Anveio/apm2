@@ -238,7 +238,7 @@ pub fn set_status_check(
                 &correlation_id,
             )?;
             println!("  [CUTOVER] AAT status receipt emitted: {state} - {description}");
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(

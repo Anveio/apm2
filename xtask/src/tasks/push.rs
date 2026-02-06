@@ -387,19 +387,17 @@ fn create_pending_statuses(
     _emit_receipt_only: bool,
     _allow_github_write: bool,
 ) {
-    use crate::util::{StatusWriteDecision, check_status_write_with_flags};
+    use crate::util::{StatusWriteDecision, check_status_write_allowed};
 
     // TCK-00297 (Stage X3): Status writes are permanently removed.
-    // check_status_write_with_flags always returns Removed as of TCK-00297.
-    match check_status_write_with_flags(_emit_receipt_only, _allow_github_write) {
+    // check_status_write_allowed always returns Removed as of TCK-00297.
+    match check_status_write_allowed() {
         StatusWriteDecision::Removed => {
             println!(
                 "    [TCK-00297] GitHub status writes removed. Would have created pending statuses on {owner_repo}@{head_sha}:"
             );
             println!("      - ai-review/security  = pending (Waiting for security review)");
-            println!(
-                "      - ai-review/code-quality = pending (Waiting for code quality review)"
-            );
+            println!("      - ai-review/code-quality = pending (Waiting for code quality review)");
             crate::util::print_status_writes_removed_notice();
         },
         // Legacy variants preserved for backwards compatibility but never returned.

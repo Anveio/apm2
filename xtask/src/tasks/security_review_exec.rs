@@ -529,7 +529,7 @@ fn update_status(
             println!(
                 "  [CUTOVER] Security review status receipt emitted: {STATUS_CONTEXT} = {state}"
             );
-            return Ok(());
+            Ok(())
         },
         StatusWriteDecision::BlockStrictMode => {
             bail!(
