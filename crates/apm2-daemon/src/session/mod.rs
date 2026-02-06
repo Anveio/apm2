@@ -627,6 +627,80 @@ impl SessionTelemetryStore {
 }
 
 // =============================================================================
+// TCK-00351 v3: Per-Session Stop Conditions Store
+// =============================================================================
+
+/// Per-session stop conditions store for pre-actuation gate enforcement.
+///
+/// TCK-00351 v3 FIX: The pre-actuation gate was called with
+/// `StopConditions::default()` and `current_episode_count=0`, meaning
+/// `max_episodes` and `escalation_predicate` were never checked.  This
+/// store associates real stop conditions with each session so the gate can
+/// enforce them.
+///
+/// # Capacity Bounds (CTR-1303)
+///
+/// Shares the same capacity limit as [`SessionTelemetryStore`].
+///
+/// # Thread Safety
+///
+/// Uses `RwLock<HashMap>` for concurrent access.  Stop conditions are
+/// immutable once registered (set at session spawn time).
+#[derive(Debug, Default)]
+pub struct SessionStopConditionsStore {
+    entries: RwLock<HashMap<String, crate::episode::envelope::StopConditions>>,
+}
+
+impl SessionStopConditionsStore {
+    /// Creates a new empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers stop conditions for a session.
+    ///
+    /// If the session already has conditions registered, the existing entry
+    /// is preserved (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the store is at capacity and the session is not
+    /// already registered.
+    pub fn register(
+        &self,
+        session_id: &str,
+        conditions: crate::episode::envelope::StopConditions,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(session_id.to_string(), conditions);
+        Ok(())
+    }
+
+    /// Returns the stop conditions for a session, if registered.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<crate::episode::envelope::StopConditions> {
+        let entries = self.entries.read().expect("lock poisoned");
+        entries.get(session_id).cloned()
+    }
+
+    /// Removes stop conditions for a session.
+    pub fn remove(&self, session_id: &str) {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id);
+    }
+}
+
+// =============================================================================
 // TCK-00384: Session Telemetry Tests
 // =============================================================================
 

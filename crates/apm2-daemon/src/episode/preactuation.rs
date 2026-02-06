@@ -89,6 +89,16 @@ pub struct StopAuthority {
     /// [`StopConditionEvaluator::evaluate_with_uncertainty`] returns
     /// [`StopStatus::Uncertain`], which triggers deadline-based fail-closed
     /// denial.
+    ///
+    /// # Production Wiring (TCK-00364)
+    ///
+    /// Currently this flag is only set in tests.  The production call path
+    /// will be wired in TCK-00364 (`FreshnessPolicyV1`), where the
+    /// governance freshness monitor periodically checks the governance
+    /// service health and calls [`StopAuthority::set_governance_uncertain`]
+    /// when the response is stale beyond the configured threshold.  The
+    /// control surface exists and is fully testable; only the monitoring
+    /// integration remains.
     governance_uncertain: AtomicBool,
 }
 
@@ -678,6 +688,12 @@ impl PreActuationGate {
         let stop_checked = true;
 
         // --- Step 2: Evaluate budget ---
+        // TCK-00351 v3 FIX: Track whether a real budget tracker performed the
+        // check.  When no tracker is present and require_budget=false (legacy/
+        // test mode), we allow through but set budget_checked=false in the
+        // receipt so downstream consumers know budget was NOT actually verified.
+        // Only set budget_checked=true when a real tracker is wired.
+        let has_real_tracker = self.budget_tracker.is_some();
         let budget_status = self.evaluate_budget();
         match budget_status {
             BudgetStatus::Available => {},
@@ -685,7 +701,7 @@ impl PreActuationGate {
                 return Err(PreActuationDenial::BudgetExhausted { error });
             },
         }
-        let budget_checked = true;
+        let budget_checked = has_real_tracker;
 
         Ok(PreActuationReceipt {
             stop_checked,
@@ -1101,9 +1117,13 @@ mod tests {
         let conditions = StopConditions::default();
         let receipt = gate.check(&conditions, 0, false, false, 0, 1000).unwrap();
         assert!(receipt.stop_checked);
-        assert!(receipt.budget_checked);
+        // TCK-00351 v3: budget_checked is false when no tracker is wired
+        // (honest receipt -- no tracker means no real budget check occurred).
+        assert!(!receipt.budget_checked);
         assert_eq!(receipt.timestamp_ns, 1000);
-        assert!(receipt.is_cleared());
+        // is_cleared() requires both stop_checked AND budget_checked, so
+        // without a tracker the receipt is not fully cleared.
+        assert!(!receipt.is_cleared());
     }
 
     #[test]
@@ -1196,7 +1216,10 @@ mod tests {
         let receipt = gate
             .check(&conditions, 0, false, false, 1000, 2000)
             .unwrap();
-        assert!(receipt.is_cleared());
+        // TCK-00351 v3: stop_checked is true, budget_checked is false
+        // (no tracker wired).
+        assert!(receipt.stop_checked);
+        assert!(!receipt.budget_checked);
     }
 
     // =========================================================================
@@ -1697,7 +1720,10 @@ mod tests {
             "production gate without tracker should allow"
         );
         let receipt = result.unwrap();
-        assert!(receipt.is_cleared());
+        // TCK-00351 v3: stop_checked is true, budget_checked is false
+        // (no tracker wired -- honest receipt).
+        assert!(receipt.stop_checked);
+        assert!(!receipt.budget_checked);
     }
 
     #[test]
@@ -1767,10 +1793,12 @@ mod tests {
         let conditions = StopConditions::default();
         let receipt = gate.check(&conditions, 0, false, false, 0, 42_000).unwrap();
 
-        // Fields must be true (checks passed) and timestamp must be 42_000
-        // (the value we passed in, not a later clock sample).
+        // stop_checked is true (checks passed), budget_checked is false
+        // (no tracker wired), timestamp must be 42_000 (the value we passed
+        // in, not a later clock sample).
         assert!(receipt.stop_checked);
-        assert!(receipt.budget_checked);
+        // TCK-00351 v3: budget_checked is false without a real tracker.
+        assert!(!receipt.budget_checked);
         assert_eq!(receipt.timestamp_ns, 42_000);
     }
 
@@ -1940,9 +1968,20 @@ mod tests {
     /// verifier evidence.
     #[test]
     fn test_replay_verifier_production_flow_evid_0305() {
+        use crate::episode::budget_tracker::BudgetTracker;
+
         // Simulate a production flow: gate check -> tool actuation.
+        // TCK-00351 v3: Use a real budget tracker so budget_checked=true
+        // in the receipt, matching production deployment where a tracker
+        // is always wired.
         let authority = Arc::new(StopAuthority::new());
-        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+        let budget = EpisodeBudget::builder()
+            .tokens(10_000)
+            .tool_calls(1000)
+            .build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let gate =
+            PreActuationGate::production_gate(Arc::clone(&authority), Some(Arc::clone(&tracker)));
         let conditions = StopConditions::default();
 
         // First tool request: gate check at ts=100
@@ -2010,6 +2049,138 @@ mod tests {
         assert!(
             matches!(err, ReplayViolation::MissingPreActuationCheck { .. }),
             "ungated actuation must be caught by verifier (EVID-0305)"
+        );
+    }
+
+    // =========================================================================
+    // TCK-00351 v3: Integration tests for real stop conditions enforcement
+    // =========================================================================
+
+    /// TCK-00351 BLOCKER 1 v3: When `max_episodes=2` and
+    /// `current_episode_count=2`, the gate MUST deny with
+    /// `StopActive { class: MaxEpisodesReached }`.
+    ///
+    /// This proves that the gate actually enforces `max_episodes` when real
+    /// conditions are passed (as opposed to `StopConditions::default()`
+    /// which has `max_episodes=0` and is never checked).
+    #[test]
+    fn test_gate_denies_when_max_episodes_reached() {
+        let authority = Arc::new(StopAuthority::new());
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+
+        // max_episodes=2, so episode_count >= 2 must deny
+        let conditions = StopConditions::max_episodes(2);
+
+        // episode_count=1: should still pass
+        let receipt = gate
+            .check(&conditions, 1, false, false, 0, 100)
+            .expect("gate should clear when episode_count < max_episodes");
+        assert!(receipt.stop_checked);
+
+        // episode_count=2: should deny (2 >= 2)
+        let err = gate
+            .check(&conditions, 2, false, false, 0, 200)
+            .expect_err("gate should deny when episode_count >= max_episodes");
+        assert!(
+            matches!(
+                err,
+                PreActuationDenial::StopActive {
+                    class: StopClass::MaxEpisodesReached
+                }
+            ),
+            "expected MaxEpisodesReached denial, got: {err:?}"
+        );
+
+        // episode_count=10: should also deny (10 >= 2)
+        let err = gate
+            .check(&conditions, 10, false, false, 0, 300)
+            .expect_err("gate should deny when episode_count >> max_episodes");
+        assert!(
+            matches!(
+                err,
+                PreActuationDenial::StopActive {
+                    class: StopClass::MaxEpisodesReached
+                }
+            ),
+            "expected MaxEpisodesReached denial at count=10, got: {err:?}"
+        );
+    }
+
+    /// TCK-00351 BLOCKER 1 v3: When the escalation predicate is non-empty,
+    /// the gate MUST deny with `StopActive { class: EscalationTriggered }`.
+    #[test]
+    fn test_gate_denies_when_escalation_predicate_set() {
+        let authority = Arc::new(StopAuthority::new());
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+
+        let conditions = StopConditions {
+            max_episodes: 0,
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+            escalation_predicate: "cost > $100".to_string(),
+        };
+
+        let err = gate
+            .check(&conditions, 0, false, false, 0, 100)
+            .expect_err("gate should deny when escalation predicate is set");
+        assert!(
+            matches!(
+                err,
+                PreActuationDenial::StopActive {
+                    class: StopClass::EscalationTriggered
+                }
+            ),
+            "expected EscalationTriggered denial, got: {err:?}"
+        );
+    }
+
+    /// TCK-00351 BLOCKER 2 v3: When no budget tracker is wired and
+    /// `require_budget=false`, the receipt MUST set `budget_checked=false`
+    /// (honest receipt claim).
+    ///
+    /// Previously the receipt claimed `budget_checked=true` even when no
+    /// tracker performed the check.
+    #[test]
+    fn test_budget_checked_false_without_tracker() {
+        let authority = Arc::new(StopAuthority::new());
+        // production_gate with no budget tracker
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+
+        let conditions = StopConditions::default();
+        let receipt = gate
+            .check(&conditions, 0, false, false, 0, 100)
+            .expect("gate should clear (no budget enforcement)");
+
+        assert!(receipt.stop_checked, "stop should always be checked");
+        assert!(
+            !receipt.budget_checked,
+            "budget_checked must be false when no tracker is wired"
+        );
+    }
+
+    /// TCK-00351 BLOCKER 2 v3: When a real budget tracker IS wired and
+    /// has sufficient budget, the receipt MUST set `budget_checked=true`.
+    #[test]
+    fn test_budget_checked_true_with_real_tracker() {
+        use crate::episode::budget_tracker::BudgetTracker;
+
+        let authority = Arc::new(StopAuthority::new());
+        let budget = EpisodeBudget::builder()
+            .tokens(1000)
+            .tool_calls(100)
+            .build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), Some(tracker));
+
+        let conditions = StopConditions::default();
+        let receipt = gate
+            .check(&conditions, 0, false, false, 0, 100)
+            .expect("gate should clear with sufficient budget");
+
+        assert!(receipt.stop_checked, "stop should be checked");
+        assert!(
+            receipt.budget_checked,
+            "budget_checked must be true when a real tracker verified the budget"
         );
     }
 }

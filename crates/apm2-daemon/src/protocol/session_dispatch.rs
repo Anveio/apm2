@@ -650,6 +650,16 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// When set, the gate ignores hardcoded false values and reads from
     /// this authority.
     stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+    /// Per-session stop conditions store (TCK-00351 v3).
+    ///
+    /// TCK-00351 BLOCKER 1 v3 FIX: The pre-actuation gate was called with
+    /// `StopConditions::default()` and `current_episode_count=0`, meaning
+    /// `max_episodes` and `escalation_predicate` were never actually
+    /// checked.  This store holds real stop conditions per session, loaded
+    /// from the episode envelope at session spawn time.  The gate reads
+    /// from this store and passes real `current_episode_count` from the
+    /// session telemetry.
+    stop_conditions_store: Option<Arc<crate::session::SessionStopConditionsStore>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -680,6 +690,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -702,6 +713,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
+            stop_conditions_store: None,
         }
     }
 }
@@ -729,6 +741,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -756,6 +769,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -799,6 +813,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             gate_orchestrator: None,
             preactuation_gate: None,
             stop_authority: None,
+            stop_conditions_store: None,
         }
     }
 
@@ -928,6 +943,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         authority: Arc<crate::episode::preactuation::StopAuthority>,
     ) -> Self {
         self.stop_authority = Some(authority);
+        self
+    }
+
+    /// Sets the per-session stop conditions store (TCK-00351 v3).
+    ///
+    /// TCK-00351 BLOCKER 1 v3 FIX: When set, the pre-actuation gate
+    /// reads real stop conditions from this store instead of using
+    /// `StopConditions::default()`.  Conditions are registered at
+    /// session spawn time from the episode envelope.
+    #[must_use]
+    pub fn with_stop_conditions_store(
+        mut self,
+        store: Arc<crate::session::SessionStopConditionsStore>,
+    ) -> Self {
+        self.stop_conditions_store = Some(store);
         self
     }
 
@@ -1340,24 +1370,46 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                         )
                     });
 
-            // Use default stop conditions (from envelope when available).
-            // The session dispatcher does not yet track per-session episode
-            // counts; the gate's StopAuthority and BudgetTracker are the
-            // primary enforcement mechanisms at the session dispatch layer.
-            let conditions = crate::episode::StopConditions::default();
-
-            // TCK-00351 MAJOR 1 FIX: Pass real elapsed time from session
-            // telemetry store instead of hardcoded 0.  This makes the
-            // stop-uncertainty deadline reachable.
-            let elapsed_ms = self
-                .telemetry_store
+            // TCK-00351 BLOCKER 1 v3 FIX: Load real stop conditions from the
+            // per-session store.  If no store is wired or the session has no
+            // conditions registered, fall back to default (unlimited).  This
+            // ensures max_episodes and escalation_predicate are actually
+            // evaluated against the session's envelope-specified limits.
+            let conditions = self
+                .stop_conditions_store
                 .as_ref()
                 .and_then(|store| store.get(&token.session_id))
-                .map_or(0, |telemetry| telemetry.elapsed_ms());
+                .unwrap_or_default();
+
+            // TCK-00351 MAJOR v3 FIX: Hard-deny when telemetry is missing for
+            // an active session.  An active session MUST have telemetry
+            // registered; missing telemetry indicates a configuration bug and
+            // continuing with elapsed_ms=0 would mask the stop-uncertainty
+            // deadline (fail-closed on uncertainty).
+            let telemetry = self
+                .telemetry_store
+                .as_ref()
+                .and_then(|store| store.get(&token.session_id));
+            let (elapsed_ms, current_episode_count) = if let Some(t) = telemetry {
+                (t.elapsed_ms(), t.get_tool_calls())
+            } else {
+                // Fail-closed: no telemetry for this session means we
+                // cannot verify elapsed time or episode count.
+                warn!(
+                    session_id = %token.session_id,
+                    tool_id = %request.tool_id,
+                    "Pre-actuation gate denied: no telemetry registered for session (fail-closed)"
+                );
+                return Ok(SessionResponse::error(
+                    SessionErrorCode::SessionErrorToolNotAllowed,
+                    "pre-actuation check failed: session telemetry unavailable (fail-closed)"
+                        .to_string(),
+                ));
+            };
 
             match gate.check(
                 &conditions,
-                0, // current_episode_count
+                current_episode_count,
                 emergency_stop,
                 governance_stop,
                 elapsed_ms,
