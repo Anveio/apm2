@@ -110,7 +110,8 @@ pub enum PolicyInheritanceError {
         max: usize,
     },
 
-    /// Sublease `gate_id` does not match parent `gate_id` (scope bypass attempt).
+    /// Sublease `gate_id` does not match parent `gate_id` (scope bypass
+    /// attempt).
     #[error(
         "gate_id mismatch: parent gate_id='{parent_gate_id}', sublease gate_id='{sublease_gate_id}'"
     )]
