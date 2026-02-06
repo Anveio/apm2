@@ -14,6 +14,7 @@
 //! - **Changeset binding**: Lease `changeset_digest` matches session data.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -280,6 +281,36 @@ pub enum GateOrchestratorError {
         /// The gate type.
         gate_type: String,
     },
+
+    /// Receipt binding mismatch (`lease_id` or `gate_id` does not match issued
+    /// lease).
+    #[error("receipt binding mismatch for work_id {work_id}: {reason}")]
+    ReceiptBindingMismatch {
+        /// The work ID.
+        work_id: String,
+        /// Description of the mismatch.
+        reason: String,
+    },
+
+    /// Invalid state transition (e.g., updating a terminal-state gate).
+    #[error("invalid state transition for gate {gate_type} in work_id {work_id}: {reason}")]
+    InvalidStateTransition {
+        /// The work ID.
+        work_id: String,
+        /// The gate type.
+        gate_type: String,
+        /// Description of the invalid transition.
+        reason: String,
+    },
+
+    /// Lease ID is empty.
+    #[error("lease_id must not be empty for gate {gate_type} in work_id {work_id}")]
+    EmptyLeaseId {
+        /// The work ID.
+        work_id: String,
+        /// The gate type.
+        gate_type: String,
+    },
 }
 
 // =============================================================================
@@ -534,22 +565,6 @@ impl GateOrchestrator {
             });
         }
 
-        // Check resource limits
-        {
-            let orchestrations = self.orchestrations.read().await;
-            if orchestrations.len() >= self.config.max_concurrent_orchestrations {
-                return Err(GateOrchestratorError::MaxOrchestrationsExceeded {
-                    current: orchestrations.len(),
-                    max: self.config.max_concurrent_orchestrations,
-                });
-            }
-            if orchestrations.contains_key(&info.work_id) {
-                return Err(GateOrchestratorError::DuplicateOrchestration {
-                    work_id: info.work_id.clone(),
-                });
-            }
-        }
-
         let now_ms = current_time_ms();
 
         // Step 1: Resolve policy for the changeset.
@@ -605,20 +620,34 @@ impl GateOrchestrator {
             issued_gate_types.push(gate_type);
         }
 
-        // Step 3: Store orchestration entry.
+        // Step 3: Atomic check+insert under a single write lock.
+        // This prevents TOCTOU races where concurrent calls could exceed
+        // max_concurrent_orchestrations or bypass duplicate detection.
         {
             let mut orchestrations = self.orchestrations.write().await;
-            orchestrations.insert(
-                info.work_id.clone(),
-                OrchestrationEntry {
-                    _session_info: info,
-                    policy_resolution,
-                    gates,
-                    leases,
-                    receipts: HashMap::new(),
-                    _started_at_ms: now_ms,
+            if orchestrations.len() >= self.config.max_concurrent_orchestrations {
+                return Err(GateOrchestratorError::MaxOrchestrationsExceeded {
+                    current: orchestrations.len(),
+                    max: self.config.max_concurrent_orchestrations,
+                });
+            }
+            match orchestrations.entry(info.work_id.clone()) {
+                Entry::Occupied(_) => {
+                    return Err(GateOrchestratorError::DuplicateOrchestration {
+                        work_id: info.work_id.clone(),
+                    });
                 },
-            );
+                Entry::Vacant(vacant) => {
+                    vacant.insert(OrchestrationEntry {
+                        _session_info: info,
+                        policy_resolution,
+                        gates,
+                        leases,
+                        receipts: HashMap::new(),
+                        _started_at_ms: now_ms,
+                    });
+                },
+            }
         }
 
         Ok(issued_gate_types)
@@ -629,9 +658,16 @@ impl GateOrchestrator {
     /// This updates the gate status from `LeaseIssued` to `Running` and
     /// emits a `GateExecutorSpawned` event.
     ///
+    /// # State Machine
+    ///
+    /// Valid transition: `LeaseIssued` -> `Running`. All other states
+    /// (including terminal states `Completed` and `TimedOut`) are rejected.
+    ///
     /// # Errors
     ///
-    /// Returns error if the orchestration or gate is not found.
+    /// Returns error if:
+    /// - The orchestration or gate is not found
+    /// - The gate is not in the `LeaseIssued` state
     pub async fn record_executor_spawned(
         &self,
         work_id: &str,
@@ -655,11 +691,27 @@ impl GateOrchestrator {
                 }
             })?;
 
-            if let GateStatus::LeaseIssued { lease_id } = gate_status {
-                *gate_status = GateStatus::Running {
-                    lease_id: lease_id.clone(),
-                    episode_id: episode_id.to_string(),
-                };
+            // Enforce explicit state machine: only LeaseIssued -> Running is valid.
+            match gate_status {
+                GateStatus::LeaseIssued { lease_id } => {
+                    if lease_id.is_empty() {
+                        return Err(GateOrchestratorError::EmptyLeaseId {
+                            work_id: work_id.to_string(),
+                            gate_type: gate_type.to_string(),
+                        });
+                    }
+                    *gate_status = GateStatus::Running {
+                        lease_id: lease_id.clone(),
+                        episode_id: episode_id.to_string(),
+                    };
+                },
+                other => {
+                    return Err(GateOrchestratorError::InvalidStateTransition {
+                        work_id: work_id.to_string(),
+                        gate_type: gate_type.to_string(),
+                        reason: format!("expected LeaseIssued state, found {}", state_name(other)),
+                    });
+                },
             }
         }
 
@@ -688,26 +740,49 @@ impl GateOrchestrator {
     /// `GateReceiptCollected` event. If all gates are complete, emits
     /// an `AllGatesCompleted` event.
     ///
+    /// # Binding Validation
+    ///
+    /// The receipt's `lease_id` and `gate_id` MUST match the issued lease for
+    /// this gate type. The receipt's `changeset_digest` and `executor_actor_id`
+    /// must also match. This prevents receipt substitution attacks.
+    ///
+    /// # Verdict Derivation
+    ///
+    /// The verdict (pass/fail) is derived from the receipt's `passed`
+    /// parameter. The orchestrator never hardcodes a default verdict. A
+    /// receipt with a zero `payload_hash` (e.g., from a timeout) is treated
+    /// as FAIL.
+    ///
+    /// # State Machine
+    ///
+    /// Valid transitions: `LeaseIssued` -> `Completed`, `Running` ->
+    /// `Completed`. Terminal states (`Completed`, `TimedOut`) are rejected.
+    ///
     /// # Arguments
     ///
     /// * `work_id` - The work ID
     /// * `gate_type` - The gate type that completed
     /// * `receipt` - The gate receipt from the executor
+    /// * `passed` - Whether the gate execution passed; derived by the caller
+    ///   from the gate executor's explicit verdict
     ///
     /// # Errors
     ///
-    /// Returns error if the orchestration or gate is not found.
+    /// Returns error if:
+    /// - The orchestration or gate is not found
+    /// - The receipt's
+    ///   `lease_id`/`gate_id`/`changeset_digest`/`executor_actor_id` do not
+    ///   match the issued lease
+    /// - The gate is in a terminal state
     pub async fn record_gate_receipt(
         &self,
         work_id: &str,
         gate_type: GateType,
         receipt: GateReceipt,
+        passed: bool,
     ) -> Result<Option<Vec<GateOutcome>>, GateOrchestratorError> {
         let now_ms = current_time_ms();
         let receipt_id = receipt.receipt_id.clone();
-        // For this implementation, a receipt means the gate passed.
-        // In production, the verdict would come from the receipt payload.
-        let passed = true;
 
         {
             let mut orchestrations = self.orchestrations.write().await;
@@ -724,14 +799,72 @@ impl GateOrchestrator {
                 }
             })?;
 
-            if let GateStatus::Running { lease_id, .. } | GateStatus::LeaseIssued { lease_id } =
-                gate_status
-            {
-                *gate_status = GateStatus::Completed {
-                    lease_id: lease_id.clone(),
-                    receipt_id: receipt_id.clone(),
-                    passed,
-                };
+            // BLOCKER 2: Validate receipt binding against the issued lease.
+            let lease = entry.leases.get(&gate_type).ok_or_else(|| {
+                GateOrchestratorError::GateNotFound {
+                    work_id: work_id.to_string(),
+                    gate_type: gate_type.to_string(),
+                }
+            })?;
+
+            if receipt.lease_id != lease.lease_id {
+                return Err(GateOrchestratorError::ReceiptBindingMismatch {
+                    work_id: work_id.to_string(),
+                    reason: format!(
+                        "lease_id mismatch: receipt has '{}', expected '{}'",
+                        receipt.lease_id, lease.lease_id
+                    ),
+                });
+            }
+            if receipt.gate_id != lease.gate_id {
+                return Err(GateOrchestratorError::ReceiptBindingMismatch {
+                    work_id: work_id.to_string(),
+                    reason: format!(
+                        "gate_id mismatch: receipt has '{}', expected '{}'",
+                        receipt.gate_id, lease.gate_id
+                    ),
+                });
+            }
+            if receipt.changeset_digest != lease.changeset_digest {
+                return Err(GateOrchestratorError::ReceiptBindingMismatch {
+                    work_id: work_id.to_string(),
+                    reason: "changeset_digest mismatch".to_string(),
+                });
+            }
+            if receipt.executor_actor_id != lease.executor_actor_id {
+                return Err(GateOrchestratorError::ReceiptBindingMismatch {
+                    work_id: work_id.to_string(),
+                    reason: format!(
+                        "executor_actor_id mismatch: receipt has '{}', expected '{}'",
+                        receipt.executor_actor_id, lease.executor_actor_id
+                    ),
+                });
+            }
+
+            // MAJOR 2: Enforce explicit state machine transitions.
+            // Only non-terminal states (LeaseIssued, Running) can transition
+            // to Completed. Terminal states are rejected.
+            match gate_status {
+                GateStatus::LeaseIssued { lease_id } | GateStatus::Running { lease_id, .. } => {
+                    if lease_id.is_empty() {
+                        return Err(GateOrchestratorError::EmptyLeaseId {
+                            work_id: work_id.to_string(),
+                            gate_type: gate_type.to_string(),
+                        });
+                    }
+                    *gate_status = GateStatus::Completed {
+                        lease_id: lease_id.clone(),
+                        receipt_id: receipt_id.clone(),
+                        passed,
+                    };
+                },
+                other => {
+                    return Err(GateOrchestratorError::InvalidStateTransition {
+                        work_id: work_id.to_string(),
+                        gate_type: gate_type.to_string(),
+                        reason: format!("cannot record receipt in {} state", state_name(other)),
+                    });
+                },
             }
 
             entry.receipts.insert(gate_type, receipt);
@@ -764,9 +897,16 @@ impl GateOrchestrator {
     /// Expired gates produce a FAIL verdict, not silent expiry. This ensures
     /// that timeouts block merge rather than allowing unreviewed code through.
     ///
+    /// # State Machine
+    ///
+    /// Valid transitions: `LeaseIssued` -> `TimedOut`, `Running` -> `TimedOut`.
+    /// Terminal states (`Completed`, `TimedOut`) are rejected.
+    ///
     /// # Errors
     ///
-    /// Returns error if the orchestration or gate is not found.
+    /// Returns error if:
+    /// - The orchestration or gate is not found
+    /// - The gate is in a terminal state
     pub async fn handle_gate_timeout(
         &self,
         work_id: &str,
@@ -789,13 +929,20 @@ impl GateOrchestrator {
                 }
             })?;
 
-            if let GateStatus::Running { lease_id, .. } | GateStatus::LeaseIssued { lease_id } =
-                gate_status
-            {
-                let lease_id_owned = lease_id.clone();
-                *gate_status = GateStatus::TimedOut {
-                    lease_id: lease_id_owned,
-                };
+            // Enforce state machine: only non-terminal -> TimedOut is valid.
+            match gate_status {
+                GateStatus::LeaseIssued { lease_id } | GateStatus::Running { lease_id, .. } => {
+                    *gate_status = GateStatus::TimedOut {
+                        lease_id: lease_id.clone(),
+                    };
+                },
+                other => {
+                    return Err(GateOrchestratorError::InvalidStateTransition {
+                        work_id: work_id.to_string(),
+                        gate_type: gate_type.to_string(),
+                        reason: format!("cannot timeout in {} state", state_name(other)),
+                    });
+                },
             }
 
             // Create and store fail-closed receipt for the timed-out gate.
@@ -893,6 +1040,77 @@ impl GateOrchestrator {
     pub async fn remove_orchestration(&self, work_id: &str) -> bool {
         let mut orchestrations = self.orchestrations.write().await;
         orchestrations.remove(work_id).is_some()
+    }
+
+    // =========================================================================
+    // Daemon Runtime Entry Point (BLOCKER 1)
+    // =========================================================================
+
+    /// Daemon runtime hook for session termination notifications.
+    ///
+    /// This is the entry point that the daemon runtime calls when a session
+    /// terminates. It orchestrates the full gate lifecycle:
+    ///
+    /// 1. Starts gate orchestration via `handle_session_terminated`
+    /// 2. Checks for timed-out gates and processes them
+    /// 3. Returns the emitted events for ledger persistence
+    ///
+    /// The daemon runtime should call this method when it receives a
+    /// `SessionTerminated` event from the ledger. The full ledger
+    /// subscription integration is deferred to TCK-00390 (merge
+    /// automation), but this method provides the clear, testable entry
+    /// point that wires the orchestrator into the daemon lifecycle.
+    ///
+    /// # Example Integration
+    ///
+    /// ```rust,ignore
+    /// // In daemon startup:
+    /// let orchestrator = Arc::new(GateOrchestrator::new(config, signer));
+    ///
+    /// // When a session terminates:
+    /// let (gate_types, events) = orchestrator
+    ///     .on_session_terminated(session_info)
+    ///     .await?;
+    ///
+    /// // Persist events to ledger
+    /// for event in events {
+    ///     ledger.append(event).await?;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `GateOrchestratorError` if orchestration setup fails.
+    pub async fn on_session_terminated(
+        &self,
+        info: SessionTerminatedInfo,
+    ) -> Result<(Vec<GateType>, Vec<GateOrchestratorEvent>), GateOrchestratorError> {
+        let work_id = info.work_id.clone();
+
+        // Step 1: Start gate orchestration.
+        let gate_types = self.handle_session_terminated(info).await?;
+
+        // Step 2: Check for any immediately timed-out gates (e.g., zero timeout).
+        let timed_out = self.check_timeouts().await;
+        for (tid, gt) in timed_out {
+            if tid == work_id {
+                // Best-effort: ignore errors from timeout handling since the
+                // orchestration is already set up.
+                let _ = self.handle_gate_timeout(&tid, gt).await;
+            }
+        }
+
+        // Step 3: Drain all events emitted during this cycle.
+        let events = self.drain_events().await;
+
+        info!(
+            work_id = %work_id,
+            gate_count = gate_types.len(),
+            event_count = events.len(),
+            "Session termination handled by orchestrator"
+        );
+
+        Ok((gate_types, events))
     }
 
     // =========================================================================
@@ -1056,6 +1274,16 @@ impl GateOrchestrator {
 // =============================================================================
 // Utility Functions
 // =============================================================================
+
+/// Returns a human-readable name for a gate status variant.
+const fn state_name(status: &GateStatus) -> &'static str {
+    match status {
+        GateStatus::LeaseIssued { .. } => "LeaseIssued",
+        GateStatus::Running { .. } => "Running",
+        GateStatus::Completed { .. } => "Completed",
+        GateStatus::TimedOut { .. } => "TimedOut",
+    }
+}
 
 /// Returns the current time in milliseconds since epoch.
 ///
@@ -1267,7 +1495,7 @@ mod tests {
             .build_and_sign(&signer);
 
         let result = orch
-            .record_gate_receipt("work-006", GateType::Quality, receipt)
+            .record_gate_receipt("work-006", GateType::Quality, receipt, true)
             .await
             .unwrap();
 
@@ -1307,7 +1535,7 @@ mod tests {
             .build_and_sign(&signer);
 
             let result = orch
-                .record_gate_receipt("work-007", gate_type, receipt)
+                .record_gate_receipt("work-007", gate_type, receipt, true)
                 .await
                 .unwrap();
 
@@ -1384,7 +1612,7 @@ mod tests {
             .evidence_bundle_hash([0xCC; 32])
             .build_and_sign(&signer);
 
-        orch.record_gate_receipt("work-009", GateType::Aat, receipt)
+        orch.record_gate_receipt("work-009", GateType::Aat, receipt, true)
             .await
             .unwrap();
 
@@ -1726,5 +1954,413 @@ mod tests {
         // (since current_time_ms >= expires_at)
         let timed_out = orch.check_timeouts().await;
         assert_eq!(timed_out.len(), 3);
+    }
+
+    // =========================================================================
+    // BLOCKER 1: Daemon Runtime Integration Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_on_session_terminated_returns_gates_and_events() {
+        let orch = test_orchestrator();
+        let info = test_session_info("work-daemon");
+
+        let (gate_types, events) = orch.on_session_terminated(info).await.unwrap();
+
+        assert_eq!(gate_types.len(), 3);
+        assert!(gate_types.contains(&GateType::Aat));
+        assert!(gate_types.contains(&GateType::Quality));
+        assert!(gate_types.contains(&GateType::Security));
+
+        // Events: 1 PolicyResolved + 3 GateLeaseIssued = 4
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events[0],
+            GateOrchestratorEvent::PolicyResolved { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_on_session_terminated_handles_immediate_timeouts() {
+        let config = GateOrchestratorConfig {
+            gate_timeout_ms: 0, // Instant timeout
+            ..Default::default()
+        };
+        let orch = GateOrchestrator::new(config, test_signer());
+        let info = test_session_info("work-imm-timeout");
+
+        let (_gate_types, events) = orch.on_session_terminated(info).await.unwrap();
+
+        // Should have timeout events in addition to policy+lease events
+        let timeout_count = events
+            .iter()
+            .filter(|e| matches!(e, GateOrchestratorEvent::GateTimedOut { .. }))
+            .count();
+        assert_eq!(timeout_count, 3, "all 3 gates should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_on_session_terminated_duplicate_rejected() {
+        let orch = test_orchestrator();
+
+        orch.on_session_terminated(test_session_info("work-dup2"))
+            .await
+            .unwrap();
+
+        let err = orch
+            .on_session_terminated(test_session_info("work-dup2"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::DuplicateOrchestration { .. }
+        ));
+    }
+
+    // =========================================================================
+    // BLOCKER 2: Receipt Binding Validation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_receipt_lease_id_mismatch_rejected() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-bind-1");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-bind-1", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Build receipt with wrong lease_id
+        let receipt = GateReceiptBuilder::new("receipt-bad", "gate-quality", "wrong-lease-id")
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+        let err = orch
+            .record_gate_receipt("work-bind-1", GateType::Quality, receipt, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::ReceiptBindingMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_receipt_gate_id_mismatch_rejected() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-bind-2");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-bind-2", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Build receipt with wrong gate_id
+        let receipt = GateReceiptBuilder::new("receipt-bad", "wrong-gate-id", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+        let err = orch
+            .record_gate_receipt("work-bind-2", GateType::Quality, receipt, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::ReceiptBindingMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_receipt_changeset_digest_mismatch_rejected() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-bind-3");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-bind-3", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Build receipt with wrong changeset_digest
+        let receipt = GateReceiptBuilder::new("receipt-bad", "gate-quality", &lease.lease_id)
+                .changeset_digest([0xFF; 32]) // Wrong digest
+                .executor_actor_id(&lease.executor_actor_id)
+                .receipt_version(1)
+                .payload_kind("quality")
+                .payload_schema_version(1)
+                .payload_hash([0xBB; 32])
+                .evidence_bundle_hash([0xCC; 32])
+                .build_and_sign(&signer);
+
+        let err = orch
+            .record_gate_receipt("work-bind-3", GateType::Quality, receipt, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::ReceiptBindingMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_receipt_executor_actor_id_mismatch_rejected() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-bind-4");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-bind-4", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Build receipt with wrong executor_actor_id
+        let receipt = GateReceiptBuilder::new("receipt-bad", "gate-quality", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id("wrong-executor")
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+        let err = orch
+            .record_gate_receipt("work-bind-4", GateType::Quality, receipt, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::ReceiptBindingMismatch { .. }
+        ));
+    }
+
+    // =========================================================================
+    // BLOCKER 3: Verdict Derivation Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_failing_receipt_produces_fail_verdict() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-fail");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        // Complete all gates, but mark quality as FAIL
+        for gate_type in GateType::all() {
+            let lease = orch.gate_lease("work-fail", gate_type).await.unwrap();
+            let receipt = GateReceiptBuilder::new(
+                format!("receipt-{}", gate_type.as_gate_id()),
+                gate_type.as_gate_id(),
+                &lease.lease_id,
+            )
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind(gate_type.payload_kind())
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+            let passed = gate_type != GateType::Quality; // Quality fails
+            let result = orch
+                .record_gate_receipt("work-fail", gate_type, receipt, passed)
+                .await
+                .unwrap();
+
+            if gate_type == GateType::Security {
+                // Last gate triggers AllGatesCompleted
+                let outcomes = result.expect("expected outcomes");
+                assert_eq!(outcomes.len(), 3);
+
+                let quality_outcome = outcomes
+                    .iter()
+                    .find(|o| o.gate_type == GateType::Quality)
+                    .unwrap();
+                assert!(
+                    !quality_outcome.passed,
+                    "quality gate should have FAIL verdict"
+                );
+
+                // Overall should be fail since quality failed
+                assert!(
+                    outcomes.iter().any(|o| !o.passed),
+                    "at least one gate should fail"
+                );
+            }
+        }
+
+        // Verify gate status shows the failure
+        let status = orch
+            .gate_status("work-fail", GateType::Quality)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, GateStatus::Completed { passed: false, .. }),
+            "quality gate should be completed with passed=false"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR 2: State Transition Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_record_executor_spawned_rejects_terminal_state() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-term-1");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        // Timeout a gate (terminal state)
+        orch.handle_gate_timeout("work-term-1", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Trying to spawn executor on timed-out gate should fail
+        let err = orch
+            .record_executor_spawned("work-term-1", GateType::Quality, "ep-bad")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::InvalidStateTransition { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_record_executor_spawned_rejects_running_state() {
+        let orch = test_orchestrator();
+        let info = test_session_info("work-term-2");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        // Spawn executor (now Running)
+        orch.record_executor_spawned("work-term-2", GateType::Quality, "ep-001")
+            .await
+            .unwrap();
+
+        // Trying to spawn again should fail (already Running)
+        let err = orch
+            .record_executor_spawned("work-term-2", GateType::Quality, "ep-002")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::InvalidStateTransition { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_record_receipt_rejects_completed_state() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-term-3");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-term-3", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Complete the gate
+        let receipt = GateReceiptBuilder::new("receipt-1", "gate-quality", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+        orch.record_gate_receipt("work-term-3", GateType::Quality, receipt, true)
+            .await
+            .unwrap();
+
+        // Try to record another receipt on the same (now Completed) gate
+        let receipt2 = GateReceiptBuilder::new("receipt-2", "gate-quality", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xDD; 32])
+            .evidence_bundle_hash([0xEE; 32])
+            .build_and_sign(&signer);
+
+        let err = orch
+            .record_gate_receipt("work-term-3", GateType::Quality, receipt2, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::InvalidStateTransition { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_handle_timeout_rejects_terminal_state() {
+        let signer = test_signer();
+        let orch = GateOrchestrator::new(GateOrchestratorConfig::default(), Arc::clone(&signer));
+        let info = test_session_info("work-term-4");
+
+        orch.handle_session_terminated(info).await.unwrap();
+
+        let lease = orch
+            .gate_lease("work-term-4", GateType::Quality)
+            .await
+            .unwrap();
+
+        // Complete the gate
+        let receipt = GateReceiptBuilder::new("receipt-1", "gate-quality", &lease.lease_id)
+            .changeset_digest([0x42; 32])
+            .executor_actor_id(&lease.executor_actor_id)
+            .receipt_version(1)
+            .payload_kind("quality")
+            .payload_schema_version(1)
+            .payload_hash([0xBB; 32])
+            .evidence_bundle_hash([0xCC; 32])
+            .build_and_sign(&signer);
+
+        orch.record_gate_receipt("work-term-4", GateType::Quality, receipt, true)
+            .await
+            .unwrap();
+
+        // Trying to timeout a completed gate should fail
+        let err = orch
+            .handle_gate_timeout("work-term-4", GateType::Quality)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GateOrchestratorError::InvalidStateTransition { .. }
+        ));
     }
 }

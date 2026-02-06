@@ -16,10 +16,10 @@
 //! gate execution by:
 //!
 //! 1. Watching for `session_terminated` events on the ledger
-//! 2. Resolving policy via [`PolicyResolvedForChangeSet`]
-//! 3. Issuing [`GateLease`] for each required gate (aat, quality, security)
-//! 4. Spawning gate executor episodes via [`EpisodeRuntime`]
-//! 5. Collecting [`GateReceipt`] results (or timeout -> FAIL verdict)
+//! 2. Resolving policy via `PolicyResolvedForChangeSet`
+//! 3. Issuing `GateLease` for each required gate (aat, quality, security)
+//! 4. Spawning gate executor episodes via `EpisodeRuntime`
+//! 5. Collecting `GateReceipt` results (or timeout -> FAIL verdict)
 //!
 //! # Security Invariants
 //!
