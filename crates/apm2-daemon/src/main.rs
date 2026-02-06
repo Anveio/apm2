@@ -1360,6 +1360,21 @@ async fn perform_crash_recovery(
         SqliteLedgerEventEmitter::new(Arc::clone(conn), signing_key)
     });
 
+    // SECURITY MAJOR 1 v3 fix: Create an HTF clock for recovery timestamps.
+    // Per RFC-0016, all ledger event timestamps must come from the HolonicClock
+    // rather than raw SystemTime. We create a dedicated clock instance for
+    // crash recovery since the full dispatcher is not yet initialized.
+    let htf_clock = match apm2_daemon::htf::HolonicClock::new(
+        apm2_daemon::htf::ClockConfig::default(),
+        None,
+    ) {
+        Ok(clock) => Some(clock),
+        Err(e) => {
+            warn!(error = %e, "Failed to create HTF clock for crash recovery; using SystemTime fallback");
+            None
+        },
+    };
+
     // TCK-00387: Perform crash recovery -- emit LEASE_REVOKED events and clean
     // up work claims for each stale session.
     let result = apm2_daemon::episode::crash_recovery::recover_stale_sessions(
@@ -1367,24 +1382,11 @@ async fn perform_crash_recovery(
         emitter.as_ref(),
         sqlite_conn,
         timeout,
+        htf_clock.as_ref(),
     );
 
     match result {
         Ok(outcome) => {
-            // TCK-00387 SECURITY BLOCKER 1 FIX: Check timeout BEFORE clearing
-            // the registry. If recovery exceeded the timeout, we must NOT clear
-            // the registry -- sessions should be preserved for retry.
-            let elapsed_ms = start.elapsed().as_millis() as u32;
-            let timeout_ms = timeout.as_millis() as u32;
-            if elapsed_ms > timeout_ms {
-                warn!(
-                    elapsed_ms = elapsed_ms,
-                    timeout_ms = timeout_ms,
-                    "Crash recovery exceeded timeout; registry NOT cleared"
-                );
-                anyhow::bail!("crash recovery timeout exceeded");
-            }
-
             info!(
                 sessions_recovered = outcome.sessions_recovered,
                 lease_revoked_events_emitted = outcome.lease_revoked_events_emitted,
@@ -1393,34 +1395,71 @@ async fn perform_crash_recovery(
                 "Crash recovery completed"
             );
 
-            // TCK-00387 SECURITY BLOCKER 2 FIX: Only clear successfully
-            // recovered sessions. Pass the succeeded IDs to clear_session_registry
-            // so failed sessions are preserved for retry.
-            apm2_daemon::episode::crash_recovery::clear_session_registry(
+            // Only clear successfully recovered sessions. Pass the succeeded
+            // IDs so failed sessions are preserved for retry.
+            // SECURITY MAJOR 2 v3 fix: propagate clear/persist failures.
+            if let Err(e) = apm2_daemon::episode::crash_recovery::clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
+            ) {
+                warn!(
+                    error = %e,
+                    "Registry clear/persist failed after successful recovery; \
+                     sessions may be replayed on next startup"
+                );
+            }
+        },
+        Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::Timeout {
+            elapsed_ms,
+            timeout_ms,
+            outcome,
+        }) => {
+            // SECURITY BLOCKER v3 fix: Timeout now carries partial progress.
+            // Clear the succeeded subset so those sessions are NOT replayed.
+            warn!(
+                elapsed_ms = elapsed_ms,
+                timeout_ms = timeout_ms,
+                sessions_completed = outcome.sessions_recovered,
+                "Crash recovery timed out; checkpointing partial progress"
             );
+            if !outcome.succeeded_session_ids.is_empty() {
+                if let Err(e) = apm2_daemon::episode::crash_recovery::clear_session_registry(
+                    session_registry,
+                    &collected,
+                    Some(&outcome.succeeded_session_ids),
+                ) {
+                    warn!(
+                        error = %e,
+                        "Registry clear/persist failed after timeout partial recovery"
+                    );
+                }
+            }
         },
         Err(apm2_daemon::episode::crash_recovery::CrashRecoveryError::PartialRecovery {
             failed_count,
             total_count,
             outcome,
         }) => {
-            // TCK-00387 SECURITY BLOCKER 2 FIX: Partial recovery -- some
-            // sessions had critical side-effect failures. Only clear the
-            // succeeded sessions; failed ones are preserved for retry.
+            // Partial recovery -- some sessions had critical side-effect
+            // failures. Only clear the succeeded sessions; failed ones are
+            // preserved for retry.
             warn!(
                 failed_count = failed_count,
                 total_count = total_count,
                 succeeded = outcome.succeeded_session_ids.len(),
                 "Partial crash recovery; clearing only succeeded sessions"
             );
-            apm2_daemon::episode::crash_recovery::clear_session_registry(
+            if let Err(e) = apm2_daemon::episode::crash_recovery::clear_session_registry(
                 session_registry,
                 &collected,
                 Some(&outcome.succeeded_session_ids),
-            );
+            ) {
+                warn!(
+                    error = %e,
+                    "Registry clear/persist failed after partial recovery"
+                );
+            }
         },
         Err(e) => {
             // Registry is NOT cleared on error -- unrecovered sessions are

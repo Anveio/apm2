@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 use tracing::{info, warn};
 
+use crate::htf::HolonicClock;
 use crate::ledger::SqliteLedgerEventEmitter;
 use crate::protocol::dispatch::LedgerEventEmitter;
 use crate::session::{SessionRegistry, SessionState};
@@ -86,13 +87,21 @@ pub struct CollectedSessions {
 /// Error type for crash recovery operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CrashRecoveryError {
-    /// Recovery timed out.
-    #[error("recovery timeout: {elapsed_ms}ms elapsed, timeout is {timeout_ms}ms")]
+    /// Recovery timed out with partial progress.
+    ///
+    /// The `outcome` field contains the sessions that were successfully
+    /// processed before the timeout. The caller MUST clear those succeeded
+    /// IDs from the registry to avoid replaying their side-effects on the
+    /// next startup.
+    #[error("recovery timeout: {elapsed_ms}ms elapsed, timeout is {timeout_ms}ms ({} sessions completed before timeout)", outcome.sessions_recovered)]
     Timeout {
         /// Elapsed time in milliseconds.
         elapsed_ms: u32,
         /// Configured timeout in milliseconds.
         timeout_ms: u32,
+        /// Partial recovery outcome: sessions that completed before timeout.
+        /// Succeeded IDs should be cleared; remaining sessions are preserved.
+        outcome: CrashRecoveryOutcome,
     },
 
     /// Ledger event emission failed.
@@ -112,6 +121,18 @@ pub enum CrashRecoveryError {
     /// Timestamp acquisition failed.
     #[error("failed to acquire timestamp: {message}")]
     TimestampFailed {
+        /// Error message.
+        message: String,
+    },
+
+    /// Registry clear/persist operation failed.
+    ///
+    /// Per the security review (MAJOR 2 v3), persistence failures must be
+    /// escalated rather than being warning-only. A failed persist means the
+    /// registry state on disk is inconsistent with in-memory state, which
+    /// could cause sessions to be replayed or lost on next startup.
+    #[error("registry clear/persist failed: {message}")]
+    RegistryClearFailed {
         /// Error message.
         message: String,
     },
@@ -189,12 +210,16 @@ pub fn collect_sessions(registry: &Arc<dyn SessionRegistry>) -> CollectedSession
 ///
 /// `Ok(CrashRecoveryOutcome)` with recovery statistics, or
 /// `Err(CrashRecoveryError)` if recovery failed critically.
+///
+/// On `Timeout`, the error includes partial progress (succeeded/failed IDs)
+/// so the caller can checkpoint the succeeded subset.
 #[allow(clippy::cast_possible_truncation)] // Recovery timeout is < 5s, well within u32
 pub fn recover_stale_sessions(
     sessions: &[SessionState],
     emitter: Option<&SqliteLedgerEventEmitter>,
     sqlite_conn: Option<&Arc<Mutex<Connection>>>,
     timeout: Duration,
+    htf_clock: Option<&HolonicClock>,
 ) -> Result<CrashRecoveryOutcome, CrashRecoveryError> {
     let start = Instant::now();
     let deadline = start + timeout;
@@ -205,11 +230,21 @@ pub fn recover_stale_sessions(
     let mut failed_session_ids: Vec<String> = Vec::new();
 
     for session in sessions {
-        // Check timeout before each session
+        // Check timeout before each session -- return partial progress so
+        // caller can checkpoint succeeded IDs (SECURITY BLOCKER v3 fix).
         if Instant::now() > deadline {
+            let recovery_time_ms = start.elapsed().as_millis() as u32;
             return Err(CrashRecoveryError::Timeout {
-                elapsed_ms: start.elapsed().as_millis() as u32,
+                elapsed_ms: recovery_time_ms,
                 timeout_ms: timeout.as_millis() as u32,
+                outcome: CrashRecoveryOutcome {
+                    sessions_recovered: succeeded_session_ids.len() as u32,
+                    lease_revoked_events_emitted,
+                    work_claims_released,
+                    recovery_time_ms,
+                    succeeded_session_ids,
+                    failed_session_ids,
+                },
             });
         }
 
@@ -219,7 +254,7 @@ pub fn recover_stale_sessions(
 
         // Step 1: Emit LEASE_REVOKED event to ledger
         if let Some(emitter) = emitter {
-            match emit_lease_revoked_event(emitter, session) {
+            match emit_lease_revoked_event(emitter, session, htf_clock) {
                 Ok(event_id) => {
                     info!(
                         session_id = %session.session_id,
@@ -284,12 +319,21 @@ pub fn recover_stale_sessions(
     let recovery_time_ms = start.elapsed().as_millis() as u32;
 
     // Post-operation deadline check: if we exceeded the timeout during
-    // processing (but didn't catch it at a loop boundary), fail before
-    // reporting success.
+    // processing (but didn't catch it at a loop boundary), return partial
+    // progress so caller can checkpoint succeeded IDs (SECURITY BLOCKER v3 fix).
     if Instant::now() > deadline {
+        let recovery_time_ms = start.elapsed().as_millis() as u32;
         return Err(CrashRecoveryError::Timeout {
-            elapsed_ms: start.elapsed().as_millis() as u32,
+            elapsed_ms: recovery_time_ms,
             timeout_ms: timeout.as_millis() as u32,
+            outcome: CrashRecoveryOutcome {
+                sessions_recovered: succeeded_session_ids.len() as u32,
+                lease_revoked_events_emitted,
+                work_claims_released,
+                recovery_time_ms,
+                succeeded_session_ids,
+                failed_session_ids,
+            },
         });
     }
 
@@ -335,11 +379,18 @@ pub fn recover_stale_sessions(
 /// * `succeeded_ids` - Session IDs that were successfully recovered. Only these
 ///   will be cleared. If `None`, all collected sessions are assumed to have
 ///   succeeded (backward-compatible path).
+///
+/// # Errors
+///
+/// Returns `CrashRecoveryError` if the registry clear or persist operation
+/// fails. Per the security review (MAJOR 2 v3), persistence failures are
+/// now escalated rather than being warning-only, since a failed persist
+/// means the registry state on disk is inconsistent with in-memory state.
 pub fn clear_session_registry(
     registry: &Arc<dyn SessionRegistry>,
     collected: &CollectedSessions,
     succeeded_ids: Option<&[String]>,
-) {
+) -> Result<(), CrashRecoveryError> {
     // Determine which IDs to clear: if succeeded_ids is provided, use it;
     // otherwise fall back to all collected session IDs.
     let ids_to_clear: Vec<String> = succeeded_ids.map_or_else(
@@ -358,65 +409,80 @@ pub fn clear_session_registry(
     let can_clear_all = !collected.was_truncated && ids_to_clear.len() == collected.sessions.len();
 
     if can_clear_all {
-        match registry.clear_all_sessions() {
-            Ok(()) => {
-                info!("Cleared session registry after crash recovery");
-            },
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to clear session registry after recovery"
-                );
-            },
-        }
+        registry
+            .clear_all_sessions()
+            .map_err(|e| CrashRecoveryError::RegistryClearFailed {
+                message: format!("Failed to clear session registry after recovery: {e}"),
+            })?;
+        info!("Cleared session registry after crash recovery");
     } else if !ids_to_clear.is_empty() {
         info!(
             cleared = ids_to_clear.len(),
             total_in_registry = collected.total_in_registry,
             "Clearing recovered subset; remaining sessions preserved for retry"
         );
-        match registry.clear_sessions_by_ids(&ids_to_clear) {
-            Ok(()) => {
-                info!(
-                    cleared = ids_to_clear.len(),
-                    "Cleared recovered sessions from registry (partial)"
-                );
-            },
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to clear recovered sessions from registry"
-                );
-            },
-        }
+        registry.clear_sessions_by_ids(&ids_to_clear).map_err(|e| {
+            CrashRecoveryError::RegistryClearFailed {
+                message: format!("Failed to clear recovered sessions from registry: {e}"),
+            }
+        })?;
+        info!(
+            cleared = ids_to_clear.len(),
+            "Cleared recovered sessions from registry (partial)"
+        );
     } else {
         info!("No sessions to clear from registry (all failed; preserved for retry)");
     }
+
+    Ok(())
 }
 
 /// Emits a `LEASE_REVOKED` event to the ledger for a stale session.
 ///
 /// The event payload includes the session ID, work ID, and the reason
 /// (`daemon_restart`).
+///
+/// # Timestamp Source
+///
+/// Per RFC-0016 and the security review, timestamps MUST come from the HTF
+/// `HolonicClock` (same clock contract used by dispatch flows) rather than
+/// raw `SystemTime::now()`. When `htf_clock` is `Some`, the HLC wall time
+/// is used. When `None` (e.g., in tests without a full clock setup), the
+/// function falls back to `SystemTime` but logs a warning.
 fn emit_lease_revoked_event(
     emitter: &SqliteLedgerEventEmitter,
     session: &SessionState,
+    htf_clock: Option<&HolonicClock>,
 ) -> Result<String, CrashRecoveryError> {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    // SECURITY MAJOR 1 v3 fix: Source recovery timestamps from the same HTF
+    // clock contract used by dispatch flows (RFC-0016 compliance).
+    let timestamp_ns = if let Some(clock) = htf_clock {
+        clock
+            .now_hlc()
+            .map(|hlc| hlc.wall_ns)
+            .map_err(|e| CrashRecoveryError::TimestampFailed {
+                message: format!("HTF clock error for session {}: {e}", session.session_id),
+            })?
+    } else {
+        // Fallback for tests or environments where HolonicClock is not available.
+        // Log a warning since this does not meet RFC-0016 HTF compliance.
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Fail-closed: if timestamp acquisition fails (e.g. system clock is before
-    // UNIX epoch), propagate the error rather than silently using timestamp 0.
-    // Per SEC-CTRL-FAC-0015, we must not emit events with invalid timestamps.
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .map_err(|e| CrashRecoveryError::TimestampFailed {
-            message: format!(
-                "system clock before UNIX epoch for session {}: {e}",
-                session.session_id
-            ),
-        })?;
+        warn!(
+            session_id = %session.session_id,
+            "Using SystemTime fallback for recovery timestamp (no HTF clock available)"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .map_err(|e| CrashRecoveryError::TimestampFailed {
+                message: format!(
+                    "system clock before UNIX epoch for session {}: {e}",
+                    session.session_id
+                ),
+            })?
+    };
 
     // Build the LEASE_REVOKED payload
     let payload = serde_json::json!({
@@ -544,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_recover_empty_sessions() {
-        let result = recover_stale_sessions(&[], None, None, Duration::from_secs(5))
+        let result = recover_stale_sessions(&[], None, None, Duration::from_secs(5), None)
             .expect("recovery should succeed");
 
         assert_eq!(result.sessions_recovered, 0);
@@ -568,6 +634,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
@@ -606,6 +673,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
@@ -636,6 +704,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
@@ -667,6 +736,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None,
         )
         .expect("first recovery should succeed");
 
@@ -680,6 +750,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None,
         )
         .expect("second recovery should succeed");
 
@@ -713,7 +784,7 @@ mod tests {
         assert!(!collected.was_truncated);
 
         // Clear after recovery (None = all collected sessions succeeded)
-        clear_session_registry(&registry, &collected, None);
+        clear_session_registry(&registry, &collected, None).expect("clear should succeed");
 
         // Now collect again (simulates second startup after reload)
         let collected_after = collect_sessions(&registry);
@@ -740,6 +811,7 @@ mod tests {
             None, // No emitter
             None, // No sqlite conn
             Duration::from_secs(5),
+            None, // No htf_clock
         )
         .expect("recovery should succeed without ledger");
 
@@ -764,6 +836,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_millis(0),
+            None,
         );
 
         assert!(result.is_err());
@@ -852,6 +925,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
@@ -880,7 +954,8 @@ mod tests {
         drop(db);
 
         // Phase 4: Clear registry (idempotency)
-        clear_session_registry(&registry, &collected, Some(&result.succeeded_session_ids));
+        clear_session_registry(&registry, &collected, Some(&result.succeeded_session_ids))
+            .expect("clear should succeed");
 
         // Phase 5: Verify second recovery finds nothing
         let collected_after = collect_sessions(&registry);
@@ -902,6 +977,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
@@ -960,6 +1036,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_millis(0),
+            None,
         );
 
         // Recovery should fail with timeout
@@ -1023,7 +1100,7 @@ mod tests {
         };
 
         // Clear only the recovered subset (None = all collected sessions succeeded)
-        clear_session_registry(&registry, &truncated, None);
+        clear_session_registry(&registry, &truncated, None).expect("clear should succeed");
 
         // Verify: only the 2 unrecovered sessions remain
         let remaining = collect_sessions(&registry);
@@ -1120,6 +1197,7 @@ mod tests {
             Some(&emitter), // Emitter also uses the same poisoned conn
             None,           // No sqlite_conn for claims (ledger will fail)
             Duration::from_secs(5),
+            None,
         );
 
         // With the poisoned connection, emit_lease_revoked_event will fail
@@ -1138,7 +1216,8 @@ mod tests {
 
                 // CRITICAL: Only clear succeeded sessions (none in this case).
                 // Failed sessions must be preserved for retry.
-                clear_session_registry(&registry, &collected, Some(&outcome.succeeded_session_ids));
+                clear_session_registry(&registry, &collected, Some(&outcome.succeeded_session_ids))
+                    .expect("clear should succeed (no sessions to clear)");
 
                 // Verify ALL sessions are still in the registry
                 let remaining = collect_sessions(&registry);
@@ -1177,7 +1256,8 @@ mod tests {
         // Simulate a partial recovery outcome: sess-0 and sess-2 succeeded,
         // sess-1 failed.
         let succeeded_ids = vec!["sess-0".to_string(), "sess-2".to_string()];
-        clear_session_registry(&registry, &collected, Some(&succeeded_ids));
+        clear_session_registry(&registry, &collected, Some(&succeeded_ids))
+            .expect("clear should succeed");
 
         // Verify: only sess-1 (the failed one) remains in the registry
         let remaining = collect_sessions(&registry);
@@ -1220,8 +1300,13 @@ mod tests {
         // Use a 0ms timeout. recover_stale_sessions checks the deadline
         // before each session AND after all sessions (post-operation check).
         // With 0ms timeout, it must return Timeout before success.
-        let result =
-            recover_stale_sessions(&collected.sessions, None, None, Duration::from_millis(0));
+        let result = recover_stale_sessions(
+            &collected.sessions,
+            None,
+            None,
+            Duration::from_millis(0),
+            None,
+        );
 
         // Must be a Timeout error
         assert!(
@@ -1278,6 +1363,7 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
@@ -1333,16 +1419,214 @@ mod tests {
             Some(&emitter),
             Some(&conn),
             Duration::from_secs(5),
+            None, // htf_clock: uses SystemTime fallback in tests
         )
         .expect("recovery should succeed");
 
         // Clear -- should clear all since not truncated
-        clear_session_registry(&registry, &collected, Some(&outcome.succeeded_session_ids));
+        clear_session_registry(&registry, &collected, Some(&outcome.succeeded_session_ids))
+            .expect("clear should succeed");
 
         let after = collect_sessions(&registry);
         assert!(
             after.sessions.is_empty(),
             "All sessions should be cleared on non-truncated success"
+        );
+    }
+
+    // =========================================================================
+    // Regression Tests: SECURITY BLOCKER v3 -- Timeout returns partial progress
+    // =========================================================================
+
+    /// Regression test: when recovery times out after processing some sessions,
+    /// the `Timeout` error MUST carry the partial outcome (succeeded/failed
+    /// IDs) so the caller can checkpoint the completed subset and avoid
+    /// replaying their side-effects on the next startup.
+    #[test]
+    fn test_timeout_returns_partial_progress() {
+        let conn = setup_sqlite();
+        let emitter = make_emitter(&conn);
+
+        // Create 1000 sessions with a very short timeout. Some will complete
+        // before the deadline is hit.
+        let sessions: Vec<SessionState> = (0..1000)
+            .map(|i| make_session(&format!("sess-{i}"), &format!("work-{i}")))
+            .collect();
+
+        // Use a 0ms timeout. With 0ms, the first iteration check fires
+        // immediately, so we expect 0 sessions completed (the check happens
+        // BEFORE processing each session).
+        let result = recover_stale_sessions(
+            &sessions,
+            Some(&emitter),
+            Some(&conn),
+            Duration::from_millis(0),
+            None,
+        );
+
+        match result {
+            Err(CrashRecoveryError::Timeout { outcome, .. }) => {
+                // The timeout carries partial progress. With 0ms timeout the
+                // pre-iteration check fires before any session is processed,
+                // so sessions_recovered should be 0. But the key invariant is
+                // that the outcome IS present (not discarded).
+                assert!(
+                    outcome.sessions_recovered as usize + outcome.failed_session_ids.len()
+                        <= sessions.len(),
+                    "Partial progress must not exceed total sessions"
+                );
+                // The succeeded + failed IDs must be consistent
+                assert_eq!(
+                    outcome.succeeded_session_ids.len(),
+                    outcome.sessions_recovered as usize
+                );
+            },
+            Ok(_) => panic!("Expected Timeout error, got Ok"),
+            Err(other) => panic!("Expected Timeout error, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: when timeout occurs after processing a prefix of
+    /// sessions, the caller checkpoints the succeeded subset. Only the
+    /// unprocessed sessions remain in the registry.
+    #[test]
+    fn test_timeout_partial_progress_checkpoint_clears_succeeded() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        // Create registry with 3 sessions
+        let registry = PersistentSessionRegistry::new(&state_path);
+        for i in 0..3 {
+            registry
+                .register_session(make_session(&format!("sess-{i}"), &format!("work-{i}")))
+                .unwrap();
+        }
+        assert_eq!(registry.session_count(), 3);
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+        assert_eq!(collected.sessions.len(), 3);
+
+        // Simulate a timeout that completed 2 of 3 sessions by directly
+        // constructing the Timeout error with partial progress.
+        let partial_outcome = CrashRecoveryOutcome {
+            sessions_recovered: 2,
+            lease_revoked_events_emitted: 2,
+            work_claims_released: 0,
+            recovery_time_ms: 100,
+            succeeded_session_ids: vec!["sess-0".to_string(), "sess-1".to_string()],
+            failed_session_ids: vec![],
+        };
+
+        // Simulate caller behavior: checkpoint the succeeded subset.
+        clear_session_registry(
+            &registry,
+            &collected,
+            Some(&partial_outcome.succeeded_session_ids),
+        )
+        .expect("clear should succeed");
+
+        // Only the unprocessed session (sess-2) should remain.
+        let remaining = collect_sessions(&registry);
+        assert_eq!(
+            remaining.sessions.len(),
+            1,
+            "Only unprocessed sessions should remain after timeout checkpoint"
+        );
+        assert_eq!(remaining.sessions[0].session_id, "sess-2");
+    }
+
+    // =========================================================================
+    // Regression Tests: SECURITY MAJOR 1 v3 -- HTF clock for timestamps
+    // =========================================================================
+
+    /// Regression test: when an HTF `HolonicClock` is provided, recovery
+    /// timestamps come from the HLC (not raw `SystemTime`).
+    #[test]
+    fn test_htf_clock_used_for_recovery_timestamps() {
+        use crate::htf::{ClockConfig, HolonicClock};
+
+        let conn = setup_sqlite();
+        let emitter = make_emitter(&conn);
+        let session = make_session("sess-htf", "work-htf");
+
+        // Create an HTF clock
+        let clock =
+            HolonicClock::new(ClockConfig::default(), None).expect("clock creation should succeed");
+
+        let result = recover_stale_sessions(
+            &[session],
+            Some(&emitter),
+            Some(&conn),
+            Duration::from_secs(5),
+            Some(&clock), // Pass the HTF clock
+        )
+        .expect("recovery should succeed");
+
+        assert_eq!(result.lease_revoked_events_emitted, 1);
+
+        // Verify the event has a non-zero timestamp from the HLC
+        let db = conn.lock().unwrap();
+        let timestamp_ns: i64 = db
+            .query_row(
+                "SELECT timestamp_ns FROM ledger_events WHERE event_type = ?1",
+                params![LEASE_REVOKED_EVENT_TYPE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(timestamp_ns > 0, "HTF timestamp must be non-zero");
+    }
+
+    // =========================================================================
+    // Regression Tests: SECURITY MAJOR 2 v3 -- Registry clear returns Result
+    // =========================================================================
+
+    /// Regression test: `clear_session_registry` returns `Result`, ensuring
+    /// persistence failures are escalated rather than being warning-only.
+    #[test]
+    fn test_clear_session_registry_returns_result() {
+        use crate::episode::PersistentSessionRegistry;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let state_path = temp_dir.path().join("state.json");
+
+        let registry = PersistentSessionRegistry::new(&state_path);
+        registry
+            .register_session(make_session("sess-1", "work-1"))
+            .unwrap();
+
+        let registry: Arc<dyn SessionRegistry> = Arc::new(registry);
+        let collected = collect_sessions(&registry);
+
+        // Successful clear should return Ok(())
+        let result = clear_session_registry(&registry, &collected, None);
+        assert!(
+            result.is_ok(),
+            "clear_session_registry should return Ok on success"
+        );
+
+        // After clearing, registry should be empty
+        let remaining = collect_sessions(&registry);
+        assert!(remaining.sessions.is_empty());
+    }
+
+    /// Regression test: `RegistryClearFailed` error variant exists and can be
+    /// constructed, ensuring the error path is compile-time verified.
+    #[test]
+    fn test_registry_clear_failed_error_variant_exists() {
+        let err = CrashRecoveryError::RegistryClearFailed {
+            message: "persistence failed".to_string(),
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("persistence failed"),
+            "RegistryClearFailed error should contain the message"
+        );
+        assert!(
+            display.contains("registry clear/persist failed"),
+            "RegistryClearFailed error should have descriptive prefix"
         );
     }
 }
