@@ -709,6 +709,9 @@ async fn async_main(args: Args) -> Result<()> {
                 Arc::clone(conn),
                 cas_path,
             )
+            .map_err(|e| {
+                anyhow::anyhow!("CAS initialization failed for {}: {e}", cas_path.display())
+            })?
         } else {
             if daemon_config.cas_path.is_some() && sqlite_conn.is_none() {
                 warn!(

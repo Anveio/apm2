@@ -116,7 +116,8 @@ fn tck_00383_with_persistence_and_cas_wires_session() {
         None, // no metrics
         sqlite_conn,
         &cas_dir,
-    );
+    )
+    .unwrap();
 
     // Verify the dispatcher was created successfully (no panic = all deps wired)
     let _session_dispatcher = dispatcher_state.session_dispatcher();
@@ -167,6 +168,32 @@ fn tck_00383_without_cas_falls_back_to_persistence() {
 }
 
 // =============================================================================
+// IT-00383-02b: Invalid CAS path returns error (not panic)
+// =============================================================================
+
+/// Verify that `with_persistence_and_cas` returns an error (not a panic)
+/// when the CAS path is invalid (e.g., a relative path).
+#[test]
+fn tck_00383_invalid_cas_path_returns_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let sqlite_conn = make_sqlite_conn(&temp_dir);
+    let session_registry = test_session_registry();
+
+    // Use a relative path, which DurableCas rejects
+    let result = DispatcherState::with_persistence_and_cas(
+        session_registry,
+        None,
+        sqlite_conn,
+        "relative/cas/path",
+    );
+
+    assert!(
+        result.is_err(),
+        "with_persistence_and_cas should return Err for relative CAS path, not panic"
+    );
+}
+
+// =============================================================================
 // IT-00383-03: EmitEvent persists to SQLite via with_persistence_and_cas
 // =============================================================================
 
@@ -191,7 +218,8 @@ fn tck_00383_emit_event_persists_to_sqlite() {
         None,
         Arc::clone(&sqlite_conn),
         &cas_dir,
-    );
+    )
+    .unwrap();
 
     // Verify the SQLite connection has the ledger schema initialized
     // (the constructor should not corrupt existing schemas)
@@ -230,7 +258,8 @@ fn tck_00383_publish_evidence_stores_in_cas() {
     let session_registry = test_session_registry();
 
     let dispatcher_state =
-        DispatcherState::with_persistence_and_cas(session_registry, None, sqlite_conn, &cas_dir);
+        DispatcherState::with_persistence_and_cas(session_registry, None, sqlite_conn, &cas_dir)
+            .unwrap();
 
     // Verify CAS directory was created with proper structure
     assert!(cas_dir.exists(), "CAS base directory should exist");
@@ -269,7 +298,8 @@ fn tck_00383_request_tool_returns_broker_result() {
     let session_registry = test_session_registry();
 
     let dispatcher_state =
-        DispatcherState::with_persistence_and_cas(session_registry, None, sqlite_conn, &cas_dir);
+        DispatcherState::with_persistence_and_cas(session_registry, None, sqlite_conn, &cas_dir)
+            .unwrap();
 
     let session_dispatcher = dispatcher_state.session_dispatcher();
     let ctx = make_session_ctx();
@@ -379,7 +409,8 @@ fn tck_00383_cas_directory_creation() {
     );
 
     let _dispatcher_state =
-        DispatcherState::with_persistence_and_cas(session_registry, None, sqlite_conn, &cas_dir);
+        DispatcherState::with_persistence_and_cas(session_registry, None, sqlite_conn, &cas_dir)
+            .unwrap();
 
     // CAS directory should now exist
     assert!(
@@ -459,10 +490,18 @@ fn tck_00383_e2e_emit_event_persists_to_sqlite() {
         None,
         Arc::clone(&sqlite_conn),
         &cas_dir,
-    );
+    )
+    .unwrap();
 
     // Get a valid session token via the full ClaimWork -> SpawnEpisode flow
     let session_token = spawn_session_and_get_token(&dispatcher_state);
+
+    // Capture ledger event count BEFORE emitting the new event
+    let count_before: i64 = {
+        let conn = sqlite_conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap()
+    };
 
     // Use the session dispatcher to emit an event
     let session_dispatcher = dispatcher_state.session_dispatcher();
@@ -495,15 +534,16 @@ fn tck_00383_e2e_emit_event_persists_to_sqlite() {
         other => panic!("Expected EmitEvent response, got: {other:?}"),
     }
 
-    // Verify the event was actually persisted in SQLite
-    let conn = sqlite_conn.lock().unwrap();
-    let event_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
-        .unwrap();
-    // Should have at least 2 events: WorkClaimed + SpawnEpisode + EmitEvent
+    // Verify the newly emitted event was actually persisted in SQLite
+    // by comparing counts before and after
+    let count_after: i64 = {
+        let conn = sqlite_conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM ledger_events", [], |row| row.get(0))
+            .unwrap()
+    };
     assert!(
-        event_count >= 2,
-        "ledger_events should have events persisted, got {event_count}"
+        count_after > count_before,
+        "ledger_events count should increase after EmitEvent: before={count_before}, after={count_after}"
     );
 }
 
@@ -528,7 +568,8 @@ fn tck_00383_e2e_publish_evidence_stores_in_cas() {
         None,
         Arc::clone(&sqlite_conn),
         &cas_dir,
-    );
+    )
+    .unwrap();
 
     // Get a valid session token
     let session_token = spawn_session_and_get_token(&dispatcher_state);
@@ -610,7 +651,8 @@ fn tck_00383_e2e_request_tool_uses_broker() {
         None,
         Arc::clone(&sqlite_conn),
         &cas_dir,
-    );
+    )
+    .unwrap();
 
     // Get a valid session token
     let session_token = spawn_session_and_get_token(&dispatcher_state);
@@ -630,10 +672,26 @@ fn tck_00383_e2e_request_tool_uses_broker() {
         .dispatch(&tool_frame, &session_ctx)
         .unwrap();
 
-    // The broker IS wired, so we should NOT get "broker unavailable".
-    // We may get other errors (tool not in manifest, etc.) which is expected.
-    match response {
+    // The broker IS wired, so we must get a RequestTool response variant
+    // (even if the tool execution itself errors about manifest/args, that
+    // proves the broker processed the request). An Error response with
+    // "broker unavailable" would mean the broker is NOT wired.
+    //
+    // Accept either:
+    // - SessionResponse::RequestTool(_) -- broker processed the request
+    // - SessionResponse::Error with a broker-processed error (e.g., tool not in
+    //   manifest, invalid arguments) -- still proves broker is wired
+    //
+    // Reject:
+    // - SessionResponse::Error with "broker unavailable" -- broker NOT wired
+    match &response {
+        SessionResponse::RequestTool(_) => {
+            // Success: broker is wired and processed the tool request
+        },
         SessionResponse::Error(err) => {
+            // The error must NOT be "broker unavailable". Any other error
+            // (manifest not found, tool not allowed, etc.) proves the broker
+            // is wired and actively processing.
             assert!(
                 !err.message.contains("broker unavailable"),
                 "Error should NOT be 'broker unavailable' when CAS+broker wired via \
@@ -641,12 +699,28 @@ fn tck_00383_e2e_request_tool_uses_broker() {
                 err.message,
                 err.code
             );
-        },
-        SessionResponse::RequestTool(_) => {
-            // Tool executed successfully - broker is wired and working
+            // Additionally verify the error is from broker processing, not a
+            // generic dispatch failure. "broker error" (e.g., "broker not
+            // initialized") proves the broker IS wired and responding, just
+            // not initialized for this session context.
+            assert!(
+                err.message.contains("tool")
+                    || err.message.contains("manifest")
+                    || err.message.contains("not allowed")
+                    || err.message.contains("session")
+                    || err.message.contains("token")
+                    || err.message.contains("episode")
+                    || err.message.contains("capability")
+                    || err.message.contains("broker error")
+                    || err.message.contains("broker not initialized"),
+                "Error should indicate broker-level processing (tool/manifest/session/broker), \
+                 got: {} (code={})",
+                err.message,
+                err.code
+            );
         },
         other => {
-            panic!("Expected Error or RequestTool response, got: {other:?}");
+            panic!("Expected RequestTool or broker-processed Error response, got: {other:?}");
         },
     }
 }

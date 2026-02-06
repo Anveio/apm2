@@ -48,7 +48,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use apm2_core::crypto::{EventHasher, HASH_SIZE, Hash};
@@ -738,6 +738,25 @@ fn create_dir_secure(path: &Path) -> Result<(), DurableCasError> {
 /// This prevents symlink redirection attacks where an attacker creates a
 /// symlink pointing to a sensitive directory.
 fn validate_no_symlinks(path: &Path) -> Result<(), DurableCasError> {
+    // SEC-CAS-002a: Reject `..` segments to prevent path traversal attacks.
+    // Without this, paths like `missing/../link/cas_store` can bypass the
+    // per-component symlink check because the `missing` component triggers
+    // NotFound (skipped), then `..` climbs back up, so the cumulative path
+    // never actually checks `link` as a symlink.
+    //
+    // Note: `Component::CurDir` (`.`) is already normalized away by
+    // `Path::components()`, so only `ParentDir` needs explicit rejection.
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(DurableCasError::InitializationFailed {
+                message: format!(
+                    "CAS path must not contain '..' segments: {}",
+                    path.display()
+                ),
+            });
+        }
+    }
+
     let mut current = PathBuf::new();
     for component in path.components() {
         current.push(component);
@@ -778,7 +797,10 @@ fn validate_no_symlinks(path: &Path) -> Result<(), DurableCasError> {
 /// - Owner must match the current effective UID (daemon UID)
 /// - Permissions must not be more permissive than 0700 (no group/other access)
 fn verify_directory_security(path: &Path) -> Result<(), DurableCasError> {
-    let metadata = fs::metadata(path)
+    // SEC-CAS-003: Use symlink_metadata instead of metadata to check the
+    // actual entry rather than following symlinks. fs::metadata follows
+    // symlinks, which would allow a symlink to masquerade as a directory.
+    let metadata = fs::symlink_metadata(path)
         .map_err(|e| DurableCasError::io(format!("stat directory {}", path.display()), e))?;
 
     if !metadata.is_dir() {
@@ -1218,6 +1240,64 @@ mod tests {
                 "Error should mention 'permissions': {message}"
             );
         }
+    }
+
+    /// SEC-CAS-002c: Regression test for `missing/../link/cas_store` path
+    /// traversal bypass.
+    ///
+    /// Without dot-segment rejection, this path bypasses the symlink check
+    /// because:
+    /// 1. `missing` does not exist -> `NotFound` is silently skipped
+    /// 2. `..` climbs back up, so the cumulative path never checks `link`
+    #[test]
+    fn test_reject_dot_dot_symlink_traversal() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+
+        // Create a real directory and a symlink to it
+        let real_dir = base.join("real_target");
+        fs::create_dir_all(&real_dir).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+
+        // Construct a path that uses `missing/../link/cas_store` to bypass
+        // the per-component symlink check
+        let malicious_path = base
+            .join("missing")
+            .join("..")
+            .join("link")
+            .join("cas_store");
+
+        let config = DurableCasConfig::new(&malicious_path);
+        let result = DurableCas::new(config);
+        assert!(
+            matches!(result, Err(DurableCasError::InitializationFailed { .. })),
+            "Expected InitializationFailed for dot-dot traversal path, got: {result:?}"
+        );
+        if let Err(DurableCasError::InitializationFailed { message }) = result {
+            assert!(
+                message.contains("..") || message.contains("dot"),
+                "Error should mention dot segments: {message}"
+            );
+        }
+    }
+
+    /// SEC-CAS-002d: Reject paths containing `..` even without symlinks.
+    ///
+    /// Even if no symlink exists, `..` segments are dangerous because they
+    /// could bypass the per-component check if a future parent directory
+    /// is missing. Reject all `..` segments unconditionally.
+    #[test]
+    fn test_reject_parent_dir_segment() {
+        let temp_dir = TempDir::new().unwrap();
+        let path_with_dotdot = temp_dir.path().join("foo").join("..").join("cas_store");
+
+        let config = DurableCasConfig::new(&path_with_dotdot);
+        let result = DurableCas::new(config);
+        assert!(
+            matches!(result, Err(DurableCasError::InitializationFailed { .. })),
+            "Expected InitializationFailed for '..' segment, got: {result:?}"
+        );
     }
 
     /// SEC-CAS-004: Shard directories created during store also get 0700
