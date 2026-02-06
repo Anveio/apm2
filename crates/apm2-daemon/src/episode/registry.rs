@@ -928,7 +928,7 @@ impl InMemorySessionRegistry {
 }
 
 impl SessionRegistry for InMemorySessionRegistry {
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+    fn register_session(&self, session: SessionState) -> Result<Vec<String>, SessionRegistryError> {
         let mut state = self.state.write().expect("lock poisoned");
 
         // TCK-00385 MINOR 1: Centralize TTL cleanup on all write paths.
@@ -944,11 +944,15 @@ impl SessionRegistry for InMemorySessionRegistry {
             });
         }
 
-        // CTR-1303: Evict oldest entry if at capacity
+        // CTR-1303: Evict oldest entry if at capacity.
+        // TCK-00384 security fix: Return evicted session IDs so callers
+        // can clean up corresponding telemetry entries.
+        let mut evicted_ids = Vec::new();
         while state.by_id.len() >= MAX_SESSIONS {
             if let Some(oldest_key) = state.queue.pop_front() {
                 if let Some(evicted) = state.by_id.remove(&oldest_key) {
                     state.by_handle.remove(&evicted.ephemeral_handle);
+                    evicted_ids.push(evicted.session_id);
                 }
             } else {
                 break;
@@ -960,7 +964,19 @@ impl SessionRegistry for InMemorySessionRegistry {
         state.queue.push_back(session_id.clone());
         state.by_handle.insert(handle, session_id.clone());
         state.by_id.insert(session_id, session);
-        Ok(())
+        Ok(evicted_ids)
+    }
+
+    fn remove_session(&self, session_id: &str) -> Option<SessionState> {
+        let mut state = self.state.write().expect("lock poisoned");
+
+        if let Some(session) = state.by_id.remove(session_id) {
+            state.by_handle.remove(&session.ephemeral_handle);
+            state.queue.retain(|id| id != session_id);
+            Some(session)
+        } else {
+            None
+        }
     }
 
     fn get_session(&self, session_id: &str) -> Option<SessionState> {
@@ -1057,22 +1073,6 @@ impl InMemorySessionRegistry {
     pub fn all_sessions(&self) -> Vec<SessionState> {
         let state = self.state.read().expect("lock poisoned");
         state.by_id.values().cloned().collect()
-    }
-
-    /// Removes a session by ID.
-    ///
-    /// Used during crash recovery to clean up sessions after sending
-    /// `LEASE_REVOKED` signals.
-    pub fn remove_session(&self, session_id: &str) -> Option<SessionState> {
-        let mut state = self.state.write().expect("lock poisoned");
-
-        if let Some(session) = state.by_id.remove(session_id) {
-            state.by_handle.remove(&session.ephemeral_handle);
-            state.queue.retain(|id| id != session_id);
-            Some(session)
-        } else {
-            None
-        }
     }
 
     /// Clears all sessions.
@@ -1289,7 +1289,13 @@ impl RecoveryManager {
         // Cleanup orphaned processes
         let orphaned_processes_cleaned = self.cleanup_orphaned_processes(&sessions)?;
 
-        // Clear the registry after recovery
+        // Clear the registry after recovery.
+        //
+        // IMPORTANT (TCK-00384): Callers MUST also clear the
+        // `SessionTelemetryStore` after invoking `recover_sessions` to
+        // prevent orphaned telemetry entries. The recovery manager does not
+        // hold a reference to the telemetry store; lifecycle cleanup is the
+        // caller's responsibility.
         registry.clear();
 
         let recovery_time_ms = start.elapsed().as_millis() as u32;
@@ -1878,9 +1884,9 @@ impl PersistentSessionRegistry {
 }
 
 impl SessionRegistry for PersistentSessionRegistry {
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError> {
+    fn register_session(&self, session: SessionState) -> Result<Vec<String>, SessionRegistryError> {
         // Register in memory first
-        self.inner.register_session(session)?;
+        let evicted = self.inner.register_session(session)?;
 
         // Persist to disk (convert error to RegistrationFailed)
         self.persist()
@@ -1888,7 +1894,11 @@ impl SessionRegistry for PersistentSessionRegistry {
                 message: format!("Failed to persist state: {e}"),
             })?;
 
-        Ok(())
+        Ok(evicted)
+    }
+
+    fn remove_session(&self, session_id: &str) -> Option<SessionState> {
+        self.inner.remove_session(session_id)
     }
 
     fn get_session(&self, session_id: &str) -> Option<SessionState> {
@@ -2135,16 +2145,21 @@ mod session_registry_tests {
         // Fill to MAX_SESSIONS
         for i in 0..MAX_SESSIONS {
             let session = make_session(&format!("sess-{i}"), &format!("handle-{i}"));
-            registry.register_session(session).unwrap();
+            let evicted = registry.register_session(session).unwrap();
+            assert!(evicted.is_empty(), "No evictions while under capacity");
         }
 
         // Verify first session exists
         assert!(registry.get_session("sess-0").is_some());
 
         // Register one more - should evict sess-0 (oldest)
-        registry
+        let evicted = registry
             .register_session(make_session("sess-new", "handle-new"))
             .unwrap();
+
+        // TCK-00384: Verify evicted session IDs are returned
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], "sess-0");
 
         // sess-0 should be evicted
         assert!(registry.get_session("sess-0").is_none());

@@ -137,7 +137,19 @@ impl std::fmt::Debug for SessionState {
 /// instead of "session not found".
 pub trait SessionRegistry: Send + Sync {
     /// Registers a new session.
-    fn register_session(&self, session: SessionState) -> Result<(), SessionRegistryError>;
+    ///
+    /// Returns a list of session IDs that were evicted to make room for the
+    /// new session (may be empty if no eviction was necessary). Callers
+    /// MUST clean up telemetry for evicted sessions to prevent orphaned
+    /// entries (TCK-00384 security fix).
+    fn register_session(&self, session: SessionState) -> Result<Vec<String>, SessionRegistryError>;
+
+    /// Removes a session by ID.
+    ///
+    /// Returns the removed session state, or `None` if the session was not
+    /// found. Used for transactional rollback when post-registration steps
+    /// fail (TCK-00384 security fix).
+    fn remove_session(&self, session_id: &str) -> Option<SessionState>;
 
     /// Queries a session by session ID.
     fn get_session(&self, session_id: &str) -> Option<SessionState>;
@@ -466,6 +478,15 @@ impl SessionTelemetryStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Removes all telemetry entries.
+    ///
+    /// Used during crash recovery to clear telemetry state alongside the
+    /// session registry (TCK-00384 security fix: complete lifecycle cleanup).
+    pub fn clear(&self) {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.clear();
     }
 
     /// Returns the maximum number of sessions this store can track.
