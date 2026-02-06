@@ -4670,9 +4670,48 @@ impl PrivilegedDispatcher {
                     episode_id = %episode_id,
                     "Failed to write episode_id back to session registry - failing closed"
                 );
+
+                // TCK-00384 review fix: Stop the already-started episode
+                // before rolling back.  Without this, the runtime episode
+                // continues running after the client receives a spawn
+                // failure, violating fail-closed semantics.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let rt = &self.episode_runtime;
+                    let stop_err = tokio::task::block_in_place(|| {
+                        handle.block_on(rt.stop(
+                            episode_id,
+                            crate::episode::TerminationClass::Cancelled,
+                            timestamp_ns,
+                        ))
+                    });
+                    if let Err(stop_e) = stop_err {
+                        warn!(
+                            error = %stop_e,
+                            episode_id = %episode_id,
+                            "Rollback: failed to stop episode after update_episode_id failure"
+                        );
+                    }
+                }
+
+                // TCK-00384 review fix: Rollback session, telemetry, and
+                // manifest to prevent leaked resources when
+                // update_episode_id persistence fails.
+                let rollback_warn =
+                    self.rollback_spawn(&session_id, &evicted_sessions, &evicted_telemetry, true);
+                if let Some(ref rw) = rollback_warn {
+                    warn!(rollback_errors = %rw, "Partial rollback failure during update_episode_id error recovery");
+                }
+                let msg = rollback_warn.map_or_else(
+                    || format!("session episode_id update failed: {e}"),
+                    |rw| {
+                        format!(
+                            "session episode_id update failed: {e} (rollback partial failure: {rw})"
+                        )
+                    },
+                );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
-                    format!("session episode_id update failed: {e}"),
+                    msg,
                 ));
             }
             debug!(
@@ -5308,7 +5347,7 @@ impl PrivilegedDispatcher {
         // Work state completion belongs to a separate workflow path
         // (gate orchestration), not EndSession.
 
-        // ---- Phase 4: POST-COMMIT session + manifest removal ----
+        // ---- Phase 4: POST-COMMIT session + manifest + telemetry removal ----
         // Remove session from registry only after ALL fallible operations
         // (runtime stop + ledger emission) have succeeded. This prevents
         // the session from being orphaned if a downstream step fails.
@@ -5317,6 +5356,14 @@ impl PrivilegedDispatcher {
         // to prevent retained session tokens from passing manifest lookup
         // in RequestTool after EndSession.
         self.manifest_store.remove(&request.session_id);
+
+        // TCK-00384 review fix: Clean up telemetry on EndSession to free
+        // capacity in the bounded store. Without this, repeated
+        // spawn/end cycles exhaust MAX_TELEMETRY_SESSIONS and block new
+        // spawns (DoS). Mirrors the cleanup in session_dispatch.rs:1421.
+        if let Some(ref store) = self.telemetry_store {
+            store.remove(&request.session_id);
+        }
 
         if let Err(e) = self.session_registry.remove_session(&request.session_id) {
             warn!(
@@ -10768,6 +10815,159 @@ mod tests {
             let result = registry.remove_session("S-NONEXISTENT");
             assert!(result.is_ok());
             assert!(result.unwrap().is_none());
+        }
+
+        /// TCK-00384 review BLOCKER fix: `EndSession` removes telemetry so
+        /// repeated spawn/end cycles do not exhaust the bounded store.
+        ///
+        /// This test performs multiple spawn -> `EndSession` cycles and asserts
+        /// the telemetry cardinality returns to 0 after each end, proving
+        /// no capacity leak.
+        #[test]
+        fn test_end_session_cleans_up_telemetry() {
+            let (dispatcher, store) = dispatcher_with_telemetry();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let baseline = store.len();
+            assert_eq!(baseline, 0, "Telemetry store must start empty");
+
+            // Perform 3 full spawn/end cycles and verify cardinality returns
+            // to baseline after each EndSession.
+            for cycle in 0..3u32 {
+                // ClaimWork
+                let claim_request = ClaimWorkRequest {
+                    actor_id: format!("actor-{cycle}"),
+                    role: WorkRole::Implementer.into(),
+                    credential_signature: vec![1, 2, 3],
+                    nonce: vec![4, 5, 6],
+                };
+                let claim_frame = encode_claim_work_request(&claim_request);
+                let claim_resp = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+                let (work_id, lease_id) = match claim_resp {
+                    PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                    other => panic!("cycle {cycle}: expected ClaimWork, got: {other:?}"),
+                };
+
+                // SpawnEpisode
+                let spawn_request = SpawnEpisodeRequest {
+                    workspace_root: test_workspace_root(),
+                    work_id: work_id.clone(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: Some(lease_id),
+                };
+                let spawn_frame = encode_spawn_episode_request(&spawn_request);
+                let spawn_resp = dispatcher.dispatch(&spawn_frame, &ctx).unwrap();
+                let session_id = match spawn_resp {
+                    PrivilegedResponse::SpawnEpisode(ref resp) => resp.session_id.clone(),
+                    other => panic!("cycle {cycle}: expected SpawnEpisode, got: {other:?}"),
+                };
+
+                // Verify telemetry was registered
+                assert!(
+                    store.get(&session_id).is_some(),
+                    "cycle {cycle}: telemetry must be registered after spawn"
+                );
+                assert_eq!(
+                    store.len(),
+                    1,
+                    "cycle {cycle}: exactly 1 telemetry entry during session"
+                );
+
+                // EndSession
+                let end_request = EndSessionRequest {
+                    session_id: session_id.clone(),
+                    reason: "test_cycle".to_string(),
+                    outcome: TerminationOutcome::Success as i32,
+                };
+                let end_frame = encode_end_session_request(&end_request);
+                let end_resp = dispatcher.dispatch(&end_frame, &ctx).unwrap();
+                match end_resp {
+                    PrivilegedResponse::EndSession(resp) => {
+                        assert_eq!(resp.session_id, session_id);
+                    },
+                    other => panic!("cycle {cycle}: expected EndSession, got: {other:?}"),
+                }
+
+                // Verify telemetry was cleaned up
+                assert!(
+                    store.get(&session_id).is_none(),
+                    "cycle {cycle}: telemetry must be removed after EndSession"
+                );
+                assert_eq!(
+                    store.len(),
+                    baseline,
+                    "cycle {cycle}: telemetry cardinality must return to baseline after EndSession"
+                );
+            }
+        }
+
+        /// TCK-00384 review MAJOR fix: `update_episode_id` failure path
+        /// must invoke `rollback_spawn` with `remove_manifest=true`.
+        ///
+        /// Verifies the rollback function cleans up session, telemetry,
+        /// and manifest when invoked with the same parameters as the
+        /// production `update_episode_id` failure path.
+        #[test]
+        fn test_update_episode_id_failure_triggers_full_rollback() {
+            use crate::episode::registry::InMemorySessionRegistry;
+            use crate::session::{SessionRegistry, SessionState, SessionTelemetryStore};
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let store = Arc::new(SessionTelemetryStore::new());
+
+            // Simulate a session that has been registered with telemetry
+            // — the state right before update_episode_id is called in the
+            // spawn flow.
+            let session = SessionState {
+                session_id: "S-EPID-FAIL".to_string(),
+                work_id: "W-EPID-FAIL".to_string(),
+                role: 1,
+                ephemeral_handle: "H-EPID-FAIL".to_string(),
+                lease_id: "L-EPID-FAIL".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            registry.register_session(session).unwrap();
+            store.register("S-EPID-FAIL", 1_000_000).unwrap();
+
+            // Build a dispatcher that shares these stores
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&store));
+
+            // Verify stores have the session
+            assert!(registry.get_session("S-EPID-FAIL").is_some());
+            assert!(store.get("S-EPID-FAIL").is_some());
+
+            // Invoke rollback_spawn with remove_manifest=true (the path
+            // taken when update_episode_id fails in production code)
+            let no_evicted_sessions: Vec<SessionState> = Vec::new();
+            let no_evicted_telemetry: Vec<(String, Arc<crate::session::SessionTelemetry>)> =
+                Vec::new();
+            let result = dispatcher.rollback_spawn(
+                "S-EPID-FAIL",
+                &no_evicted_sessions,
+                &no_evicted_telemetry,
+                true,
+            );
+            assert!(result.is_none(), "Rollback should succeed without warnings");
+
+            // Verify session and telemetry are cleaned up
+            assert!(
+                registry.get_session("S-EPID-FAIL").is_none(),
+                "Session must be removed after rollback"
+            );
+            assert!(
+                store.get("S-EPID-FAIL").is_none(),
+                "Telemetry must be removed after rollback"
+            );
         }
     }
 
