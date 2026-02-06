@@ -38,6 +38,7 @@ use crate::episode::{
     PersistentRegistryError, PersistentSessionRegistry, SharedToolBroker, ToolBrokerConfig,
     new_shared_broker_with_cas,
 };
+use crate::gate::{GateOrchestrator, GateOrchestratorEvent, SessionTerminatedInfo};
 use crate::governance::GovernancePolicyResolver;
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
@@ -137,6 +138,15 @@ pub struct DispatcherState {
     /// The `ManifestStore` is shared with `PrivilegedDispatcher` so manifests
     /// registered during spawn are accessible for tool validation.
     session_dispatcher: SessionDispatcher<InMemoryManifestStore>,
+
+    /// Gate execution orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// When set, the dispatcher invokes
+    /// [`GateOrchestrator::on_session_terminated`] from the production
+    /// session termination path, returning ledger events for persistence.
+    /// The full ledger subscription integration is deferred to
+    /// TCK-00390 (merge automation).
+    gate_orchestrator: Option<Arc<GateOrchestrator>>,
 }
 
 impl DispatcherState {
@@ -231,6 +241,7 @@ impl DispatcherState {
         Self {
             privileged_dispatcher,
             session_dispatcher,
+            gate_orchestrator: None,
         }
     }
 
@@ -303,6 +314,7 @@ impl DispatcherState {
         Self {
             privileged_dispatcher,
             session_dispatcher,
+            gate_orchestrator: None,
         }
     }
 
@@ -316,11 +328,16 @@ impl DispatcherState {
     /// * `sqlite_conn` - Optional `SQLite` connection for persistent ledger. If
     ///   provided, uses durable `Sqlite*` implementations. Otherwise uses
     ///   stubs.
+    /// * `ledger_signing_key` - Optional ledger signing key. When provided, the
+    ///   dispatcher reuses this key instead of generating a new ephemeral one.
+    ///   Per Security Review v5 MAJOR 2, there must be ONE signing key per
+    ///   daemon lifecycle, shared between crash recovery and the dispatcher.
     #[must_use]
     pub fn with_persistence(
         session_registry: Arc<dyn SessionRegistry>,
         metrics_registry: Option<SharedMetricsRegistry>,
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
+        ledger_signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Self {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
@@ -342,8 +359,13 @@ impl DispatcherState {
 
         let privileged_dispatcher = if let Some(conn) = sqlite_conn {
             // Use real implementations
-            use rand::rngs::OsRng;
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+            // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
+            // if provided, otherwise generate a new one. This ensures recovery
+            // and dispatcher events are signed with the same key.
+            let signing_key = ledger_signing_key.unwrap_or_else(|| {
+                use rand::rngs::OsRng;
+                ed25519_dalek::SigningKey::generate(&mut OsRng)
+            });
 
             let policy_resolver = Arc::new(GovernancePolicyResolver::new());
             let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
@@ -446,6 +468,7 @@ impl DispatcherState {
         Self {
             privileged_dispatcher,
             session_dispatcher,
+            gate_orchestrator: None,
         }
     }
 
@@ -479,8 +502,35 @@ impl DispatcherState {
         sqlite_conn: Arc<Mutex<Connection>>,
         cas_path: impl AsRef<Path>,
     ) -> Result<Self, crate::cas::DurableCasError> {
-        use rand::rngs::OsRng;
+        Self::with_persistence_and_cas_and_key(
+            session_registry,
+            metrics_registry,
+            sqlite_conn,
+            cas_path,
+            None,
+        )
+    }
 
+    /// Creates new dispatcher state with persistent ledger, CAS,
+    /// `ToolBroker`, and an optional pre-existing ledger signing key
+    /// (TCK-00387 Security Review v5 MAJOR 2).
+    ///
+    /// When `ledger_signing_key` is `Some`, that key is reused for the ledger
+    /// event emitter instead of generating a new ephemeral one. This ensures
+    /// ONE signing key per daemon lifecycle, shared between crash recovery and
+    /// the dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CAS initialization fails.
+    #[allow(clippy::needless_pass_by_value)] // Arc is intentionally moved for shared ownership
+    pub fn with_persistence_and_cas_and_key(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Arc<Mutex<Connection>>,
+        cas_path: impl AsRef<Path>,
+        ledger_signing_key: Option<ed25519_dalek::SigningKey>,
+    ) -> Result<Self, crate::cas::DurableCasError> {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -508,8 +558,13 @@ impl DispatcherState {
         let clock =
             Arc::new(HolonicClock::new(ClockConfig::default(), None).expect("clock failed"));
 
-        // Use real implementations
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+        // Security Review v5 MAJOR 2: Reuse the daemon-lifecycle signing key
+        // if provided, otherwise generate a new one. This ensures recovery
+        // and dispatcher events are signed with the same key.
+        let signing_key = ledger_signing_key.unwrap_or_else(|| {
+            use rand::rngs::OsRng;
+            ed25519_dalek::SigningKey::generate(&mut OsRng)
+        });
 
         let policy_resolver = Arc::new(GovernancePolicyResolver::new());
         let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&sqlite_conn)));
@@ -621,6 +676,7 @@ impl DispatcherState {
         Ok(Self {
             privileged_dispatcher,
             session_dispatcher,
+            gate_orchestrator: None,
         })
     }
 
@@ -634,6 +690,49 @@ impl DispatcherState {
     pub fn with_daemon_state(mut self, state: SharedState) -> Self {
         self.privileged_dispatcher = self.privileged_dispatcher.with_daemon_state(state);
         self
+    }
+
+    /// Sets the gate orchestrator for autonomous gate lifecycle (TCK-00388).
+    ///
+    /// When set, [`notify_session_terminated`](Self::notify_session_terminated)
+    /// delegates to [`GateOrchestrator::on_session_terminated`], returning
+    /// ledger events for the caller to persist.
+    #[must_use]
+    pub fn with_gate_orchestrator(mut self, orchestrator: Arc<GateOrchestrator>) -> Self {
+        // Wire orchestrator into session dispatcher so termination triggers
+        // gate lifecycle directly from the session dispatch path (Security
+        // BLOCKER 1 fix).
+        self.session_dispatcher
+            .set_gate_orchestrator(Arc::clone(&orchestrator));
+        self.gate_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Returns a reference to the gate orchestrator, if configured.
+    #[must_use]
+    pub const fn gate_orchestrator(&self) -> Option<&Arc<GateOrchestrator>> {
+        self.gate_orchestrator.as_ref()
+    }
+
+    /// Notifies the gate orchestrator that a session has terminated.
+    ///
+    /// This is the production entry point that wires the
+    /// `GateOrchestrator` into the daemon runtime (Quality BLOCKER 4 fix).
+    /// The caller is responsible for persisting the returned events to the
+    /// ledger.
+    ///
+    /// Returns `None` if no gate orchestrator is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns the orchestrator error if gate setup fails.
+    pub async fn notify_session_terminated(
+        &self,
+        info: SessionTerminatedInfo,
+    ) -> Option<Result<Vec<GateOrchestratorEvent>, crate::gate::GateOrchestratorError>> {
+        let orch = self.gate_orchestrator.as_ref()?;
+        let result = orch.on_session_terminated(info).await;
+        Some(result.map(|(_gate_types, _signers, events)| events))
     }
 
     /// Returns a reference to the privileged dispatcher.
