@@ -27,8 +27,13 @@ evidence_artifact:
         - all_authoritative_routes_require_receipts: no authoritative route lacks receipts
         - all_routes_have_unique_ids: no duplicate route IDs
         - all_routes_have_unique_routes: no duplicate route paths
-        - missing_semantics_error_path_triggers: concrete negative test that deterministically
-          triggers ManifestBuildError::MissingSemantics via a test-only route with no annotation
+        - missing_semantics_error_path_triggers_via_build: concrete negative test that calls
+          build_manifest_from_descriptors() with a fake route lacking semantics annotation and
+          asserts MissingSemantics error is returned from the production build pipeline
+        - conflicting_shared_route_causes_build_error: negative test that injects two descriptors
+          for the same route with differing schemas and asserts ConflictingSharedRoute error
+        - identical_shared_route_deduplicates_cleanly: positive test verifying identical shared
+          routes are silently deduplicated without error
         - every_dispatchable_variant_appears_in_manifest: verifies all enum variants in manifest
         Semantics tests verify annotation coverage:
         - authoritative_routes_always_require_receipts: invariant holds for all routes

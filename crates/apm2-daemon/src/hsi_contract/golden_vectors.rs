@@ -4,8 +4,12 @@
 //! of the `HSIContractManifestV1` artifact. Each vector consists of:
 //!
 //! 1. A manifest constructed from the dispatch registry
-//! 2. The expected canonical bytes (hex-encoded)
-//! 3. The expected domain-separated BLAKE3 hash
+//! 2. The expected domain-separated BLAKE3 hash (hex-encoded)
+//!
+//! Hash-only vectors are sufficient because the content hash is computed from
+//! the canonical bytes via domain-separated BLAKE3; if the canonical bytes
+//! change, the hash changes. Full canonical-bytes vectors are not stored
+//! because they are large and volatile (any route addition changes them).
 //!
 //! # Purpose
 //!
@@ -27,12 +31,18 @@
 //! - EVID-0001: HSI contract manifest determinism evidence
 
 /// A golden test vector for the HSI contract manifest.
+///
+/// Each vector stores only the expected domain-separated BLAKE3 hash
+/// (hex-encoded, without the `blake3:` prefix). The hash is sufficient
+/// to detect any change in canonical bytes because it is computed from
+/// those bytes via domain-separated BLAKE3.
 pub struct GoldenVector {
     /// Human-readable name for the vector.
     pub name: &'static str,
     /// Contract reference.
     pub contract: &'static str,
-    /// Expected domain-separated BLAKE3 hash (hex-encoded, no prefix).
+    /// Expected domain-separated BLAKE3 hash (hex-encoded, no `blake3:`
+    /// prefix).
     pub expected_hash: &'static str,
 }
 
@@ -208,6 +218,31 @@ mod tests {
             &hash_text[7..],
             hex_from_bytes,
             "text and bytes hash forms must match"
+        );
+    }
+
+    /// Verifies that the EVID-0001 evidence artifact contains the current
+    /// golden vector hash. This prevents the evidence artifact from drifting
+    /// out of sync with the actual golden vector constant.
+    ///
+    /// If this test fails, update the hash in
+    /// `documents/rfcs/RFC-0020/evidence_artifacts/EVID-0001.yaml` to match
+    /// `MANIFEST_FULL_VECTOR.expected_hash`.
+    #[test]
+    fn evid_0001_hash_matches_golden_vector() {
+        let evid_contents =
+            include_str!("../../../../documents/rfcs/RFC-0020/evidence_artifacts/EVID-0001.yaml");
+        assert!(
+            evid_contents.contains(MANIFEST_FULL_VECTOR.expected_hash),
+            "EVID-0001.yaml does not contain the current full manifest golden hash \
+             '{}'. Update the evidence artifact to match MANIFEST_FULL_VECTOR.expected_hash.",
+            MANIFEST_FULL_VECTOR.expected_hash,
+        );
+        assert!(
+            evid_contents.contains(MANIFEST_MINIMAL_VECTOR.expected_hash),
+            "EVID-0001.yaml does not contain the current minimal manifest golden hash \
+             '{}'. Update the evidence artifact to match MANIFEST_MINIMAL_VECTOR.expected_hash.",
+            MANIFEST_MINIMAL_VECTOR.expected_hash,
         );
     }
 }

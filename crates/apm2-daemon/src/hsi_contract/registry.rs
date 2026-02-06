@@ -43,6 +43,20 @@ pub enum ManifestBuildError {
         /// Routes that are missing annotations.
         routes: Vec<String>,
     },
+
+    /// A route appears in both privileged and session registries with
+    /// conflicting descriptors (differing id, `request_schema`,
+    /// `response_schema`, or stability).
+    ///
+    /// Shared routes MUST have identical metadata in both registries to
+    /// ensure manifest determinism regardless of which registry provides
+    /// the winning entry.
+    ConflictingSharedRoute {
+        /// The route path that has conflicting descriptors.
+        route: String,
+        /// Human-readable description of the conflict.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ManifestBuildError {
@@ -54,6 +68,12 @@ impl std::fmt::Display for ManifestBuildError {
                     "HSI contract manifest build failed: missing semantics annotations for {} route(s): {}",
                     routes.len(),
                     routes.join(", ")
+                )
+            },
+            Self::ConflictingSharedRoute { route, detail } => {
+                write!(
+                    f,
+                    "HSI contract manifest build failed: conflicting shared route '{route}': {detail}"
                 )
             },
         }
@@ -126,6 +146,9 @@ fn session_routes() -> Vec<RouteDescriptor> {
 /// semantics annotation. Per RFC-0020 section 3.1.1, this MUST fail the
 /// build.
 ///
+/// Returns `ManifestBuildError::ConflictingSharedRoute` if a route appears
+/// in both privileged and session registries with differing metadata.
+///
 /// # Determinism
 ///
 /// The returned manifest is deterministic: routes are sorted
@@ -140,18 +163,54 @@ pub fn build_manifest(
         routes
     };
 
+    build_manifest_from_descriptors(cli_version, &all_routes)
+}
+
+/// Internal: builds a manifest from an explicit list of route descriptors.
+///
+/// This function contains the core build logic shared by `build_manifest()`
+/// and test helpers. It is not public because production callers should use
+/// `build_manifest()` which derives descriptors from the dispatch enums.
+fn build_manifest_from_descriptors(
+    cli_version: CliVersion,
+    all_routes: &[RouteDescriptor],
+) -> Result<HsiContractManifestV1, ManifestBuildError> {
     let mut missing = Vec::new();
     let mut entries = Vec::with_capacity(all_routes.len());
-    let mut seen_routes = std::collections::HashSet::new();
+    let mut seen_routes: std::collections::HashMap<&str, &RouteDescriptor> =
+        std::collections::HashMap::new();
 
-    for desc in &all_routes {
+    for desc in all_routes {
         // Deduplicate routes that appear in both privileged and session
         // dispatch registries (e.g., SubscribePulse, UnsubscribePulse).
-        // The first occurrence wins; subsequent duplicates with the same
-        // route path are silently skipped.
-        if !seen_routes.insert(desc.route) {
+        // On duplicate detection, verify that the full descriptor tuple
+        // (id, request_schema, response_schema, stability) matches. If
+        // they differ, return an error to prevent silent metadata loss.
+        if let Some(prev) = seen_routes.get(desc.route) {
+            if prev.id != desc.id
+                || prev.request_schema != desc.request_schema
+                || prev.response_schema != desc.response_schema
+                || prev.stability != desc.stability
+            {
+                return Err(ManifestBuildError::ConflictingSharedRoute {
+                    route: desc.route.to_string(),
+                    detail: format!(
+                        "privileged descriptor (id={}, req={}, resp={}, stability={:?}) \
+                         vs session descriptor (id={}, req={}, resp={}, stability={:?})",
+                        prev.id,
+                        prev.request_schema,
+                        prev.response_schema,
+                        prev.stability,
+                        desc.id,
+                        desc.request_schema,
+                        desc.response_schema,
+                        desc.stability,
+                    ),
+                });
+            }
             continue;
         }
+        seen_routes.insert(desc.route, desc);
         match annotate_route(desc.route) {
             Some(semantics) => {
                 entries.push(HsiRouteEntry {
@@ -356,69 +415,108 @@ mod tests {
         }
     }
 
-    /// Verifies that the `MissingSemantics` error path triggers when a route
-    /// has no semantics annotation.
+    /// Verifies that `build_manifest_from_descriptors()` returns
+    /// `MissingSemantics` when a route has no semantics annotation.
     ///
-    /// This test constructs a scenario where `annotate_route` returns `None`
-    /// for a route by building the manifest with a test-only route injected
-    /// into the route list. Since the builder function is not easily
-    /// injectable, we instead directly exercise the `MissingSemantics` error
-    /// path by calling `annotate_route` on a non-existent route and verifying
-    /// the build logic. We also verify the error type is properly constructed.
+    /// This test injects a fake route descriptor with no corresponding
+    /// `annotate_route` entry and calls the production build pipeline,
+    /// asserting that the fail-closed `MissingSemantics` error is returned.
     ///
-    /// EVID-0301: concrete failing-path test for `MissingSemantics`.
+    /// EVID-0301: concrete failing-path test for `MissingSemantics` via the
+    /// real build function.
     #[test]
-    fn missing_semantics_error_path_triggers() {
-        // Verify that annotate_route returns None for unknown routes
-        let unknown = super::annotate_route("hsi.nonexistent.test_only_route");
-        assert!(
-            unknown.is_none(),
-            "unknown route must return None from annotate_route"
-        );
-
-        // Construct a ManifestBuildError::MissingSemantics directly and verify
-        // its properties, since we cannot inject a fake route into the real
-        // build pipeline without modifying the dispatch enums.
-        let err = ManifestBuildError::MissingSemantics {
-            routes: vec!["hsi.nonexistent.test_only_route".to_string()],
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("missing semantics annotations"),
-            "error message must mention missing semantics: {msg}"
-        );
-        assert!(
-            msg.contains("hsi.nonexistent.test_only_route"),
-            "error message must contain the failing route: {msg}"
-        );
-
-        // Now exercise the actual build logic: replicate the fail-closed
-        // annotation lookup that build_manifest() performs. A descriptor with
-        // no semantics annotation must end up in the missing list.
-        let fake_descriptors = vec![RouteDescriptor {
+    fn missing_semantics_error_path_triggers_via_build() {
+        let descriptors = vec![RouteDescriptor {
             id: "FAKE_MISSING",
             route: "hsi.nonexistent.test_only_route",
             stability: StabilityClass::Stable,
             request_schema: "apm2.fake.v1",
             response_schema: "apm2.fake.v1",
         }];
-        let mut missing = Vec::new();
-        for desc in &fake_descriptors {
-            if super::annotate_route(desc.route).is_none() {
-                missing.push(desc.route.to_string());
-            }
-        }
-        assert!(
-            !missing.is_empty(),
-            "fake route must be detected as missing semantics"
-        );
-        let result_err = ManifestBuildError::MissingSemantics { routes: missing };
-        match &result_err {
-            ManifestBuildError::MissingSemantics { routes } => {
+        let result = super::build_manifest_from_descriptors(test_cli_version(), &descriptors);
+        match result {
+            Err(ManifestBuildError::MissingSemantics { routes }) => {
                 assert_eq!(routes.len(), 1);
                 assert_eq!(routes[0], "hsi.nonexistent.test_only_route");
+                let msg = ManifestBuildError::MissingSemantics { routes }.to_string();
+                assert!(
+                    msg.contains("missing semantics annotations"),
+                    "error message must mention missing semantics: {msg}"
+                );
+                assert!(
+                    msg.contains("hsi.nonexistent.test_only_route"),
+                    "error message must contain the failing route: {msg}"
+                );
             },
+            Ok(_) => panic!("build_manifest_from_descriptors must fail for unknown routes"),
+            Err(other) => panic!("expected MissingSemantics, got: {other:?}"),
         }
+    }
+
+    /// Verifies that shared routes with conflicting descriptors cause
+    /// `ConflictingSharedRoute` error.
+    ///
+    /// When a route path appears in both privileged and session registries
+    /// with differing metadata (id, schemas, or stability), the builder
+    /// MUST reject it to prevent silent metadata loss.
+    #[test]
+    fn conflicting_shared_route_causes_build_error() {
+        let descriptors = vec![
+            RouteDescriptor {
+                id: "PULSE_SUBSCRIBE",
+                route: "hsi.pulse.subscribe",
+                stability: StabilityClass::Stable,
+                request_schema: "apm2.subscribe_pulse_request.v1",
+                response_schema: "apm2.subscribe_pulse_response.v1",
+            },
+            // Same route but with a different request_schema
+            RouteDescriptor {
+                id: "PULSE_SUBSCRIBE",
+                route: "hsi.pulse.subscribe",
+                stability: StabilityClass::Stable,
+                request_schema: "apm2.subscribe_pulse_request.v2_CONFLICT",
+                response_schema: "apm2.subscribe_pulse_response.v1",
+            },
+        ];
+        let result = super::build_manifest_from_descriptors(test_cli_version(), &descriptors);
+        match result {
+            Err(ManifestBuildError::ConflictingSharedRoute { route, detail }) => {
+                assert_eq!(route, "hsi.pulse.subscribe");
+                assert!(
+                    detail.contains("v2_CONFLICT"),
+                    "detail must describe the conflict: {detail}"
+                );
+            },
+            Ok(_) => panic!("build must fail for conflicting shared routes"),
+            Err(other) => panic!("expected ConflictingSharedRoute, got: {other:?}"),
+        }
+    }
+
+    /// Verifies that shared routes with identical descriptors are
+    /// deduplicated without error.
+    #[test]
+    fn identical_shared_route_deduplicates_cleanly() {
+        let descriptors = vec![
+            RouteDescriptor {
+                id: "WORK_CLAIM",
+                route: "hsi.work.claim",
+                stability: StabilityClass::Stable,
+                request_schema: "apm2.claim_work_request.v1",
+                response_schema: "apm2.claim_work_response.v1",
+            },
+            // Exact duplicate — should be silently deduplicated
+            RouteDescriptor {
+                id: "WORK_CLAIM",
+                route: "hsi.work.claim",
+                stability: StabilityClass::Stable,
+                request_schema: "apm2.claim_work_request.v1",
+                response_schema: "apm2.claim_work_response.v1",
+            },
+        ];
+        let manifest = super::build_manifest_from_descriptors(test_cli_version(), &descriptors)
+            .expect("identical shared routes must deduplicate cleanly");
+        assert_eq!(manifest.routes.len(), 1);
+        assert_eq!(manifest.routes[0].route, "hsi.work.claim");
     }
 
     /// Verifies that every dispatchable request variant from both dispatch

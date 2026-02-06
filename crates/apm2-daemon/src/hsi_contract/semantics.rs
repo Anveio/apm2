@@ -8,8 +8,11 @@
 //! # Authoritative Routes and Receipts
 //!
 //! Per RFC-0020 section 1.3, ALL authoritative routes MUST require receipts
-//! for proof-carrying-effects/accountability. Routes that do not need
-//! receipts (e.g., local-only operations) MUST be classified as advisory.
+//! for proof-carrying-effects/accountability. Side-effectful local operations
+//! (e.g., daemon shutdown, credential mutations) are classified as
+//! authoritative with `receipt_required: true` because they produce
+//! observable state changes requiring accountability. Only truly read-only
+//! query routes are classified as advisory.
 //!
 //! # Fail-closed Build Enforcement
 //!
@@ -87,8 +90,10 @@ const AUTH_IDEMPOTENT_RECEIPT_LOCAL: HsiRouteSemantics = HsiRouteSemantics {
 /// # Authoritative and Receipts Invariant
 ///
 /// Per RFC-0020 section 1.3, all authoritative routes MUST have
-/// `receipt_required: true`. Routes that do not need receipts (e.g.,
-/// local-only credential management) are classified as advisory.
+/// `receipt_required: true`. Side-effectful local operations (daemon
+/// shutdown, credential mutations) are classified as authoritative with
+/// receipts because they produce observable state changes. Only read-only
+/// query routes are classified as advisory.
 ///
 /// # Fail-closed
 ///
