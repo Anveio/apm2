@@ -1991,10 +1991,21 @@ pub struct PolicyResolution {
     ///
     /// Used by `handle_ingest_review_receipt` to enforce attestation
     /// ratcheting: higher tiers require stronger attestation levels.
-    /// Defaults to `0` (Tier0) for backward compatibility with existing
-    /// callers that don't set this field.
-    #[serde(default)]
+    /// SECURITY: Defaults to `4` (Tier4, most restrictive) via
+    /// `risk_tier_fail_closed` to prevent attestation downgrade via
+    /// schema drift or tampered persistence (fail-closed semantics).
+    #[serde(default = "risk_tier_fail_closed")]
     pub resolved_risk_tier: u8,
+}
+
+/// Serde default for `resolved_risk_tier`: returns `4` (Tier4, most
+/// restrictive).
+///
+/// SECURITY: This ensures that missing or omitted `resolved_risk_tier` values
+/// fail closed to the most restrictive tier, preventing attestation downgrade
+/// via schema drift or tampered persistence.
+const fn risk_tier_fail_closed() -> u8 {
+    4
 }
 
 /// Error type for policy resolution operations.
@@ -7287,6 +7298,66 @@ impl PrivilegedDispatcher {
             ));
         };
 
+        // ---- Phase 2b: Sublease ID uniqueness check (admission before mutation) ----
+        //
+        // SECURITY: Enforce sublease_id uniqueness to prevent conflicting
+        // leases from sharing the same ID. Check both full lease storage
+        // and the lease validator's executor lookup.
+        if let Some(existing) = self.lease_validator.get_gate_lease(&request.sublease_id) {
+            // Idempotent return: if the existing sublease has identical
+            // parameters, return it. Otherwise reject as a conflict.
+            // Compare executor_actor_id of existing sublease against the
+            // requested delegatee — these are intentionally different field
+            // names (the sublease's executor IS the delegatee).
+            let delegatee_matches = existing.executor_actor_id == request.delegatee_actor_id;
+            if existing.work_id == parent_lease.work_id
+                && existing.gate_id == parent_lease.gate_id
+                && delegatee_matches
+            {
+                info!(
+                    sublease_id = %request.sublease_id,
+                    "Sublease already exists with identical parameters - idempotent return"
+                );
+                return Ok(PrivilegedResponse::DelegateSublease(
+                    DelegateSubleaseResponse {
+                        sublease_id: existing.lease_id.clone(),
+                        parent_lease_id: request.parent_lease_id,
+                        delegatee_actor_id: request.delegatee_actor_id,
+                        gate_id: existing.gate_id.clone(),
+                        expires_at_ns: existing.expires_at,
+                        event_id: String::new(), // No new event for idempotent return
+                    },
+                ));
+            }
+            warn!(
+                sublease_id = %request.sublease_id,
+                "Sublease ID conflict: existing sublease has different parameters"
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease_id '{}' already exists with different parameters",
+                    request.sublease_id
+                ),
+            ));
+        }
+        // Also check if a lease (non-sublease) with this ID already exists
+        // via the executor lookup (covers leases registered through
+        // register_lease_with_executor).
+        if self
+            .lease_validator
+            .get_lease_executor_actor_id(&request.sublease_id)
+            .is_some()
+        {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "sublease_id '{}' conflicts with an existing lease",
+                    request.sublease_id
+                ),
+            ));
+        }
+
         // ---- Phase 3: Get HTF timestamp ----
         let timestamp_ns = match self.get_htf_timestamp_ns() {
             Ok(ts) => ts,
@@ -7349,6 +7420,9 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
+
+        // ---- Phase 6: Register sublease for future uniqueness checks ----
+        self.lease_validator.register_full_lease(&sublease);
 
         info!(
             parent_lease_id = %request.parent_lease_id,
@@ -16440,6 +16514,461 @@ mod tests {
             assert_eq!(event.event_type, "SubleaseIssued");
             assert_eq!(event.actor_id, "child-executor-evt");
             assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
+        }
+
+        #[test]
+        fn test_delegate_sublease_duplicate_id_idempotent() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-dup",
+                "W-DS-DUP",
+                "gate-quality",
+                "executor-dup",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-dup".to_string(),
+                delegatee_actor_id: "child-executor-dup".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-dup-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            // First call: should succeed
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match &response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-dup-001");
+                },
+                other => panic!("Expected DelegateSublease success, got {other:?}"),
+            }
+
+            // Second call with same parameters: should return idempotent result
+            let response2 = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response2 {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(
+                        resp.sublease_id, "sublease-dup-001",
+                        "Idempotent return should have same sublease_id"
+                    );
+                },
+                other => panic!("Expected idempotent DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_duplicate_id_conflict_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            // Create parent lease in gate "gate-A"
+            let parent_a = apm2_core::fac::GateLeaseBuilder::new("parent-A", "W-A", "gate-A")
+                .changeset_digest([0x42; 32])
+                .executor_actor_id("exec-A")
+                .issued_at(1_000_000)
+                .expires_at(2_000_000)
+                .policy_hash([0xAB; 32])
+                .issuer_actor_id("issuer-001")
+                .time_envelope_ref("htf:tick:100")
+                .build_and_sign(&signer);
+
+            // Create parent lease in gate "gate-B" (different parameters)
+            let parent_b = apm2_core::fac::GateLeaseBuilder::new("parent-B", "W-B", "gate-B")
+                .changeset_digest([0x42; 32])
+                .executor_actor_id("exec-B")
+                .issued_at(1_000_000)
+                .expires_at(2_000_000)
+                .policy_hash([0xAB; 32])
+                .issuer_actor_id("issuer-001")
+                .time_envelope_ref("htf:tick:200")
+                .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher.lease_validator.register_full_lease(&parent_a);
+            dispatcher.lease_validator.register_full_lease(&parent_b);
+            dispatcher
+                .lease_validator
+                .register_lease_with_executor("parent-A", "W-A", "gate-A", "exec-A");
+            dispatcher
+                .lease_validator
+                .register_lease_with_executor("parent-B", "W-B", "gate-B", "exec-B");
+
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            // First call: issue sublease under parent A
+            let req1 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-A".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "shared-sublease-id".to_string(),
+            };
+            let frame1 = encode_delegate_sublease_request(&req1);
+            let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
+            assert!(
+                matches!(resp1, PrivilegedResponse::DelegateSublease(_)),
+                "First sublease should succeed"
+            );
+
+            // Second call: try to issue sublease with SAME ID under parent B
+            // (different work_id/gate_id) — must be rejected as conflict
+            let req2 = DelegateSubleaseRequest {
+                parent_lease_id: "parent-B".to_string(),
+                delegatee_actor_id: "child-002".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "shared-sublease-id".to_string(),
+            };
+            let frame2 = encode_delegate_sublease_request(&req2);
+            let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
+            match resp2 {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("already exists with different parameters"),
+                        "Must reject conflicting sublease_id, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected conflict rejection, got {other:?}"),
+            }
+        }
+    }
+
+    // ========================================================================
+    // TCK-00340: Serde fail-closed default tests
+    // ========================================================================
+    mod serde_fail_closed {
+        use super::*;
+
+        #[test]
+        fn test_policy_resolution_missing_risk_tier_defaults_to_tier4() {
+            // SECURITY: When `resolved_risk_tier` is missing from JSON,
+            // it must default to Tier4 (4), not Tier0 (0).
+            let json = r#"{
+                "policy_resolved_ref": "test-ref",
+                "resolved_policy_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "capability_manifest_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "context_pack_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }"#;
+
+            let resolution: PolicyResolution = serde_json::from_str(json)
+                .expect("PolicyResolution should deserialize without resolved_risk_tier");
+            assert_eq!(
+                resolution.resolved_risk_tier, 4,
+                "Missing resolved_risk_tier must default to Tier4 (4), not Tier0 (0) — fail-closed"
+            );
+        }
+
+        #[test]
+        fn test_policy_resolution_explicit_tier0_preserved() {
+            // When `resolved_risk_tier` is explicitly set to 0, it must be preserved.
+            let json = r#"{
+                "policy_resolved_ref": "test-ref",
+                "resolved_policy_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "capability_manifest_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "context_pack_hash": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+                "resolved_risk_tier": 0
+            }"#;
+
+            let resolution: PolicyResolution = serde_json::from_str(json)
+                .expect("PolicyResolution should deserialize with explicit Tier0");
+            assert_eq!(
+                resolution.resolved_risk_tier, 0,
+                "Explicit Tier0 must be preserved"
+            );
+        }
+    }
+
+    // ========================================================================
+    // TCK-00340: SQLite integration tests (production path)
+    // ========================================================================
+    mod sqlite_integration {
+        use std::sync::{Arc, Mutex};
+
+        use rusqlite::Connection;
+
+        use super::*;
+        use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
+
+        /// Creates a `PrivilegedDispatcher` backed by real `SQLite`
+        /// implementations for testing the production persistence path.
+        fn setup_sqlite_dispatcher() -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            Arc<Mutex<Connection>>,
+        ) {
+            let conn = Connection::open_in_memory().unwrap();
+            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteWorkRegistry::init_schema(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            let policy_resolver = Arc::new(StubPolicyResolver);
+            let work_registry = Arc::new(SqliteWorkRegistry::new(Arc::clone(&conn)));
+            let event_emitter = Arc::new(SqliteLedgerEventEmitter::new(
+                Arc::clone(&conn),
+                signing_key,
+            ));
+            let lease_validator: Arc<dyn LeaseValidator> =
+                Arc::new(SqliteLeaseValidator::new(Arc::clone(&conn)));
+            let session_registry: Arc<dyn SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+            let clock = Arc::new(
+                HolonicClock::new(ClockConfig::default(), None).expect("clock creation failed"),
+            );
+            let token_minter = Arc::new(TokenMinter::new(TokenMinter::generate_secret()));
+            let manifest_store = Arc::new(InMemoryManifestStore::new());
+            let manifest_loader: Arc<dyn ManifestLoader> =
+                Arc::new(InMemoryCasManifestLoader::with_reviewer_v0_manifest());
+            let subscription_registry: SharedSubscriptionRegistry =
+                Arc::new(SubscriptionRegistry::with_defaults());
+
+            let dispatcher = PrivilegedDispatcher::with_dependencies(
+                DecodeConfig::default(),
+                policy_resolver,
+                work_registry,
+                event_emitter,
+                Arc::new(EpisodeRuntime::new(EpisodeRuntimeConfig::default())),
+                session_registry,
+                lease_validator,
+                clock,
+                token_minter,
+                manifest_store,
+                manifest_loader,
+                subscription_registry,
+            );
+
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            (dispatcher, ctx, conn)
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_sqlite_tier0_passes() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            // Register lease via SqliteLeaseValidator (production path)
+            dispatcher.lease_validator.register_lease_with_executor(
+                "sqlite-lease-001",
+                "W-SQL-001",
+                "gate-sql",
+                "reviewer-sql",
+            );
+
+            // Register work claim via SqliteWorkRegistry (production path)
+            let claim = WorkClaim {
+                work_id: "W-SQL-001".to_string(),
+                lease_id: "sqlite-lease-001".to_string(),
+                actor_id: "reviewer-sql".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-001".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0, // Tier0
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "sqlite-lease-001".to_string(),
+                receipt_id: "RR-SQL-001".to_string(),
+                reviewer_actor_id: "reviewer-sql".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-SQL-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 with SelfSigned must pass through sqlite path"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty on sqlite success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier0 SelfSigned should pass on sqlite path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_sqlite_higher_tier_rejected() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            // Register lease via SqliteLeaseValidator
+            dispatcher.lease_validator.register_lease_with_executor(
+                "sqlite-lease-t2",
+                "W-SQL-T2",
+                "gate-sql",
+                "reviewer-sql-t2",
+            );
+
+            // Register work claim at Tier2 (should be rejected)
+            let claim = WorkClaim {
+                work_id: "W-SQL-T2".to_string(),
+                lease_id: "sqlite-lease-t2".to_string(),
+                actor_id: "reviewer-sql-t2".to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: "PolicyResolvedForChangeSet:W-SQL-T2".to_string(),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 2, // Tier2
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "sqlite-lease-t2".to_string(),
+                receipt_id: "RR-SQL-T2".to_string(),
+                reviewer_actor_id: "reviewer-sql-t2".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("only supports Tier0"),
+                        "Tier2 SelfSigned must be rejected on sqlite path, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected Tier2 rejection on sqlite path, got {other:?}");
+                },
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_valid_succeeds() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                Arc::clone(&signer),
+            ));
+
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new("sql-parent", "W-SQL-DS", "gate-sql-ds")
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id("executor-sql")
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            // Use production SqliteLeaseValidator path to register full lease
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_lease);
+            dispatcher.lease_validator.register_lease_with_executor(
+                "sql-parent",
+                "W-SQL-DS",
+                "gate-sql-ds",
+                "executor-sql",
+            );
+
+            // Wire orchestrator after construction (mimics DispatcherState flow)
+            let dispatcher = dispatcher.with_gate_orchestrator(orch);
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "sql-parent".to_string(),
+                delegatee_actor_id: "child-sql-exec".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-sql-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-sql-001");
+                    assert_eq!(resp.gate_id, "gate-sql-ds");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty on sqlite success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "DelegateSublease should succeed on sqlite path, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_sqlite_invalid_parent_rejected() {
+            let (dispatcher, ctx, _conn) = setup_sqlite_dispatcher();
+
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+
+            let dispatcher = dispatcher.with_gate_orchestrator(orch);
+
+            // Don't register any parent lease — should fail
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "nonexistent-parent".to_string(),
+                delegatee_actor_id: "child-sql".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-sql-invalid".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("parent gate lease not found"),
+                        "Must reject when parent lease not in sqlite, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected parent-not-found rejection, got {other:?}"),
+            }
         }
     }
 }

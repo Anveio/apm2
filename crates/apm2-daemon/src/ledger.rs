@@ -1707,6 +1707,119 @@ impl LeaseValidator for SqliteLeaseValidator {
             );
         }
     }
+
+    fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+
+        // Query gate_lease_issued events and extract the work_id for the
+        // matching lease. Uses the work_id index for efficient lookup and
+        // rowid tiebreaker for deterministic ordering.
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id, payload FROM ledger_events \
+                 WHERE event_type = 'gate_lease_issued' \
+                 ORDER BY rowid",
+            )
+            .ok()?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let work_id: String = row.get(0)?;
+                let payload: Vec<u8> = row.get(1)?;
+                Ok((work_id, payload))
+            })
+            .ok()?;
+
+        for row in rows.flatten() {
+            let (work_id, payload_bytes) = row;
+            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
+                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
+                    if l == lease_id {
+                        return Some(work_id);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
+        let conn = self.conn.lock().ok()?;
+
+        // Query gate_lease_issued events and reconstruct a GateLease for the
+        // matching lease_id. Uses rowid tiebreaker for deterministic ordering.
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id, payload FROM ledger_events \
+                 WHERE event_type = 'gate_lease_issued' \
+                 ORDER BY rowid",
+            )
+            .ok()?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let work_id: String = row.get(0)?;
+                let payload: Vec<u8> = row.get(1)?;
+                Ok((work_id, payload))
+            })
+            .ok()?;
+
+        for row in rows.flatten() {
+            let (_work_id, payload_bytes) = row;
+            if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) {
+                if let Some(l) = payload.get("lease_id").and_then(|v| v.as_str()) {
+                    if l == lease_id {
+                        // Try to deserialize from the stored full_lease JSON
+                        // if available, otherwise reconstruct from fields.
+                        if let Some(full_lease) = payload.get("full_lease") {
+                            if let Ok(lease) = serde_json::from_value::<apm2_core::fac::GateLease>(
+                                full_lease.clone(),
+                            ) {
+                                return Some(lease);
+                            }
+                        }
+                        // Cannot reconstruct a full GateLease from partial
+                        // event data (signature, policy_hash, etc. are missing).
+                        return None;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
+        // Store the full lease as a gate_lease_issued event with the complete
+        // lease object embedded in the payload for later retrieval.
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+        let payload = serde_json::json!({
+            "event_type": "gate_lease_issued",
+            "lease_id": lease.lease_id,
+            "work_id": lease.work_id,
+            "gate_id": lease.gate_id,
+            "executor_actor_id": lease.executor_actor_id,
+            "full_lease": lease
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute(
+                "INSERT INTO ledger_events (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event_id,
+                    "gate_lease_issued",
+                    lease.work_id,
+                    "system",
+                    payload_bytes,
+                    vec![0u8; 64],
+                    i64::try_from(lease.issued_at).unwrap_or(0)
+                ],
+            );
+        }
+    }
 }
 
 // ============================================================================
