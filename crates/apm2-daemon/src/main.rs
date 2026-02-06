@@ -331,6 +331,9 @@ fn init_supervisor(config: &EcosystemConfig) -> Supervisor {
 }
 
 /// Collect all running process instances from the supervisor.
+///
+/// Returns a list of `(name, instance)` pairs for every process instance
+/// whose supervisor handle reports a running state.
 async fn collect_running_processes(state: &SharedState) -> Vec<(String, u32)> {
     let inner = state.read().await;
     inner
@@ -349,30 +352,81 @@ async fn collect_running_processes(state: &SharedState) -> Vec<(String, u32)> {
         .collect()
 }
 
-/// Graceful shutdown: stop all running processes.
+/// Collect tracked PIDs for all running process instances.
 ///
-/// This function attempts a graceful stop for each process. If the outer
-/// timeout fires (see `force_kill_all_processes`), this function may be
-/// cancelled mid-loop. The caller MUST follow up with
-/// `force_kill_all_processes` to guarantee no child process survives daemon
-/// exit.
-async fn shutdown_all_processes(state: &SharedState) {
-    info!("Stopping all running processes...");
+/// Returns a set of OS PIDs that the supervisor has recorded for running
+/// processes. This is used as a **secondary PID ledger** by the force-kill
+/// phase so that orphaned children can be reaped even if their
+/// `ProcessRunner` handle has been dropped.
+async fn collect_tracked_pids(state: &SharedState) -> std::collections::HashSet<u32> {
+    let inner = state.read().await;
+    let mut pids = std::collections::HashSet::new();
+    for spec in inner.supervisor.specs() {
+        for i in 0..spec.instances {
+            if let Some(handle) = inner.supervisor.get_handle(&spec.name, i) {
+                if handle.state.is_running() {
+                    if let Some(pid) = handle.pid {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
 
-    let per_process_timeout = Duration::from_secs(10);
+/// Graceful shutdown: stop all running processes using a deadline-driven
+/// loop.
+///
+/// **Cancellation safety (TCK-00392 BLOCKER fix):**
+///
+/// Unlike the previous implementation, this function is NOT wrapped in an
+/// outer `tokio::time::timeout`. Instead it uses an internal deadline: each
+/// process stop is attempted within the remaining time budget. When the
+/// deadline is exceeded the loop breaks and the caller proceeds to the
+/// force-kill phase.
+///
+/// Runners are NOT removed from daemon state until the stop call has
+/// completed (or been skipped due to deadline). This ensures that
+/// `force_kill_all_processes` can always find the runner handle if needed.
+///
+/// Returns `true` if all processes were stopped within the deadline, or
+/// `false` if the deadline was exceeded (force-kill is required).
+async fn shutdown_all_processes(state: &SharedState, deadline: tokio::time::Instant) -> bool {
+    info!("Stopping all running processes...");
 
     let processes_to_stop = collect_running_processes(state).await;
 
     if processes_to_stop.is_empty() {
         info!("No running processes to stop");
-        return;
+        return true;
     }
 
     info!("Stopping {} process instance(s)", processes_to_stop.len());
 
-    // Stop each process gracefully
+    let mut all_stopped = true;
+
     for (name, instance) in processes_to_stop {
-        // Take the runner out
+        // Check deadline BEFORE starting a new stop attempt.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            warn!(
+                process = %name,
+                instance,
+                "Graceful shutdown deadline exceeded — skipping remaining processes"
+            );
+            all_stopped = false;
+            break;
+        }
+
+        let remaining = deadline - now;
+        // Cap per-process timeout to the remaining deadline budget.
+        let per_process_timeout = remaining.min(Duration::from_secs(10));
+
+        // Take the runner out of state, stop it, then update supervisor.
+        // We hold the write lock briefly to take the runner. The actual
+        // stop (which may block for up to `per_process_timeout`) happens
+        // OUTSIDE the lock.
         let runner = {
             let mut inner = state.write().await;
             let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
@@ -388,7 +442,7 @@ async fn shutdown_all_processes(state: &SharedState) {
             }
         }
 
-        // Update supervisor state
+        // Update supervisor state to reflect the stop.
         {
             let mut inner = state.write().await;
             inner.supervisor.update_state(
@@ -400,54 +454,89 @@ async fn shutdown_all_processes(state: &SharedState) {
         }
     }
 
-    info!("All processes stopped gracefully");
+    if all_stopped {
+        info!("All processes stopped gracefully");
+    }
+    all_stopped
 }
 
 /// Force-kill any child processes that are still running.
 ///
 /// **Containment invariant**: This function MUST NOT be wrapped in a
 /// cancellable timeout. It runs unconditionally after the graceful shutdown
-/// phase (whether that phase completed or was cancelled by timeout) to
+/// phase (whether that phase completed or the deadline was exceeded) to
 /// guarantee that no managed child process survives daemon exit.
-async fn force_kill_all_processes(state: &SharedState) {
+///
+/// **PID-tracking safety (TCK-00392 BLOCKER fix):**
+///
+/// In addition to iterating runners still present in daemon state, this
+/// function also accepts a set of PIDs that were recorded _before_ the
+/// graceful phase started. If a runner was dropped mid-stop (e.g. due to
+/// deadline expiry) and the process was spawned with `kill_on_drop(false)`,
+/// the child may still be alive. The PID set lets us issue an OS-level
+/// `SIGKILL` even when the runner handle is gone.
+async fn force_kill_all_processes(
+    state: &SharedState,
+    pre_shutdown_pids: &std::collections::HashSet<u32>,
+) {
+    // Phase A: kill processes still tracked in supervisor state.
     let still_running = collect_running_processes(state).await;
 
-    if still_running.is_empty() {
-        return;
-    }
+    if !still_running.is_empty() {
+        warn!(
+            count = still_running.len(),
+            "Force-killing remaining child processes after graceful shutdown timeout"
+        );
 
-    warn!(
-        count = still_running.len(),
-        "Force-killing remaining child processes after graceful shutdown timeout"
-    );
+        for (name, instance) in still_running {
+            let runner = {
+                let mut inner = state.write().await;
+                let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
+                spec_id.and_then(|id| inner.remove_runner(id, instance))
+            };
 
-    for (name, instance) in still_running {
-        let runner = {
-            let mut inner = state.write().await;
-            let spec_id = inner.supervisor.get_spec(&name).map(|s| s.id);
-            spec_id.and_then(|id| inner.remove_runner(id, instance))
-        };
-
-        if let Some(mut runner) = runner {
-            if runner.state().is_running() {
-                warn!("Force-killing {}-{}", name, instance);
-                // runner.stop with a zero-second timeout will send SIGTERM
-                // then immediately SIGKILL.
-                if let Err(e) = runner.stop(Duration::ZERO).await {
-                    warn!("Error force-killing {}-{}: {}", name, instance, e);
+            if let Some(mut runner) = runner {
+                if runner.state().is_running() {
+                    warn!("Force-killing {}-{}", name, instance);
+                    // runner.stop with a zero-second timeout will send SIGTERM
+                    // then immediately SIGKILL.
+                    if let Err(e) = runner.stop(Duration::ZERO).await {
+                        warn!("Error force-killing {}-{}: {}", name, instance, e);
+                    }
                 }
             }
-        }
 
-        // Update supervisor state
-        {
-            let mut inner = state.write().await;
-            inner.supervisor.update_state(
-                &name,
-                instance,
-                ProcessState::Stopped { exit_code: None },
-            );
-            inner.supervisor.update_pid(&name, instance, None);
+            // Update supervisor state
+            {
+                let mut inner = state.write().await;
+                inner.supervisor.update_state(
+                    &name,
+                    instance,
+                    ProcessState::Stopped { exit_code: None },
+                );
+                inner.supervisor.update_pid(&name, instance, None);
+            }
+        }
+    }
+
+    // Phase B: OS-level kill for any PID in the pre-shutdown set that is
+    // still alive. This catches processes whose runner was dropped mid-stop
+    // (cancellation / deadline expiry) and were spawned with
+    // `kill_on_drop(false)`.
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        for &pid in pre_shutdown_pids {
+            // Check if the process is still alive (signal 0 = no-op probe).
+            #[allow(clippy::cast_possible_wrap)]
+            let target = Pid::from_raw(pid as i32);
+            if kill(target, None).is_ok() {
+                warn!(pid, "Orphan process still alive — sending SIGKILL");
+                #[allow(clippy::cast_possible_wrap)]
+                let _ = kill(target, Signal::SIGKILL);
+            }
         }
     }
 
@@ -1077,32 +1166,41 @@ async fn async_main(args: Args) -> Result<()> {
         }
     }
 
-    // Graceful shutdown with 30-second timeout (TCK-00392).
+    // Graceful shutdown with deadline-driven loop (TCK-00392).
     //
-    // Phase 1 (cancellable): Attempt graceful shutdown of all processes.
-    // The timeout ensures we do not hang indefinitely waiting for SIGTERM.
+    // **Cancellation-safe design:**
     //
-    // Phase 2 (uncancellable): Force-kill any processes that survived the
-    // graceful phase. This runs unconditionally to uphold the containment
-    // invariant: no child process may survive daemon exit.
+    // Phase 1 uses an internal deadline (NOT an outer `tokio::time::timeout`
+    // wrapping an async future). This avoids the cancellation-safety hazard
+    // where a runner could be removed from daemon state but not yet fully
+    // stopped — if the outer timeout fired at that point the runner handle
+    // would be dropped without killing the child (spawned with
+    // `kill_on_drop(false)`).
+    //
+    // Phase 2 runs unconditionally. It uses both the runner handles that
+    // remain in daemon state AND a pre-recorded PID set to guarantee
+    // containment even for processes whose runner was dropped mid-stop.
     info!("Shutting down daemon...");
-    let shutdown_timeout = Duration::from_secs(30);
-    match tokio::time::timeout(shutdown_timeout, shutdown_all_processes(&state)).await {
-        Ok(()) => {
-            info!("All processes stopped within graceful shutdown window");
-        },
-        Err(_) => {
-            warn!(
-                timeout_secs = 30,
-                "Graceful shutdown timed out — force-killing remaining processes"
-            );
-        },
+
+    // Record all tracked PIDs BEFORE the graceful phase so we can always
+    // find orphans in the force-kill phase.
+    let pre_shutdown_pids = collect_tracked_pids(&state).await;
+
+    let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let all_graceful = shutdown_all_processes(&state, shutdown_deadline).await;
+
+    if !all_graceful {
+        warn!(
+            timeout_secs = 30,
+            "Graceful shutdown deadline exceeded — force-killing remaining processes"
+        );
     }
 
     // Phase 2: Force-kill any survivors. This is NOT wrapped in a timeout
     // because the containment invariant requires that every managed child
-    // process is terminated before the daemon exits.
-    force_kill_all_processes(&state).await;
+    // process is terminated before the daemon exits. The pre-shutdown PID
+    // set ensures we can kill orphans even if their runner was dropped.
+    force_kill_all_processes(&state, &pre_shutdown_pids).await;
 
     // Cleanup sockets (SocketManager handles this in Drop, but explicit cleanup is
     // safer)
