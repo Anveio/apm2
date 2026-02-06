@@ -103,7 +103,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Run tests
-        run: cargo nextest run --workspace --all-features --config-file .config/nextest.toml
+        run: cargo nextest run --workspace --all-features --config-file .config/nextest.toml --profile ci
       - name: Run doctests
         run: cargo test --doc --workspace --all-features
 
