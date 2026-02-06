@@ -494,20 +494,27 @@ impl DispatcherState {
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
-        // TCK-00351: Create pre-actuation gate for stop/budget checks.
-        let preactuation_gate =
-            Arc::new(crate::episode::preactuation::PreActuationGate::default_gate());
+        // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
+        // with real StopAuthority and fail-closed budget enforcement.
+        let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let preactuation_gate = Arc::new(
+            crate::episode::preactuation::PreActuationGate::production_gate(
+                Arc::clone(&stop_authority),
+                None, // No per-session budget tracker at this level
+            ),
+        );
 
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
-        // TCK-00351: Wire pre-actuation gate for stop/budget proof obligations
+        // TCK-00351: Wire pre-actuation gate and stop authority
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
                 .with_session_registry(session_registry_for_session)
                 .with_telemetry_store(telemetry_store)
-                .with_preactuation_gate(preactuation_gate);
+                .with_preactuation_gate(preactuation_gate)
+                .with_stop_authority(stop_authority);
 
         Self {
             privileged_dispatcher,
@@ -714,18 +721,22 @@ impl DispatcherState {
         let privileged_dispatcher =
             privileged_dispatcher.with_telemetry_store(Arc::clone(&telemetry_store));
 
-        // TCK-00351: Create pre-actuation gate for stop/budget checks.
-        // Uses default evaluator (30s uncertainty deadline) and no budget
-        // tracker at the session-dispatcher level.  Per-episode budget
-        // tracking is handled by EpisodeRuntime; the gate here provides
-        // the session-level obligation proof.
-        let preactuation_gate =
-            Arc::new(crate::episode::preactuation::PreActuationGate::default_gate());
+        // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
+        // with real StopAuthority and fail-closed budget enforcement.
+        // Per-episode budget tracking is handled by EpisodeRuntime; the
+        // gate here provides the session-level obligation proof.
+        let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
+        let preactuation_gate = Arc::new(
+            crate::episode::preactuation::PreActuationGate::production_gate(
+                Arc::clone(&stop_authority),
+                None, // Per-episode budget is tracked by EpisodeRuntime
+            ),
+        );
 
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
         // TCK-00384: Wire telemetry store for counter updates and SessionStatus queries
-        // TCK-00351: Wire pre-actuation gate for stop/budget proof obligations
+        // TCK-00351: Wire pre-actuation gate, stop authority for stop/budget proof
         let session_dispatcher =
             SessionDispatcher::with_manifest_store((*token_minter).clone(), manifest_store)
                 .with_subscription_registry(subscription_registry)
@@ -736,7 +747,8 @@ impl DispatcherState {
                 .with_broker(broker)
                 .with_episode_runtime(episode_runtime)
                 .with_telemetry_store(telemetry_store)
-                .with_preactuation_gate(preactuation_gate);
+                .with_preactuation_gate(preactuation_gate)
+                .with_stop_authority(stop_authority);
 
         Ok(Self {
             privileged_dispatcher,

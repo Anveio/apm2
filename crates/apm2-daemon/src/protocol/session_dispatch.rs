@@ -643,6 +643,13 @@ pub struct SessionDispatcher<M: ManifestStore = InMemoryManifestStore> {
     /// budget availability, returning a receipt that is embedded in the
     /// tool response.
     preactuation_gate: Option<Arc<crate::episode::preactuation::PreActuationGate>>,
+    /// Authoritative stop state for the daemon runtime (TCK-00351).
+    ///
+    /// TCK-00351 BLOCKER 1 FIX: This provides the runtime stop flags
+    /// (emergency stop, governance stop) that the pre-actuation gate reads.
+    /// When set, the gate ignores hardcoded false values and reads from
+    /// this authority.
+    stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
 }
 
 impl SessionDispatcher<InMemoryManifestStore> {
@@ -672,6 +679,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             telemetry_store: None,
             gate_orchestrator: None,
             preactuation_gate: None,
+            stop_authority: None,
         }
     }
 
@@ -693,6 +701,7 @@ impl SessionDispatcher<InMemoryManifestStore> {
             telemetry_store: None,
             gate_orchestrator: None,
             preactuation_gate: None,
+            stop_authority: None,
         }
     }
 }
@@ -719,6 +728,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             telemetry_store: None,
             gate_orchestrator: None,
             preactuation_gate: None,
+            stop_authority: None,
         }
     }
 
@@ -745,6 +755,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             telemetry_store: None,
             gate_orchestrator: None,
             preactuation_gate: None,
+            stop_authority: None,
         }
     }
 
@@ -787,6 +798,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
             telemetry_store: None,
             gate_orchestrator: None,
             preactuation_gate: None,
+            stop_authority: None,
         }
     }
 
@@ -901,6 +913,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         gate: Arc<crate::episode::preactuation::PreActuationGate>,
     ) -> Self {
         self.preactuation_gate = Some(gate);
+        self
+    }
+
+    /// Sets the stop authority for authoritative stop-state reads
+    /// (TCK-00351).
+    ///
+    /// TCK-00351 BLOCKER 1 FIX: When set, the pre-actuation gate reads
+    /// emergency and governance stop flags from this authority instead
+    /// of using hardcoded `false`.
+    #[must_use]
+    pub fn with_stop_authority(
+        mut self,
+        authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Self {
+        self.stop_authority = Some(authority);
         self
     }
 
@@ -1283,33 +1310,56 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         // TCK-00351: Pre-actuation stop/budget gate.
         // This check MUST precede broker dispatch.  If the gate denies,
         // we return immediately without reaching the broker (fail-closed).
-        if let Some(ref gate) = self.preactuation_gate {
+        //
+        // TCK-00351 BLOCKER 1 FIX: Read real stop state from stop_authority
+        // instead of hardcoded false.
+        // TCK-00351 MAJOR 1 FIX: Store the receipt and propagate its fields
+        // into the response (stop_checked, budget_checked, timestamp_ns).
+        let preactuation_receipt = if let Some(ref gate) = self.preactuation_gate {
             // Get monotonic timestamp for the receipt.
             let precheck_ts = self.get_htf_timestamp()?;
 
+            // TCK-00351 BLOCKER 1 FIX: Use real stop conditions.
+            // Read stop flags from the authoritative StopAuthority (set by
+            // operator/governance) instead of hardcoded false.
+            // No stop authority configured; defaults to no stops.
+            // The gate itself may also have a StopAuthority wired in
+            // via with_stop_authority(), providing defense in depth.
+            let (emergency_stop, governance_stop) =
+                self.stop_authority
+                    .as_ref()
+                    .map_or((false, false), |authority| {
+                        (
+                            authority.emergency_stop_active(),
+                            authority.governance_stop_active(),
+                        )
+                    });
+
             // Use default stop conditions (from envelope when available).
+            // The session dispatcher does not yet track per-session episode
+            // counts; the gate's StopAuthority and BudgetTracker are the
+            // primary enforcement mechanisms at the session dispatch layer.
             let conditions = crate::episode::StopConditions::default();
 
-            // For v1, episode count and stop flags are passed as zero/false
-            // because the session dispatcher does not yet track per-session
-            // episode counts.  The gate still enforces budget checks via
-            // the BudgetTracker, which is the primary enforcement mechanism
-            // at the session dispatch layer.
             match gate.check(
                 &conditions,
-                0,     // current_episode_count
-                false, // emergency_stop_active - would be set by operator
-                false, // governance_stop_active - would be set by policy
-                0,     // elapsed_ms
+                0, // current_episode_count
+                emergency_stop,
+                governance_stop,
+                0, // elapsed_ms
                 precheck_ts,
             ) {
-                Ok(_receipt) => {
+                Ok(receipt) => {
                     // Gate cleared; proceed to broker dispatch.
                     debug!(
                         session_id = %token.session_id,
                         tool_id = %request.tool_id,
-                        "Pre-actuation gate cleared (stop_checked=true, budget_checked=true)"
+                        stop_checked = receipt.stop_checked,
+                        budget_checked = receipt.budget_checked,
+                        timestamp_ns = receipt.timestamp_ns,
+                        "Pre-actuation gate cleared"
                     );
+                    Some(receipt)
                 },
                 Err(denial) => {
                     warn!(
@@ -1324,7 +1374,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 },
             }
-        }
+        } else {
+            None
+        };
 
         // TCK-00290: Use ToolBroker for request validation and execution
         // Per DOD: "RequestTool executes via ToolBroker and returns ToolResult or Deny"
@@ -1400,6 +1452,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 &request_arguments,
                 timestamp_ns,
                 &episode_id,
+                preactuation_receipt.as_ref(),
             );
 
             // TCK-00384: Increment tool_calls counter on successful dispatch.
@@ -1429,7 +1482,18 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     }
 
     /// Handles the broker decision and converts it to a `SessionResponse`.
-    #[allow(clippy::unnecessary_wraps, clippy::items_after_statements)]
+    ///
+    /// # TCK-00351 MAJOR 1 FIX
+    ///
+    /// The `preactuation_receipt` parameter carries the gate receipt from
+    /// the pre-actuation check. Its fields (`stop_checked`, `budget_checked`,
+    /// `timestamp_ns`) are propagated into the `RequestToolResponse` instead
+    /// of hardcoded `true` / later clock sample.
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::items_after_statements,
+        clippy::too_many_arguments
+    )]
     fn handle_broker_decision(
         &self,
         decision: Result<ToolDecision, crate::episode::BrokerError>,
@@ -1438,6 +1502,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         request_arguments: &[u8],
         timestamp_ns: u64,
         episode_id: &EpisodeId,
+        preactuation_receipt: Option<&crate::episode::preactuation::PreActuationReceipt>,
     ) -> ProtocolResult<SessionResponse> {
         match decision {
             Ok(ToolDecision::Allow {
@@ -1545,6 +1610,16 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     ));
                 };
 
+                // TCK-00351 MAJOR 1 FIX: Populate proof fields from the
+                // gate receipt, not from hardcoded values or a later
+                // clock sample.  The receipt's timestamp proves the
+                // ordering invariant (check preceded actuation).
+                // No gate configured: fields remain false/0 so the replay
+                // verifier treats this as a violation.
+                let (stop_checked, budget_checked, preactuation_ts) = preactuation_receipt
+                    .map_or((false, false, 0), |r| {
+                        (r.stop_checked, r.budget_checked, r.timestamp_ns)
+                    });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
@@ -1552,13 +1627,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash,
                     inline_result,
-                    // TCK-00351: Pre-actuation proof fields.
-                    // These are set to true when the pre-actuation gate
-                    // has cleared the request (checked before we reach
-                    // the broker dispatch).
-                    stop_checked: true,
-                    budget_checked: true,
-                    preactuation_timestamp_ns: timestamp_ns,
+                    stop_checked,
+                    budget_checked,
+                    preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
             Ok(ToolDecision::Deny {
@@ -1573,6 +1644,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     reason = %reason,
                     "Tool request denied by broker"
                 );
+                // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
+                let (stop_checked, budget_checked, preactuation_ts) = preactuation_receipt
+                    .map_or((false, false, 0), |r| {
+                        (r.stop_checked, r.budget_checked, r.timestamp_ns)
+                    });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Deny.into(),
@@ -1580,12 +1656,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: policy_hash.to_vec(),
                     result_hash: None,
                     inline_result: None,
-                    // TCK-00351: Pre-actuation checks were performed even
-                    // though the broker denied.  The checks are a
-                    // prerequisite for reaching the broker.
-                    stop_checked: true,
-                    budget_checked: true,
-                    preactuation_timestamp_ns: timestamp_ns,
+                    stop_checked,
+                    budget_checked,
+                    preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
             Ok(ToolDecision::DedupeCacheHit { request_id, result }) => {
@@ -1618,6 +1691,11 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     None
                 };
 
+                // TCK-00351 MAJOR 1 FIX: Derive proof fields from receipt.
+                let (stop_checked, budget_checked, preactuation_ts) = preactuation_receipt
+                    .map_or((false, false, 0), |r| {
+                        (r.stop_checked, r.budget_checked, r.timestamp_ns)
+                    });
                 Ok(SessionResponse::RequestTool(RequestToolResponse {
                     request_id,
                     decision: DecisionType::Allow.into(),
@@ -1626,11 +1704,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     policy_hash: Vec::new(),
                     result_hash,
                     inline_result,
-                    // TCK-00351: Pre-actuation checks were performed for
-                    // cache hits too (checks precede broker dispatch).
-                    stop_checked: true,
-                    budget_checked: true,
-                    preactuation_timestamp_ns: timestamp_ns,
+                    stop_checked,
+                    budget_checked,
+                    preactuation_timestamp_ns: preactuation_ts,
                 }))
             },
             Ok(ToolDecision::Terminate {

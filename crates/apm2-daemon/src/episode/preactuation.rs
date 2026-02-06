@@ -34,6 +34,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,76 @@ pub const MAX_REPLAY_ENTRIES: usize = 100_000;
 /// If the stop status is uncertain and this deadline has elapsed since
 /// the episode started, actuation is denied (fail-closed).
 pub const DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS: u64 = 30_000;
+
+// =============================================================================
+// StopAuthority
+// =============================================================================
+
+/// Thread-safe authoritative stop state for the daemon runtime.
+///
+/// This struct holds the runtime stop flags that are set by the operator
+/// (emergency stop) or policy engine (governance stop).  The
+/// [`PreActuationGate`] reads these flags on every tool request to determine
+/// whether actuation should be blocked.
+///
+/// # TCK-00351 BLOCKER 1 FIX
+///
+/// Prior to this fix, the session dispatcher passed hardcoded `false` for
+/// both `emergency_stop_active` and `governance_stop_active`, meaning real
+/// stop conditions from operators/governance could never block tool requests
+/// at the gate level.  `StopAuthority` provides the authoritative source of
+/// truth for these flags.
+///
+/// # Thread Safety
+///
+/// All flags use `AtomicBool` for lock-free reads from the dispatch hot path.
+/// Writes are expected to be rare (operator action or policy engine trigger).
+#[derive(Debug)]
+pub struct StopAuthority {
+    /// Whether an emergency stop has been issued by an operator.
+    emergency_stop: AtomicBool,
+    /// Whether a governance stop has been issued by the policy engine.
+    governance_stop: AtomicBool,
+}
+
+impl StopAuthority {
+    /// Creates a new stop authority with no active stops.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            emergency_stop: AtomicBool::new(false),
+            governance_stop: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns whether an emergency stop is active.
+    #[must_use]
+    pub fn emergency_stop_active(&self) -> bool {
+        self.emergency_stop.load(Ordering::Acquire)
+    }
+
+    /// Returns whether a governance stop is active.
+    #[must_use]
+    pub fn governance_stop_active(&self) -> bool {
+        self.governance_stop.load(Ordering::Acquire)
+    }
+
+    /// Sets the emergency stop flag.
+    pub fn set_emergency_stop(&self, active: bool) {
+        self.emergency_stop.store(active, Ordering::Release);
+    }
+
+    /// Sets the governance stop flag.
+    pub fn set_governance_stop(&self, active: bool) {
+        self.governance_stop.store(active, Ordering::Release);
+    }
+}
+
+impl Default for StopAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // =============================================================================
 // StopStatus
@@ -291,11 +362,14 @@ impl StopConditionEvaluator {
         }
 
         // Check escalation predicate (non-empty means triggered).
+        // TCK-00351 BLOCKER 1 FIX: Actually trigger EscalationTriggered
+        // deny when the predicate is non-empty.  The previous implementation
+        // checked the predicate but fell through to Clear, allowing actuation
+        // to proceed even when escalation was triggered.
         if !conditions.escalation_predicate.is_empty() {
-            // For v1, a non-empty escalation predicate that evaluates
-            // to a truthy string indicates escalation.  The predicate
-            // language is free-form; we treat non-empty as triggered.
-            // Future versions will have a structured predicate evaluator.
+            return StopStatus::Active {
+                class: StopClass::EscalationTriggered,
+            };
         }
 
         StopStatus::Clear
@@ -317,8 +391,10 @@ impl Default for StopConditionEvaluator {
 /// # Usage
 ///
 /// ```rust,ignore
-/// let gate = PreActuationGate::new(evaluator, budget_tracker);
-/// let receipt = gate.check(conditions, episode_count, false, false, ts)?;
+/// let authority = Arc::new(StopAuthority::new());
+/// let gate = PreActuationGate::new(evaluator, Some(budget_tracker))
+///     .with_stop_authority(authority);
+/// let receipt = gate.check(conditions, episode_count, 0, ts)?;
 /// // receipt.is_cleared() == true  =>  actuation may proceed
 /// ```
 ///
@@ -326,12 +402,34 @@ impl Default for StopConditionEvaluator {
 ///
 /// If any check fails, the gate returns `Err(PreActuationDenial)`.
 /// The caller MUST NOT proceed with actuation on error.
+///
+/// # TCK-00351 BLOCKER 1 & 2 FIX
+///
+/// The gate now holds:
+/// - [`StopAuthority`] for authoritative emergency/governance stop state
+///   (BLOCKER 1: stop-state enforcement connected to runtime state).
+/// - `require_budget`: when `true`, a missing budget tracker causes fail-closed
+///   denial instead of pass-through (BLOCKER 2: budget validation no longer
+///   defaults to available when tracker is absent).
 #[derive(Debug)]
 pub struct PreActuationGate {
     /// Stop condition evaluator.
     evaluator: StopConditionEvaluator,
     /// Budget tracker for the episode.
     budget_tracker: Option<Arc<BudgetTracker>>,
+    /// Authoritative stop state from the daemon runtime.
+    ///
+    /// TCK-00351 BLOCKER 1: When set, the gate reads emergency and
+    /// governance stop flags from this authority instead of accepting
+    /// hardcoded `false` from the caller.
+    stop_authority: Option<Arc<StopAuthority>>,
+    /// Whether to require a budget tracker for authority-bearing actuation.
+    ///
+    /// TCK-00351 BLOCKER 2: When `true` and no budget tracker is
+    /// configured, the gate denies with `BudgetExhausted` (fail-closed).
+    /// When `false`, a missing tracker is treated as unlimited budget
+    /// (useful for tests or non-budget-constrained sessions).
+    require_budget: bool,
 }
 
 impl PreActuationGate {
@@ -344,21 +442,77 @@ impl PreActuationGate {
         Self {
             evaluator,
             budget_tracker,
+            stop_authority: None,
+            require_budget: false,
         }
     }
 
     /// Creates a gate with default evaluator and no budget tracker.
     ///
-    /// This is useful for sessions that do not have an associated
-    /// budget tracker (e.g., no `EpisodeRuntime` configured). The budget
-    /// check is still performed: if no tracker is set, it reports
-    /// `Available` (the budget is unlimited).
+    /// **WARNING**: This gate does NOT enforce budget checks (budget
+    /// defaults to `Available`).  For production use, prefer
+    /// [`production_gate`](Self::production_gate) which fails closed
+    /// when the budget tracker is absent.
     #[must_use]
     pub const fn default_gate() -> Self {
         Self {
             evaluator: StopConditionEvaluator::new(),
             budget_tracker: None,
+            stop_authority: None,
+            require_budget: false,
         }
+    }
+
+    /// Creates a production gate that fails closed on missing budget.
+    ///
+    /// TCK-00351 BLOCKER 2 FIX: This constructor sets `require_budget`
+    /// to `true`, so the gate denies tool requests when no budget
+    /// tracker is configured.  This prevents the `default_gate()` from
+    /// silently allowing all requests to bypass budget enforcement.
+    ///
+    /// # Arguments
+    ///
+    /// * `stop_authority` - Authoritative runtime stop state.
+    /// * `budget_tracker` - Budget tracker; `None` will cause fail-closed
+    ///   denial for all tool requests.
+    #[must_use]
+    pub const fn production_gate(
+        stop_authority: Arc<StopAuthority>,
+        budget_tracker: Option<Arc<BudgetTracker>>,
+    ) -> Self {
+        Self {
+            evaluator: StopConditionEvaluator::new(),
+            budget_tracker,
+            stop_authority: Some(stop_authority),
+            require_budget: true,
+        }
+    }
+
+    /// Sets the stop authority for authoritative stop state reads.
+    ///
+    /// TCK-00351 BLOCKER 1 FIX: Connects the gate to the runtime's
+    /// stop state so emergency/governance stops actually block actuation.
+    #[must_use]
+    pub fn with_stop_authority(mut self, authority: Arc<StopAuthority>) -> Self {
+        self.stop_authority = Some(authority);
+        self
+    }
+
+    /// Sets the budget tracker for budget enforcement.
+    #[must_use]
+    pub fn with_budget_tracker(mut self, tracker: Arc<BudgetTracker>) -> Self {
+        self.budget_tracker = Some(tracker);
+        self
+    }
+
+    /// Enables fail-closed budget enforcement.
+    ///
+    /// When enabled, a missing budget tracker causes denial instead of
+    /// pass-through.
+    #[must_use]
+    pub const fn with_require_budget(mut self, require: bool) -> Self {
+        self.require_budget = require;
+        self
     }
 
     /// Returns a reference to the stop condition evaluator.
@@ -374,7 +528,11 @@ impl PreActuationGate {
     /// * `conditions` - Stop conditions from the episode envelope.
     /// * `current_episode_count` - Number of episodes already executed.
     /// * `emergency_stop_active` - Whether an emergency stop is active.
+    ///   **Ignored** when a [`StopAuthority`] is configured; the authority's
+    ///   value takes precedence.
     /// * `governance_stop_active` - Whether a governance stop is active.
+    ///   **Ignored** when a [`StopAuthority`] is configured; the authority's
+    ///   value takes precedence.
     /// * `elapsed_ms` - Milliseconds elapsed since episode started.
     /// * `timestamp_ns` - HTF timestamp for the receipt.
     ///
@@ -390,13 +548,22 @@ impl PreActuationGate {
         elapsed_ms: u64,
         timestamp_ns: u64,
     ) -> Result<PreActuationReceipt, PreActuationDenial> {
-        // --- Step 1: Evaluate stop conditions ---
-        let stop_status = self.evaluator.evaluate(
-            conditions,
-            current_episode_count,
-            emergency_stop_active,
-            governance_stop_active,
+        // TCK-00351 BLOCKER 1 FIX: Read from authoritative stop state
+        // when available, instead of trusting caller-supplied values.
+        let (emer_stop, gov_stop) = self.stop_authority.as_ref().map_or(
+            (emergency_stop_active, governance_stop_active),
+            |authority| {
+                (
+                    authority.emergency_stop_active(),
+                    authority.governance_stop_active(),
+                )
+            },
         );
+
+        // --- Step 1: Evaluate stop conditions ---
+        let stop_status =
+            self.evaluator
+                .evaluate(conditions, current_episode_count, emer_stop, gov_stop);
 
         match stop_status {
             StopStatus::Active { class } => {
@@ -436,9 +603,22 @@ impl PreActuationGate {
 
     /// Evaluates the budget dimension.
     ///
-    /// If no budget tracker is configured, returns `Available` (unlimited).
+    /// TCK-00351 BLOCKER 2 FIX: When `require_budget` is `true` and no
+    /// budget tracker is configured, returns `Exhausted` (fail-closed).
+    /// When `require_budget` is `false` (legacy/test mode), returns
+    /// `Available` for missing trackers (unlimited budget).
     fn evaluate_budget(&self) -> BudgetStatus {
         let Some(ref tracker) = self.budget_tracker else {
+            // TCK-00351 BLOCKER 2: Fail-closed when budget is required
+            // but no tracker is available.
+            if self.require_budget {
+                return BudgetStatus::Exhausted {
+                    error: BudgetExhaustedError::Tokens {
+                        requested: 1,
+                        remaining: 0,
+                    },
+                };
+            }
             return BudgetStatus::Available;
         };
 
@@ -1282,5 +1462,237 @@ mod tests {
         let violation = ReplayViolation::TraceTooLarge { count: 200_000 };
         let msg = violation.to_string();
         assert!(msg.contains("200000"));
+    }
+
+    // =========================================================================
+    // StopAuthority tests (TCK-00351 BLOCKER 1 FIX)
+    // =========================================================================
+
+    #[test]
+    fn test_stop_authority_default_no_stops() {
+        let authority = StopAuthority::new();
+        assert!(!authority.emergency_stop_active());
+        assert!(!authority.governance_stop_active());
+    }
+
+    #[test]
+    fn test_stop_authority_emergency_stop() {
+        let authority = StopAuthority::new();
+        authority.set_emergency_stop(true);
+        assert!(authority.emergency_stop_active());
+        assert!(!authority.governance_stop_active());
+    }
+
+    #[test]
+    fn test_stop_authority_governance_stop() {
+        let authority = StopAuthority::new();
+        authority.set_governance_stop(true);
+        assert!(!authority.emergency_stop_active());
+        assert!(authority.governance_stop_active());
+    }
+
+    #[test]
+    fn test_stop_authority_both_stops() {
+        let authority = StopAuthority::new();
+        authority.set_emergency_stop(true);
+        authority.set_governance_stop(true);
+        assert!(authority.emergency_stop_active());
+        assert!(authority.governance_stop_active());
+    }
+
+    #[test]
+    fn test_stop_authority_clear_after_set() {
+        let authority = StopAuthority::new();
+        authority.set_emergency_stop(true);
+        assert!(authority.emergency_stop_active());
+        authority.set_emergency_stop(false);
+        assert!(!authority.emergency_stop_active());
+    }
+
+    // =========================================================================
+    // Gate with StopAuthority tests (TCK-00351 BLOCKER 1 FIX)
+    // =========================================================================
+
+    #[test]
+    fn test_gate_with_stop_authority_emergency_stop_denies() {
+        let authority = Arc::new(StopAuthority::new());
+        authority.set_emergency_stop(true);
+
+        let gate = PreActuationGate::new(StopConditionEvaluator::new(), None)
+            .with_stop_authority(Arc::clone(&authority));
+
+        let conditions = StopConditions::default();
+        // Even though caller passes false for emergency_stop, the authority
+        // overrides it to true.
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::StopActive { class } => {
+                assert_eq!(class, StopClass::EmergencyStop);
+            },
+            other => panic!("unexpected denial: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_gate_with_stop_authority_governance_stop_denies() {
+        let authority = Arc::new(StopAuthority::new());
+        authority.set_governance_stop(true);
+
+        let gate = PreActuationGate::new(StopConditionEvaluator::new(), None)
+            .with_stop_authority(Arc::clone(&authority));
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::StopActive { class } => {
+                assert_eq!(class, StopClass::GovernanceStop);
+            },
+            other => panic!("unexpected denial: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_gate_with_stop_authority_overrides_caller_false() {
+        // StopAuthority says emergency stop is active, but caller passes false.
+        // The authority MUST take precedence.
+        let authority = Arc::new(StopAuthority::new());
+        authority.set_emergency_stop(true);
+
+        let gate = PreActuationGate::new(StopConditionEvaluator::new(), None)
+            .with_stop_authority(authority);
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_gate_without_stop_authority_uses_caller_flags() {
+        // No StopAuthority; gate should use the caller-supplied false values.
+        let gate = PreActuationGate::new(StopConditionEvaluator::new(), None);
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Production gate / require_budget tests (TCK-00351 BLOCKER 2 FIX)
+    // =========================================================================
+
+    #[test]
+    fn test_production_gate_no_tracker_denies() {
+        // Production gate with require_budget=true and no tracker should deny.
+        let authority = Arc::new(StopAuthority::new());
+        let gate = PreActuationGate::production_gate(authority, None);
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::BudgetExhausted { .. } => {},
+            other => panic!("expected BudgetExhausted, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_production_gate_with_tracker_allows() {
+        // Production gate with a real tracker that has budget remaining.
+        let authority = Arc::new(StopAuthority::new());
+        let budget = EpisodeBudget::builder().tool_calls(10).build();
+        let tracker = Arc::new(BudgetTracker::from_envelope(budget));
+
+        let gate = PreActuationGate::production_gate(authority, Some(tracker));
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_ok());
+        let receipt = result.unwrap();
+        assert!(receipt.is_cleared());
+    }
+
+    #[test]
+    fn test_default_gate_no_tracker_allows() {
+        // Default gate (test mode) with no tracker should allow (backwards compat).
+        let gate = PreActuationGate::default_gate();
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_with_require_budget_flag() {
+        // Test explicit require_budget flag via builder.
+        let gate =
+            PreActuationGate::new(StopConditionEvaluator::new(), None).with_require_budget(true);
+
+        let conditions = StopConditions::default();
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::BudgetExhausted { .. } => {},
+            other => panic!("expected BudgetExhausted, got: {other}"),
+        }
+    }
+
+    // =========================================================================
+    // Receipt field provenance tests (TCK-00351 MAJOR 1 FIX)
+    // =========================================================================
+
+    #[test]
+    fn test_receipt_fields_from_gate_check() {
+        // Verify that the receipt fields come from the gate check, not
+        // from hardcoded values.
+        let gate = PreActuationGate::default_gate();
+        let conditions = StopConditions::default();
+        let receipt = gate.check(&conditions, 0, false, false, 0, 42_000).unwrap();
+
+        // Fields must be true (checks passed) and timestamp must be 42_000
+        // (the value we passed in, not a later clock sample).
+        assert!(receipt.stop_checked);
+        assert!(receipt.budget_checked);
+        assert_eq!(receipt.timestamp_ns, 42_000);
+    }
+
+    // =========================================================================
+    // Escalation predicate denial tests (TCK-00351 BLOCKER 1 FIX)
+    // =========================================================================
+
+    #[test]
+    fn test_evaluator_escalation_predicate_triggers_deny() {
+        let evaluator = StopConditionEvaluator::new();
+        let conditions = StopConditions {
+            max_episodes: 0,
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+            escalation_predicate: "model_uncertainty_high".to_string(),
+        };
+        let status = evaluator.evaluate(&conditions, 0, false, false);
+        assert_eq!(
+            status,
+            StopStatus::Active {
+                class: StopClass::EscalationTriggered,
+            }
+        );
+    }
+
+    #[test]
+    fn test_gate_denies_on_escalation_predicate() {
+        let gate = PreActuationGate::default_gate();
+        let conditions = StopConditions {
+            max_episodes: 0,
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+            escalation_predicate: "uncertainty_threshold_exceeded".to_string(),
+        };
+        let result = gate.check(&conditions, 0, false, false, 0, 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PreActuationDenial::StopActive { class } => {
+                assert_eq!(class, StopClass::EscalationTriggered);
+            },
+            other => panic!("unexpected denial: {other}"),
+        }
     }
 }

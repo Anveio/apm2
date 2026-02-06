@@ -219,7 +219,7 @@ pub use output::{MAX_CHUNK_SIZE, PtyOutput, PtyOutputRecord, SequenceGenerator, 
 pub use preactuation::{
     BudgetStatus, DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, MAX_REPLAY_ENTRIES, PreActuationDenial,
     PreActuationGate, PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayVerifier,
-    ReplayViolation, StopClass, StopConditionEvaluator, StopStatus,
+    ReplayViolation, StopAuthority, StopClass, StopConditionEvaluator, StopStatus,
 };
 pub use pty::{ExitStatus, PtyConfig, PtyError, PtyRunner};
 pub use raw_adapter::{
