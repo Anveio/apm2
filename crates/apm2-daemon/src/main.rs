@@ -590,6 +590,17 @@ async fn force_kill_all_processes(
                         );
                         continue;
                     }
+                } else {
+                    // Snapshot start time was None — we cannot verify whether
+                    // this PID still belongs to our original child.  Fail-closed:
+                    // do NOT kill an unverified PID.  Phase A (runner handles)
+                    // is responsible for these processes.
+                    warn!(
+                        pid,
+                        "Snapshot start time unavailable — skipping SIGKILL \
+                         (cannot verify PID identity)"
+                    );
+                    continue;
                 }
                 warn!(pid, "Orphan process still alive — sending SIGKILL");
                 #[allow(clippy::cast_possible_wrap)]

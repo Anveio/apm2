@@ -214,6 +214,10 @@ async fn force_kill_all_processes(
                         // PID was recycled — do NOT kill.
                         continue;
                     }
+                } else {
+                    // Snapshot start time was None — cannot verify PID identity.
+                    // Fail-closed: do NOT kill an unverified PID.
+                    continue;
                 }
                 #[allow(clippy::cast_possible_wrap)]
                 let _ = kill(target, Signal::SIGKILL);
@@ -454,6 +458,70 @@ async fn tck_00392_pid_reuse_no_false_positive_kill() {
         pid_alive(bystander_pid),
         "bystander process was killed — PID-reuse guard failed! \
          original_pid={original_pid}, bystander_pid={bystander_pid}"
+    );
+
+    // Cleanup: kill the bystander ourselves.
+    bystander.kill().expect("failed to kill bystander");
+    bystander.wait().expect("failed to wait for bystander");
+}
+
+// =============================================================================
+// IT-00392-BLOCKER-04: Unknown-identity PID (snapshot_start_time=None) survives
+// =============================================================================
+
+/// Regression test for the v4 security review BLOCKER: when the snapshot start
+/// time is `None` (unknown identity), the force-kill Phase B must NOT send
+/// SIGKILL. The rationale is fail-closed: if we cannot prove a PID belongs to
+/// our child, we must not kill it.
+///
+/// Strategy:
+/// 1. Spawn a bystander process directly (not through daemon state).
+/// 2. Build a fake pre-shutdown snapshot mapping the bystander's PID to `None`
+///    (simulating a missing start time at snapshot).
+/// 3. Run `force_kill_all_processes` with this snapshot.
+/// 4. Assert the bystander is still alive -- Phase B must have skipped it.
+#[tokio::test]
+async fn tck_00392_unknown_identity_pid_not_killed() {
+    use std::process::Command;
+
+    // Step 1: Spawn a bystander process.
+    let mut bystander = Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("failed to spawn bystander");
+    let bystander_pid = bystander.id();
+
+    // Give the process a moment to start.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        pid_alive(bystander_pid),
+        "bystander must be alive before force-kill"
+    );
+
+    // Step 2: Build a fake pre-shutdown snapshot with start_time = None.
+    let mut fake_snapshot: HashMap<u32, Option<u64>> = HashMap::new();
+    fake_snapshot.insert(bystander_pid, None);
+
+    // Step 3: Create minimal daemon state (no runners -- Phase A is a no-op).
+    let spec = ProcessSpec::builder()
+        .name("dummy")
+        .command("true")
+        .instances(1)
+        .build();
+    let state = create_state_with_spec(&spec);
+
+    // Run force-kill with the None-identity snapshot.
+    force_kill_all_processes(&state, &fake_snapshot).await;
+
+    // Give the kernel a moment in case a signal was sent.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 4: Assert the bystander survived.
+    assert!(
+        pid_alive(bystander_pid),
+        "bystander process with unknown identity (snapshot_start_time=None) was killed! \
+         Phase B must NOT send SIGKILL when PID identity cannot be verified."
     );
 
     // Cleanup: kill the bystander ourselves.
