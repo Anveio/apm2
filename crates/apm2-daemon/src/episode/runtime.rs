@@ -1289,9 +1289,11 @@ impl EpisodeRuntime {
         termination_class: TerminationClass,
         timestamp_ns: u64,
     ) -> Result<(), EpisodeError> {
-        // TCK-00385 BLOCKER fix: Capture session_id before transitioning so
-        // we can wire the session registry after the lock is released.
-        let session_id_for_registry: Option<String>;
+        // BLOCKER 1 fix: Make lifecycle transition and mark_terminated
+        // effectively atomic at API level. We mark the session terminated
+        // FIRST, then commit the runtime terminal transition only on
+        // success. On mark_terminated failure the runtime state stays
+        // Running so callers can retry.
 
         {
             let mut episodes = self.episodes.write().await;
@@ -1329,7 +1331,41 @@ impl EpisodeRuntime {
                 },
             };
 
-            session_id_for_registry = Some(session_id);
+            // BLOCKER 1 fix: Mark session terminated BEFORE committing
+            // the runtime terminal transition. If mark_terminated fails,
+            // the runtime stays in Running state so the caller can retry.
+            if let Some(registry) = &self.session_registry {
+                let (rationale, classification, exit_code) = match termination_class {
+                    TerminationClass::Success => ("normal", "SUCCESS", Some(0)),
+                    TerminationClass::Failure | TerminationClass::Crashed => {
+                        ("crash", "FAILURE", Some(1))
+                    },
+                    TerminationClass::BudgetExhausted => ("budget_exhausted", "FAILURE", None),
+                    TerminationClass::Timeout => ("timeout", "FAILURE", None),
+                    TerminationClass::Cancelled => ("normal", "CANCELLED", None),
+                    TerminationClass::Killed => ("crash", "FAILURE", Some(137)),
+                };
+
+                let mut info = SessionTerminationInfo::new(&session_id, rationale, classification);
+                if let Some(code) = exit_code {
+                    info = info.with_exit_code(code);
+                }
+
+                registry.mark_terminated(&session_id, info).map_err(|e| {
+                    error!(
+                        episode_id = %episode_id,
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to mark session terminated from episode stop (fail-closed); \
+                         runtime state NOT transitioned -- caller may retry"
+                    );
+                    EpisodeError::SessionTerminationFailed {
+                        episode_id: episode_id.as_str().to_string(),
+                        session_id: session_id.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+            }
 
             // Signal stop to handle if present
             if let Some(handle) = &entry.handle {
@@ -1338,7 +1374,8 @@ impl EpisodeRuntime {
                 });
             }
 
-            // Transition to Terminated
+            // Session persisted successfully (or no registry) -- now commit
+            // the runtime terminal transition.
             entry.state = EpisodeState::Terminated {
                 created_at_ns,
                 started_at_ns,
@@ -1347,45 +1384,6 @@ impl EpisodeRuntime {
                 termination_class,
             };
             entry.handle = None;
-        }
-
-        // TCK-00385 BLOCKER fix: Wire episode lifecycle to session registry.
-        // Map TerminationClass to a rationale code and exit classification
-        // so the SessionStatus query returns meaningful termination details.
-        if let (Some(registry), Some(sess_id)) = (&self.session_registry, &session_id_for_registry)
-        {
-            let (rationale, classification, exit_code) = match termination_class {
-                TerminationClass::Success => ("normal", "SUCCESS", Some(0)),
-                TerminationClass::Failure | TerminationClass::Crashed => {
-                    ("crash", "FAILURE", Some(1))
-                },
-                TerminationClass::BudgetExhausted => ("budget_exhausted", "FAILURE", None),
-                TerminationClass::Timeout => ("timeout", "FAILURE", None),
-                TerminationClass::Cancelled => ("normal", "CANCELLED", None),
-                TerminationClass::Killed => ("crash", "FAILURE", Some(137)),
-            };
-
-            let mut info = SessionTerminationInfo::new(sess_id, rationale, classification);
-            if let Some(code) = exit_code {
-                info = info.with_exit_code(code);
-            }
-
-            // TCK-00385 MAJOR 1: Propagate mark_terminated errors (fail-closed).
-            // Per session/mod.rs:159, persistence failures are fatal for the
-            // session lifecycle.
-            registry.mark_terminated(sess_id, info).map_err(|e| {
-                error!(
-                    episode_id = %episode_id,
-                    session_id = %sess_id,
-                    error = %e,
-                    "Failed to mark session terminated from episode stop (fail-closed)"
-                );
-                EpisodeError::SessionTerminationFailed {
-                    episode_id: episode_id.as_str().to_string(),
-                    session_id: sess_id.clone(),
-                    message: e.to_string(),
-                }
-            })?;
         }
 
         // Emit event (INV-ER002)
@@ -1442,8 +1440,9 @@ impl EpisodeRuntime {
         reason: QuarantineReason,
         timestamp_ns: u64,
     ) -> Result<(), EpisodeError> {
-        // TCK-00385 BLOCKER fix: Capture session_id before transitioning.
-        let session_id_for_registry: Option<String>;
+        // BLOCKER 1 fix: Make lifecycle transition and mark_terminated
+        // effectively atomic. Mark session terminated FIRST, then commit
+        // the runtime terminal transition only on success.
 
         {
             let mut episodes = self.episodes.write().await;
@@ -1481,7 +1480,26 @@ impl EpisodeRuntime {
                 },
             };
 
-            session_id_for_registry = Some(session_id);
+            // BLOCKER 1 fix: Mark session terminated BEFORE committing
+            // the runtime terminal transition. If mark_terminated fails,
+            // the runtime stays in Running state so the caller can retry.
+            if let Some(registry) = &self.session_registry {
+                let info = SessionTerminationInfo::new(&session_id, "quarantined", "FAILURE");
+                registry.mark_terminated(&session_id, info).map_err(|e| {
+                    error!(
+                        episode_id = %episode_id,
+                        session_id = %session_id,
+                        error = %e,
+                        "Failed to mark session terminated from episode quarantine (fail-closed); \
+                         runtime state NOT transitioned -- caller may retry"
+                    );
+                    EpisodeError::SessionTerminationFailed {
+                        episode_id: episode_id.as_str().to_string(),
+                        session_id: session_id.clone(),
+                        message: e.to_string(),
+                    }
+                })?;
+            }
 
             // Signal quarantine to handle if present
             if let Some(handle) = &entry.handle {
@@ -1490,7 +1508,8 @@ impl EpisodeRuntime {
                 });
             }
 
-            // Transition to Quarantined
+            // Session persisted successfully (or no registry) -- now commit
+            // the runtime terminal transition.
             entry.state = EpisodeState::Quarantined {
                 created_at_ns,
                 started_at_ns,
@@ -1499,26 +1518,6 @@ impl EpisodeRuntime {
                 reason: reason.clone(),
             };
             entry.handle = None;
-        }
-
-        // TCK-00385 BLOCKER fix: Wire quarantine to session termination.
-        // TCK-00385 MAJOR 1: Propagate mark_terminated errors (fail-closed).
-        if let (Some(registry), Some(sess_id)) = (&self.session_registry, &session_id_for_registry)
-        {
-            let info = SessionTerminationInfo::new(sess_id, "quarantined", "FAILURE");
-            registry.mark_terminated(sess_id, info).map_err(|e| {
-                error!(
-                    episode_id = %episode_id,
-                    session_id = %sess_id,
-                    error = %e,
-                    "Failed to mark session terminated from episode quarantine (fail-closed)"
-                );
-                EpisodeError::SessionTerminationFailed {
-                    episode_id: episode_id.as_str().to_string(),
-                    session_id: sess_id.clone(),
-                    message: e.to_string(),
-                }
-            })?;
         }
 
         // Emit event (INV-ER002)
@@ -3542,6 +3541,86 @@ mod tests {
             err.kind(),
             "session_termination_failed",
             "Error should be SessionTerminationFailed, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // BLOCKER 1 regression: Runtime stays Running on mark_terminated failure,
+    // allowing retry reconciliation.
+    // =========================================================================
+
+    /// BLOCKER 1 regression: On `mark_terminated` failure, `stop()` leaves the
+    /// runtime state as Running (not terminal). A subsequent retry succeeds
+    /// when the registry is no longer failing (simulated by replacing the
+    /// runtime with a working registry). This proves the caller is not blocked
+    /// by `InvalidTransition` on retry.
+    #[tokio::test]
+    async fn blocker1_stop_stays_running_on_mark_terminated_failure() {
+        let registry: Arc<dyn SessionRegistry> = Arc::new(FailingSessionRegistry);
+        let runtime = EpisodeRuntime::new(test_config()).with_session_registry(registry);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // First attempt: mark_terminated fails
+        let result = runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await;
+        assert!(result.is_err(), "First stop() should fail");
+
+        // Runtime state MUST still be Running (not Terminated)
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(
+            state.is_running(),
+            "Runtime state must remain Running after mark_terminated failure, got: {}",
+            state.state_name()
+        );
+    }
+
+    /// BLOCKER 1 regression: On `mark_terminated` failure, `quarantine()`
+    /// leaves the runtime state as Running (not Quarantined).
+    #[tokio::test]
+    async fn blocker1_quarantine_stays_running_on_mark_terminated_failure() {
+        let registry: Arc<dyn SessionRegistry> = Arc::new(FailingSessionRegistry);
+        let runtime = EpisodeRuntime::new(test_config()).with_session_registry(registry);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // First attempt: mark_terminated fails
+        let result = runtime
+            .quarantine(
+                &episode_id,
+                QuarantineReason::new("TEST", "test quarantine"),
+                test_timestamp() + 2000,
+            )
+            .await;
+        assert!(result.is_err(), "First quarantine() should fail");
+
+        // Runtime state MUST still be Running (not Quarantined)
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(
+            state.is_running(),
+            "Runtime state must remain Running after mark_terminated failure, got: {}",
+            state.state_name()
         );
     }
 }

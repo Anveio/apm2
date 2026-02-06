@@ -1725,6 +1725,24 @@ impl PersistentSessionRegistry {
                     };
                     inner_state.terminated.insert(session_id, entry);
                 }
+
+                // MAJOR 1 fix: Enforce MAX_TERMINATED_SESSIONS cap after
+                // loading all entries. Use the same eviction policy as
+                // runtime insertion: evict the oldest entries (earliest
+                // expires_at) until we are within the cap. This prevents
+                // churned/tampered state files from exceeding the bound.
+                while inner_state.terminated.len() > MAX_TERMINATED_SESSIONS {
+                    let oldest_key = inner_state
+                        .terminated
+                        .iter()
+                        .min_by_key(|(_, e)| e.expires_at)
+                        .map(|(k, _)| k.clone());
+                    if let Some(key) = oldest_key {
+                        inner_state.terminated.remove(&key);
+                    } else {
+                        break;
+                    }
+                }
             }
         }
 
@@ -3510,6 +3528,76 @@ mod tck_00385_security_fixes {
         assert!(
             recovered.get_termination_info("collide-1").is_none(),
             "Terminated entry colliding with active must be dropped"
+        );
+    }
+
+    // =========================================================================
+    // MAJOR 1 regression: load_from_file enforces MAX_TERMINATED_SESSIONS cap
+    // =========================================================================
+
+    /// MAJOR 1 regression: `load_from_file()` enforces
+    /// `MAX_TERMINATED_SESSIONS` cap. A state file with more terminated
+    /// entries than the cap must be trimmed on load using the same eviction
+    /// policy (oldest `expires_at` first).
+    #[test]
+    fn reload_enforces_terminated_session_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("over_cap.json");
+
+        let future_base = wall_clock_secs() + 200;
+
+        // Build a state file with MAX_TERMINATED_SESSIONS + 50 entries.
+        let overflow_count = MAX_TERMINATED_SESSIONS + 50;
+        let terminated: Vec<PersistableTerminatedEntry> = (0..overflow_count)
+            .map(|i| {
+                let sid = format!("reload-cap-{i}");
+                PersistableTerminatedEntry {
+                    session: PersistableSessionState {
+                        session_id: sid.clone(),
+                        work_id: format!("work-{sid}"),
+                        role: 1,
+                        ephemeral_handle: format!("h-{sid}"),
+                        policy_resolved_ref: String::new(),
+                        capability_manifest_hash: vec![],
+                        episode_id: None,
+                    },
+                    info: SessionTerminationInfo::new(&sid, "normal", "SUCCESS"),
+                    issued_at_epoch_secs: future_base.saturating_sub(300),
+                    // Stagger expiry so eviction is deterministic: earlier
+                    // indices expire first.
+                    #[allow(clippy::cast_possible_truncation)]
+                    expires_at_epoch_secs: future_base + (i as u64),
+                    ttl_remaining_secs: 200,
+                }
+            })
+            .collect();
+
+        let state_file = PersistentStateFile {
+            version: 1,
+            sessions: vec![],
+            terminated,
+        };
+        let json = serde_json::to_string(&state_file).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let recovered = PersistentSessionRegistry::load_from_file(&path).expect("should load");
+
+        // The terminated count must not exceed the cap.
+        let inner_state = recovered.inner.state.read().expect("lock poisoned");
+        assert!(
+            inner_state.terminated.len() <= MAX_TERMINATED_SESSIONS,
+            "Loaded terminated count {} exceeds cap {}",
+            inner_state.terminated.len(),
+            MAX_TERMINATED_SESSIONS
+        );
+
+        // The oldest entries (lowest index / earliest expiry) should have been
+        // evicted, and the newest entries should remain.
+        let last_idx = overflow_count - 1;
+        let last_key = format!("reload-cap-{last_idx}");
+        assert!(
+            inner_state.terminated.contains_key(&last_key),
+            "Newest terminated entry should survive eviction"
         );
     }
 }
