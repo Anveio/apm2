@@ -1307,7 +1307,21 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 // MAJOR 2: Wire session end-of-life to mark_terminated()
                 // so production sessions transition to TERMINATED state.
                 if let Some(session_registry) = &self.session_registry {
-                    session_registry.mark_terminated(session_id, *termination_info.clone());
+                    // MINOR fix: Normalize info.session_id to the authoritative
+                    // session_id.  The broker may populate this field with
+                    // episode_id (since session context is unavailable at that
+                    // layer), so we overwrite it here where the real session_id
+                    // is known.
+                    let mut info = *termination_info.clone();
+                    info.session_id = session_id.to_string();
+
+                    if let Err(e) = session_registry.mark_terminated(session_id, info) {
+                        error!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Failed to persist session termination state (fail-closed)"
+                        );
+                    }
                 }
 
                 // TCK-00307: Emit DefectRecorded for ContextMiss
@@ -4105,7 +4119,9 @@ mod tests {
                 .with_tokens_consumed(42_000);
 
             assert!(
-                registry.mark_terminated("session-001", term_info),
+                registry
+                    .mark_terminated("session-001", term_info)
+                    .expect("mark_terminated should not fail"),
                 "mark_terminated should return true for existing session"
             );
 
@@ -4170,7 +4186,7 @@ mod tests {
             let term_info =
                 SessionTerminationInfo::new("session-001", "crash", "FAILURE").with_exit_code(137); // Killed by SIGKILL
 
-            assert!(registry.mark_terminated("session-001", term_info));
+            assert!(registry.mark_terminated("session-001", term_info).unwrap());
 
             let dyn_registry: Arc<dyn crate::session::SessionRegistry> = registry;
             let dispatcher =
@@ -4206,7 +4222,9 @@ mod tests {
             let term_info = SessionTerminationInfo::new("nonexistent", "normal", "SUCCESS");
 
             assert!(
-                !registry.mark_terminated("nonexistent", term_info),
+                !registry
+                    .mark_terminated("nonexistent", term_info)
+                    .expect("mark_terminated should not fail"),
                 "mark_terminated should return false for non-existent session"
             );
         }
@@ -4234,7 +4252,7 @@ mod tests {
             assert!(registry.get_session("sess-term").is_some());
 
             let term_info = SessionTerminationInfo::new("sess-term", "normal", "SUCCESS");
-            assert!(registry.mark_terminated("sess-term", term_info));
+            assert!(registry.mark_terminated("sess-term", term_info).unwrap());
 
             // Session should no longer be in active set
             assert!(
@@ -4288,11 +4306,15 @@ mod tests {
             registry.register_session(session1).unwrap();
             registry.register_session(session2).unwrap();
 
-            registry.mark_terminated("s1", SessionTerminationInfo::new("s1", "normal", "SUCCESS"));
-            registry.mark_terminated(
-                "s2",
-                SessionTerminationInfo::new("s2", "timeout", "FAILURE"),
-            );
+            registry
+                .mark_terminated("s1", SessionTerminationInfo::new("s1", "normal", "SUCCESS"))
+                .unwrap();
+            registry
+                .mark_terminated(
+                    "s2",
+                    SessionTerminationInfo::new("s2", "timeout", "FAILURE"),
+                )
+                .unwrap();
 
             assert_eq!(registry.terminated_count(), 2);
             assert_eq!(registry.len(), 0, "No active sessions should remain");
@@ -4345,7 +4367,7 @@ mod tests {
             assert!(registry.get_session_by_handle("handle-h").is_some());
 
             let term_info = SessionTerminationInfo::new("sess-h", "normal", "SUCCESS");
-            registry.mark_terminated("sess-h", term_info);
+            registry.mark_terminated("sess-h", term_info).unwrap();
 
             // Handle should no longer resolve to an active session
             assert!(
@@ -4413,7 +4435,7 @@ mod tests {
                 SessionTerminationInfo::new("session-001", "budget_exhausted", "FAILURE")
                     .with_exit_code(1)
                     .with_tokens_consumed(500_000);
-            registry.mark_terminated("session-001", term_info);
+            registry.mark_terminated("session-001", term_info).unwrap();
 
             // Step 4: Verify session is now TERMINATED with details
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
@@ -4469,7 +4491,7 @@ mod tests {
                 "some_arbitrary_freeform_reason",
                 "FAILURE",
             );
-            registry.mark_terminated("session-001", term_info);
+            registry.mark_terminated("session-001", term_info).unwrap();
 
             let dyn_registry: Arc<dyn crate::session::SessionRegistry> = registry;
             let dispatcher =

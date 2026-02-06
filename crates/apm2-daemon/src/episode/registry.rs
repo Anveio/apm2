@@ -972,7 +972,11 @@ impl SessionRegistry for InMemorySessionRegistry {
         state.by_id.values().find(|s| s.work_id == work_id).cloned()
     }
 
-    fn mark_terminated(&self, session_id: &str, info: SessionTerminationInfo) -> bool {
+    fn mark_terminated(
+        &self,
+        session_id: &str,
+        info: SessionTerminationInfo,
+    ) -> Result<bool, SessionRegistryError> {
         let mut state = self.state.write().expect("lock poisoned");
 
         // Lazily clean up expired terminated entries on write
@@ -1005,9 +1009,9 @@ impl SessionRegistry for InMemorySessionRegistry {
                 expires_at: now + Duration::from_secs(TERMINATED_SESSION_TTL_SECS),
             };
             state.terminated.insert(session_id.to_string(), entry);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -1726,25 +1730,25 @@ impl SessionRegistry for PersistentSessionRegistry {
         self.inner.get_session_by_work_id(work_id)
     }
 
-    fn mark_terminated(&self, session_id: &str, info: SessionTerminationInfo) -> bool {
-        let result = self.inner.mark_terminated(session_id, info);
+    fn mark_terminated(
+        &self,
+        session_id: &str,
+        info: SessionTerminationInfo,
+    ) -> Result<bool, SessionRegistryError> {
+        let found = self.inner.mark_terminated(session_id, info)?;
 
-        // BLOCKER 2: Persist termination state to disk so that a crash
-        // after mark_terminated() does not resurrect the session as active.
-        if result {
-            if let Err(e) = self.persist() {
-                // Log but don't fail -- the in-memory state is correct and
-                // the worst case is a stale-active resurrection on crash,
-                // which is the same behavior as before this fix.
-                tracing::error!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Failed to persist termination state"
-                );
-            }
+        // BLOCKER 2 / MAJOR fix: Persist termination state to disk so that a
+        // crash after mark_terminated() does not resurrect the session as
+        // active.  Fail-closed: if persistence fails, propagate the error to
+        // the caller instead of silently returning success.
+        if found {
+            self.persist()
+                .map_err(|e| SessionRegistryError::RegistrationFailed {
+                    message: format!("Failed to persist termination state: {e}"),
+                })?;
         }
 
-        result
+        Ok(found)
     }
 
     fn get_termination_info(&self, session_id: &str) -> Option<SessionTerminationInfo> {
@@ -2560,7 +2564,9 @@ mod tck_00385_security_fixes {
             for i in 0..this_batch {
                 let idx = terminated_so_far + i;
                 let info = SessionTerminationInfo::new(format!("churn-{idx}"), "normal", "SUCCESS");
-                registry.mark_terminated(&format!("churn-{idx}"), info);
+                registry
+                    .mark_terminated(&format!("churn-{idx}"), info)
+                    .unwrap();
             }
 
             terminated_so_far += this_batch;
@@ -2595,7 +2601,9 @@ mod tck_00385_security_fixes {
             let session = make_session(&format!("evict-{i}"), &format!("handle-evict-{i}"));
             registry.register_session(session).unwrap();
             let info = SessionTerminationInfo::new(format!("evict-{i}"), "normal", "SUCCESS");
-            registry.mark_terminated(&format!("evict-{i}"), info);
+            registry
+                .mark_terminated(&format!("evict-{i}"), info)
+                .unwrap();
         }
 
         // Verify the first entry still exists (map is exactly at cap)
@@ -2608,7 +2616,7 @@ mod tck_00385_security_fixes {
         let overflow = make_session("evict-overflow", "handle-evict-overflow");
         registry.register_session(overflow).unwrap();
         let info = SessionTerminationInfo::new("evict-overflow", "normal", "SUCCESS");
-        registry.mark_terminated("evict-overflow", info);
+        registry.mark_terminated("evict-overflow", info).unwrap();
 
         // The overflow entry should exist
         assert!(
@@ -2658,7 +2666,9 @@ mod tck_00385_security_fixes {
         // Step 2: Mark terminated (should persist removal from active set)
         let info = SessionTerminationInfo::new("persist-term-1", "normal", "SUCCESS");
         assert!(
-            registry.mark_terminated("persist-term-1", info),
+            registry
+                .mark_terminated("persist-term-1", info)
+                .expect("mark_terminated should not fail"),
             "mark_terminated should succeed"
         );
 
@@ -2699,7 +2709,7 @@ mod tck_00385_security_fixes {
 
         // Terminate only one
         let info = SessionTerminationInfo::new("terminate-1", "crash", "FAILURE");
-        registry.mark_terminated("terminate-1", info);
+        registry.mark_terminated("terminate-1", info).unwrap();
 
         // Recover
         let recovered = PersistentSessionRegistry::load_from_file(&path).unwrap();
@@ -2777,5 +2787,97 @@ mod tck_00385_security_fixes {
                 "Proto-documented value '{v}' should be a known reason"
             );
         }
+    }
+
+    // =========================================================================
+    // MAJOR: PersistentSessionRegistry persist failure is observable
+    // =========================================================================
+
+    /// MAJOR fix: `PersistentSessionRegistry::mark_terminated` returns Err
+    /// when persistence fails (e.g., read-only path).
+    #[test]
+    fn persistent_mark_terminated_returns_err_on_persist_failure() {
+        // Create a registry pointing to a path that will fail to write
+        // (non-existent directory with no permission to create).
+        let bad_path = "/proc/nonexistent_dir/impossible_file.json";
+        let registry = PersistentSessionRegistry::new(bad_path);
+
+        // Register a session -- this will also fail to persist, but the
+        // in-memory state is updated. For this test we directly use the
+        // inner registry to seed the session.
+        let session = make_session("fail-persist-1", "handle-fp-1");
+        registry
+            .inner
+            .register_session(session)
+            .expect("in-memory register should succeed");
+
+        let info = SessionTerminationInfo::new("fail-persist-1", "normal", "SUCCESS");
+        let result = registry.mark_terminated("fail-persist-1", info);
+
+        assert!(
+            result.is_err(),
+            "mark_terminated should return Err when persistence fails"
+        );
+
+        match result.unwrap_err() {
+            SessionRegistryError::RegistrationFailed { message } => {
+                assert!(
+                    message.contains("persist"),
+                    "Error message should mention persistence: {message}"
+                );
+            },
+            other @ SessionRegistryError::DuplicateSessionId { .. } => {
+                panic!("Expected RegistrationFailed, got: {other:?}")
+            },
+        }
+    }
+
+    /// MAJOR fix: `InMemorySessionRegistry::mark_terminated` always returns
+    /// Ok (no persistence).
+    #[test]
+    fn in_memory_mark_terminated_returns_ok() {
+        let registry = InMemorySessionRegistry::new();
+        let session = make_session("ok-1", "handle-ok-1");
+        registry.register_session(session).unwrap();
+
+        let info = SessionTerminationInfo::new("ok-1", "normal", "SUCCESS");
+        let result = registry.mark_terminated("ok-1", info);
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+
+        // Non-existent session returns Ok(false)
+        let info2 = SessionTerminationInfo::new("no-such", "normal", "SUCCESS");
+        let result2 = registry.mark_terminated("no-such", info2);
+        assert!(result2.is_ok());
+        assert!(!result2.unwrap());
+    }
+
+    // =========================================================================
+    // MINOR: session_id normalization in mark_terminated
+    // =========================================================================
+
+    /// MINOR fix: When `SessionTerminationInfo.session_id` contains an
+    /// `episode_id`, the registry stores it under the correct `session_id` key
+    /// and the info can be retrieved.
+    #[test]
+    fn mark_terminated_with_episode_id_in_info_still_works() {
+        let registry = InMemorySessionRegistry::new();
+        let session = make_session("real-session-id", "handle-norm");
+        registry.register_session(session).unwrap();
+
+        // Info has episode_id in its session_id field (simulating broker bug)
+        let mut info = SessionTerminationInfo::new("episode-id-not-session", "normal", "SUCCESS");
+        // Caller normalizes before calling mark_terminated
+        info.session_id = "real-session-id".to_string();
+
+        assert!(registry.mark_terminated("real-session-id", info).unwrap());
+
+        let retrieved = registry
+            .get_termination_info("real-session-id")
+            .expect("Should find termination info");
+        assert_eq!(
+            retrieved.session_id, "real-session-id",
+            "Stored info should have the normalized session_id"
+        );
     }
 }

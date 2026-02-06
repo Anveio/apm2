@@ -154,9 +154,15 @@ pub trait SessionRegistry: Send + Sync {
     /// `SessionStatus` queries return TERMINATED state with exit details.
     /// The entry will be cleaned up after the configured TTL.
     ///
-    /// Returns `true` if the session was found and marked terminated,
-    /// `false` if the session was not found.
-    fn mark_terminated(&self, session_id: &str, info: SessionTerminationInfo) -> bool;
+    /// Returns `Ok(true)` if the session was found and marked terminated,
+    /// `Ok(false)` if the session was not found. Returns `Err` if the
+    /// termination could not be persisted (fail-closed: callers MUST treat
+    /// persistence failures as fatal for the session lifecycle).
+    fn mark_terminated(
+        &self,
+        session_id: &str,
+        info: SessionTerminationInfo,
+    ) -> Result<bool, SessionRegistryError>;
 
     /// Queries termination info for a session (TCK-00385).
     ///

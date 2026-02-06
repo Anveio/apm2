@@ -41,7 +41,7 @@ use tracing::{debug, info, instrument, warn};
 
 use super::budget::EpisodeBudget;
 use super::budget_tracker::BudgetTracker;
-use super::decision::{Credential, ToolResult};
+use super::decision::{Credential, SessionTerminationInfo, ToolResult};
 use super::error::{EpisodeError, EpisodeId};
 use super::executor::{ContentAddressedStore, ExecutionContext, SharedToolExecutor, ToolExecutor};
 use super::handle::{SessionHandle, StopSignal};
@@ -49,6 +49,7 @@ use super::state::{EpisodeState, QuarantineReason, TerminationClass};
 use super::tool_handler::{ToolArgs, ToolHandler};
 use crate::htf::HolonicClock;
 use crate::protocol::dispatch::LedgerEventEmitter;
+use crate::session::SessionRegistry;
 
 /// Maximum number of concurrent episodes per runtime.
 ///
@@ -531,6 +532,15 @@ pub struct EpisodeRuntime {
     ///
     /// When `None`, events are buffered in memory (legacy behavior for tests).
     ledger_emitter: Option<Arc<dyn LedgerEventEmitter>>,
+    /// Session registry for wiring episode lifecycle to session termination
+    /// (TCK-00385 BLOCKER fix).
+    ///
+    /// When present, episode `stop()` and `quarantine()` calls automatically
+    /// mark the corresponding session as terminated via
+    /// `SessionRegistry::mark_terminated()`. This ensures all exit paths
+    /// (normal, crash, timeout, quarantined, budget-exhausted) produce a
+    /// `TERMINATED + reason/exit_code` status in the session registry.
+    session_registry: Option<Arc<dyn SessionRegistry>>,
 }
 
 impl EpisodeRuntime {
@@ -557,6 +567,8 @@ impl EpisodeRuntime {
             default_budget: EpisodeBudget::default(),
             // TCK-00321: No ledger emitter by default (tests use in-memory buffer)
             ledger_emitter: None,
+            // TCK-00385: No session registry by default (tests don't need it)
+            session_registry: None,
         }
     }
 
@@ -587,6 +599,8 @@ impl EpisodeRuntime {
             default_budget: EpisodeBudget::default(),
             // TCK-00321: No ledger emitter by default (tests use in-memory buffer)
             ledger_emitter: None,
+            // TCK-00385: No session registry by default
+            session_registry: None,
         }
     }
 
@@ -724,6 +738,20 @@ impl EpisodeRuntime {
     #[must_use]
     pub fn ledger_emitter(&self) -> Option<&Arc<dyn LedgerEventEmitter>> {
         self.ledger_emitter.as_ref()
+    }
+
+    /// Sets the session registry for wiring episode lifecycle to session
+    /// termination (TCK-00385 BLOCKER fix).
+    ///
+    /// When configured, `stop()` and `quarantine()` automatically call
+    /// `session_registry.mark_terminated()` for the session associated with
+    /// the episode. This ensures all exit paths (normal completion, crash,
+    /// timeout, quarantine, budget exhaustion) produce a `TERMINATED` status
+    /// with reason and exit code in the session registry.
+    #[must_use]
+    pub fn with_session_registry(mut self, registry: Arc<dyn SessionRegistry>) -> Self {
+        self.session_registry = Some(registry);
+        self
     }
 
     /// Registers a factory for creating tool handlers (builder pattern).
@@ -1261,6 +1289,10 @@ impl EpisodeRuntime {
         termination_class: TerminationClass,
         timestamp_ns: u64,
     ) -> Result<(), EpisodeError> {
+        // TCK-00385 BLOCKER fix: Capture session_id before transitioning so
+        // we can wire the session registry after the lock is released.
+        let session_id_for_registry: Option<String>;
+
         {
             let mut episodes = self.episodes.write().await;
 
@@ -1275,13 +1307,19 @@ impl EpisodeRuntime {
             super::state::validate_transition(episode_id.as_str(), &entry.state, "Terminated")?;
 
             // Extract required fields from current state
-            let (created_at_ns, started_at_ns, envelope_hash) = match &entry.state {
+            let (created_at_ns, started_at_ns, envelope_hash, session_id) = match &entry.state {
                 EpisodeState::Running {
                     created_at_ns,
                     started_at_ns,
                     envelope_hash,
+                    session_id,
                     ..
-                } => (*created_at_ns, *started_at_ns, *envelope_hash),
+                } => (
+                    *created_at_ns,
+                    *started_at_ns,
+                    *envelope_hash,
+                    session_id.clone(),
+                ),
                 _ => {
                     return Err(EpisodeError::InvalidTransition {
                         id: episode_id.as_str().to_string(),
@@ -1290,6 +1328,8 @@ impl EpisodeRuntime {
                     });
                 },
             };
+
+            session_id_for_registry = Some(session_id);
 
             // Signal stop to handle if present
             if let Some(handle) = &entry.handle {
@@ -1307,6 +1347,37 @@ impl EpisodeRuntime {
                 termination_class,
             };
             entry.handle = None;
+        }
+
+        // TCK-00385 BLOCKER fix: Wire episode lifecycle to session registry.
+        // Map TerminationClass to a rationale code and exit classification
+        // so the SessionStatus query returns meaningful termination details.
+        if let (Some(registry), Some(sess_id)) = (&self.session_registry, &session_id_for_registry)
+        {
+            let (rationale, classification, exit_code) = match termination_class {
+                TerminationClass::Success => ("normal", "SUCCESS", Some(0)),
+                TerminationClass::Failure | TerminationClass::Crashed => {
+                    ("crash", "FAILURE", Some(1))
+                },
+                TerminationClass::BudgetExhausted => ("budget_exhausted", "FAILURE", None),
+                TerminationClass::Timeout => ("timeout", "FAILURE", None),
+                TerminationClass::Cancelled => ("normal", "CANCELLED", None),
+                TerminationClass::Killed => ("crash", "FAILURE", Some(137)),
+            };
+
+            let mut info = SessionTerminationInfo::new(sess_id, rationale, classification);
+            if let Some(code) = exit_code {
+                info = info.with_exit_code(code);
+            }
+
+            if let Err(e) = registry.mark_terminated(sess_id, info) {
+                warn!(
+                    episode_id = %episode_id,
+                    session_id = %sess_id,
+                    error = %e,
+                    "Failed to mark session terminated from episode stop (fail-closed)"
+                );
+            }
         }
 
         // Emit event (INV-ER002)
@@ -1363,6 +1434,9 @@ impl EpisodeRuntime {
         reason: QuarantineReason,
         timestamp_ns: u64,
     ) -> Result<(), EpisodeError> {
+        // TCK-00385 BLOCKER fix: Capture session_id before transitioning.
+        let session_id_for_registry: Option<String>;
+
         {
             let mut episodes = self.episodes.write().await;
 
@@ -1377,13 +1451,19 @@ impl EpisodeRuntime {
             super::state::validate_transition(episode_id.as_str(), &entry.state, "Quarantined")?;
 
             // Extract required fields from current state
-            let (created_at_ns, started_at_ns, envelope_hash) = match &entry.state {
+            let (created_at_ns, started_at_ns, envelope_hash, session_id) = match &entry.state {
                 EpisodeState::Running {
                     created_at_ns,
                     started_at_ns,
                     envelope_hash,
+                    session_id,
                     ..
-                } => (*created_at_ns, *started_at_ns, *envelope_hash),
+                } => (
+                    *created_at_ns,
+                    *started_at_ns,
+                    *envelope_hash,
+                    session_id.clone(),
+                ),
                 _ => {
                     return Err(EpisodeError::InvalidTransition {
                         id: episode_id.as_str().to_string(),
@@ -1392,6 +1472,8 @@ impl EpisodeRuntime {
                     });
                 },
             };
+
+            session_id_for_registry = Some(session_id);
 
             // Signal quarantine to handle if present
             if let Some(handle) = &entry.handle {
@@ -1409,6 +1491,20 @@ impl EpisodeRuntime {
                 reason: reason.clone(),
             };
             entry.handle = None;
+        }
+
+        // TCK-00385 BLOCKER fix: Wire quarantine to session termination.
+        if let (Some(registry), Some(sess_id)) = (&self.session_registry, &session_id_for_registry)
+        {
+            let info = SessionTerminationInfo::new(sess_id, "quarantined", "FAILURE");
+            if let Err(e) = registry.mark_terminated(sess_id, info) {
+                warn!(
+                    episode_id = %episode_id,
+                    session_id = %sess_id,
+                    error = %e,
+                    "Failed to mark session terminated from episode quarantine (fail-closed)"
+                );
+            }
         }
 
         // Emit event (INV-ER002)
@@ -2946,5 +3042,370 @@ mod tests {
 
         // Should be rejected by path validation
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // TCK-00385 BLOCKER: Episode stop/quarantine wires session termination
+    // =========================================================================
+
+    /// TCK-00385 BLOCKER regression: `stop()` with `session_registry` marks
+    /// the session as TERMINATED with correct reason and exit code.
+    #[tokio::test]
+    async fn tck_00385_stop_wires_session_terminated() {
+        use crate::episode::registry::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_session_registry(registry.clone() as Arc<dyn SessionRegistry>);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let session_id = handle.session_id().to_string();
+
+        // Register the session in the registry (as production code would)
+        registry
+            .register_session(SessionState {
+                session_id: session_id.clone(),
+                work_id: "work-1".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-1".to_string(),
+                lease_id: "lease-1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some(episode_id.as_str().to_string()),
+            })
+            .unwrap();
+
+        // Stop the episode (normal success)
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        // Session should now be terminated in the registry
+        assert!(
+            registry.get_session(&session_id).is_none(),
+            "Session should no longer be in active set"
+        );
+
+        let term_info = registry
+            .get_termination_info(&session_id)
+            .expect("Session should have termination info");
+        assert_eq!(term_info.rationale_code, "normal");
+        assert_eq!(term_info.exit_classification, "SUCCESS");
+        assert_eq!(term_info.exit_code, Some(0));
+        assert_eq!(
+            term_info.session_id, session_id,
+            "Termination info should have the correct session_id"
+        );
+    }
+
+    /// TCK-00385 BLOCKER regression: `stop()` with `BudgetExhausted` maps to
+    /// correct reason.
+    #[tokio::test]
+    async fn tck_00385_stop_budget_exhausted_wires_reason() {
+        use crate::episode::registry::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_session_registry(registry.clone() as Arc<dyn SessionRegistry>);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let session_id = handle.session_id().to_string();
+
+        registry
+            .register_session(SessionState {
+                session_id: session_id.clone(),
+                work_id: "work-1".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-budget".to_string(),
+                lease_id: "lease-1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some(episode_id.as_str().to_string()),
+            })
+            .unwrap();
+
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::BudgetExhausted,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        let term_info = registry
+            .get_termination_info(&session_id)
+            .expect("Should have termination info for budget exhausted");
+        assert_eq!(term_info.rationale_code, "budget_exhausted");
+        assert_eq!(term_info.exit_classification, "FAILURE");
+    }
+
+    /// TCK-00385 BLOCKER regression: `stop()` with Timeout maps correctly.
+    #[tokio::test]
+    async fn tck_00385_stop_timeout_wires_reason() {
+        use crate::episode::registry::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_session_registry(registry.clone() as Arc<dyn SessionRegistry>);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let session_id = handle.session_id().to_string();
+
+        registry
+            .register_session(SessionState {
+                session_id: session_id.clone(),
+                work_id: "work-1".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-timeout".to_string(),
+                lease_id: "lease-1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some(episode_id.as_str().to_string()),
+            })
+            .unwrap();
+
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Timeout,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        let term_info = registry
+            .get_termination_info(&session_id)
+            .expect("Should have termination info for timeout");
+        assert_eq!(term_info.rationale_code, "timeout");
+        assert_eq!(term_info.exit_classification, "FAILURE");
+    }
+
+    /// TCK-00385 BLOCKER regression: `quarantine()` wires session termination
+    /// with "quarantined" reason.
+    #[tokio::test]
+    async fn tck_00385_quarantine_wires_session_terminated() {
+        use crate::episode::registry::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_session_registry(registry.clone() as Arc<dyn SessionRegistry>);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let session_id = handle.session_id().to_string();
+
+        registry
+            .register_session(SessionState {
+                session_id: session_id.clone(),
+                work_id: "work-1".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-quarantine".to_string(),
+                lease_id: "lease-1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some(episode_id.as_str().to_string()),
+            })
+            .unwrap();
+
+        let reason = QuarantineReason::policy_violation("TEST_POLICY");
+        runtime
+            .quarantine(&episode_id, reason, test_timestamp() + 2000)
+            .await
+            .unwrap();
+
+        // Session should be terminated
+        assert!(
+            registry.get_session(&session_id).is_none(),
+            "Session should not be in active set after quarantine"
+        );
+
+        let term_info = registry
+            .get_termination_info(&session_id)
+            .expect("Quarantined session should have termination info");
+        assert_eq!(term_info.rationale_code, "quarantined");
+        assert_eq!(term_info.exit_classification, "FAILURE");
+        assert_eq!(
+            term_info.session_id, session_id,
+            "Termination info should have correct session_id"
+        );
+    }
+
+    /// TCK-00385 BLOCKER regression: Without `session_registry`,
+    /// stop/quarantine still works (backward compatibility).
+    #[tokio::test]
+    async fn tck_00385_stop_without_registry_still_works() {
+        let runtime = EpisodeRuntime::new(test_config());
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        // Should succeed without session_registry
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(matches!(state, EpisodeState::Terminated { .. }));
+    }
+
+    /// TCK-00385 BLOCKER: `stop()` with Crashed maps to crash/FAILURE/exit 1.
+    #[tokio::test]
+    async fn tck_00385_stop_crashed_wires_reason() {
+        use crate::episode::registry::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_session_registry(registry.clone() as Arc<dyn SessionRegistry>);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let session_id = handle.session_id().to_string();
+
+        registry
+            .register_session(SessionState {
+                session_id: session_id.clone(),
+                work_id: "work-1".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-crash".to_string(),
+                lease_id: "lease-1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some(episode_id.as_str().to_string()),
+            })
+            .unwrap();
+
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Crashed,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        let term_info = registry
+            .get_termination_info(&session_id)
+            .expect("Should have termination info for crashed");
+        assert_eq!(term_info.rationale_code, "crash");
+        assert_eq!(term_info.exit_classification, "FAILURE");
+        assert_eq!(term_info.exit_code, Some(1));
+    }
+
+    /// TCK-00385 BLOCKER: `stop()` with Killed maps to crash/FAILURE/exit 137.
+    #[tokio::test]
+    async fn tck_00385_stop_killed_wires_reason() {
+        use crate::episode::registry::InMemorySessionRegistry;
+        use crate::session::{SessionRegistry, SessionState};
+
+        let registry = Arc::new(InMemorySessionRegistry::new());
+        let runtime = EpisodeRuntime::new(test_config())
+            .with_session_registry(registry.clone() as Arc<dyn SessionRegistry>);
+
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        let handle = runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let session_id = handle.session_id().to_string();
+
+        registry
+            .register_session(SessionState {
+                session_id: session_id.clone(),
+                work_id: "work-1".to_string(),
+                role: 1,
+                ephemeral_handle: "handle-killed".to_string(),
+                lease_id: "lease-1".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![],
+                episode_id: Some(episode_id.as_str().to_string()),
+            })
+            .unwrap();
+
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Killed,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        let term_info = registry
+            .get_termination_info(&session_id)
+            .expect("Should have termination info for killed");
+        assert_eq!(term_info.rationale_code, "crash");
+        assert_eq!(term_info.exit_classification, "FAILURE");
+        assert_eq!(term_info.exit_code, Some(137));
     }
 }
