@@ -104,6 +104,8 @@ jobs:
           tool: cargo-nextest
       - name: Run tests
         run: cargo nextest run --workspace --all-features --config-file .config/nextest.toml
+      - name: Run doctests
+        run: cargo test --doc --workspace --all-features
 
   # Cross-platform canonicalization test vectors (TCK-00130)
   # Verifies CAC-JSON canonicalization produces identical results on linux and macos
