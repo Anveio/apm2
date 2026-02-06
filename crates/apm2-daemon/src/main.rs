@@ -51,9 +51,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use apm2_core::bootstrap::verify_bootstrap_hash;
 use apm2_core::config::EcosystemConfig;
+use apm2_core::crypto::Signer;
 use apm2_core::process::ProcessState;
 use apm2_core::schema_registry::{InMemorySchemaRegistry, register_kernel_schemas};
 use apm2_core::supervisor::Supervisor;
+use apm2_daemon::gate::{GateOrchestrator, GateOrchestratorConfig};
 use apm2_daemon::ledger::{SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use apm2_daemon::metrics::{SharedMetricsRegistry, new_shared_registry};
 use apm2_daemon::protocol; // Import from library
@@ -944,6 +946,53 @@ async fn async_main(args: Args) -> Result<()> {
         }
         .with_daemon_state(Arc::clone(&state)),
     );
+
+    // TCK-00388: Wire gate orchestrator into daemon for autonomous gate lifecycle.
+    //
+    // The orchestrator is instantiated with a fresh signing key and wired into
+    // the DispatcherState. When a session terminates, the dispatcher calls
+    // `notify_session_terminated` which delegates to the orchestrator. A
+    // background task polls for gate timeouts periodically.
+    let gate_signer = Arc::new(Signer::generate());
+    let gate_orchestrator = Arc::new(GateOrchestrator::new(
+        GateOrchestratorConfig::default(),
+        gate_signer,
+    ));
+
+    // Wire orchestrator into dispatcher state so session termination events
+    // trigger autonomous gate lifecycle (Quality BLOCKER 1).
+    let dispatcher_state = {
+        // Unwrap the Arc, attach the orchestrator, and re-wrap.
+        // Safety: we just created this Arc and hold the only reference.
+        match Arc::try_unwrap(dispatcher_state) {
+            Ok(inner) => Arc::new(inner.with_gate_orchestrator(Arc::clone(&gate_orchestrator))),
+            Err(_arc) => {
+                unreachable!("dispatcher_state Arc should have single owner at bootstrap");
+            },
+        }
+    };
+
+    // Spawn background timeout poller for autonomous gate execution (Quality
+    // BLOCKER 2). This ensures timed-out gates produce FAIL verdicts even
+    // without explicit receipt collection. The poller runs every 10 seconds.
+    {
+        let orch = Arc::clone(&gate_orchestrator);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let events = orch.poll_timeouts().await;
+                if !events.is_empty() {
+                    info!(
+                        event_count = events.len(),
+                        "Gate timeout poller emitted events"
+                    );
+                    // Events would be persisted to ledger here once ledger
+                    // subscription integration is wired (TCK-00390).
+                }
+            }
+        });
+    }
 
     // TCK-00322: Start projection worker if ledger and projection are configured.
     // The projection worker:

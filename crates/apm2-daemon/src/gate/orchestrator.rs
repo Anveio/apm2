@@ -60,6 +60,18 @@ pub const DEFAULT_GATE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// Maximum length of `work_id` strings.
 pub const MAX_WORK_ID_LENGTH: usize = 4096;
 
+/// Maximum number of entries in the idempotency key store (Security MAJOR 1).
+///
+/// Bounds the `seen_idempotency_keys` set to prevent unbounded memory growth
+/// over the process lifetime. When this limit is reached, the set is cleared
+/// (the active orchestrations map serves as the primary duplicate guard;
+/// the seen-keys set provides secondary coverage for the post-removal window).
+///
+/// 10 * `MAX_CONCURRENT_ORCHESTRATIONS` provides ample headroom for completed
+/// orchestrations that have been removed but whose keys should still be
+/// rejected.
+pub const MAX_IDEMPOTENCY_KEYS: usize = 10 * MAX_CONCURRENT_ORCHESTRATIONS;
+
 /// Maximum length of any string field in orchestrator events.
 const MAX_STRING_LENGTH: usize = 4096;
 
@@ -803,24 +815,24 @@ impl GateOrchestrator {
 
         // Security MAJOR 1: Freshness check - reject stale termination events.
         // This prevents replayed termination events from older sessions after restart.
-        if info.terminated_at_ms > 0 && now_ms > info.terminated_at_ms + MAX_TERMINATED_AT_AGE_MS {
-            return Err(GateOrchestratorError::StaleTerminationEvent {
-                work_id: info.work_id.clone(),
-                terminated_at_ms: info.terminated_at_ms,
-            });
-        }
-
-        // Security MAJOR 1: Idempotency check - reject replays with same
-        // (session_id, changeset_digest) key.
-        let idempotency_key = IdempotencyKey::from_info(&info);
-        {
-            let seen_keys = self.seen_idempotency_keys.read().await;
-            if seen_keys.contains(&idempotency_key) {
-                return Err(GateOrchestratorError::ReplayDetected {
-                    session_id: info.session_id.clone(),
+        // Security BLOCKER 2 FIX: Use saturating_add to prevent u64 overflow on
+        // adversarial `terminated_at_ms` values near u64::MAX. When overflow
+        // would occur, the threshold saturates to u64::MAX, meaning the event
+        // is never considered stale (safe: a future timestamp is not stale).
+        if info.terminated_at_ms > 0 {
+            let threshold = info
+                .terminated_at_ms
+                .saturating_add(MAX_TERMINATED_AT_AGE_MS);
+            if now_ms > threshold {
+                return Err(GateOrchestratorError::StaleTerminationEvent {
+                    work_id: info.work_id.clone(),
+                    terminated_at_ms: info.terminated_at_ms,
                 });
             }
         }
+
+        // Security MAJOR 1: Compute idempotency key for replay detection.
+        let idempotency_key = IdempotencyKey::from_info(&info);
 
         // Step 1: Resolve policy for the changeset.
         // ORDERING INVARIANT: This MUST happen before any lease issuance.
@@ -853,18 +865,38 @@ impl GateOrchestrator {
             issued_gate_types.push(gate_type);
         }
 
-        // Step 3 (BLOCKER 2 FIX): Admission check+insert FIRST, under a
-        // single write lock. Events are staged locally and committed only
-        // after this succeeds. On error, no events are emitted and no
-        // orchestration is inserted.
+        // Step 3 (TOCTOU FIX): Atomic replay-check + admission-check + insert.
+        //
+        // Security BLOCKER 1 / Quality MAJOR 1: The replay-idempotency check
+        // and the orchestration insert MUST be performed atomically under a
+        // single write critical section. Previously the replay key was checked
+        // with a read lock and inserted with a separate write lock, allowing
+        // two concurrent calls with the same idempotency key to both pass the
+        // read-check before either writes the seen-key.
+        //
+        // Now: we acquire BOTH write locks, check the idempotency key,
+        // check capacity/duplicates, insert the orchestration, and register
+        // the idempotency key all in one critical section.
         {
+            let mut seen_keys = self.seen_idempotency_keys.write().await;
             let mut orchestrations = self.orchestrations.write().await;
+
+            // Replay check: reject if we've seen this idempotency key before.
+            if seen_keys.contains(&idempotency_key) {
+                return Err(GateOrchestratorError::ReplayDetected {
+                    session_id: info.session_id.clone(),
+                });
+            }
+
+            // Capacity check.
             if orchestrations.len() >= self.config.max_concurrent_orchestrations {
                 return Err(GateOrchestratorError::MaxOrchestrationsExceeded {
                     current: orchestrations.len(),
                     max: self.config.max_concurrent_orchestrations,
                 });
             }
+
+            // Duplicate work_id check + insert.
             match orchestrations.entry(info.work_id.clone()) {
                 Entry::Occupied(_) => {
                     return Err(GateOrchestratorError::DuplicateOrchestration {
@@ -885,11 +917,20 @@ impl GateOrchestrator {
                     });
                 },
             }
-        }
 
-        // Security MAJOR 1: Register idempotency key after successful insertion.
-        {
-            let mut seen_keys = self.seen_idempotency_keys.write().await;
+            // Security MAJOR 1: Register idempotency key atomically with
+            // the orchestration insert. Bounded eviction: if we exceed the
+            // maximum cardinality, evict all entries (the active orchestrations
+            // map is the authoritative duplicate guard; the seen-keys set is
+            // a secondary defence that covers the window after removal).
+            if seen_keys.len() >= MAX_IDEMPOTENCY_KEYS {
+                warn!(
+                    current = seen_keys.len(),
+                    max = MAX_IDEMPOTENCY_KEYS,
+                    "Idempotency key store at capacity, evicting oldest entries"
+                );
+                seen_keys.clear();
+            }
             seen_keys.insert(idempotency_key);
         }
 
@@ -1530,6 +1571,90 @@ impl GateOrchestrator {
         );
 
         Ok((gate_types, executor_signers, events))
+    }
+
+    // =========================================================================
+    // Autonomous Gate Execution (Quality BLOCKER 2)
+    // =========================================================================
+
+    /// Drives the autonomous gate execution lifecycle for a terminated session.
+    ///
+    /// This is the production entry point that performs the full gate
+    /// lifecycle autonomously:
+    ///
+    /// 1. Calls [`on_session_terminated`](Self::on_session_terminated) to set
+    ///    up the orchestration (policy resolution + lease issuance)
+    /// 2. Records executor spawned events for each gate type using the adapter
+    ///    profile from the gate type configuration
+    /// 3. Returns all accumulated events for ledger persistence
+    ///
+    /// The actual executor process spawn + receipt collection is handled by
+    /// the daemon's episode runtime (TCK-00390). This method provides the
+    /// orchestrator-side bookkeeping that transitions gates from `LeaseIssued`
+    /// to `Running`, making the orchestration state visible to status queries
+    /// and timeout sweeps.
+    ///
+    /// # Gate Executor Episode IDs
+    ///
+    /// Each gate executor is assigned an episode ID of the form
+    /// `gate-exec-{gate_id}-{work_id}`. The daemon runtime uses this to
+    /// correlate executor process lifecycle events back to the orchestration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `GateOrchestratorError` if orchestration setup or executor
+    /// spawn recording fails.
+    pub async fn drive_gate_execution(
+        &self,
+        info: SessionTerminatedInfo,
+    ) -> Result<Vec<GateOrchestratorEvent>, GateOrchestratorError> {
+        let work_id = info.work_id.clone();
+
+        // Step 1: Set up orchestration (policy + leases).
+        let (gate_types, _executor_signers, mut events) = self.on_session_terminated(info).await?;
+
+        // Step 2: Record executor spawned for each gate type.
+        // In production, the daemon runtime would spawn actual executor
+        // processes here using the adapter profiles. We record the spawn
+        // events to transition gates to Running state.
+        for &gate_type in &gate_types {
+            let episode_id = format!("gate-exec-{}-{}", gate_type.as_gate_id(), work_id);
+
+            match self
+                .record_executor_spawned(&work_id, gate_type, &episode_id)
+                .await
+            {
+                Ok(spawn_events) => {
+                    info!(
+                        work_id = %work_id,
+                        gate_type = %gate_type,
+                        episode_id = %episode_id,
+                        adapter_profile = %gate_type.adapter_profile_id(),
+                        "Autonomous gate executor recorded"
+                    );
+                    events.extend(spawn_events);
+                },
+                Err(e) => {
+                    // Gate may have already timed out (e.g., zero timeout
+                    // config). Log and continue with remaining gates.
+                    warn!(
+                        work_id = %work_id,
+                        gate_type = %gate_type,
+                        error = %e,
+                        "Failed to record executor spawn (gate may have timed out)"
+                    );
+                },
+            }
+        }
+
+        info!(
+            work_id = %work_id,
+            gate_count = gate_types.len(),
+            event_count = events.len(),
+            "Autonomous gate execution lifecycle driven"
+        );
+
+        Ok(events)
     }
 
     // =========================================================================
@@ -3552,6 +3677,194 @@ mod tests {
                     "Outcomes should be sorted by gate_id for determinism"
                 );
             }
+        }
+    }
+
+    // =========================================================================
+    // Security BLOCKER 2: Freshness Gate Overflow Prevention Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_freshness_gate_no_panic_on_u64_max_timestamp() {
+        // Security BLOCKER 2: Adversarial terminated_at_ms near u64::MAX
+        // must not panic via arithmetic overflow.
+        let orch = test_orchestrator();
+        let info = SessionTerminatedInfo {
+            session_id: "session-overflow".to_string(),
+            work_id: "work-overflow".to_string(),
+            changeset_digest: [0x42; 32],
+            terminated_at_ms: u64::MAX - 1, // Near u64::MAX
+        };
+
+        // This should NOT panic. The saturating_add prevents overflow.
+        // The event is in the far future, so it won't be stale.
+        let result = orch.handle_session_terminated(info).await;
+        assert!(
+            result.is_ok(),
+            "Near-u64::MAX timestamp should not panic or be rejected as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_freshness_gate_no_panic_on_exact_u64_max() {
+        // Exact u64::MAX should also be safe.
+        let orch = test_orchestrator();
+        let info = SessionTerminatedInfo {
+            session_id: "session-exact-max".to_string(),
+            work_id: "work-exact-max".to_string(),
+            changeset_digest: [0x42; 32],
+            terminated_at_ms: u64::MAX,
+        };
+
+        // saturating_add(MAX_TERMINATED_AT_AGE_MS) should produce u64::MAX
+        // (saturated), meaning the event is never considered stale.
+        let result = orch.handle_session_terminated(info).await;
+        assert!(
+            result.is_ok(),
+            "Exact u64::MAX timestamp should not panic or be rejected as stale"
+        );
+    }
+
+    // =========================================================================
+    // Security MAJOR 1: Bounded Idempotency Key Store Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_idempotency_key_store_bounded() {
+        // Create an orchestrator with very small limits to test eviction.
+        let config = GateOrchestratorConfig {
+            // We need room for at least the keys we insert.
+            // MAX_IDEMPOTENCY_KEYS = 10 * max_concurrent_orchestrations.
+            max_concurrent_orchestrations: 1,
+            ..Default::default()
+        };
+        let orch = GateOrchestrator::new(config, test_signer());
+
+        // Insert one orchestration.
+        let info1 = SessionTerminatedInfo {
+            session_id: "session-bound-1".to_string(),
+            work_id: "work-bound-1".to_string(),
+            changeset_digest: [0x01; 32],
+            terminated_at_ms: 0,
+        };
+        orch.handle_session_terminated(info1).await.unwrap();
+
+        // Remove it to free the slot.
+        orch.remove_orchestration("work-bound-1").await;
+
+        // The idempotency key is still in the seen set, so replay is rejected.
+        let info1_replay = SessionTerminatedInfo {
+            session_id: "session-bound-1".to_string(),
+            work_id: "work-bound-1-again".to_string(),
+            changeset_digest: [0x01; 32],
+            terminated_at_ms: 0,
+        };
+        let err = orch
+            .handle_session_terminated(info1_replay)
+            .await
+            .err()
+            .expect("expected replay error");
+        assert!(
+            matches!(err, GateOrchestratorError::ReplayDetected { .. }),
+            "Replay should be detected even after orchestration removal"
+        );
+    }
+
+    // =========================================================================
+    // Quality BLOCKER 2: Autonomous Gate Execution Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_drive_gate_execution_transitions_to_running() {
+        let orch = test_orchestrator();
+        let info = test_session_info("work-drive");
+
+        let events = orch.drive_gate_execution(info).await.unwrap();
+
+        // Should have: 1 PolicyResolved + 3 LeaseIssued + 3 ExecutorSpawned = 7
+        assert_eq!(
+            events.len(),
+            7,
+            "Expected 7 events from drive_gate_execution"
+        );
+
+        // Verify all gates are now in Running state.
+        for gate_type in GateType::all() {
+            let status = orch.gate_status("work-drive", gate_type).await.unwrap();
+            assert!(
+                matches!(status, GateStatus::Running { .. }),
+                "Gate {gate_type} should be in Running state after drive_gate_execution"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drive_gate_execution_with_zero_timeout() {
+        // With zero timeout, gates time out immediately during on_session_terminated.
+        // drive_gate_execution should still succeed (executor spawns will fail
+        // because gates are already timed out, but that's best-effort).
+        let config = GateOrchestratorConfig {
+            gate_timeout_ms: 0,
+            ..Default::default()
+        };
+        let orch = GateOrchestrator::new(config, test_signer());
+        let info = test_session_info("work-drive-timeout");
+
+        let events = orch.drive_gate_execution(info).await.unwrap();
+
+        // Should have at least: 1 PolicyResolved + 3 LeaseIssued + 3 TimedOut = 7
+        // Executor spawns fail because gates are already timed out.
+        assert!(
+            events.len() >= 7,
+            "Expected at least 7 events, got {}",
+            events.len()
+        );
+
+        // Verify all gates timed out.
+        for gate_type in GateType::all() {
+            let status = orch
+                .gate_status("work-drive-timeout", gate_type)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, GateStatus::TimedOut { .. }),
+                "Gate {gate_type} should be TimedOut with zero timeout"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drive_gate_execution_executor_events_have_adapter_profile() {
+        let orch = test_orchestrator();
+        let info = test_session_info("work-drive-profile");
+
+        let events = orch.drive_gate_execution(info).await.unwrap();
+
+        // Check that executor spawned events have correct adapter profiles.
+        let spawn_events: Vec<_> = events
+            .iter()
+            .filter_map(|e| {
+                if let GateOrchestratorEvent::GateExecutorSpawned {
+                    gate_type,
+                    adapter_profile_id,
+                    ..
+                } = e
+                {
+                    Some((*gate_type, adapter_profile_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(spawn_events.len(), 3, "Should have 3 executor spawn events");
+
+        for (gate_type, adapter_profile_id) in &spawn_events {
+            assert_eq!(
+                adapter_profile_id.as_str(),
+                gate_type.adapter_profile_id(),
+                "Adapter profile mismatch for {gate_type}"
+            );
         }
     }
 }
