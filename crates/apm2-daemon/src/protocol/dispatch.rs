@@ -1986,6 +1986,15 @@ pub struct PolicyResolution {
 
     /// BLAKE3 hash of the sealed context pack.
     pub context_pack_hash: [u8; 32],
+
+    /// Resolved risk tier (0-4) from `PolicyResolvedForChangeSet`.
+    ///
+    /// Used by `handle_ingest_review_receipt` to enforce attestation
+    /// ratcheting: higher tiers require stronger attestation levels.
+    /// Defaults to `0` (Tier0) for backward compatibility with existing
+    /// callers that don't set this field.
+    #[serde(default)]
+    pub resolved_risk_tier: u8,
 }
 
 /// Error type for policy resolution operations.
@@ -2153,6 +2162,7 @@ impl PolicyResolver for StubPolicyResolver {
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: manifest_hash,
             context_pack_hash,
+            resolved_risk_tier: 0, // Stub resolver: Tier0 default
         })
     }
 }
@@ -3040,6 +3050,19 @@ pub trait LeaseValidator: Send + Sync {
         self.register_lease(lease_id, work_id, gate_id);
     }
 
+    /// Returns the `work_id` bound to a lease (TCK-00340).
+    ///
+    /// Used by `handle_ingest_review_receipt` to resolve the work claim
+    /// and its associated risk tier for attestation ratcheting.
+    ///
+    /// # Returns
+    ///
+    /// `Some(work_id)` if the lease exists, `None` otherwise.
+    fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
+        let _ = lease_id;
+        None
+    }
+
     /// Returns the full `GateLease` for a given lease ID (TCK-00340).
     ///
     /// Used by `DelegateSublease` to retrieve the parent lease for
@@ -3151,6 +3174,12 @@ impl LeaseValidator for StubLeaseValidator {
         leases
             .get(lease_id)
             .map(|entry| entry.executor_actor_id.clone())
+    }
+
+    fn get_lease_work_id(&self, lease_id: &str) -> Option<String> {
+        let guard = self.leases.read().expect("lock poisoned");
+        let (_, leases) = &*guard;
+        leases.get(lease_id).map(|entry| entry.work_id.clone())
     }
 
     fn register_lease(&self, lease_id: &str, work_id: &str, gate_id: &str) {
@@ -6182,18 +6211,10 @@ impl PrivilegedDispatcher {
 
         // ---- Phase 1b (TCK-00340): Attestation ratchet validation ----
         //
-        // SECURITY: This endpoint currently only supports Tier0 work items.
-        // Tier0 requires no attestation beyond SelfSigned (reviewer identity
-        // verified in Phase 1). Non-Tier0 work items require stronger
-        // attestation (CounterSigned / ThresholdSigned) that this endpoint
-        // cannot yet provide — we HARD DENY them (fail-closed).
-        //
-        // TODO(RFC-0019): Resolve real risk tier from the active work item's
-        // policy state via ledger query when higher tiers are enabled. When
-        // `IngestReviewReceiptRequest` gains explicit attestation fields
-        // (counter_signer, threshold_count), replace the Tier0 constraint
-        // with a full `validate_receipt_attestation` call using actual
-        // metadata and the resolved risk tier.
+        // SECURITY: Resolve the real risk tier from the work item's policy
+        // resolution state. Higher tiers require stronger attestation
+        // (CounterSigned / ThresholdSigned). Fail-closed: if risk tier
+        // cannot be resolved, default to Tier4 (most restrictive).
         {
             let changeset_digest: [u8; 32] = request
                 .changeset_digest
@@ -6201,23 +6222,53 @@ impl PrivilegedDispatcher {
                 .try_into()
                 .expect("validated to be 32 bytes above");
 
-            // Resolve the risk tier for this work item. Currently the lease
-            // validator does not expose risk tier, so we default to Tier0 and
-            // hard-deny anything that would resolve to a higher tier.
-            //
-            // TODO(RFC-0019): Replace with real risk tier from work registry:
-            //   let risk_tier = self.lease_validator.get_work_risk_tier(&request.lease_id);
-            let risk_tier = RiskTier::Tier0;
+            // Resolve risk tier via: lease_id -> work_id -> work_claim -> policy_resolution
+            let (risk_tier, resolved_policy_hash) =
+                if let Some(wid) = self.lease_validator.get_lease_work_id(&request.lease_id) {
+                    if let Some(claim) = self.work_registry.get_claim(&wid) {
+                        let tier_u8 = claim.policy_resolution.resolved_risk_tier;
+                        let tier = RiskTier::try_from(tier_u8).unwrap_or_else(|_| {
+                            // FAIL-CLOSED: invalid tier value -> Tier4 (most restrictive)
+                            warn!(
+                                lease_id = %request.lease_id,
+                                work_id = %wid,
+                                tier_value = tier_u8,
+                                "Invalid risk tier value in policy resolution — \
+                                 defaulting to Tier4 (fail-closed)"
+                            );
+                            RiskTier::Tier4
+                        });
+                        (tier, claim.policy_resolution.resolved_policy_hash)
+                    } else {
+                        // FAIL-CLOSED: no work claim -> Tier4
+                        warn!(
+                            lease_id = %request.lease_id,
+                            work_id = %wid,
+                            "Work claim not found for lease — \
+                             defaulting to Tier4 (fail-closed)"
+                        );
+                        (RiskTier::Tier4, changeset_digest)
+                    }
+                } else {
+                    // FAIL-CLOSED: no work_id from lease -> Tier4
+                    warn!(
+                        lease_id = %request.lease_id,
+                        "Could not resolve work_id from lease — \
+                         defaulting to Tier4 (fail-closed)"
+                    );
+                    (RiskTier::Tier4, changeset_digest)
+                };
 
-            // FAIL-CLOSED: If the resolved tier were ever non-Tier0, reject
-            // immediately because this endpoint cannot provide the required
-            // attestation level for higher tiers.
+            // For non-Tier0 work: this endpoint only provides SelfSigned
+            // attestation. Higher tiers require CounterSigned or
+            // ThresholdSigned which this endpoint cannot produce — reject
+            // immediately (fail-closed).
             if risk_tier != RiskTier::Tier0 {
                 warn!(
                     receipt_id = %request.receipt_id,
                     risk_tier = ?risk_tier,
-                    "Non-Tier0 work item submitted to Tier0-only review receipt endpoint - \
-                     rejecting (fail-closed)"
+                    "Non-Tier0 work item submitted to review receipt endpoint — \
+                     rejecting (fail-closed, requires stronger attestation)"
                 );
                 return Ok(PrivilegedResponse::error(
                     PrivilegedErrorCode::CapabilityRequestRejected,
@@ -6231,21 +6282,21 @@ impl PrivilegedDispatcher {
             let attestation = ReceiptAttestation {
                 kind: ReceiptKind::Review,
                 level: AttestationLevel::SelfSigned,
-                policy_hash: changeset_digest,
+                policy_hash: resolved_policy_hash,
                 signer_identity: request.reviewer_actor_id.clone(),
                 counter_signer_identity: None,
                 threshold_signer_count: None,
             };
 
-            // Validate attestation against the Tier0 requirements.
-            // The policy_hash is bound to changeset_digest for Tier0 binding.
-            // This will reject if internal consistency checks fail (e.g.,
-            // empty signer_identity).
+            // Validate attestation against requirements using the resolved
+            // policy hash from the work item's policy resolution (not the
+            // raw changeset_digest). This binds the attestation to the
+            // governance-resolved policy state.
             let requirements = AttestationRequirements::new();
             if let Err(e) = validate_receipt_attestation(
                 &attestation,
                 risk_tier,
-                &changeset_digest,
+                &resolved_policy_hash,
                 &requirements,
             ) {
                 warn!(
@@ -8543,6 +8594,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -8854,6 +8906,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             author_custody_domains: vec![],
             executor_custody_domains: vec![],
@@ -10221,6 +10274,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -10253,6 +10307,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec![],
             author_custody_domains: vec![],
@@ -10322,6 +10377,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()],
@@ -10381,6 +10437,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec!["team-dev".to_string()],
@@ -10444,6 +10501,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-review".to_string()],
             author_custody_domains: vec![], // Empty - resolution failed
@@ -10504,6 +10562,7 @@ mod tests {
                 resolved_policy_hash: [0u8; 32],
                 capability_manifest_hash: [0u8; 32],
                 context_pack_hash: [0u8; 32],
+                resolved_risk_tier: 0,
             },
             executor_custody_domains: vec!["team-alpha".to_string()],
             author_custody_domains: vec!["team-alpha".to_string()], // Overlapping!
@@ -11260,6 +11319,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 author_custody_domains: vec![],
                 executor_custody_domains: vec![],
@@ -13628,6 +13688,7 @@ mod tests {
                             resolved_policy_hash: [0u8; 32],
                             capability_manifest_hash: [0u8; 32],
                             context_pack_hash: [0u8; 32],
+                            resolved_risk_tier: 0,
                         },
                         executor_custody_domains: vec![],
                         author_custody_domains: vec![],
@@ -13696,6 +13757,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -13739,6 +13801,7 @@ mod tests {
                     resolved_policy_hash: [0u8; 32],
                     capability_manifest_hash: [0u8; 32],
                     context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: 0,
                 },
                 executor_custody_domains: vec![],
                 author_custody_domains: vec![],
@@ -15094,12 +15157,27 @@ mod tests {
     mod ingest_review_receipt {
         use super::*;
 
-        /// Creates a dispatcher with a registered lease for testing.
+        /// Creates a dispatcher with a registered lease and Tier0 work claim
+        /// for testing. The work claim is registered so risk-tier
+        /// resolution can succeed (fail-closed semantics mean missing
+        /// claims -> Tier4 rejection).
         fn setup_dispatcher_with_lease(
             lease_id: &str,
             work_id: &str,
             gate_id: &str,
             executor_actor_id: &str,
+        ) -> (PrivilegedDispatcher, ConnectionContext) {
+            setup_dispatcher_with_lease_and_tier(lease_id, work_id, gate_id, executor_actor_id, 0)
+        }
+
+        /// Creates a dispatcher with a registered lease and a work claim at the
+        /// specified risk tier. Used to test attestation ratcheting behavior.
+        fn setup_dispatcher_with_lease_and_tier(
+            lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+            executor_actor_id: &str,
+            risk_tier: u8,
         ) -> (PrivilegedDispatcher, ConnectionContext) {
             let dispatcher = PrivilegedDispatcher::new();
             dispatcher.lease_validator.register_lease_with_executor(
@@ -15108,6 +15186,23 @@ mod tests {
                 gate_id,
                 executor_actor_id,
             );
+            // Register work claim so risk-tier resolution succeeds
+            let claim = WorkClaim {
+                work_id: work_id.to_string(),
+                lease_id: lease_id.to_string(),
+                actor_id: executor_actor_id.to_string(),
+                role: WorkRole::Reviewer,
+                policy_resolution: PolicyResolution {
+                    policy_resolved_ref: format!("PolicyResolvedForChangeSet:{work_id}"),
+                    resolved_policy_hash: [0u8; 32],
+                    capability_manifest_hash: [0u8; 32],
+                    context_pack_hash: [0u8; 32],
+                    resolved_risk_tier: risk_tier,
+                },
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            dispatcher.work_registry.register_claim(claim).unwrap();
             let ctx = ConnectionContext::privileged(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,
@@ -15751,6 +15846,231 @@ mod tests {
                     );
                 },
                 other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        // ====================================================================
+        // TCK-00340: Risk-tier resolution integration tests
+        // ====================================================================
+
+        #[test]
+        fn test_ingest_review_receipt_tier2_self_signed_rejected() {
+            // Tier2 work items require CounterSigned attestation for Review
+            // receipts. SelfSigned is insufficient — must be rejected.
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-t2-001",
+                "W-T2-001",
+                "gate-001",
+                "reviewer-tier2",
+                2, // Tier2
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t2-001".to_string(),
+                receipt_id: "RR-T2-001".to_string(),
+                reviewer_actor_id: "reviewer-tier2".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("only supports Tier0"),
+                        "Tier2 SelfSigned must be rejected with Tier0-only message, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("Tier2"),
+                        "Error must mention the resolved tier, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected rejection for Tier2 SelfSigned attestation, got {other:?}")
+                },
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier4_self_signed_rejected() {
+            // Tier4 is the highest risk tier — requires ThresholdSigned.
+            // SelfSigned must be rejected (fail-closed).
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-t4-001",
+                "W-T4-001",
+                "gate-001",
+                "reviewer-tier4",
+                4, // Tier4
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t4-001".to_string(),
+                receipt_id: "RR-T4-001".to_string(),
+                reviewer_actor_id: "reviewer-tier4".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("only supports Tier0"),
+                        "Tier4 SelfSigned must be rejected with Tier0-only message, got: {}",
+                        err.message
+                    );
+                    assert!(
+                        err.message.contains("Tier4"),
+                        "Error must mention the resolved tier, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected rejection for Tier4 SelfSigned attestation, got {other:?}")
+                },
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier0_resolved_passes_end_to_end() {
+            // Tier0 with SelfSigned through the FULL production path:
+            // lease -> work_id -> work_claim -> risk_tier=0 -> attestation ok -> event
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-e2e-001",
+                "W-E2E-001",
+                "gate-001",
+                "reviewer-e2e",
+                0, // Tier0
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-e2e-001".to_string(),
+                receipt_id: "RR-E2E-001".to_string(),
+                reviewer_actor_id: "reviewer-e2e".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-E2E-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Tier0 work with SelfSigned must pass attestation end-to-end"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "event_id must be non-empty on success"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Tier0 SelfSigned should pass end-to-end, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected IngestReviewReceipt, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_unresolvable_risk_tier_fails_closed() {
+            // When work_id can be resolved from the lease but no work claim
+            // exists in the registry, the risk tier is unresolvable.
+            // FAIL-CLOSED: must default to Tier4 and reject SelfSigned.
+            let dispatcher = PrivilegedDispatcher::new();
+            // Register lease but do NOT register a work claim
+            dispatcher.lease_validator.register_lease_with_executor(
+                "lease-no-claim",
+                "W-NO-CLAIM",
+                "gate-001",
+                "reviewer-no-claim",
+            );
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-no-claim".to_string(),
+                receipt_id: "RR-NO-CLAIM".to_string(),
+                reviewer_actor_id: "reviewer-no-claim".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("only supports Tier0")
+                            || err.message.contains("Tier4"),
+                        "Unresolvable risk tier must fail-closed (Tier4 rejection), got: {}",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected fail-closed rejection for unresolvable risk tier, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_tier1_rejected() {
+            // Tier1 requires at least CounterSigned for review receipts.
+            // SelfSigned is insufficient — must be rejected.
+            let (dispatcher, ctx) = setup_dispatcher_with_lease_and_tier(
+                "lease-t1-001",
+                "W-T1-001",
+                "gate-001",
+                "reviewer-tier1",
+                1, // Tier1
+            );
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-t1-001".to_string(),
+                receipt_id: "RR-T1-001".to_string(),
+                reviewer_actor_id: "reviewer-tier1".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("only supports Tier0"),
+                        "Tier1 SelfSigned must be rejected, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected rejection for Tier1 SelfSigned attestation, got {other:?}")
+                },
             }
         }
 

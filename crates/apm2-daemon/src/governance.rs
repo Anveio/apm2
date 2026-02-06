@@ -69,6 +69,8 @@ impl PolicyResolver for GovernancePolicyResolver {
             resolved_policy_hash: *policy_hash.as_bytes(),
             capability_manifest_hash: *manifest_hash.as_bytes(),
             context_pack_hash,
+            // TODO(RFC-0019): Resolve from governance policy. Tier0 default for now.
+            resolved_risk_tier: 0,
         })
     }
 }
