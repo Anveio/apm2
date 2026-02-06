@@ -67,6 +67,9 @@ use super::messages::{
     CredentialAuthMethod as ProtoAuthMethod,
     CredentialProvider as ProtoProvider,
     DecodeConfig,
+    // TCK-00340: Sublease delegation types
+    DelegateSubleaseRequest,
+    DelegateSubleaseResponse,
     EndSessionRequest,
     EndSessionResponse,
     // TCK-00389: Review receipt ingestion types
@@ -2623,6 +2626,9 @@ pub enum PrivilegedMessageType {
     // --- ChangeSet Publishing (RFC-0018, TCK-00394) ---
     /// `PublishChangeSet` request (IPC-PRIV-017)
     PublishChangeSet    = 70,
+    // --- Sublease Delegation (RFC-0019, TCK-00340) ---
+    /// `DelegateSublease` request (IPC-PRIV-072)
+    DelegateSublease    = 72,
 }
 
 impl PrivilegedMessageType {
@@ -2665,6 +2671,8 @@ impl PrivilegedMessageType {
             68 => Some(Self::PulseEvent),
             // ChangeSet publishing (TCK-00394)
             70 => Some(Self::PublishChangeSet),
+            // Sublease delegation (TCK-00340)
+            72 => Some(Self::DelegateSublease),
             _ => None,
         }
     }
@@ -2739,6 +2747,8 @@ pub enum PrivilegedResponse {
     ConsensusMetrics(ConsensusMetricsResponse),
     /// Successful `PublishChangeSet` response (TCK-00394).
     PublishChangeSet(PublishChangeSetResponse),
+    /// Successful `DelegateSublease` response (TCK-00340).
+    DelegateSublease(DelegateSubleaseResponse),
     /// Error response.
     Error(PrivilegedError),
 }
@@ -2879,6 +2889,10 @@ impl PrivilegedResponse {
             },
             Self::PublishChangeSet(resp) => {
                 buf.push(PrivilegedMessageType::PublishChangeSet.tag());
+                resp.encode(&mut buf).expect("encode cannot fail");
+            },
+            Self::DelegateSublease(resp) => {
+                buf.push(PrivilegedMessageType::DelegateSublease.tag());
                 resp.encode(&mut buf).expect("encode cannot fail");
             },
             Self::Error(err) => {
@@ -3025,6 +3039,27 @@ pub trait LeaseValidator: Send + Sync {
         let _ = executor_actor_id;
         self.register_lease(lease_id, work_id, gate_id);
     }
+
+    /// Returns the full `GateLease` for a given lease ID (TCK-00340).
+    ///
+    /// Used by `DelegateSublease` to retrieve the parent lease for
+    /// strict-subset validation and sublease issuance.
+    ///
+    /// # Returns
+    ///
+    /// `Some(GateLease)` if the lease exists, `None` otherwise.
+    fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
+        let _ = lease_id;
+        None
+    }
+
+    /// Registers a full `GateLease` for sublease delegation (TCK-00340).
+    ///
+    /// This method exists to support test fixtures and production paths
+    /// that need full lease objects for sublease delegation.
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
+        let _ = lease;
+    }
 }
 
 /// Entry for a registered lease.
@@ -3063,6 +3098,8 @@ pub struct StubLeaseValidator {
         std::collections::VecDeque<String>,
         std::collections::HashMap<String, LeaseEntry>,
     )>,
+    /// Full gate leases for sublease delegation (TCK-00340).
+    full_leases: std::sync::RwLock<std::collections::HashMap<String, apm2_core::fac::GateLease>>,
 }
 
 impl StubLeaseValidator {
@@ -3074,6 +3111,7 @@ impl StubLeaseValidator {
                 std::collections::VecDeque::new(),
                 std::collections::HashMap::new(),
             )),
+            full_leases: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -3164,6 +3202,16 @@ impl LeaseValidator for StubLeaseValidator {
                 executor_actor_id: executor_actor_id.to_string(),
             },
         );
+    }
+
+    fn get_gate_lease(&self, lease_id: &str) -> Option<apm2_core::fac::GateLease> {
+        let guard = self.full_leases.read().expect("lock poisoned");
+        guard.get(lease_id).cloned()
+    }
+
+    fn register_full_lease(&self, lease: &apm2_core::fac::GateLease) {
+        let mut guard = self.full_leases.write().expect("lock poisoned");
+        guard.insert(lease.lease_id.clone(), lease.clone());
     }
 }
 
@@ -3344,6 +3392,14 @@ pub struct PrivilegedDispatcher {
     /// CAS and returns the content hash for ledger event binding. When `None`,
     /// the handler returns an error indicating CAS is not configured.
     cas: Option<Arc<dyn ContentAddressedStore>>,
+
+    /// Gate orchestrator for sublease delegation (TCK-00340).
+    ///
+    /// When present, `DelegateSublease` delegates to the orchestrator to
+    /// issue signed subleases with strict-subset validation. When `None`,
+    /// the handler returns an error indicating the orchestrator is not
+    /// configured.
+    gate_orchestrator: Option<Arc<crate::gate::GateOrchestrator>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -3418,6 +3474,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -3475,6 +3532,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -3551,6 +3609,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -3604,6 +3663,7 @@ impl PrivilegedDispatcher {
             credential_store: None,
             telemetry_store: None,
             cas: None,
+            gate_orchestrator: None,
         }
     }
 
@@ -3656,6 +3716,16 @@ impl PrivilegedDispatcher {
     #[must_use]
     pub fn with_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
         self.cas = Some(cas);
+        self
+    }
+
+    /// Sets the gate orchestrator for sublease delegation (TCK-00340).
+    #[must_use]
+    pub fn with_gate_orchestrator(
+        mut self,
+        orchestrator: Arc<crate::gate::GateOrchestrator>,
+    ) -> Self {
+        self.gate_orchestrator = Some(orchestrator);
         self
     }
 
@@ -3983,6 +4053,8 @@ impl PrivilegedDispatcher {
             )),
             // TCK-00394: ChangeSet publishing for daemon-anchored submission
             PrivilegedMessageType::PublishChangeSet => self.handle_publish_changeset(payload, ctx),
+            // TCK-00340: Sublease delegation for child holon authorization
+            PrivilegedMessageType::DelegateSublease => self.handle_delegate_sublease(payload, ctx),
         };
 
         // TCK-00268: Emit IPC request completion metrics
@@ -4023,6 +4095,8 @@ impl PrivilegedDispatcher {
                 PrivilegedMessageType::PulseEvent => "PulseEvent",
                 // TCK-00394
                 PrivilegedMessageType::PublishChangeSet => "PublishChangeSet",
+                // TCK-00340
+                PrivilegedMessageType::DelegateSublease => "DelegateSublease",
             };
             let status = match &result {
                 Ok(PrivilegedResponse::Error(_)) => "error",
@@ -7061,6 +7135,190 @@ impl PrivilegedDispatcher {
         ))
     }
 
+    // =========================================================================
+    // TCK-00340: DelegateSublease Handler
+    // =========================================================================
+
+    /// Handles `DelegateSublease` requests (IPC-PRIV-072, TCK-00340).
+    ///
+    /// Delegates a sublease from a parent gate lease to a child holon,
+    /// validating strict-subset constraints before signing the sublease.
+    ///
+    /// # Security Invariants
+    ///
+    /// - **Admission before mutation**: Parent lease existence and validity are
+    ///   checked before any sublease issuance.
+    /// - **Fail-closed**: Any validation failure rejects the request.
+    /// - **Gate-scope enforcement**: Sublease inherits the parent's `gate_id`.
+    /// - **Strict-subset**: Sublease constraints cannot exceed parent bounds.
+    fn handle_delegate_sublease(
+        &self,
+        payload: &[u8],
+        _ctx: &ConnectionContext,
+    ) -> ProtocolResult<PrivilegedResponse> {
+        let request = DelegateSubleaseRequest::decode_bounded(payload, &self.decode_config)
+            .map_err(|e| ProtocolError::Serialization {
+                reason: format!("invalid DelegateSubleaseRequest: {e}"),
+            })?;
+
+        info!(
+            parent_lease_id = %request.parent_lease_id,
+            delegatee_actor_id = %request.delegatee_actor_id,
+            sublease_id = %request.sublease_id,
+            requested_expiry_ns = request.requested_expiry_ns,
+            "DelegateSublease request received"
+        );
+
+        // ---- Phase 0: Validate required fields (admission checks) ----
+
+        if request.parent_lease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "parent_lease_id is required",
+            ));
+        }
+        if request.parent_lease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("parent_lease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.delegatee_actor_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "delegatee_actor_id is required",
+            ));
+        }
+        if request.delegatee_actor_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("delegatee_actor_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.sublease_id.is_empty() {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "sublease_id is required",
+            ));
+        }
+        if request.sublease_id.len() > MAX_ID_LENGTH {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!("sublease_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        if request.requested_expiry_ns == 0 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "requested_expiry_ns must be non-zero",
+            ));
+        }
+
+        // ---- Phase 1: Gate orchestrator availability ----
+        let Some(gate_orchestrator) = &self.gate_orchestrator else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                "gate orchestrator not configured",
+            ));
+        };
+
+        // ---- Phase 2: Retrieve parent lease (admission check) ----
+        let Some(parent_lease) = self
+            .lease_validator
+            .get_gate_lease(&request.parent_lease_id)
+        else {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::GateLeaseMissing,
+                format!("parent gate lease not found: {}", request.parent_lease_id),
+            ));
+        };
+
+        // ---- Phase 3: Get HTF timestamp ----
+        let timestamp_ns = match self.get_htf_timestamp_ns() {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(error = %e, "HTF timestamp generation failed - failing closed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("HTF timestamp error: {e}"),
+                ));
+            },
+        };
+
+        // ---- Phase 4: Issue sublease via orchestrator (validates strict-subset) ----
+        let sublease = match gate_orchestrator.issue_delegated_sublease(
+            &parent_lease,
+            &request.sublease_id,
+            &request.delegatee_actor_id,
+            timestamp_ns,
+            request.requested_expiry_ns,
+        ) {
+            Ok(lease) => lease,
+            Err(e) => {
+                warn!(
+                    parent_lease_id = %request.parent_lease_id,
+                    error = %e,
+                    "Sublease delegation rejected"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("sublease delegation failed: {e}"),
+                ));
+            },
+        };
+
+        // ---- Phase 5: Emit SubleaseIssued event ----
+        let event_payload = serde_json::json!({
+            "parent_lease_id": request.parent_lease_id,
+            "sublease_id": sublease.lease_id,
+            "delegatee_actor_id": request.delegatee_actor_id,
+            "gate_id": sublease.gate_id,
+            "work_id": sublease.work_id,
+            "expires_at": sublease.expires_at,
+            "issued_at": sublease.issued_at,
+        });
+        let event_payload_bytes = serde_json::to_vec(&event_payload).unwrap_or_default();
+
+        let signed_event = match self.event_emitter.emit_session_event(
+            &sublease.lease_id,
+            "SubleaseIssued",
+            &event_payload_bytes,
+            &request.delegatee_actor_id,
+            timestamp_ns,
+        ) {
+            Ok(evt) => evt,
+            Err(e) => {
+                warn!(error = %e, "SubleaseIssued event emission failed");
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("SubleaseIssued event emission failed: {e}"),
+                ));
+            },
+        };
+
+        info!(
+            parent_lease_id = %request.parent_lease_id,
+            sublease_id = %sublease.lease_id,
+            gate_id = %sublease.gate_id,
+            event_id = %signed_event.event_id,
+            "Sublease delegation completed successfully"
+        );
+
+        Ok(PrivilegedResponse::DelegateSublease(
+            DelegateSubleaseResponse {
+                sublease_id: sublease.lease_id,
+                parent_lease_id: request.parent_lease_id,
+                delegatee_actor_id: request.delegatee_actor_id,
+                gate_id: sublease.gate_id,
+                expires_at_ns: sublease.expires_at,
+                event_id: signed_event.event_id,
+            },
+        ))
+    }
+
     #[allow(clippy::result_large_err)] // Error variant is PrivilegedResponse, matching dispatch pattern
     fn require_credential_store(&self) -> Result<&CredentialStore, PrivilegedResponse> {
         self.credential_store.as_deref().ok_or_else(|| {
@@ -7980,6 +8238,14 @@ pub fn encode_end_session_request(request: &EndSessionRequest) -> Bytes {
 #[must_use]
 pub fn encode_ingest_review_receipt_request(request: &IngestReviewReceiptRequest) -> Bytes {
     let mut buf = vec![PrivilegedMessageType::IngestReviewReceipt.tag()];
+    request.encode(&mut buf).expect("encode cannot fail");
+    Bytes::from(buf)
+}
+
+/// Encodes a `DelegateSublease` request to bytes for sending (TCK-00340).
+#[must_use]
+pub fn encode_delegate_sublease_request(request: &DelegateSubleaseRequest) -> Bytes {
+    let mut buf = vec![PrivilegedMessageType::DelegateSublease.tag()];
     request.encode(&mut buf).expect("encode cannot fail");
     Bytes::from(buf)
 }
@@ -15486,6 +15752,374 @@ mod tests {
                 },
                 other => panic!("Expected IngestReviewReceipt, got {other:?}"),
             }
+        }
+
+        // ====================================================================
+        // TCK-00340: DelegateSublease IPC Integration Tests
+        // ====================================================================
+
+        /// Helper: build a dispatcher with a gate orchestrator and a registered
+        /// parent lease for sublease delegation tests.
+        fn setup_dispatcher_with_orchestrator(
+            parent_lease_id: &str,
+            work_id: &str,
+            gate_id: &str,
+            executor_actor_id: &str,
+        ) -> (
+            PrivilegedDispatcher,
+            ConnectionContext,
+            apm2_core::fac::GateLease,
+        ) {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer.clone(),
+            ));
+
+            let parent_lease =
+                apm2_core::fac::GateLeaseBuilder::new(parent_lease_id, work_id, gate_id)
+                    .changeset_digest([0x42; 32])
+                    .executor_actor_id(executor_actor_id)
+                    .issued_at(1_000_000)
+                    .expires_at(2_000_000)
+                    .policy_hash([0xAB; 32])
+                    .issuer_actor_id("issuer-001")
+                    .time_envelope_ref("htf:tick:100")
+                    .build_and_sign(&signer);
+
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            dispatcher
+                .lease_validator
+                .register_full_lease(&parent_lease);
+            dispatcher.lease_validator.register_lease_with_executor(
+                parent_lease_id,
+                work_id,
+                gate_id,
+                executor_actor_id,
+            );
+
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+            (dispatcher, ctx, parent_lease)
+        }
+
+        #[test]
+        fn test_delegate_sublease_valid_succeeds() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-001",
+                "W-DS-001",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::DelegateSublease(resp) => {
+                    assert_eq!(resp.sublease_id, "sublease-001");
+                    assert_eq!(resp.parent_lease_id, "parent-lease-001");
+                    assert_eq!(resp.delegatee_actor_id, "child-executor-001");
+                    assert_eq!(resp.gate_id, "gate-quality");
+                    assert_eq!(resp.expires_at_ns, 1_900_000);
+                    assert!(!resp.event_id.is_empty(), "event_id must be non-empty");
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "Expected DelegateSublease success, got error: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected DelegateSublease, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_parent_not_found_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            // Do NOT register any parent lease
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "nonexistent-lease".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-002".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("parent gate lease not found"),
+                        "Error should mention parent lease not found: {}",
+                        err.message
+                    );
+                    assert_eq!(
+                        err.code,
+                        i32::from(PrivilegedErrorCode::GateLeaseMissing),
+                        "Error code should be GateLeaseMissing"
+                    );
+                },
+                other => panic!("Expected error for missing parent, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_expired_parent_rejected() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-exp",
+                "W-DS-EXP",
+                "gate-quality",
+                "executor-001",
+            );
+
+            // Request sublease with expiry EXCEEDING parent bounds (parent
+            // expires at 2_000_000, sublease requests 3_000_000).
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-exp".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 3_000_000, // Exceeds parent's expires_at
+                sublease_id: "sublease-overflow".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("sublease delegation failed"),
+                        "Error should mention sublease delegation failure: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for expiry overflow, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_empty_parent_lease_id_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: String::new(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-003".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("parent_lease_id is required"),
+                        "Error should mention missing parent_lease_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for empty parent_lease_id, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_empty_delegatee_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: String::new(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-004".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("delegatee_actor_id is required"),
+                        "Error should mention missing delegatee_actor_id: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for empty delegatee_actor_id, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_no_orchestrator_rejected() {
+            // Dispatcher without gate orchestrator configured
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-005".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("gate orchestrator not configured"),
+                        "Error should mention orchestrator not configured: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing orchestrator, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_non_privileged_rejected() {
+            let (dispatcher, _ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-np",
+                "W-DS-NP",
+                "gate-quality",
+                "executor-001",
+            );
+            // Non-privileged context
+            let ctx = ConnectionContext::session(
+                Some(PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                }),
+                Some("test-session".to_string()),
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-np".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-006".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("permission denied"),
+                        "Non-privileged connections must be rejected: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected permission denied, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_message_type_tag() {
+            assert_eq!(PrivilegedMessageType::DelegateSublease.tag(), 72);
+            assert_eq!(
+                PrivilegedMessageType::from_tag(72),
+                Some(PrivilegedMessageType::DelegateSublease)
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_response_encoding() {
+            let resp = PrivilegedResponse::DelegateSublease(DelegateSubleaseResponse {
+                sublease_id: "sub-001".to_string(),
+                parent_lease_id: "parent-001".to_string(),
+                delegatee_actor_id: "child-001".to_string(),
+                gate_id: "gate-quality".to_string(),
+                expires_at_ns: 1_900_000,
+                event_id: "evt-001".to_string(),
+            });
+            let encoded = resp.encode();
+            assert_eq!(
+                encoded[0],
+                PrivilegedMessageType::DelegateSublease.tag(),
+                "First byte should be DelegateSublease tag (72)"
+            );
+            assert!(
+                encoded.len() > 1,
+                "Encoded response should have payload after tag"
+            );
+        }
+
+        #[test]
+        fn test_delegate_sublease_ledger_event_emitted() {
+            let (dispatcher, ctx, _parent) = setup_dispatcher_with_orchestrator(
+                "parent-lease-evt",
+                "W-DS-EVT",
+                "gate-quality",
+                "executor-001",
+            );
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-evt".to_string(),
+                delegatee_actor_id: "child-executor-evt".to_string(),
+                requested_expiry_ns: 1_900_000,
+                sublease_id: "sublease-evt-001".to_string(),
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            let event_id = match response {
+                PrivilegedResponse::DelegateSublease(resp) => resp.event_id,
+                other => panic!("Expected DelegateSublease, got {other:?}"),
+            };
+
+            // Verify the event was persisted to the emitter
+            let stored_event = dispatcher.event_emitter.get_event(&event_id);
+            assert!(
+                stored_event.is_some(),
+                "SubleaseIssued event should be persisted in emitter"
+            );
+            let event = stored_event.unwrap();
+            assert_eq!(event.event_type, "SubleaseIssued");
+            assert_eq!(event.actor_id, "child-executor-evt");
+            assert!(event.timestamp_ns > 0, "Timestamp must be non-zero (HTF)");
         }
     }
 }
