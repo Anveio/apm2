@@ -15389,11 +15389,11 @@ mod tests {
             // This test validates that the attestation requirements table
             // correctly rejects SelfSigned at higher tiers (proving the
             // fail-closed guard is necessary and would work if activated).
+            use apm2_core::fac::RiskTier;
             use apm2_core::fac::policy_inheritance::{
                 AttestationLevel, AttestationRequirements, ReceiptAttestation, ReceiptKind,
                 validate_receipt_attestation,
             };
-            use apm2_core::fac::RiskTier;
 
             let requirements = AttestationRequirements::new();
             let changeset_digest = [0x42; 32];
