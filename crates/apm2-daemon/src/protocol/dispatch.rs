@@ -7730,8 +7730,27 @@ impl PrivilegedDispatcher {
                     ));
                 }
 
+                // Look up the original SubleaseIssued event_id from the
+                // ledger. The emit_session_event call stored the event with
+                // work_id = sublease.lease_id, so we query by that key and
+                // filter for event_type == "SubleaseIssued".
+                //
+                // SECURITY: The response contract defines event_id as the
+                // ledger event identity for SubleaseIssued. Returning an
+                // empty string on idempotent replay would violate this
+                // contract and prevent callers from verifying the ledger
+                // trail of the sublease.
+                let original_event_id = self
+                    .event_emitter
+                    .get_events_by_work_id(&existing.lease_id)
+                    .into_iter()
+                    .find(|e| e.event_type == "SubleaseIssued")
+                    .map(|e| e.event_id)
+                    .unwrap_or_default();
+
                 info!(
                     sublease_id = %request.sublease_id,
+                    event_id = %original_event_id,
                     "Sublease already exists with identical parameters - idempotent return"
                 );
                 // Convert ms -> ns for response (existing.expires_at is in ms)
@@ -7742,7 +7761,7 @@ impl PrivilegedDispatcher {
                         delegatee_actor_id: request.delegatee_actor_id,
                         gate_id: existing.gate_id.clone(),
                         expires_at_ns: existing.expires_at.saturating_mul(1_000_000),
-                        event_id: String::new(), // No new event for idempotent return
+                        event_id: original_event_id,
                     },
                 ));
             }
@@ -17233,22 +17252,36 @@ mod tests {
             };
             let frame = encode_delegate_sublease_request(&request);
 
-            // First call: should succeed
+            // First call: should succeed and return a non-empty event_id
             let response = dispatcher.dispatch(&frame, &ctx).unwrap();
-            match &response {
+            let original_event_id = match &response {
                 PrivilegedResponse::DelegateSublease(resp) => {
                     assert_eq!(resp.sublease_id, "sublease-dup-001");
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "First delegation must return non-empty event_id"
+                    );
+                    resp.event_id.clone()
                 },
                 other => panic!("Expected DelegateSublease success, got {other:?}"),
-            }
+            };
 
-            // Second call with same parameters: should return idempotent result
+            // Second call with same parameters: should return idempotent
+            // result with the ORIGINAL event_id (not empty).
             let response2 = dispatcher.dispatch(&frame, &ctx).unwrap();
             match response2 {
                 PrivilegedResponse::DelegateSublease(resp) => {
                     assert_eq!(
                         resp.sublease_id, "sublease-dup-001",
                         "Idempotent return should have same sublease_id"
+                    );
+                    assert_eq!(
+                        resp.event_id, original_event_id,
+                        "Idempotent return must replay the original SubleaseIssued event_id"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Idempotent event_id must not be empty"
                     );
                 },
                 other => panic!("Expected idempotent DelegateSublease, got {other:?}"),
@@ -17933,6 +17966,128 @@ mod tests {
                     );
                 },
                 other => panic!("Expected IngestReviewReceipt via production path, got {other:?}"),
+            }
+        }
+
+        /// Integration test: exercises the production `GovernancePolicyResolver
+        /// -> ClaimWork -> IngestReviewReceipt` path end-to-end.
+        /// Verifies that the governance resolver's transitional Tier1
+        /// mapping permits `SelfSigned` attestation through the review
+        /// receipt handler.
+        ///
+        /// This test was added as part of TCK-00340 quality fix to prevent
+        /// regression where hardcoded Tier4 would block all production claims.
+        #[test]
+        fn test_governance_resolver_claim_then_ingest_review_receipt_production_path() {
+            use crate::governance::GovernancePolicyResolver;
+            use crate::state::DispatcherState;
+
+            let conn = Connection::open_in_memory().unwrap();
+            SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+            SqliteWorkRegistry::init_schema(&conn).unwrap();
+            let conn = Arc::new(Mutex::new(conn));
+
+            let session_registry: Arc<dyn SessionRegistry> =
+                Arc::new(InMemorySessionRegistry::new());
+
+            // Construct via production DispatcherState path
+            let state = DispatcherState::with_persistence(
+                session_registry,
+                None, // no metrics
+                Some(Arc::clone(&conn)),
+                None, // generate fresh signing key
+            );
+
+            // Derive caller actor from test peer credentials
+            let test_creds = PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            };
+            let caller_actor = derive_actor_id(&test_creds);
+            let ctx = ConnectionContext::privileged(Some(test_creds));
+
+            // Step 1: Use GovernancePolicyResolver to produce the PolicyResolution
+            // (this is what ClaimWork calls in production with_persistence path)
+            let governance_resolver = GovernancePolicyResolver::new();
+            let policy_resolution = governance_resolver
+                .resolve_for_claim("W-GOV-001", WorkRole::Reviewer, &caller_actor)
+                .expect("GovernancePolicyResolver must succeed");
+
+            // Verify the governance resolver returns Tier1 (not Tier4)
+            assert_eq!(
+                policy_resolution.resolved_risk_tier, 1,
+                "GovernancePolicyResolver must return Tier1 for transitional mapping"
+            );
+
+            // Step 2: Register the work claim with the governance-produced resolution
+            let claim = WorkClaim {
+                work_id: "W-GOV-001".to_string(),
+                lease_id: "lease-gov-001".to_string(),
+                actor_id: caller_actor.clone(),
+                role: WorkRole::Reviewer,
+                policy_resolution,
+                executor_custody_domains: vec![],
+                author_custody_domains: vec![],
+            };
+            state
+                .privileged_dispatcher()
+                .work_registry
+                .register_claim(claim)
+                .expect("Claim registration must succeed");
+
+            // Step 3: Register the lease for reviewer identity validation
+            state
+                .privileged_dispatcher()
+                .lease_validator
+                .register_lease_with_executor(
+                    "lease-gov-001",
+                    "W-GOV-001",
+                    "gate-gov",
+                    &caller_actor,
+                );
+
+            // Step 4: Submit IngestReviewReceipt with SelfSigned attestation
+            let review_request = IngestReviewReceiptRequest {
+                lease_id: "lease-gov-001".to_string(),
+                receipt_id: "RR-GOV-001".to_string(),
+                reviewer_actor_id: caller_actor,
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+            };
+            let review_frame = encode_ingest_review_receipt_request(&review_request);
+
+            let review_response = state
+                .privileged_dispatcher()
+                .dispatch(&review_frame, &ctx)
+                .unwrap();
+            match review_response {
+                PrivilegedResponse::IngestReviewReceipt(resp) => {
+                    assert_eq!(resp.receipt_id, "RR-GOV-001");
+                    assert_eq!(
+                        resp.event_type, "ReviewReceiptRecorded",
+                        "Governance-resolved Tier1 claim with SelfSigned attestation \
+                         must pass through production path"
+                    );
+                    assert!(
+                        !resp.event_id.is_empty(),
+                        "Event ID must be non-empty for governance-resolved production path"
+                    );
+                },
+                PrivilegedResponse::Error(err) => {
+                    panic!(
+                        "IngestReviewReceipt MUST succeed for governance-resolved Tier1 claim \
+                         with SelfSigned attestation. Got error: {}. This is the TCK-00340 \
+                         regression where hardcoded Tier4 blocked all production claims.",
+                        err.message
+                    );
+                },
+                other => panic!(
+                    "Expected IngestReviewReceipt via governance-resolved path, got {other:?}"
+                ),
             }
         }
     }
