@@ -28,8 +28,12 @@
 //!
 //! The merkle root is computed as:
 //! ```text
-//! blake3("apm2:keyset_id:v1\0" + canonical_sorted_member_key_ids)
+//! blake3("apm2:keyset_id:v1\0" + set_mode_name + "\n" + canonical_sorted_member_key_ids)
 //! ```
+//!
+//! The set mode name (e.g. `"multisig"`, `"threshold"`) is included in
+//! the hash so that distinct quorum policies over the same member set
+//! produce distinct identifiers, preventing policy-collision attacks.
 //!
 //! Member key IDs are sorted lexicographically by their raw binary form
 //! before hashing, ensuring deterministic derivation regardless of input
@@ -140,7 +144,12 @@ impl KeySetIdV1 {
     /// hashing, ensuring deterministic derivation regardless of input order.
     ///
     /// The merkle root is computed as:
-    /// `blake3("apm2:keyset_id:v1\0" + sorted_member_binaries)`
+    /// `blake3("apm2:keyset_id:v1\0" + set_tag_name + "\n" +
+    /// sorted_member_binaries)`
+    ///
+    /// The `set_tag` mode name is included in the hash so that distinct
+    /// quorum policies (e.g. Multisig vs Threshold) over the same member
+    /// set produce distinct identifiers, preventing policy-collision attacks.
     pub fn from_members(set_tag: SetTag, members: &[PublicKeyIdV1]) -> Self {
         // Sort members by their binary representation for determinism
         let mut sorted_binaries: Vec<[u8; BINARY_LEN]> =
@@ -149,6 +158,9 @@ impl KeySetIdV1 {
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN_SEPARATION);
+        // Include the mode name so distinct policies never collide
+        hasher.update(set_tag.name().as_bytes());
+        hasher.update(b"\n");
         for member_binary in &sorted_binaries {
             hasher.update(member_binary);
         }
@@ -171,13 +183,12 @@ impl KeySetIdV1 {
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
         validate_text_common(input)?;
 
-        // Check prefix
+        // Check prefix — use `str::get` for char-boundary-safe extraction to
+        // avoid panics on malformed/multi-byte Unicode input.
         let payload = input.strip_prefix(PREFIX).ok_or_else(|| {
-            let got = if input.len() >= PREFIX.len() {
-                input[..PREFIX.len()].to_string()
-            } else {
-                input.to_string()
-            };
+            let got = input
+                .get(..PREFIX.len())
+                .map_or_else(|| input.to_string(), str::to_string);
             KeyIdError::WrongPrefix {
                 expected: PREFIX,
                 got,
@@ -336,12 +347,15 @@ mod tests {
         let key1 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
         let key2 = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
 
-        // from_members uses the tag in the binary form but not in hash derivation
-        // so the hash is the same but the binary differs at byte 0
+        // The set_tag mode name is included in the hash derivation so
+        // distinct quorum policies produce distinct identifiers even when
+        // the member set is identical.
         let id_multi = KeySetIdV1::from_members(SetTag::Multisig, &[key1.clone(), key2.clone()]);
         let id_thresh = KeySetIdV1::from_members(SetTag::Threshold, &[key1, key2]);
 
         assert_ne!(id_multi, id_thresh);
+        // Verify the merkle roots themselves differ (not just the tag byte)
+        assert_ne!(id_multi.merkle_root(), id_thresh.merkle_root());
     }
 
     #[test]
@@ -472,5 +486,24 @@ mod tests {
         assert_eq!(id.set_tag(), SetTag::Multisig);
         assert_eq!(id.merkle_root().len(), 32);
         assert_eq!(id.as_bytes().len(), 33);
+    }
+
+    /// Regression test: multi-byte Unicode at the prefix boundary must return
+    /// `Err`, never panic via byte-index slicing on a non-char boundary.
+    #[test]
+    fn unicode_prefix_boundary_does_not_panic() {
+        let inputs = [
+            "\u{00E9}\u{00E9}xx",               // 2-byte chars at positions 0..4
+            "\u{1F600}garbage",                 // 4-byte emoji at position 0
+            "k\u{00E9}1:stuff",                 // multi-byte char overlapping prefix boundary
+            "\u{0301}\u{0301}\u{0301}\u{0301}", // combining accents
+        ];
+        for input in &inputs {
+            let result = KeySetIdV1::parse_text(input);
+            assert!(
+                result.is_err(),
+                "expected Err for malformed Unicode input {input:?}, got Ok"
+            );
+        }
     }
 }

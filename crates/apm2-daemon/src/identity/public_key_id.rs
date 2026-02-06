@@ -148,13 +148,12 @@ impl PublicKeyIdV1 {
     pub fn parse_text(input: &str) -> Result<Self, KeyIdError> {
         validate_text_common(input)?;
 
-        // Check prefix
+        // Check prefix — use `str::get` for char-boundary-safe extraction to
+        // avoid panics on malformed/multi-byte Unicode input.
         let payload = input.strip_prefix(PREFIX).ok_or_else(|| {
-            let got = if input.len() >= PREFIX.len() {
-                input[..PREFIX.len()].to_string()
-            } else {
-                input.to_string()
-            };
+            let got = input
+                .get(..PREFIX.len())
+                .map_or_else(|| input.to_string(), str::to_string);
             KeyIdError::WrongPrefix {
                 expected: PREFIX,
                 got,
@@ -465,5 +464,26 @@ mod tests {
         let err =
             PublicKeyIdV1::parse_text("pk1:1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert!(err.is_err());
+    }
+
+    /// Regression test: multi-byte Unicode at the prefix boundary must return
+    /// `Err`, never panic via byte-index slicing on a non-char boundary.
+    #[test]
+    fn unicode_prefix_boundary_does_not_panic() {
+        // U+00E9 (e-acute) is 2 bytes in UTF-8; placing it so that byte index
+        // 4 (PREFIX.len()) falls inside the multi-byte sequence.
+        let inputs = [
+            "\u{00E9}\u{00E9}xx",               // 2-byte chars at positions 0..4
+            "\u{1F600}garbage",                 // 4-byte emoji at position 0
+            "p\u{00E9}1:stuff",                 // multi-byte char overlapping prefix boundary
+            "\u{0301}\u{0301}\u{0301}\u{0301}", // combining accents
+        ];
+        for input in &inputs {
+            let result = PublicKeyIdV1::parse_text(input);
+            assert!(
+                result.is_err(),
+                "expected Err for malformed Unicode input {input:?}, got Ok"
+            );
+        }
     }
 }

@@ -3,18 +3,58 @@
 //! This module implements [`PublicKeyIdV1`] and [`KeySetIdV1`], the canonical
 //! binary and text forms for self-certifying cryptographic key identifiers.
 //!
-//! # Text Form Grammar
+//! # V1 Canonical Text Form Grammar
+//!
+//! The following grammar defines the **v1 canonical text form** for key
+//! identifiers. This is the authoritative grammar for this implementation;
+//! future versions may extend it with additional prefixes or tag values while
+//! preserving backward compatibility.
 //!
 //! ```text
-//! PublicKeyIdV1 ::= "pk1:" <base32lower_no_pad(algorithm_tag || key_hash)>
-//! KeySetIdV1   ::= "ks1:" <base32lower_no_pad(set_tag || merkle_root)>
+//! identifier       ::= public_key_id | keyset_id
+//! public_key_id    ::= "pk1:" payload
+//! keyset_id        ::= "ks1:" payload
+//! payload          ::= base32lower_char{53}
+//! base32lower_char ::= [a-z2-7]
 //! ```
 //!
-//! - `algorithm_tag`: 1 byte identifying the key algorithm
-//! - `key_hash`: 32-byte BLAKE3 hash of the domain-separated key material
-//! - `set_tag`: 1 byte identifying the key-set mode
-//! - `merkle_root`: 32-byte BLAKE3 hash of sorted member key IDs
-//! - Base32 encoding: RFC 4648 lowercase, no padding (`a-z2-7`)
+//! The decoded payload (33 bytes) is structured as:
+//!
+//! ```text
+//! decoded_payload  ::= tag_byte hash_bytes
+//! tag_byte         ::= OCTET              ; 1 byte, must be a known tag value
+//! hash_bytes       ::= 32*OCTET           ; 32-byte BLAKE3 digest
+//! ```
+//!
+//! ## Tag Byte Values
+//!
+//! | Prefix | Tag  | Meaning           |
+//! |--------|------|-------------------|
+//! | `pk1:` | 0x01 | Ed25519           |
+//! | `ks1:` | 0x01 | Multisig (n-of-n) |
+//! | `ks1:` | 0x02 | Threshold (k-of-n)|
+//!
+//! Unknown tag values MUST be rejected (fail-closed per REQ-0007).
+//!
+//! ## Derivation Details
+//!
+//! **`PublicKeyIdV1` hash:**
+//!
+//! ```text
+//! blake3("apm2:pkid:v1\0" + algorithm_name + "\n" + key_bytes)
+//! ```
+//!
+//! **`KeySetIdV1` hash:**
+//!
+//! ```text
+//! blake3("apm2:keyset_id:v1\0" + set_mode_name + "\n" + sorted_member_binaries)
+//! ```
+//!
+//! The set mode name is included in the `KeySetIdV1` hash so that distinct
+//! quorum policies (Multisig vs Threshold) over the same member set produce
+//! distinct identifiers.
+//!
+//! - Base32 encoding: RFC 4648 lowercase alphabet, no padding (`a-z2-7`)
 //!
 //! # Security Invariants
 //!

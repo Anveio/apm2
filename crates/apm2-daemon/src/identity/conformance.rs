@@ -5,6 +5,16 @@
 //! non-canonical / malformed inputs. They are suitable for cross-language
 //! conformance testing.
 //!
+//! # Design: Frozen Static Fixtures
+//!
+//! Valid vectors use **precomputed, frozen** hex/text values derived once
+//! from known key material and then checked in as static string constants.
+//! This ensures that conformance tests detect regressions in derivation
+//! logic rather than tautologically re-deriving expected values at runtime.
+//!
+//! Parser-differential tests (which *do* derive at runtime and compare
+//! text vs binary parsers) are kept separate in the `#[cfg(test)]` section.
+//!
 //! # Vector Categories
 //!
 //! 1. **Valid `PublicKeyIdV1` vectors**: known-good binary + text round-trips
@@ -100,110 +110,96 @@ pub enum ExpectedError {
 }
 
 // ============================================================================
-// Valid PublicKeyIdV1 Vectors
+// Valid PublicKeyIdV1 Vectors (frozen static fixtures)
 // ============================================================================
 
-/// Generate valid `PublicKeyIdV1` conformance vectors at runtime.
+/// Frozen valid `PublicKeyIdV1` conformance vectors.
 ///
-/// These vectors are computed from known key material to ensure
-/// deterministic derivation across implementations.
-pub fn valid_public_key_id_vectors() -> Vec<(ValidPublicKeyIdVector, PublicKeyIdV1)> {
-    let vectors = [
-        ("ed25519_zeros", AlgorithmTag::Ed25519, [0x00u8; 32]),
-        ("ed25519_ones", AlgorithmTag::Ed25519, [0x01u8; 32]),
-        ("ed25519_ff", AlgorithmTag::Ed25519, [0xFFu8; 32]),
-        ("ed25519_ascending", AlgorithmTag::Ed25519, {
-            let mut buf = [0u8; 32];
-            let mut i: u8 = 0;
-            for b in &mut buf {
-                *b = i;
-                i = i.wrapping_add(1);
-            }
-            buf
-        }),
-        ("ed25519_descending", AlgorithmTag::Ed25519, {
-            let mut buf = [0u8; 32];
-            let mut i: u8 = 31;
-            for b in &mut buf {
-                *b = i;
-                i = i.wrapping_sub(1);
-            }
-            buf
-        }),
-    ];
-
-    vectors
-        .into_iter()
-        .map(|(name, alg, key_bytes)| {
-            let id = PublicKeyIdV1::from_key_bytes(alg, &key_bytes);
-            let text = id.to_text();
-            let binary = id.to_binary();
-            let binary_hex_owned = hex::encode(binary);
-            // Leak the strings so they live for 'static (test-only pattern)
-            let text_leaked: &'static str = Box::leak(text.into_boxed_str());
-            let hex_leaked: &'static str = Box::leak(binary_hex_owned.into_boxed_str());
-            let vector = ValidPublicKeyIdVector {
-                name,
-                algorithm: alg,
-                binary_hex: hex_leaked,
-                text: text_leaked,
-            };
-            (vector, id)
-        })
-        .collect()
+/// These values were derived once from known key material:
+///   - `ed25519_zeros`:      Ed25519, `key_bytes` = `[0x00; 32]`
+///   - `ed25519_ones`:       Ed25519, `key_bytes` = `[0x01; 32]`
+///   - `ed25519_ff`:         Ed25519, `key_bytes` = `[0xFF; 32]`
+///   - `ed25519_ascending`:  Ed25519, `key_bytes` = `[0, 1, 2, ..., 31]`
+///   - `ed25519_descending`: Ed25519, `key_bytes` = `[31, 30, ..., 0]`
+///
+/// They are now checked in as static constants. Any change to the
+/// derivation algorithm will cause these tests to fail, which is the
+/// intended regression-detection behavior.
+pub fn valid_public_key_id_vectors() -> Vec<ValidPublicKeyIdVector> {
+    vec![
+        ValidPublicKeyIdVector {
+            name: "ed25519_zeros",
+            algorithm: AlgorithmTag::Ed25519,
+            binary_hex: "01e75e981fde14df8a9ced962f1ac75bd10acc7d561eac03feebbe9206137bff4d",
+            text: "pk1:ahtv5ga73ykn7cu45wlc6gwhlpiqvtd5kypkya765o7jebqtpp7u2",
+        },
+        ValidPublicKeyIdVector {
+            name: "ed25519_ones",
+            algorithm: AlgorithmTag::Ed25519,
+            binary_hex: "01cbdd01abdad3a310a236bdd30c66844bdbb5d6900e31f3c755e22a8a56b00b04",
+            text: "pk1:ahf52anl3lj2gefcg265gddgqrf5xnowsahdd46hkxrcvcswwafqi",
+        },
+        ValidPublicKeyIdVector {
+            name: "ed25519_ff",
+            algorithm: AlgorithmTag::Ed25519,
+            binary_hex: "01914b4ecc450789be90462cec21b1012da35085b5a08efebc136632dc7bf6719c",
+            text: "pk1:agiuwtwmiudytpuqiywoyinraew2guefwwqi57v4cntdfxd36zyzy",
+        },
+        ValidPublicKeyIdVector {
+            name: "ed25519_ascending",
+            algorithm: AlgorithmTag::Ed25519,
+            binary_hex: "013a3b4abb8571e625ff5ac950526527eba0b6f1d8110e97fd70a7c7d08fb2cc3a",
+            text: "pk1:ae5dwsv3qvy6mjp7llevautfe7v2bnxr3aiq5f75oct4puepwlgdu",
+        },
+        ValidPublicKeyIdVector {
+            name: "ed25519_descending",
+            algorithm: AlgorithmTag::Ed25519,
+            binary_hex: "01a02d40fc8cb608ad2a6d798607543625c3a041cc61e30e2be5ab0675387aadbc",
+            text: "pk1:agqc2qh4rs3arljknv4ymb2ugys4hicbzrq6gdrl4wvqm5jypkw3y",
+        },
+    ]
 }
 
 // ============================================================================
-// Valid KeySetIdV1 Vectors
+// Valid KeySetIdV1 Vectors (frozen static fixtures)
 // ============================================================================
 
-/// Generate valid `KeySetIdV1` conformance vectors at runtime.
-pub fn valid_keyset_id_vectors() -> Vec<(ValidKeySetIdVector, KeySetIdV1)> {
-    let key_a = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
-    let key_b = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
-    let key_c = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xCC; 32]);
-
-    let vectors: Vec<(&str, SetTag, Vec<PublicKeyIdV1>)> = vec![
-        (
-            "multisig_two_members",
-            SetTag::Multisig,
-            vec![key_a.clone(), key_b.clone()],
-        ),
-        (
-            "multisig_three_members",
-            SetTag::Multisig,
-            vec![key_a.clone(), key_b.clone(), key_c.clone()],
-        ),
-        (
-            "threshold_two_members",
-            SetTag::Threshold,
-            vec![key_a.clone(), key_b.clone()],
-        ),
-        (
-            "threshold_three_members",
-            SetTag::Threshold,
-            vec![key_a, key_b, key_c],
-        ),
-    ];
-
-    vectors
-        .into_iter()
-        .map(|(name, tag, members)| {
-            let id = KeySetIdV1::from_members(tag, &members);
-            let text = id.to_text();
-            let binary = id.to_binary();
-            let binary_hex_owned = hex::encode(binary);
-            let text_leaked: &'static str = Box::leak(text.into_boxed_str());
-            let hex_leaked: &'static str = Box::leak(binary_hex_owned.into_boxed_str());
-            let vector = ValidKeySetIdVector {
-                name,
-                set_tag: tag,
-                binary_hex: hex_leaked,
-                text: text_leaked,
-            };
-            (vector, id)
-        })
-        .collect()
+/// Frozen valid `KeySetIdV1` conformance vectors.
+///
+/// These values were derived once from known member key material:
+///   - `key_a` = Ed25519 from `[0xAA; 32]`
+///   - `key_b` = Ed25519 from `[0xBB; 32]`
+///   - `key_c` = Ed25519 from `[0xCC; 32]`
+///
+/// The set mode name is included in the hash derivation, so Multisig
+/// and Threshold over the same member set produce distinct identifiers.
+pub fn valid_keyset_id_vectors() -> Vec<ValidKeySetIdVector> {
+    vec![
+        ValidKeySetIdVector {
+            name: "multisig_two_members",
+            set_tag: SetTag::Multisig,
+            binary_hex: "01962408fc4d20e712ff46cefd94d796e033230be13f9ba45df933f1813ff51586",
+            text: "ks1:aglcich4juqooex7i3hp3fgxs3qdgiyl4e7zxjc57ez7daj76ukym",
+        },
+        ValidKeySetIdVector {
+            name: "multisig_three_members",
+            set_tag: SetTag::Multisig,
+            binary_hex: "012f4db2b2b947cb467d988f0cf43dd7386135767bb284f2d9f7e9d94252b3e2a9",
+            text: "ks1:aexu3mvsxfd4wrt5tchqz5b5244gcnlwpozij4wz67u5sqsswprks",
+        },
+        ValidKeySetIdVector {
+            name: "threshold_two_members",
+            set_tag: SetTag::Threshold,
+            binary_hex: "02e4c09e4ce1f56bab3b021aff69e682bd8450eede585cf820c1708c219b941463",
+            text: "ks1:alsmbhsm4h2wxkz3ainp62pgqk6yiuho3zmfz6bayfyiyim3sqkgg",
+        },
+        ValidKeySetIdVector {
+            name: "threshold_three_members",
+            set_tag: SetTag::Threshold,
+            binary_hex: "02d629f27d4a7e69868f00447925a889e860d0aa8d6adbb71c56218b426aa5f106",
+            text: "ks1:allct4t5jj7gtbupabchsjnirhugbufkrvvnxny4kyqywqtkuxyqm",
+        },
+    ]
 }
 
 // ============================================================================
@@ -379,19 +375,24 @@ pub fn invalid_text_vectors() -> Vec<InvalidTextVector> {
 // Conformance Test Runner
 // ============================================================================
 
-/// Run all conformance tests and return the results.
+/// Run all conformance tests against frozen fixture vectors and return the
+/// results.
 ///
 /// Each entry in the returned vector is `(vector_name, passed, detail)`.
 /// A conforming implementation MUST have all entries pass.
+///
+/// Valid vectors use precomputed static hex/text values. The test runner
+/// parses these fixtures through the production parsers and verifies
+/// round-trip fidelity without re-deriving expected values at runtime.
 pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
     let mut results = Vec::new();
 
-    // --- Valid PublicKeyIdV1 vectors ---
-    for (vector, expected_id) in valid_public_key_id_vectors() {
+    // --- Valid PublicKeyIdV1 vectors (static fixtures) ---
+    for vector in valid_public_key_id_vectors() {
         // Text parse must succeed
         let text_result = PublicKeyIdV1::parse_text(vector.text);
-        let text_pass = match &text_result {
-            Ok(parsed) => *parsed == expected_id,
+        let text_ok = match &text_result {
+            Ok(_) => true,
             Err(e) => {
                 results.push((vector.name, false, format!("text parse failed: {e}")));
                 continue;
@@ -399,19 +400,19 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         };
         results.push((
             vector.name,
-            text_pass,
-            if text_pass {
+            text_ok,
+            if text_ok {
                 "text parse OK".to_string()
             } else {
-                "text parse mismatch".to_string()
+                "text parse failed".to_string()
             },
         ));
 
         // Binary parse must succeed
         let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex in vector");
         let binary_result = PublicKeyIdV1::from_binary(&binary_bytes);
-        let binary_pass = match &binary_result {
-            Ok(parsed) => *parsed == expected_id,
+        let binary_ok = match &binary_result {
+            Ok(_) => true,
             Err(e) => {
                 results.push((vector.name, false, format!("binary parse failed: {e}")));
                 continue;
@@ -419,16 +420,30 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         };
         results.push((
             vector.name,
-            binary_pass,
-            if binary_pass {
+            binary_ok,
+            if binary_ok {
                 "binary parse OK".to_string()
             } else {
-                "binary parse mismatch".to_string()
+                "binary parse failed".to_string()
             },
         ));
 
-        // Text re-encoding must match
-        let re_encoded = text_result.unwrap().to_text();
+        // Text and binary parsers must agree
+        let from_text = text_result.unwrap();
+        let from_binary = binary_result.unwrap();
+        let agree = from_text == from_binary;
+        results.push((
+            vector.name,
+            agree,
+            if agree {
+                "text/binary agree".to_string()
+            } else {
+                "text/binary DISAGREE".to_string()
+            },
+        ));
+
+        // Text re-encoding must match frozen fixture
+        let re_encoded = from_text.to_text();
         let re_pass = re_encoded == vector.text;
         results.push((
             vector.name,
@@ -441,23 +456,23 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         ));
 
         // Algorithm tag must match
-        let alg_pass = expected_id.algorithm() == vector.algorithm;
+        let alg_pass = from_text.algorithm() == vector.algorithm;
         results.push((
             vector.name,
             alg_pass,
             if alg_pass {
                 "algorithm tag OK".to_string()
             } else {
-                format!("algorithm tag mismatch: got {:?}", expected_id.algorithm())
+                format!("algorithm tag mismatch: got {:?}", from_text.algorithm())
             },
         ));
     }
 
-    // --- Valid KeySetIdV1 vectors ---
-    for (vector, expected_id) in valid_keyset_id_vectors() {
+    // --- Valid KeySetIdV1 vectors (static fixtures) ---
+    for vector in valid_keyset_id_vectors() {
         let text_result = KeySetIdV1::parse_text(vector.text);
-        let text_pass = match &text_result {
-            Ok(parsed) => *parsed == expected_id,
+        let text_ok = match &text_result {
+            Ok(_) => true,
             Err(e) => {
                 results.push((vector.name, false, format!("text parse failed: {e}")));
                 continue;
@@ -465,18 +480,18 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         };
         results.push((
             vector.name,
-            text_pass,
-            if text_pass {
+            text_ok,
+            if text_ok {
                 "text parse OK".to_string()
             } else {
-                "text parse mismatch".to_string()
+                "text parse failed".to_string()
             },
         ));
 
         let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex in vector");
         let binary_result = KeySetIdV1::from_binary(&binary_bytes);
-        let binary_pass = match &binary_result {
-            Ok(parsed) => *parsed == expected_id,
+        let binary_ok = match &binary_result {
+            Ok(_) => true,
             Err(e) => {
                 results.push((vector.name, false, format!("binary parse failed: {e}")));
                 continue;
@@ -484,15 +499,28 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
         };
         results.push((
             vector.name,
-            binary_pass,
-            if binary_pass {
+            binary_ok,
+            if binary_ok {
                 "binary parse OK".to_string()
             } else {
-                "binary parse mismatch".to_string()
+                "binary parse failed".to_string()
             },
         ));
 
-        let re_encoded = text_result.unwrap().to_text();
+        let from_text = text_result.unwrap();
+        let from_binary = binary_result.unwrap();
+        let agree = from_text == from_binary;
+        results.push((
+            vector.name,
+            agree,
+            if agree {
+                "text/binary agree".to_string()
+            } else {
+                "text/binary DISAGREE".to_string()
+            },
+        ));
+
+        let re_encoded = from_text.to_text();
         let re_pass = re_encoded == vector.text;
         results.push((
             vector.name,
@@ -504,14 +532,14 @@ pub fn run_conformance_tests() -> Vec<(&'static str, bool, String)> {
             },
         ));
 
-        let tag_pass = expected_id.set_tag() == vector.set_tag;
+        let tag_pass = from_text.set_tag() == vector.set_tag;
         results.push((
             vector.name,
             tag_pass,
             if tag_pass {
                 "set tag OK".to_string()
             } else {
-                format!("set tag mismatch: got {:?}", expected_id.set_tag())
+                format!("set tag mismatch: got {:?}", from_text.set_tag())
             },
         ));
     }
@@ -598,9 +626,10 @@ mod tests {
                 .join("\n")
         );
 
-        // Binding assertion: total vector count must be specific non-zero value
-        // (prevents silent test-count regression)
-        assert_eq!(total, 61, "expected exactly 61 conformance vector checks");
+        // Binding assertion: total vector count must be specific non-zero
+        // value (prevents silent test-count regression).
+        // 5 PK vectors x 5 checks + 4 KS vectors x 5 checks + 25 invalid = 70
+        assert_eq!(total, 70, "expected exactly 70 conformance vector checks");
     }
 
     /// Verify valid `PublicKeyIdV1` vectors produce non-zero distinct
@@ -615,9 +644,10 @@ mod tests {
         );
 
         let mut seen = std::collections::HashSet::new();
-        for (vector, id) in &vectors {
+        for vector in &vectors {
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
             assert!(
-                seen.insert(id.to_binary()),
+                seen.insert(binary),
                 "duplicate PublicKeyIdV1 in vector set: {}",
                 vector.name
             );
@@ -635,9 +665,10 @@ mod tests {
         );
 
         let mut seen = std::collections::HashSet::new();
-        for (vector, id) in &vectors {
+        for vector in &vectors {
+            let binary = hex::decode(vector.binary_hex).expect("valid hex");
             assert!(
-                seen.insert(id.to_binary()),
+                seen.insert(binary),
                 "duplicate KeySetIdV1 in vector set: {}",
                 vector.name
             );
@@ -655,11 +686,108 @@ mod tests {
         );
     }
 
+    /// Parser differential: runtime-derived `PublicKeyIdV1` values must match
+    /// the frozen fixture hex/text values. This test re-derives from known
+    /// key material and compares against the static fixtures.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn pk_derivation_matches_frozen_fixtures() {
+        let ascending = {
+            let mut buf = [0u8; 32];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            buf
+        };
+        let descending = {
+            let mut buf = [0u8; 32];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = (31 - i) as u8;
+            }
+            buf
+        };
+        let key_materials: &[(&str, AlgorithmTag, [u8; 32])] = &[
+            ("ed25519_zeros", AlgorithmTag::Ed25519, [0x00u8; 32]),
+            ("ed25519_ones", AlgorithmTag::Ed25519, [0x01u8; 32]),
+            ("ed25519_ff", AlgorithmTag::Ed25519, [0xFFu8; 32]),
+            ("ed25519_ascending", AlgorithmTag::Ed25519, ascending),
+            ("ed25519_descending", AlgorithmTag::Ed25519, descending),
+        ];
+
+        let fixtures = valid_public_key_id_vectors();
+        assert_eq!(key_materials.len(), fixtures.len());
+
+        for (i, (name, alg, key_bytes)) in key_materials.iter().enumerate() {
+            let derived = PublicKeyIdV1::from_key_bytes(*alg, key_bytes);
+            let fixture = &fixtures[i];
+            assert_eq!(
+                fixture.name, *name,
+                "fixture ordering mismatch at index {i}"
+            );
+            assert_eq!(
+                hex::encode(derived.to_binary()),
+                fixture.binary_hex,
+                "binary mismatch for {name}"
+            );
+            assert_eq!(derived.to_text(), fixture.text, "text mismatch for {name}");
+        }
+    }
+
+    /// Parser differential: runtime-derived `KeySetIdV1` values must match
+    /// the frozen fixture hex/text values.
+    #[test]
+    fn ks_derivation_matches_frozen_fixtures() {
+        let key_a = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xAA; 32]);
+        let key_b = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xBB; 32]);
+        let key_c = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0xCC; 32]);
+
+        let derivations: Vec<(&str, SetTag, Vec<PublicKeyIdV1>)> = vec![
+            (
+                "multisig_two_members",
+                SetTag::Multisig,
+                vec![key_a.clone(), key_b.clone()],
+            ),
+            (
+                "multisig_three_members",
+                SetTag::Multisig,
+                vec![key_a.clone(), key_b.clone(), key_c.clone()],
+            ),
+            (
+                "threshold_two_members",
+                SetTag::Threshold,
+                vec![key_a.clone(), key_b.clone()],
+            ),
+            (
+                "threshold_three_members",
+                SetTag::Threshold,
+                vec![key_a, key_b, key_c],
+            ),
+        ];
+
+        let fixtures = valid_keyset_id_vectors();
+        assert_eq!(derivations.len(), fixtures.len());
+
+        for (i, (name, tag, members)) in derivations.iter().enumerate() {
+            let derived = KeySetIdV1::from_members(*tag, members);
+            let fixture = &fixtures[i];
+            assert_eq!(
+                fixture.name, *name,
+                "fixture ordering mismatch at index {i}"
+            );
+            assert_eq!(
+                hex::encode(derived.to_binary()),
+                fixture.binary_hex,
+                "binary mismatch for {name}"
+            );
+            assert_eq!(derived.to_text(), fixture.text, "text mismatch for {name}");
+        }
+    }
+
     /// Parser differential: `PublicKeyIdV1::parse_text` and `from_binary`
-    /// agree on all valid vectors.
+    /// agree on all frozen fixture vectors.
     #[test]
     fn pk_parser_differential_valid() {
-        for (vector, expected) in valid_public_key_id_vectors() {
+        for vector in valid_public_key_id_vectors() {
             let from_text =
                 PublicKeyIdV1::parse_text(vector.text).expect("valid vector must parse");
             let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
@@ -671,19 +799,14 @@ mod tests {
                 "text/binary parser differential for {}",
                 vector.name
             );
-            assert_eq!(
-                from_text, expected,
-                "parser output mismatch for {}",
-                vector.name
-            );
         }
     }
 
     /// Parser differential: `KeySetIdV1::parse_text` and `from_binary`
-    /// agree on all valid vectors.
+    /// agree on all frozen fixture vectors.
     #[test]
     fn ks_parser_differential_valid() {
-        for (vector, expected) in valid_keyset_id_vectors() {
+        for vector in valid_keyset_id_vectors() {
             let from_text = KeySetIdV1::parse_text(vector.text).expect("valid vector must parse");
             let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
             let from_binary =
@@ -692,11 +815,6 @@ mod tests {
             assert_eq!(
                 from_text, from_binary,
                 "text/binary parser differential for {}",
-                vector.name
-            );
-            assert_eq!(
-                from_text, expected,
-                "parser output mismatch for {}",
                 vector.name
             );
         }
@@ -724,7 +842,7 @@ mod tests {
     /// vectors.
     #[test]
     fn pk_binary_text_binary_round_trip() {
-        for (vector, _) in valid_public_key_id_vectors() {
+        for vector in valid_public_key_id_vectors() {
             let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
             let id = PublicKeyIdV1::from_binary(&binary_bytes).expect("valid binary");
             let text = id.to_text();
@@ -741,7 +859,7 @@ mod tests {
     /// Binary -> text -> binary round-trip for all valid `KeySetIdV1` vectors.
     #[test]
     fn ks_binary_text_binary_round_trip() {
-        for (vector, _) in valid_keyset_id_vectors() {
+        for vector in valid_keyset_id_vectors() {
             let binary_bytes = hex::decode(vector.binary_hex).expect("valid hex");
             let id = KeySetIdV1::from_binary(&binary_bytes).expect("valid binary");
             let text = id.to_text();
