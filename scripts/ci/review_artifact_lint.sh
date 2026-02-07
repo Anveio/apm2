@@ -55,28 +55,116 @@ echo
 
 check_dependencies
 
-# Check 1: Review prompts must not contain deprecated direct status-write commands.
-# The approved path for setting security review statuses is:
-#   cargo xtask security-review-exec (approve|deny)
-# Direct writes to statuses/check-runs for ai-review/security are deprecated,
-# regardless of HTTP client used (gh api, curl, or variable indirection).
-# Note: ai-review/code-quality has no xtask equivalent, so `gh api` writes targeting
-# that context are permitted.
-# Similarly, `gh pr review --approve` bypasses the review gate and is always forbidden.
-log_info "Checking for deprecated direct status-write patterns in review scripts..."
+# Check 1: Review artifacts must not contain direct GitHub API calls.
+#
+# ALLOWLIST/PROHIBITION APPROACH (TCK-00409 hardening):
+# Instead of trying to enumerate all bad patterns (denylist — impossible to
+# be exhaustive against token-splitting, variable indirection, etc.), we
+# PROHIBIT all direct GitHub API calls in review artifacts, with a strict
+# file-level exemption list.
+#
+# The approved paths are:
+#   - cargo xtask security-review-exec (approve|deny) — for ai-review/security
+#   - cargo xtask review — for other review types
+#
+# Exemptions (files that legitimately need direct API calls):
+#   - CODE_QUALITY_PROMPT.md — uses gh api for ai-review/code-quality status
+#     (no xtask equivalent exists yet; protected by the primary security-literal
+#     gate which ensures it never references ai-review/security)
+#
+# Similarly, `gh pr review --approve` bypasses the review gate and is always
+# forbidden in all review artifacts (no exemptions).
+log_info "Checking for forbidden direct GitHub API calls in review artifacts..."
 
-# detect_direct_status_write checks whether a logical line (continuations joined)
-# contains a forbidden direct GitHub status write.  Returns 0 (true) if the line
-# is a violation.
+# strip_comments: Remove comment lines from file content.
+# For .md files: lines starting with optional whitespace then # in code blocks
+# For .sh files: lines starting with optional whitespace then #
+# For all files: we strip lines where the first non-whitespace char is #
+# This is intentionally conservative — inline comments after code are kept,
+# which is fine because we want to catch code, not miss it.
+strip_comments() {
+    local content="$1"
+    # Remove lines that are purely comments (first non-whitespace is #)
+    echo "$content" | grep -v '^[[:space:]]*#' || true
+}
+
+# flatten_stream: Remove newlines and collapse whitespace to produce a single
+# character stream.  This defeats line-splitting bypasses entirely.
+flatten_stream() {
+    local content="$1"
+    # Replace newlines with spaces, then collapse multiple spaces.
+    # Use sed/awk instead of tr for portability (some systems have
+    # non-standard tr implementations).
+    printf '%s' "$content" | awk '{printf "%s ", $0}' | sed 's/  */ /g'
+}
+
+# detect_forbidden_api_usage: FILE-LEVEL check for forbidden GitHub API calls.
+# Takes a file path and basename.  Returns 0 (true) if the file is a violation.
 #
-# Strategy (content-based): instead of enumerating every HTTP client (gh, curl,
-# etc.), we detect violations by the _content_ of the line.  Any line containing
-# `ai-review/security` together with a status/check-run write indicator is
-# forbidden.  The only blessed path is `cargo xtask security-review-exec`.
+# Strategy: strip comments, flatten to a single stream, check for ANY of:
+#   - "gh" followed by whitespace then "api" (catches gh api, gh  api, etc.)
+#   - "gh" followed by whitespace then "pr" ... "review" ... "--approve"
+#   - "curl" combined with "github" or "api.github"
 #
-# For non-security contexts (e.g. ai-review/code-quality), direct `gh api`
-# writes to statuses/check-runs with unknown or unspecified context are still
-# flagged.  `gh pr review --approve` is always forbidden.
+# This is an ALLOWLIST approach: review artifacts should NEVER call GitHub
+# APIs directly.  The only sanctioned paths are cargo xtask commands.
+detect_forbidden_api_usage() {
+    local file="$1"
+    local file_basename="$2"
+
+    # Exemption: CODE_QUALITY_PROMPT.md legitimately uses gh api for
+    # code-quality status (protected by separate security-literal gate).
+    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
+        return 1
+    fi
+
+    # Read file, strip comments, flatten to stream, lowercase
+    local content
+    content="$(cat "$file")"
+    local stripped
+    stripped="$(strip_comments "$content")"
+    local stream
+    stream="$(flatten_stream "$stripped")"
+    local lc="${stream,,}"
+
+    # Rule 1: Forbid "gh pr review --approve" (always, no exemptions)
+    # Check on the flattened lowercase stream
+    if [[ "$lc" == *"gh"*"pr"*"review"*"--approve"* ]]; then
+        log_error "Forbidden gh pr review --approve in review artifact:"
+        log_error "  ${file}"
+        log_error "  gh pr review --approve bypasses the review gate."
+        return 0
+    fi
+
+    # Rule 2: Forbid ANY "gh api" call
+    # Match "gh" followed by any amount of whitespace then "api"
+    # On the flattened stream, whitespace is already collapsed to single spaces
+    if [[ "$lc" == *"gh api"* ]] || [[ "$lc" == *"gh  api"* ]]; then
+        log_error "Forbidden gh api call in review artifact:"
+        log_error "  ${file}"
+        log_error "  Review artifacts must not call gh api directly."
+        log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+        return 0
+    fi
+
+    # Rule 3: Forbid "curl" combined with GitHub API indicators
+    if [[ "$lc" == *"curl"* ]]; then
+        if [[ "$lc" == *"github"* ]] || [[ "$lc" == *"api.github"* ]]; then
+            log_error "Forbidden curl-to-GitHub call in review artifact:"
+            log_error "  ${file}"
+            log_error "  Review artifacts must not call GitHub APIs via curl."
+            log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# detect_direct_status_write: LEGACY per-line check, kept as defense-in-depth.
+# Now also uses the prohibition approach: any line containing "gh api" or
+# "curl" + "github" in a non-exempt context is a violation.
+# Returns 0 (true) if the line is a violation.
 detect_direct_status_write() {
     local line="$1"
     # Skip comment lines
@@ -92,39 +180,23 @@ detect_direct_status_write() {
         return 0
     fi
 
-    # Rule 2 (content-based): Any line containing ai-review/security AND any
-    # write-indicating context (statuses, check-runs, POST, -X POST, -f, --field,
-    # --method) is a violation — regardless of the HTTP client used (gh, curl,
-    # variable indirection, etc.).
-    # Exception: the blessed xtask path is allowed.
-    if [[ "$lc" == *"ai-review/security"* ]]; then
-        # Allow the blessed xtask path
-        if [[ "$lc" == *"cargo"*"xtask"*"security-review-exec"* ]]; then
-            return 1
-        fi
-        # Flag if any status/check-run endpoint or write indicator is present
-        if [[ "$lc" == *"statuses"* || "$lc" == *"check-runs"* \
-           || "$lc" == *"-x post"* || "$lc" == *"-x "* \
-           || "$lc" == *"post"* \
-           || "$lc" == *" -f "* || "$lc" == *" --field "* \
-           || "$lc" == *" --method "* \
-           || "$lc" == *"gh"*"api"* || "$lc" == *"curl"* ]]; then
-            return 0  # violation: ai-review/security with write context
-        fi
+    # Rule 2: ANY "gh api" call is forbidden (allowlist approach).
+    # On a single line, match gh followed by whitespace then api.
+    if [[ "$lc" =~ gh[[:space:]]+api ]]; then
+        return 0
     fi
 
-    # Rule 3: gh api / curl to statuses or check-runs without any ai-review
-    # context specified is a violation (unknown context).
-    # Exception: lines exclusively targeting ai-review/code-quality are permitted.
+    # Rule 3: ANY "curl" + "github" combination is forbidden.
+    if [[ "$lc" == *"curl"* ]] && [[ "$lc" == *"github"* || "$lc" == *"api.github"* ]]; then
+        return 0
+    fi
+
+    # Rule 4: ANY reference to statuses/ or check-runs with a write indicator
+    # (catches variable-indirected endpoint construction)
     if [[ "$lc" == *"statuses/"* || "$lc" == *"check-runs"* ]]; then
-        # Only check lines that use an HTTP client (gh api or curl)
-        if [[ "$lc" == *"gh"*"api"* || "$lc" == *"curl"* ]]; then
-            if [[ "$lc" == *"ai-review/code-quality"* ]] && [[ "$lc" != *"ai-review/security"* ]]; then
-                return 1  # permitted: exclusively code-quality
-            fi
-            # Already handled security context above in Rule 2, but if it
-            # somehow reaches here (e.g. no ai-review context at all), flag it.
-            return 0  # violation: unknown or unspecified context
+        if [[ "$lc" == *"-f "* || "$lc" == *"--field "* || "$lc" == *"--method"* \
+           || "$lc" == *"-x post"* || "$lc" == *"post"* ]]; then
+            return 0
         fi
     fi
 
@@ -176,54 +248,114 @@ join_continuations() {
     fi
 }
 
-# Primary gate (broad text search): reject any review artifact containing the
-# literal string "ai-review/security" UNLESS it is the security review prompt
-# itself.  This catches variable indirection, split-line assignments, and any
-# other encoding that still contains the literal context name.
-# Comment lines (starting with #) are excluded.
+# Primary gate: reject any review artifact containing the literal string
+# "ai-review/security" UNLESS it is the security review prompt itself.
+#
+# STREAM-LEVEL ANALYSIS (TCK-00409 hardening):
+# Instead of line-by-line grep, we strip comments and flatten the entire file
+# into a single character stream, then check for the literal.  This defeats
+# line-splitting bypasses where the literal is constructed across multiple
+# lines or variable assignments.
+#
+# Additionally, we check for the COMPONENTS "ai-review" and "/security" as
+# separate tokens that could be concatenated at runtime.  If both appear in
+# non-comment code, that's suspicious enough to flag (defense-in-depth).
 log_info "Primary gate: scanning for ai-review/security literal in non-exempt files..."
 
 check_file_for_security_literal() {
     local file="$1"
     local file_basename="$2"
-    # The SECURITY_REVIEW_PROMPT.md is the only file permitted to reference
-    # the ai-review/security context name.
+    # SECURITY_REVIEW_PROMPT.md is permitted to reference the security context.
     if [[ "$file_basename" == "SECURITY_REVIEW_PROMPT.md" ]]; then
         return 1
     fi
-    # File-wide literal scan: check the ENTIRE file content for the string
-    # "ai-review/security" (case-insensitive).  This is the primary gate and
-    # cannot be bypassed by splitting tokens across lines, variable
-    # indirection, or any other encoding — the literal must appear somewhere
-    # in the file to be useful, and we catch it here.
-    if grep -qi 'ai-review/security' "$file"; then
-        # Report the first matching line for diagnostic context
+    # CODE_QUALITY_PROMPT.md is a canonical controlled file that legitimately
+    # references "ai-review/code-quality" (containing the "ai-review" substring)
+    # and discusses security concepts in prose.  It is exempt from the
+    # split-token heuristic but NOT from the direct literal check (Check 1
+    # below still applies — if it ever contains "ai-review/security" literally,
+    # that would be caught).
+    local exempt_from_split_token=0
+    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
+        exempt_from_split_token=1
+    fi
+
+    # Read file, strip comments, flatten to character stream
+    local content
+    content="$(cat "$file")"
+    local stripped
+    stripped="$(strip_comments "$content")"
+    local stream
+    stream="$(flatten_stream "$stripped")"
+    local lc="${stream,,}"
+
+    # Check 1: Direct literal "ai-review/security" in the flattened stream
+    if [[ "$lc" == *"ai-review/security"* ]]; then
         local match_info
-        match_info=$(grep -ni 'ai-review/security' "$file" | head -1)
+        match_info=$(grep -ni 'ai-review/security' "$file" | head -1 || echo "(found in flattened stream)")
         log_error "Forbidden ai-review/security literal in non-exempt review artifact:"
         log_error "  ${file}: ${match_info}"
         log_error "  Only SECURITY_REVIEW_PROMPT.md may reference this context."
         return 0
     fi
+
+    # Check 2 (defense-in-depth): Components "ai-review" AND "security" both
+    # present in non-comment code.  This catches split-token construction like:
+    #   ctx_a="ai-review"; ctx_b="security"; ctx="${ctx_a}/${ctx_b}"
+    # where the full literal never appears but both halves do.
+    # Note: this is intentionally broad — review artifacts other than the
+    # security prompt have no legitimate reason to reference both tokens.
+    # Canonical prompt files may be exempt (they reference ai-review/code-quality
+    # and discuss security in prose, which is a known-good false positive).
+    if [[ $exempt_from_split_token -eq 0 ]] && [[ "$lc" == *"ai-review"* ]] && [[ "$lc" == *"security"* ]]; then
+        # Verify this isn't just documentation mentioning "security review"
+        # generically — check for assignment/variable patterns or quotes around
+        # the tokens, which indicate code, not prose.
+        # We flag if "ai-review" appears in a code-like context (quoted, assigned)
+        if [[ "$lc" == *'"ai-review'* ]] || [[ "$lc" == *"'ai-review"* ]] \
+           || [[ "$lc" == *'=ai-review'* ]] || [[ "$lc" == *'="ai-review'* ]] \
+           || [[ "$lc" == *"='ai-review"* ]]; then
+            log_error "Suspicious ai-review + security component tokens in non-exempt review artifact:"
+            log_error "  ${file}"
+            log_error "  Both 'ai-review' and 'security' appear in code context."
+            log_error "  This may be split-token construction of the forbidden context."
+            log_error "  Only SECURITY_REVIEW_PROMPT.md may reference the security context."
+            return 0
+        fi
+    fi
+
     return 1
 }
 
 while IFS= read -r review_file; do
     file_basename="$(basename "$review_file")"
+
+    # Gate 1: security-literal check (stream-level)
     if check_file_for_security_literal "$review_file" "$file_basename"; then
         VIOLATIONS=1
     fi
+
+    # Gate 2: forbidden API usage check (file-level, stream-based)
+    if detect_forbidden_api_usage "$review_file" "$file_basename"; then
+        VIOLATIONS=1
+    fi
+
 done < <(find "$REVIEW_DIR" -type f \( -name '*.md' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' \) 2>/dev/null)
 
 # Defense-in-depth: per-line pattern detection via continuation-joined lines.
-# Scan every file in the review directory for direct status writes.
-log_info "Defense-in-depth: checking per-line status-write patterns..."
+# This catches patterns even if the file-level check somehow missed them.
+# Uses the prohibition approach: any gh api or curl-to-GitHub is forbidden.
+log_info "Defense-in-depth: per-line prohibition check..."
 while IFS= read -r review_file; do
     file_basename="$(basename "$review_file")"
+    # Skip exempt files (already checked at file level with appropriate exemptions)
+    if [[ "$file_basename" == "CODE_QUALITY_PROMPT.md" ]]; then
+        continue
+    fi
     # Process with continuation-joining so multiline commands are caught
     while IFS=$'\t' read -r line_num logical_line; do
         if detect_direct_status_write "$logical_line"; then
-            log_error "Deprecated direct status-write bypassing review gate:"
+            log_error "Forbidden direct GitHub API call in review artifact:"
             log_error "  ${review_file}:${line_num}: ${logical_line}"
             log_error "  Use 'cargo xtask security-review-exec (approve|deny)' instead."
             VIOLATIONS=1

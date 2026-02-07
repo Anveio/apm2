@@ -38,8 +38,10 @@ echo "=== Lint Fixture Regression Tests ==="
 echo
 
 # --- Test 1: review_artifact_lint violation patterns ---
-# Source the detect_direct_status_write function from the lint script.
-# We do this by extracting just the function.
+# Source helper functions and detect_direct_status_write from the lint script.
+# strip_comments and flatten_stream are needed by the file-level check functions.
+source <(sed -n '/^strip_comments()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
+source <(sed -n '/^flatten_stream()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
 source <(sed -n '/^detect_direct_status_write()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
 
 echo "Test 1: review_artifact_lint violation patterns"
@@ -67,12 +69,13 @@ done < "${FIXTURE_DIR}/review_artifact_lint_permitted.txt"
 echo
 
 # --- Test 2b: review_artifact_lint primary gate (file-level ai-review/security literal) ---
-echo "Test 2b: review_artifact_lint primary gate (file-level ai-review/security literal scan)"
+echo "Test 2b: review_artifact_lint primary gate (stream-level ai-review/security detection)"
 # Provide stub log_error for the sourced function (it uses log_error internally)
 log_error() { :; }
+# strip_comments and flatten_stream already sourced above
 source <(sed -n '/^check_file_for_security_literal()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
 
-# Test 2b-i: File containing ai-review/security literal in non-comment code → MUST FAIL
+# Test 2b-i: File containing ai-review/security literal in non-comment code -> MUST FAIL
 violation_fixture="${FIXTURE_DIR}/review_file_literal_violation.md"
 if check_file_for_security_literal "$violation_fixture" "review_file_literal_violation.md"; then
     log_pass "Primary gate caught ai-review/security literal in non-exempt file"
@@ -80,7 +83,7 @@ else
     log_fail "Primary gate missed ai-review/security literal in non-exempt file: $(basename "$violation_fixture")"
 fi
 
-# Test 2b-ii: File that does NOT contain ai-review/security anywhere → MUST PASS
+# Test 2b-ii: File that does NOT contain ai-review/security anywhere -> MUST PASS
 permitted_fixture="${FIXTURE_DIR}/review_file_literal_permitted.md"
 if check_file_for_security_literal "$permitted_fixture" "review_file_literal_permitted.md"; then
     log_fail "Primary gate false positive on file without ai-review/security: $(basename "$permitted_fixture")"
@@ -88,13 +91,54 @@ else
     log_pass "Primary gate correctly permits file without ai-review/security literal"
 fi
 
-# Test 2b-iii: SECURITY_REVIEW_PROMPT.md is always exempt → MUST PASS
+# Test 2b-iii: SECURITY_REVIEW_PROMPT.md is always exempt -> MUST PASS
 if check_file_for_security_literal "$violation_fixture" "SECURITY_REVIEW_PROMPT.md"; then
     log_fail "Primary gate not exempting SECURITY_REVIEW_PROMPT.md"
 else
     log_pass "Primary gate correctly exempts SECURITY_REVIEW_PROMPT.md"
 fi
+
+# Test 2b-iv: Split-token construction (bypass vector) -> MUST FAIL
+split_token_fixture="${FIXTURE_DIR}/review_file_split_token_violation.md"
+if check_file_for_security_literal "$split_token_fixture" "review_file_split_token_violation.md"; then
+    log_pass "Primary gate caught split-token ai-review + security construction"
+else
+    log_fail "Primary gate missed split-token ai-review + security construction: $(basename "$split_token_fixture")"
+fi
+
 # Remove stub log_error so it doesn't shadow real log functions
+unset -f log_error
+echo
+
+# --- Test 2c: review_artifact_lint file-level API prohibition ---
+echo "Test 2c: review_artifact_lint file-level API prohibition (detect_forbidden_api_usage)"
+# Provide stub log_error for the sourced function
+log_error() { :; }
+source <(sed -n '/^detect_forbidden_api_usage()/,/^}/p' "${SCRIPT_DIR}/review_artifact_lint.sh")
+
+# Test 2c-i: File with gh api call in non-comment code -> MUST FAIL
+# (reuse the literal violation fixture which has "gh api" in it)
+if detect_forbidden_api_usage "$violation_fixture" "review_file_literal_violation.md"; then
+    log_pass "API prohibition caught gh api in non-exempt file"
+else
+    log_fail "API prohibition missed gh api in non-exempt file: $(basename "$violation_fixture")"
+fi
+
+# Test 2c-ii: File without any API calls -> MUST PASS
+if detect_forbidden_api_usage "$permitted_fixture" "review_file_literal_permitted.md"; then
+    log_fail "API prohibition false positive on file without API calls: $(basename "$permitted_fixture")"
+else
+    log_pass "API prohibition correctly permits file without API calls"
+fi
+
+# Test 2c-iii: CODE_QUALITY_PROMPT.md is exempt -> MUST PASS
+if detect_forbidden_api_usage "$violation_fixture" "CODE_QUALITY_PROMPT.md"; then
+    log_fail "API prohibition not exempting CODE_QUALITY_PROMPT.md"
+else
+    log_pass "API prohibition correctly exempts CODE_QUALITY_PROMPT.md"
+fi
+
+# Remove stub log_error
 unset -f log_error
 echo
 
