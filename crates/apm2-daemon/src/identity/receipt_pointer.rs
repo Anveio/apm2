@@ -738,6 +738,31 @@ impl ReceiptMultiProofV1 {
     pub fn contains_receipt(&self, receipt_hash: &Hash) -> bool {
         self.receipt_hashes.binary_search(receipt_hash).is_ok()
     }
+
+    /// Test-only: construct a `ReceiptMultiProofV1` WITHOUT validation.
+    ///
+    /// This bypasses all constructor checks (proof verification, sorting,
+    /// bounds) to allow testing that `verify_multiproof` independently
+    /// catches tampered proofs at the verification boundary.
+    ///
+    /// # Safety (logical)
+    ///
+    /// Only available in `#[cfg(test)]`. MUST NOT be used in production.
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn)]
+    fn new_unchecked(
+        batch_root_hash: Hash,
+        receipt_hashes: Vec<Hash>,
+        authority_seal_hash: Hash,
+        individual_proofs: Vec<MerkleInclusionProof>,
+    ) -> Self {
+        Self {
+            batch_root_hash,
+            receipt_hashes,
+            authority_seal_hash,
+            individual_proofs,
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -954,6 +979,19 @@ impl ReceiptPointerVerifier {
         expected_subject_kind: &str,
         require_temporal: bool,
     ) -> Result<Vec<VerificationResult>, ReceiptPointerError> {
+        // ── Structural validation (fail-closed, treat as untrusted) ──
+        // Do NOT rely on constructor-time invariants; re-validate
+        // structure at the verification boundary.
+        if multiproof.receipt_hashes.is_empty() {
+            return Err(ReceiptPointerError::EmptyMultiproof);
+        }
+        if multiproof.individual_proofs.len() != multiproof.receipt_hashes.len() {
+            return Err(ReceiptPointerError::TooManyProofNodes {
+                count: multiproof.individual_proofs.len(),
+                max: multiproof.receipt_hashes.len(),
+            });
+        }
+
         // Bind authority_seal_hash: compute hash from seal canonical bytes
         // and reject mismatch (fail-closed).
         let actual_seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
@@ -976,19 +1014,44 @@ impl ReceiptPointerVerifier {
             require_temporal,
         )?;
 
-        // For remaining receipts, we only need to verify the inclusion
-        // proofs (the seal is already verified). The construction
-        // validation in `ReceiptMultiProofV1::new` already verified all
-        // proofs against the batch root, so we can trust the
-        // construction-time validation.
-        let mut results = Vec::with_capacity(multiproof.receipt_hashes.len());
-        for receipt_hash in &multiproof.receipt_hashes {
-            results.push(VerificationResult {
+        // ── Per-receipt inclusion proof verification (fail-closed) ──
+        // Independently verify EVERY (receipt_hash, inclusion_proof)
+        // pair against the authenticated batch root. Do NOT trust
+        // constructor-time validation — treat the multiproof as
+        // untrusted at this verification boundary.
+        //
+        // The seal's subject_hash is the batch root for MERKLE_BATCH
+        // seals. The first receipt was already verified above via
+        // verify_merkle_batch (which checks both seal signature AND
+        // inclusion proof), but we re-verify it here for uniformity
+        // and defense-in-depth — the cost is negligible.
+        let batch_root = seal.subject_hash();
+        for (receipt_hash, proof) in multiproof
+            .receipt_hashes
+            .iter()
+            .zip(multiproof.individual_proofs.iter())
+        {
+            // Verify leaf hash is the domain-separated receipt hash.
+            let expected_leaf = compute_receipt_leaf_hash(receipt_hash);
+            if proof.leaf_hash != expected_leaf {
+                return Err(ReceiptPointerError::NotAMember);
+            }
+            // Verify the inclusion proof reconstructs to the batch root.
+            proof
+                .verify(batch_root)
+                .map_err(ReceiptPointerError::SealError)?;
+        }
+
+        // All proofs verified — emit results transactionally.
+        let results = multiproof
+            .receipt_hashes
+            .iter()
+            .map(|receipt_hash| VerificationResult {
                 receipt_hash: *receipt_hash,
                 authority_seal_hash: multiproof.authority_seal_hash,
                 pointer_kind: PointerKind::Batch,
-            });
-        }
+            })
+            .collect();
 
         Ok(results)
     }
@@ -1792,6 +1855,135 @@ mod tests {
             matches!(result, Err(ReceiptPointerError::SealHashMismatch { .. })),
             "expected SealHashMismatch, got: {result:?}",
         );
+    }
+
+    /// SECURITY: `verify_multiproof` must independently verify every
+    /// inclusion proof -- not just the first. A multiproof where the
+    /// first proof is valid but a subsequent proof has a tampered leaf
+    /// hash MUST be rejected (fail-closed, transactional: all-or-nothing).
+    ///
+    /// Uses `new_unchecked` to bypass constructor validation, simulating
+    /// state corruption or a decoder bug that produces a multiproof
+    /// with a tampered proof.
+    #[test]
+    fn verify_multiproof_rejects_tampered_subsequent_proof() {
+        let signer = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        hashes.sort_unstable();
+        let (root, mut proofs) = build_merkle_tree(&hashes);
+
+        let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        // Tamper with the SECOND proof's leaf hash so it won't verify
+        // against the batch root, while keeping the first proof intact.
+        proofs[1].leaf_hash = [0xFF; 32];
+
+        // Bypass constructor validation via `new_unchecked` to simulate
+        // a decoder bug or state corruption that lets a tampered
+        // multiproof through.
+        let tampered = ReceiptMultiProofV1::new_unchecked(root, hashes.clone(), seal_hash, proofs);
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &tampered,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "verify_multiproof must reject multiproof with tampered \
+             subsequent proof, got: {result:?}",
+        );
+    }
+
+    /// SECURITY: `verify_multiproof` must reject a multiproof where
+    /// a subsequent proof reconstructs to a DIFFERENT root than the
+    /// seal's batch root. This tests the inclusion-proof-to-root
+    /// verification (not just the leaf hash check).
+    #[test]
+    fn verify_multiproof_rejects_wrong_root_in_subsequent_proof() {
+        let signer = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+
+        let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        // Build a proof for the second receipt from a DIFFERENT tree.
+        let mut other_hashes = vec![[0x43; 32], [0x99; 32]];
+        other_hashes.sort_unstable();
+        let (_other_root, other_proofs) = build_merkle_tree(&other_hashes);
+
+        // Find which index in other_proofs corresponds to [0x43; 32].
+        let other_idx = other_hashes.iter().position(|h| *h == [0x43; 32]).unwrap();
+
+        // Use the first valid proof, but swap the second proof with one
+        // from the other tree. The leaf hash is correct (same receipt
+        // hash) but the proof path reconstructs to a different root.
+        let tampered_proofs = vec![proofs[0].clone(), other_proofs[other_idx].clone()];
+
+        let tampered =
+            ReceiptMultiProofV1::new_unchecked(root, hashes.clone(), seal_hash, tampered_proofs);
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &tampered,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            result.is_err(),
+            "verify_multiproof must reject when subsequent proof \
+             reconstructs to wrong root, got: {result:?}",
+        );
+    }
+
+    /// SECURITY: `verify_multiproof` must verify all inclusion proofs at
+    /// the verification boundary. This test constructs a valid 4-receipt
+    /// multiproof and confirms all 4 receipts are verified (not just
+    /// the first). We verify by checking that the result contains
+    /// exactly 4 entries and each matches.
+    #[test]
+    fn verify_multiproof_verifies_all_receipts_not_just_first() {
+        let signer = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32], [0x44; 32], [0x45; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+
+        let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        let multiproof = ReceiptMultiProofV1::new(root, hashes.clone(), seal_hash, proofs).unwrap();
+
+        let results = ReceiptPointerVerifier::verify_multiproof(
+            &multiproof,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        )
+        .unwrap();
+
+        // All 4 receipts must be present in results.
+        assert_eq!(results.len(), 4, "must verify all 4 receipts");
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result.receipt_hash, hashes[i], "receipt {i} hash mismatch");
+            assert_eq!(
+                result.pointer_kind,
+                PointerKind::Batch,
+                "receipt {i} pointer kind mismatch"
+            );
+            assert_eq!(
+                result.authority_seal_hash, seal_hash,
+                "receipt {i} seal hash mismatch"
+            );
+        }
     }
 
     // ────────── Multiproof bounds enforcement tests ──────────
