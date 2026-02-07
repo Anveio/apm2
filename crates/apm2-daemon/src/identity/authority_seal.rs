@@ -31,7 +31,7 @@
 //!
 //! - Fail-closed: unknown seal kinds and missing fields produce errors, never
 //!   defaults.
-//! - Constant-time signature comparison via `subtle::ConstantTimeEq`.
+//! - Signature byte-length and total seal size validated at construction.
 //! - Domain separation tags are required and validated before verification.
 //! - Quorum seals require issuer quorum identifier.
 //! - `MERKLE_BATCH` seals with quorum issuers enforce quorum verification:
@@ -92,6 +92,9 @@ pub const MAX_QUORUM_SIGNATURES: usize = 256;
 
 /// Minimum number of quorum signatures required.
 pub const MIN_QUORUM_SIGNATURES: usize = 1;
+
+/// Expected byte length of an Ed25519 signature.
+pub const ED25519_SIGNATURE_LENGTH: usize = 64;
 
 /// Zero time envelope reference — used when temporal authority is absent or
 /// not applicable (Tier0/Tier1 contexts).
@@ -200,6 +203,27 @@ pub enum AuthoritySealError {
         expected: String,
         /// Found subject kind.
         found: String,
+    },
+
+    /// A signature has an invalid byte length (Ed25519 requires exactly 64
+    /// bytes).
+    #[error("invalid signature byte length at index {index}: expected {expected}, actual {actual}")]
+    InvalidSignatureLength {
+        /// Index of the offending signature.
+        index: usize,
+        /// Expected byte length.
+        expected: usize,
+        /// Actual byte length.
+        actual: usize,
+    },
+
+    /// The total serialized seal size exceeds `MAX_AUTHORITY_SEAL_BYTES`.
+    #[error("seal size {actual} exceeds maximum {max}")]
+    SealSizeExceeded {
+        /// Maximum allowed size.
+        max: usize,
+        /// Estimated actual size.
+        actual: usize,
     },
 }
 
@@ -434,6 +458,8 @@ impl AuthoritySealV1 {
     /// - A single-sig seal kind uses a quorum issuer
     /// - Signature count is out of bounds for quorum seals
     /// - `MERKLE_BATCH` with single-key issuer has more than one signature
+    /// - Any signature is not exactly `ED25519_SIGNATURE_LENGTH` (64) bytes
+    /// - The estimated serialized seal size exceeds `MAX_AUTHORITY_SEAL_BYTES`
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         issuer_cell_id: CellIdV1,
@@ -497,6 +523,51 @@ impl AuthoritySealV1 {
                     });
                 }
             },
+        }
+
+        // Validate per-signature byte length: Ed25519 signatures are exactly
+        // 64 bytes. Reject malformed signatures at construction time rather
+        // than deferring to verify-time (fail-closed, defense-in-depth).
+        for (i, sig) in signatures.iter().enumerate() {
+            if sig.len() != ED25519_SIGNATURE_LENGTH {
+                return Err(AuthoritySealError::InvalidSignatureLength {
+                    index: i,
+                    expected: ED25519_SIGNATURE_LENGTH,
+                    actual: sig.len(),
+                });
+            }
+        }
+
+        // Validate total serialized seal size does not exceed
+        // MAX_AUTHORITY_SEAL_BYTES (defense-in-depth bound).
+        //
+        // Estimate based on canonical_bytes layout:
+        //   seal_kind_tag(1) + issuer_cell_id(33) + issuer_id(33)
+        //   + subject_kind_len(4) + subject_kind_bytes
+        //   + subject_hash(32) + ledger_anchor_canonical_bytes(variable)
+        //   + time_envelope_ref(32) + sig_count(4)
+        //   + [sig_len(4) + sig_bytes(64)] * sig_count
+        //
+        // We use a conservative upper bound for ledger_anchor by computing
+        // its actual canonical bytes.
+        let kind_bytes_len = subject_kind.as_str().len();
+        let anchor_bytes_len = ledger_anchor.canonical_bytes().len();
+        let estimated_size = 1 // seal_kind_tag
+            + 33              // issuer_cell_id
+            + 33              // issuer_id
+            + 4               // subject_kind_len
+            + kind_bytes_len
+            + 32              // subject_hash
+            + anchor_bytes_len
+            + 32              // time_envelope_ref
+            + 4               // signature_count
+            + signatures.len() * (4 + ED25519_SIGNATURE_LENGTH);
+
+        if estimated_size > MAX_AUTHORITY_SEAL_BYTES {
+            return Err(AuthoritySealError::SealSizeExceeded {
+                max: MAX_AUTHORITY_SEAL_BYTES,
+                actual: estimated_size,
+            });
         }
 
         Ok(Self {
@@ -2856,6 +2927,211 @@ mod tests {
                 Err(AuthoritySealError::InvalidQuorumSignatureCount { .. })
             ),
             "verify_merkle_batch_quorum_threshold must reject extra signatures"
+        );
+    }
+
+    // ────────── Signature byte-length validation tests ──────────
+
+    /// Signature shorter than 64 bytes MUST be rejected at construction.
+    #[test]
+    fn constructor_rejects_signature_too_short() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 63]], // 63 bytes — too short
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidSignatureLength {
+                    index: 0,
+                    expected: ED25519_SIGNATURE_LENGTH,
+                    actual: 63,
+                })
+            ),
+            "Signature shorter than 64 bytes must be rejected"
+        );
+    }
+
+    /// Signature longer than 64 bytes MUST be rejected at construction.
+    #[test]
+    fn constructor_rejects_signature_too_long() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 65]], // 65 bytes — too long
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidSignatureLength {
+                    index: 0,
+                    expected: ED25519_SIGNATURE_LENGTH,
+                    actual: 65,
+                })
+            ),
+            "Signature longer than 64 bytes must be rejected"
+        );
+    }
+
+    /// Quorum seal with one valid-length and one invalid-length signature
+    /// MUST report the correct index.
+    #[test]
+    fn constructor_rejects_wrong_length_at_correct_index() {
+        let cell_id = test_cell_id();
+        let keyset_id = test_keyset_id();
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 32]], // index 1 is wrong
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidSignatureLength {
+                    index: 1,
+                    expected: ED25519_SIGNATURE_LENGTH,
+                    actual: 32,
+                })
+            ),
+            "Wrong-length signature must be reported at the correct index"
+        );
+    }
+
+    /// Valid 64-byte signatures MUST be accepted.
+    #[test]
+    fn constructor_accepts_valid_signature_length() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![0u8; 64]], // exactly 64 bytes
+        );
+
+        assert!(result.is_ok(), "Valid 64-byte signature must be accepted");
+    }
+
+    // ────────── Seal size bound validation tests ──────────
+
+    /// Seal exceeding `MAX_AUTHORITY_SEAL_BYTES` MUST be rejected at
+    /// construction.
+    #[test]
+    fn constructor_rejects_oversized_seal() {
+        let cell_id = test_cell_id();
+        let keyset_id = test_keyset_id();
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        // Each signature is 64 bytes + 4-byte length prefix = 68 bytes per
+        // signature in canonical form. With MAX_AUTHORITY_SEAL_BYTES = 8192
+        // and ~175 bytes of fixed overhead, we need roughly 119 signatures
+        // to exceed the limit. Use MAX_QUORUM_SIGNATURES (256) to be safe.
+        let sigs = vec![vec![0u8; 64]; MAX_QUORUM_SIGNATURES];
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            sigs,
+        );
+
+        assert!(
+            matches!(result, Err(AuthoritySealError::SealSizeExceeded { .. })),
+            "Oversized seal must be rejected at construction"
+        );
+    }
+
+    /// A seal within bounds MUST be accepted.
+    #[test]
+    fn constructor_accepts_seal_within_size_bounds() {
+        let cell_id = test_cell_id();
+        let keyset_id = test_keyset_id();
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        // 2 signatures: well within bounds.
+        let sigs = vec![vec![0u8; 64]; 2];
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            sigs,
+        );
+
+        assert!(result.is_ok(), "Seal within size bounds must be accepted");
+    }
+
+    /// Empty signature (0 bytes) MUST be rejected at construction.
+    #[test]
+    fn constructor_rejects_empty_signature_bytes() {
+        let cell_id = test_cell_id();
+        let pkid = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &[0x01; 32]);
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+
+        let result = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::PublicKey(pkid),
+            subject_kind,
+            [0; HASH_SIZE],
+            LedgerAnchorV1::ConsensusIndex { index: 1 },
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::SingleSig,
+            vec![vec![]], // 0 bytes
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(AuthoritySealError::InvalidSignatureLength {
+                    index: 0,
+                    expected: ED25519_SIGNATURE_LENGTH,
+                    actual: 0,
+                })
+            ),
+            "Empty signature bytes must be rejected"
         );
     }
 }
