@@ -375,6 +375,22 @@ impl FlatteningRelation {
 // Bisimulation Checker
 // ============================================================================
 
+/// Groups transitions by their operation label, preserving insertion order.
+///
+/// Returns a map from operation to the list of target states for transitions
+/// with that label. Used to ensure ALL transitions with duplicate labels are
+/// matched during bisimulation checking.
+fn group_transitions_by_label(transitions: &[Transition]) -> BTreeMap<HsiOperation, Vec<StateId>> {
+    let mut grouped: BTreeMap<HsiOperation, Vec<StateId>> = BTreeMap::new();
+    for tr in transitions {
+        grouped
+            .entry(tr.operation.clone())
+            .or_default()
+            .push(tr.target);
+    }
+    grouped
+}
+
 /// Verifies observational equivalence between two LTS via bisimulation.
 ///
 /// Uses bounded state exploration (not model checking) with deterministic
@@ -415,9 +431,11 @@ impl BisimulationChecker {
     /// # Algorithm
     ///
     /// 1. Start with the pair of initial states
-    /// 2. For each pair, check that every transition in one has a matching
-    ///    transition in the other (same label, target pair in relation)
-    /// 3. If a mismatch is found, emit a counterexample trace
+    /// 2. For each pair, group transitions by label on both sides
+    /// 3. Verify that every label present on one side is also present on the
+    ///    other, and that ALL transitions with the same label are matched
+    ///    pairwise (not just the first match)
+    /// 4. If a mismatch is found, emit a counterexample trace
     ///
     /// # Errors
     ///
@@ -447,33 +465,57 @@ impl BisimulationChecker {
             let t1 = lhs.transitions(s1);
             let t2 = rhs.transitions(s2);
 
-            // Check forward: every transition from s1 has a match from s2
-            for tr1 in t1 {
-                if let Some(tr2) = t2.iter().find(|tr2| tr2.operation == tr1.operation) {
-                    let pair = (tr1.target, tr2.target);
-                    if relation.insert(pair) {
-                        worklist.push(pair);
-                    }
-                } else {
-                    // Counterexample found: s1 can do tr1.operation but s2 cannot
+            // Group transitions by label for both sides
+            let grouped_t1 = group_transitions_by_label(t1);
+            let grouped_t2 = group_transitions_by_label(t2);
+
+            // Check forward: every label from s1 exists on s2 with matching
+            // transition count and pairwise target pairing.
+            for (op, targets1) in &grouped_t1 {
+                let Some(targets2) = grouped_t2.get(op) else {
                     trace.push(TraceStep {
                         lhs_state: s1,
                         rhs_state: s2,
-                        operation: tr1.operation.clone(),
+                        operation: op.clone(),
                         direction: MismatchDirection::LeftOnly,
                     });
                     return Ok(BisimulationResult::fail(trace));
-                }
-            }
+                };
 
-            // Check backward: every transition from s2 has a match from s1
-            for tr2 in t2 {
-                let matched = t1.iter().any(|tr1| tr1.operation == tr2.operation);
-                if !matched {
+                // Soundness: the number of transitions with the same label
+                // must match on both sides. Otherwise one side can take a
+                // branch the other cannot.
+                if targets1.len() != targets2.len() {
                     trace.push(TraceStep {
                         lhs_state: s1,
                         rhs_state: s2,
-                        operation: tr2.operation.clone(),
+                        operation: op.clone(),
+                        direction: if targets1.len() > targets2.len() {
+                            MismatchDirection::LeftOnly
+                        } else {
+                            MismatchDirection::RightOnly
+                        },
+                    });
+                    return Ok(BisimulationResult::fail(trace));
+                }
+
+                // Pair targets positionally (deterministic, order-preserving).
+                for (&tgt1, &tgt2) in targets1.iter().zip(targets2.iter()) {
+                    let pair = (tgt1, tgt2);
+                    if relation.insert(pair) {
+                        worklist.push(pair);
+                    }
+                }
+            }
+
+            // Check backward: every label from s2 exists on s1 (count
+            // equality was already verified above for shared labels).
+            for op in grouped_t2.keys() {
+                if !grouped_t1.contains_key(op) {
+                    trace.push(TraceStep {
+                        lhs_state: s1,
+                        rhs_state: s2,
+                        operation: op.clone(),
                         direction: MismatchDirection::RightOnly,
                     });
                     return Ok(BisimulationResult::fail(trace));
@@ -689,10 +731,15 @@ impl PromotionGate {
     /// If any depth fails, promotion is blocked and blocking defects are
     /// emitted.
     ///
+    /// **Fail-closed**: An empty `compositions` slice is treated as
+    /// "no evidence of equivalence" and results in denial. Partial inputs
+    /// (fewer entries than `max_depth`) are also denied.
+    ///
     /// # Arguments
     ///
     /// * `compositions` - Observable semantics for each depth to check. The
-    ///   slice must contain one entry per depth, indexed from depth 1.
+    ///   slice must contain one entry per depth, indexed from depth 1. Must
+    ///   contain at least `max_depth` entries for promotion to be allowed.
     ///
     /// # Errors
     ///
@@ -701,6 +748,39 @@ impl PromotionGate {
         &self,
         compositions: &[ObservableSemantics],
     ) -> Result<PromotionGateResult, BisimulationError> {
+        // Fail-closed: empty input means no evidence of equivalence.
+        if compositions.is_empty() {
+            return Ok(PromotionGateResult {
+                allowed: false,
+                depth_results: Vec::new(),
+                blocking_defects: vec![BlockingDefect {
+                    depth: 0,
+                    counterexample: Vec::new(),
+                    description:
+                        "No compositions provided; promotion requires evidence of equivalence"
+                            .to_string(),
+                }],
+            });
+        }
+
+        // Fail-closed: partial input (fewer depths than required) is denied.
+        let required = self.checker.max_depth();
+        if compositions.len() < required {
+            return Ok(PromotionGateResult {
+                allowed: false,
+                depth_results: Vec::new(),
+                blocking_defects: vec![BlockingDefect {
+                    depth: 0,
+                    counterexample: Vec::new(),
+                    description: format!(
+                        "Partial input: {provided} composition(s) provided but \
+                         {required} required for depths 1..={required}",
+                        provided = compositions.len(),
+                    ),
+                }],
+            });
+        }
+
         let mut depth_results = Vec::new();
         let mut blocking_defects = Vec::new();
 
@@ -1134,6 +1214,180 @@ mod tests {
     }
 
     // ====================================================================
+    // Duplicate-label soundness tests
+    // ====================================================================
+
+    #[test]
+    fn test_bisimulation_detects_divergent_duplicate_label_branches() {
+        // Regression test for soundness gap: when both sides have
+        // transitions with the same label but different target counts,
+        // the checker must detect the mismatch.
+        let checker = BisimulationChecker::new(12).unwrap();
+
+        // LHS: state 0 --spawn(0)--> state 1
+        //      state 0 --spawn(0)--> state 2  (duplicate label, two branches)
+        let mut lhs = ObservableSemantics::new(0);
+        let l1 = lhs.add_state().unwrap();
+        let l2 = lhs.add_state().unwrap();
+        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l1)
+            .unwrap();
+        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l2)
+            .unwrap();
+        // l1 stops, l2 escalates -- observably different successors
+        let l1_stop = lhs.add_state().unwrap();
+        lhs.add_transition(
+            l1,
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied,
+            },
+            l1_stop,
+        )
+        .unwrap();
+        let l2_esc = lhs.add_state().unwrap();
+        lhs.add_transition(
+            l2,
+            HsiOperation::Escalate {
+                reason: "overload".to_string(),
+            },
+            l2_esc,
+        )
+        .unwrap();
+
+        // RHS: state 0 --spawn(0)--> state 1  (only ONE branch)
+        let mut rhs = ObservableSemantics::new(0);
+        let r1 = rhs.add_state().unwrap();
+        rhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, r1)
+            .unwrap();
+        let r1_stop = rhs.add_state().unwrap();
+        rhs.add_transition(
+            r1,
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied,
+            },
+            r1_stop,
+        )
+        .unwrap();
+
+        let result = checker.check(&lhs, &rhs).unwrap();
+        assert!(
+            !result.passed(),
+            "Divergent duplicate-label branches must be detected as non-bisimilar"
+        );
+    }
+
+    #[test]
+    fn test_bisimulation_same_label_same_count_different_targets() {
+        // Both sides have two spawn(0) transitions, but with observably
+        // different successor behavior.
+        let checker = BisimulationChecker::new(12).unwrap();
+
+        // LHS: 0 --spawn(0)--> 1 (stops), 0 --spawn(0)--> 2 (escalates)
+        let mut lhs = ObservableSemantics::new(0);
+        let l1 = lhs.add_state().unwrap();
+        let l2 = lhs.add_state().unwrap();
+        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l1)
+            .unwrap();
+        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l2)
+            .unwrap();
+        let l1_stop = lhs.add_state().unwrap();
+        lhs.add_transition(
+            l1,
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied,
+            },
+            l1_stop,
+        )
+        .unwrap();
+        let l2_esc = lhs.add_state().unwrap();
+        lhs.add_transition(
+            l2,
+            HsiOperation::Escalate {
+                reason: "err".to_string(),
+            },
+            l2_esc,
+        )
+        .unwrap();
+
+        // RHS: 0 --spawn(0)--> 1 (escalates), 0 --spawn(0)--> 2 (stops)
+        // Same labels and count, but reversed target behavior.
+        let mut rhs = ObservableSemantics::new(0);
+        let r1 = rhs.add_state().unwrap();
+        let r2 = rhs.add_state().unwrap();
+        rhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, r1)
+            .unwrap();
+        rhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, r2)
+            .unwrap();
+        let r1_esc = rhs.add_state().unwrap();
+        rhs.add_transition(
+            r1,
+            HsiOperation::Escalate {
+                reason: "err".to_string(),
+            },
+            r1_esc,
+        )
+        .unwrap();
+        let r2_stop = rhs.add_state().unwrap();
+        rhs.add_transition(
+            r2,
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied,
+            },
+            r2_stop,
+        )
+        .unwrap();
+
+        // Positional matching pairs (l1,r1) and (l2,r2). l1 stops but
+        // r1 escalates, so the checker should detect the mismatch.
+        let result = checker.check(&lhs, &rhs).unwrap();
+        assert!(
+            !result.passed(),
+            "Same-label transitions with positionally divergent targets must fail"
+        );
+    }
+
+    #[test]
+    fn test_bisimulation_duplicate_labels_identical_targets_pass() {
+        // Both sides have identical duplicate-label structure: should pass.
+        let checker = BisimulationChecker::new(12).unwrap();
+
+        // Both: 0 --spawn(0)--> 1, 0 --spawn(0)--> 2
+        //       1 --stop--> 3,  2 --stop--> 4
+        let mut lhs = ObservableSemantics::new(0);
+        let l1 = lhs.add_state().unwrap();
+        let l2 = lhs.add_state().unwrap();
+        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l1)
+            .unwrap();
+        lhs.add_transition(0, HsiOperation::Spawn { depth: 0 }, l2)
+            .unwrap();
+        let l3 = lhs.add_state().unwrap();
+        let l4 = lhs.add_state().unwrap();
+        lhs.add_transition(
+            l1,
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied,
+            },
+            l3,
+        )
+        .unwrap();
+        lhs.add_transition(
+            l2,
+            HsiOperation::Stop {
+                kind: StopKind::GoalSatisfied,
+            },
+            l4,
+        )
+        .unwrap();
+
+        let rhs = lhs.clone();
+
+        let result = checker.check(&lhs, &rhs).unwrap();
+        assert!(
+            result.passed(),
+            "Identical duplicate-label structures must be bisimilar"
+        );
+    }
+
+    // ====================================================================
     // BisimulationResult tests
     // ====================================================================
 
@@ -1207,10 +1461,11 @@ mod tests {
     }
 
     #[test]
-    fn test_promotion_gate_blocks_on_failure() {
+    fn test_promotion_gate_blocks_on_bisimulation_failure() {
         let gate = PromotionGate::new(3).unwrap();
 
-        // Build compositions where depth 2 will fail
+        // Provide 3 compositions (matching max_depth) where depths 2 and 3
+        // fail bisimulation because nested spawns differ from flattened.
         let compositions = vec![
             // Depth 1: trivially passes (depth 0 semantics)
             ObservableSemantics::new(0),
@@ -1234,11 +1489,37 @@ mod tests {
     }
 
     #[test]
-    fn test_promotion_gate_empty_compositions() {
+    fn test_promotion_gate_blocks_on_partial_input() {
+        // Fail-closed: fewer compositions than max_depth must deny
+        let gate = PromotionGate::new(3).unwrap();
+
+        // Only provide 2 of 3 required compositions
+        let compositions = vec![ObservableSemantics::new(0), ObservableSemantics::new(0)];
+
+        let result = gate.evaluate(&compositions).unwrap();
+        assert!(
+            !result.allowed(),
+            "Partial input (2 of 3 depths) must be denied"
+        );
+        assert_eq!(result.blocking_defects().len(), 1);
+        assert!(
+            result.blocking_defects()[0]
+                .description
+                .contains("Partial input"),
+        );
+    }
+
+    #[test]
+    fn test_promotion_gate_empty_compositions_returns_fail() {
+        // Fail-closed: no compositions = no evidence = deny promotion
         let gate = PromotionGate::new(3).unwrap();
         let result = gate.evaluate(&[]).unwrap();
-        assert!(result.allowed());
+        assert!(
+            !result.allowed(),
+            "Empty compositions must be denied (fail-closed)"
+        );
         assert!(result.depth_results().is_empty());
+        assert_eq!(result.blocking_defects().len(), 1);
     }
 
     #[test]
@@ -1351,7 +1632,11 @@ mod tests {
     fn test_gate_blocks_promotion_on_proof_failure() {
         // This test verifies the DoD requirement: gate integration blocks
         // promotion on proof failure.
-        let gate = PromotionGate::new(12).unwrap();
+        //
+        // NOTE: Integration into an authoritative promotion path (e.g.
+        // CI pipeline or CLI gate) is tracked as a separate integration
+        // ticket. This test covers the gate's own blocking logic.
+        let gate = PromotionGate::new(1).unwrap();
 
         // Create a composition that is NOT bisimilar to its flattening
         let mut nested = ObservableSemantics::new(5);
