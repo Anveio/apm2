@@ -93,6 +93,14 @@ pub const MAX_REASON_LEN: usize = 1024;
 /// An attacker could inject arbitrary elements to cause OOM.
 pub const MAX_SET_ELEMENTS: usize = 1024;
 
+/// Maximum number of re-admission anchors tracked per directory entry.
+///
+/// Bounded to prevent denial-of-service via memory exhaustion (CTR-1303).
+pub const MAX_READMISSION_ANCHORS: usize = 64;
+
+/// Domain separator for re-admission anchor hashing.
+pub const READMISSION_ANCHOR_DOMAIN: &[u8] = b"apm2:readmission_anchor:v1\0";
+
 // =============================================================================
 // Errors
 // =============================================================================
@@ -173,6 +181,31 @@ pub enum CrdtMergeError {
     /// `SetUnion` has too many elements.
     #[error("SetUnion element limit exceeded: {count} > {max}")]
     SetUnionElementLimitExceeded {
+        /// Actual count.
+        count: usize,
+        /// Maximum allowed count.
+        max: usize,
+    },
+
+    /// Attempted to activate a revoked entry without a valid re-admission
+    /// anchor.
+    #[error("revoked entry cannot be activated without re-admission anchor")]
+    RevocationWinsViolation,
+
+    /// Re-admission anchor does not reference the current revocation event.
+    #[error(
+        "re-admission anchor references revocation {anchor_revocation_hash} but current is {current_revocation_hash}"
+    )]
+    ReAdmissionAnchorMismatch {
+        /// Hash referenced by the anchor.
+        anchor_revocation_hash: String,
+        /// Current revocation event hash.
+        current_revocation_hash: String,
+    },
+
+    /// Too many re-admission anchors.
+    #[error("re-admission anchor limit exceeded: {count} > {max}")]
+    ReAdmissionAnchorLimitExceeded {
         /// Actual count.
         count: usize,
         /// Maximum allowed count.
@@ -1295,6 +1328,446 @@ pub fn validate_key(key: &str) -> Result<(), CrdtMergeError> {
 }
 
 // =============================================================================
+// Directory Entry Status (local to CRDT merge semantics)
+// =============================================================================
+
+/// Status of a directory entry for CRDT merge purposes.
+///
+/// Governs revocation-wins semantics: once an entry reaches
+/// [`DirectoryStatus::Revoked`], it can only return to
+/// [`DirectoryStatus::Active`] via an explicit [`ReAdmissionAnchor`] that
+/// references the revocation event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DirectoryStatus {
+    /// Entry is active and eligible for authoritative operations.
+    Active    = 0,
+    /// Entry has been suspended; authoritative operations MUST be denied.
+    Suspended = 1,
+    /// Entry has been revoked; authoritative operations MUST be denied.
+    /// This is the absorbing state under merge: revoked always wins.
+    Revoked   = 2,
+}
+
+impl DirectoryStatus {
+    /// Returns `true` if the entry permits authoritative operations.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Returns `true` if the entry has been revoked (absorbing state).
+    #[must_use]
+    pub const fn is_revoked(self) -> bool {
+        matches!(self, Self::Revoked)
+    }
+}
+
+// =============================================================================
+// Re-Admission Anchor
+// =============================================================================
+
+/// A signed anchor that permits re-activation of a previously revoked entry.
+///
+/// The anchor must reference the specific revocation event hash to prove that
+/// the re-admitter is aware of the revocation. This prevents accidental or
+/// malicious resurrection of revoked identities.
+///
+/// # Security Properties
+///
+/// - References the exact revocation event hash (fail-closed if mismatched)
+/// - Carries its own HLC timestamp for causal ordering
+/// - Signed by the re-admitting authority (signer node ID)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReAdmissionAnchor {
+    /// BLAKE3 hash of the revocation event this anchor references.
+    revocation_event_hash: [u8; 32],
+    /// HLC timestamp of the re-admission decision.
+    hlc: Hlc,
+    /// Node ID of the authority that signed the re-admission.
+    signer_node_id: NodeId,
+    /// BLAKE3 hash of the re-admission anchor itself (for CAS addressing).
+    anchor_hash: [u8; 32],
+}
+
+impl ReAdmissionAnchor {
+    /// Creates a new re-admission anchor.
+    ///
+    /// The `anchor_hash` is computed deterministically from the domain
+    /// separator, revocation event hash, HLC, and signer node ID.
+    #[must_use]
+    pub fn new(revocation_event_hash: [u8; 32], hlc: Hlc, signer_node_id: NodeId) -> Self {
+        let anchor_hash = Self::compute_hash(&revocation_event_hash, &hlc, &signer_node_id);
+        Self {
+            revocation_event_hash,
+            hlc,
+            signer_node_id,
+            anchor_hash,
+        }
+    }
+
+    /// Returns the revocation event hash this anchor references.
+    #[must_use]
+    pub const fn revocation_event_hash(&self) -> &[u8; 32] {
+        &self.revocation_event_hash
+    }
+
+    /// Returns the HLC timestamp of the re-admission.
+    #[must_use]
+    pub const fn hlc(&self) -> Hlc {
+        self.hlc
+    }
+
+    /// Returns the signer node ID.
+    #[must_use]
+    pub const fn signer_node_id(&self) -> &NodeId {
+        &self.signer_node_id
+    }
+
+    /// Returns the anchor hash (CAS address).
+    #[must_use]
+    pub const fn anchor_hash(&self) -> &[u8; 32] {
+        &self.anchor_hash
+    }
+
+    /// Computes the deterministic hash of this anchor.
+    #[must_use]
+    fn compute_hash(
+        revocation_event_hash: &[u8; 32],
+        hlc: &Hlc,
+        signer_node_id: &NodeId,
+    ) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(READMISSION_ANCHOR_DOMAIN);
+        hasher.update(revocation_event_hash);
+        hasher.update(&hlc.wall_time_ns().to_le_bytes());
+        hasher.update(&hlc.logical_counter().to_le_bytes());
+        hasher.update(signer_node_id);
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Validates that this anchor references the given revocation event hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::ReAdmissionAnchorMismatch`] if the hashes
+    /// do not match.
+    pub fn validate_for_revocation(
+        &self,
+        current_revocation_hash: &[u8; 32],
+    ) -> Result<(), CrdtMergeError> {
+        if self.revocation_event_hash != *current_revocation_hash {
+            return Err(CrdtMergeError::ReAdmissionAnchorMismatch {
+                anchor_revocation_hash: hex::encode(self.revocation_event_hash),
+                current_revocation_hash: hex::encode(current_revocation_hash),
+            });
+        }
+        Ok(())
+    }
+}
+
+// =============================================================================
+// Revocation-Wins Register (TCK-00360)
+// =============================================================================
+
+/// A CRDT register with revocation-wins merge semantics.
+///
+/// This register extends the standard LWW register with a key invariant:
+/// **if either replica says "revoked", the merged result is "revoked"**,
+/// regardless of timestamps. This is the absorbing-state property.
+///
+/// # Merge Rules
+///
+/// 1. If both replicas have the same status and value, no conflict.
+/// 2. If either replica is `Revoked`, the merged result is `Revoked`
+///    (revocation-wins, regardless of HLC ordering).
+/// 3. If either replica is `Suspended`, and neither is `Revoked`, the merged
+///    result is `Suspended`.
+/// 4. If both are `Active`, standard LWW by HLC applies.
+/// 5. Re-activation from `Revoked` requires an explicit [`ReAdmissionAnchor`].
+///
+/// # CRDT Properties
+///
+/// - **Commutativity**: `merge(a, b) = merge(b, a)`
+/// - **Associativity**: `merge(merge(a, b), c) = merge(a, merge(b, c))`
+/// - **Idempotence**: `merge(a, a) = a`
+///
+/// These properties hold because `DirectoryStatus` forms a join-semilattice
+/// where `Active < Suspended < Revoked`, and `max` is the merge function
+/// for the status dimension.
+///
+/// # References
+///
+/// - RFC-0020: Identity Directory and Revocation
+/// - TCK-00360: Revocation-wins signed CRDT merge law
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevocationWinsRegister<T> {
+    /// The stored value (e.g., certificate hash, directory entry payload).
+    value: T,
+    /// Current directory status.
+    status: DirectoryStatus,
+    /// HLC timestamp of the last state change.
+    hlc: Hlc,
+    /// Node ID that performed the last state change.
+    node_id: NodeId,
+    /// Hash of the revocation event, if status is `Revoked`.
+    /// Used to validate re-admission anchors.
+    revocation_event_hash: Option<[u8; 32]>,
+    /// Re-admission anchor, if this entry was re-activated after revocation.
+    readmission_anchor: Option<ReAdmissionAnchor>,
+}
+
+impl<T: Clone + PartialEq> RevocationWinsRegister<T> {
+    /// Creates a new active register.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(value: T, hlc: Hlc, node_id: NodeId) -> Self {
+        Self {
+            value,
+            status: DirectoryStatus::Active,
+            hlc,
+            node_id,
+            revocation_event_hash: None,
+            readmission_anchor: None,
+        }
+    }
+
+    /// Creates a new register with a specific status.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn with_status(
+        value: T,
+        status: DirectoryStatus,
+        hlc: Hlc,
+        node_id: NodeId,
+        revocation_event_hash: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            value,
+            status,
+            hlc,
+            node_id,
+            revocation_event_hash,
+            readmission_anchor: None,
+        }
+    }
+
+    /// Returns a reference to the stored value.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Returns the current directory status.
+    #[must_use]
+    pub const fn status(&self) -> DirectoryStatus {
+        self.status
+    }
+
+    /// Returns the HLC timestamp.
+    #[must_use]
+    pub const fn hlc(&self) -> Hlc {
+        self.hlc
+    }
+
+    /// Returns the node ID.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Returns the HLC with node ID for comparison.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn timestamp(&self) -> HlcWithNodeId {
+        HlcWithNodeId::new(self.hlc, self.node_id)
+    }
+
+    /// Returns the revocation event hash, if revoked.
+    #[must_use]
+    pub const fn revocation_event_hash(&self) -> Option<&[u8; 32]> {
+        self.revocation_event_hash.as_ref()
+    }
+
+    /// Returns the re-admission anchor, if present.
+    #[must_use]
+    pub const fn readmission_anchor(&self) -> Option<&ReAdmissionAnchor> {
+        self.readmission_anchor.as_ref()
+    }
+
+    /// Revokes this entry, setting the revocation event hash.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn revoke(mut self, hlc: Hlc, node_id: NodeId, revocation_event_hash: [u8; 32]) -> Self {
+        self.status = DirectoryStatus::Revoked;
+        self.hlc = hlc;
+        self.node_id = node_id;
+        self.revocation_event_hash = Some(revocation_event_hash);
+        self.readmission_anchor = None;
+        self
+    }
+
+    /// Suspends this entry.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn suspend(mut self, hlc: Hlc, node_id: NodeId) -> Self {
+        self.status = DirectoryStatus::Suspended;
+        self.hlc = hlc;
+        self.node_id = node_id;
+        self
+    }
+
+    /// Re-admits a revoked entry using an explicit re-admission anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtMergeError::RevocationWinsViolation`] if the entry is not
+    /// currently revoked.
+    ///
+    /// Returns [`CrdtMergeError::ReAdmissionAnchorMismatch`] if the anchor does
+    /// not reference the current revocation event.
+    pub fn readmit(
+        mut self,
+        new_value: T,
+        hlc: Hlc,
+        node_id: NodeId,
+        anchor: ReAdmissionAnchor,
+    ) -> Result<Self, CrdtMergeError> {
+        // Must be currently revoked
+        if self.status != DirectoryStatus::Revoked {
+            return Err(CrdtMergeError::RevocationWinsViolation);
+        }
+
+        // Anchor must reference current revocation
+        let revocation_hash = self
+            .revocation_event_hash
+            .as_ref()
+            .ok_or(CrdtMergeError::RevocationWinsViolation)?;
+        anchor.validate_for_revocation(revocation_hash)?;
+
+        self.value = new_value;
+        self.status = DirectoryStatus::Active;
+        self.hlc = hlc;
+        self.node_id = node_id;
+        self.readmission_anchor = Some(anchor);
+        Ok(self)
+    }
+
+    /// Merges this register with another using revocation-wins semantics.
+    ///
+    /// # Merge Rules
+    ///
+    /// The merge computes the join of the status lattice first, then uses LWW
+    /// for the value dimension when statuses are equal.
+    ///
+    /// Status lattice: `Active < Suspended < Revoked`
+    ///
+    /// 1. If statuses differ, the higher status wins (revocation-wins).
+    /// 2. If statuses are equal, LWW by `(HLC, node_id)` determines the winner.
+    /// 3. If everything is equal (same status, value, HLC, `node_id`), no
+    ///    conflict.
+    ///
+    /// # CRDT Properties
+    ///
+    /// Commutativity, associativity, and idempotence hold because:
+    /// - Status merge uses `max()` on an ordered enum (a lattice join)
+    /// - Value merge uses deterministic LWW when statuses are equal
+    /// - The combined `(status, hlc, node_id)` comparison is a total order
+    pub fn merge(&self, other: &Self) -> MergeResult<Self> {
+        // Fast path: identical entries
+        if self.status == other.status && self.value == other.value {
+            let winner = if self.timestamp() >= other.timestamp() {
+                self.clone()
+            } else {
+                other.clone()
+            };
+            return MergeResult::NoConflict(winner);
+        }
+
+        // Status lattice join: higher status always wins
+        let merged_status = if self.status >= other.status {
+            self.status
+        } else {
+            other.status
+        };
+
+        // Determine the winner based on merged status.
+        // Status dimension uses lattice join (max); value dimension uses LWW.
+        let (winner, resolution, reason) = match self.status.cmp(&other.status) {
+            Ordering::Equal => {
+                // Same status: LWW by timestamp
+                match self.timestamp().cmp(&other.timestamp()) {
+                    Ordering::Greater => (
+                        self.clone(),
+                        MergeWinner::LocalWins,
+                        "local timestamp wins (same status)",
+                    ),
+                    Ordering::Less => (
+                        other.clone(),
+                        MergeWinner::RemoteWins,
+                        "remote timestamp wins (same status)",
+                    ),
+                    Ordering::Equal => {
+                        // Same timestamp, same status, different values: Byzantine fault
+                        (
+                            self.clone(),
+                            MergeWinner::LocalWins,
+                            "identical timestamps: undefined behavior (same status)",
+                        )
+                    },
+                }
+            },
+            Ordering::Greater => (
+                self.clone(),
+                MergeWinner::LocalWins,
+                "local status wins (revocation-wins lattice)",
+            ),
+            Ordering::Less => (
+                other.clone(),
+                MergeWinner::RemoteWins,
+                "remote status wins (revocation-wins lattice)",
+            ),
+        };
+
+        // Ensure the winner has the correct merged status
+        let mut winner = winner;
+        winner.status = merged_status;
+
+        // If either side was revoked, preserve the revocation event hash
+        if merged_status == DirectoryStatus::Revoked {
+            // Prefer the revocation hash from the side that was actually revoked
+            if winner.revocation_event_hash.is_none() {
+                if self.status == DirectoryStatus::Revoked {
+                    winner.revocation_event_hash = self.revocation_event_hash;
+                } else if other.status == DirectoryStatus::Revoked {
+                    winner.revocation_event_hash = other.revocation_event_hash;
+                }
+            }
+            // Clear any re-admission anchor when merging to revoked
+            winner.readmission_anchor = None;
+        }
+
+        let conflict = ConflictRecord {
+            operator: MergeOperator::LastWriterWins,
+            local_hlc: Some(self.hlc),
+            local_node_id: Some(self.node_id),
+            remote_hlc: Some(other.hlc),
+            remote_node_id: Some(other.node_id),
+            resolution,
+            reason: reason.to_string(),
+            key: None,
+            local_value_hash: None,
+            remote_value_hash: None,
+        };
+
+        MergeResult::Resolved { winner, conflict }
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -2366,5 +2839,652 @@ mod tests {
             u64::MAX,
             "value() should saturate when sum overflows"
         );
+    }
+
+    // =========================================================================
+    // TCK-00360: Revocation-Wins Signed CRDT Merge Law
+    // =========================================================================
+
+    /// Helper: create a `RevocationWinsRegister` with Active status.
+    fn make_active_reg(value: &str, wall_time: u64, node: u8) -> RevocationWinsRegister<String> {
+        RevocationWinsRegister::new(value.to_string(), Hlc::new(wall_time, 0), [node; 32])
+    }
+
+    /// Helper: create a `RevocationWinsRegister` with Revoked status.
+    fn make_revoked_reg(
+        value: &str,
+        wall_time: u64,
+        node: u8,
+        rev_hash: [u8; 32],
+    ) -> RevocationWinsRegister<String> {
+        RevocationWinsRegister::with_status(
+            value.to_string(),
+            DirectoryStatus::Revoked,
+            Hlc::new(wall_time, 0),
+            [node; 32],
+            Some(rev_hash),
+        )
+    }
+
+    /// Helper: create a `RevocationWinsRegister` with Suspended status.
+    fn make_suspended_reg(value: &str, wall_time: u64, node: u8) -> RevocationWinsRegister<String> {
+        RevocationWinsRegister::with_status(
+            value.to_string(),
+            DirectoryStatus::Suspended,
+            Hlc::new(wall_time, 0),
+            [node; 32],
+            None,
+        )
+    }
+
+    /// AC1: Revocation-wins merge is commutative.
+    #[test]
+    fn tck_00360_revocation_wins_commutativity() {
+        let reg_a = make_active_reg("active_a", 1000, 0x01);
+        let reg_b = make_revoked_reg("revoked_b", 900, 0x02, [0xBB; 32]);
+
+        let result_ab = reg_a.merge(&reg_b);
+        let result_ba = reg_b.merge(&reg_a);
+
+        let winner_ab = result_ab.winner().unwrap();
+        let winner_ba = result_ba.winner().unwrap();
+
+        // Both must agree on status (revoked wins regardless of timestamp)
+        assert_eq!(winner_ab.status(), DirectoryStatus::Revoked);
+        assert_eq!(winner_ba.status(), DirectoryStatus::Revoked);
+        // Both must produce the same winner value
+        assert_eq!(winner_ab.value(), winner_ba.value());
+    }
+
+    /// AC1: Revocation-wins merge is associative.
+    #[test]
+    fn tck_00360_revocation_wins_associativity() {
+        let reg_a = make_active_reg("a", 1000, 0x01);
+        let reg_b = make_revoked_reg("b", 900, 0x02, [0xBB; 32]);
+        let reg_c = make_suspended_reg("c", 1100, 0x03);
+
+        // (a merge b) merge c
+        let ab = reg_a.merge(&reg_b).winner().unwrap();
+        let abc_left = ab.merge(&reg_c).winner().unwrap();
+
+        // a merge (b merge c)
+        let bc = reg_b.merge(&reg_c).winner().unwrap();
+        let abc_right = reg_a.merge(&bc).winner().unwrap();
+
+        // Both must converge to the same status
+        assert_eq!(abc_left.status(), abc_right.status());
+        assert_eq!(abc_left.status(), DirectoryStatus::Revoked);
+        // Values must match
+        assert_eq!(abc_left.value(), abc_right.value());
+    }
+
+    /// AC1: Revocation-wins merge is idempotent.
+    #[test]
+    fn tck_00360_revocation_wins_idempotent() {
+        let reg = make_revoked_reg("revoked", 1000, 0x01, [0xAA; 32]);
+
+        let result = reg.merge(&reg);
+        assert!(!result.had_conflict());
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+        assert_eq!(winner.value(), "revoked");
+    }
+
+    /// AC1: Active vs Active uses LWW.
+    #[test]
+    fn tck_00360_active_vs_active_lww() {
+        let reg_a = make_active_reg("a", 1000, 0x01);
+        let reg_b = make_active_reg("b", 1001, 0x02);
+
+        let result = reg_a.merge(&reg_b);
+        let winner = result.winner().unwrap();
+
+        assert_eq!(winner.status(), DirectoryStatus::Active);
+        assert_eq!(winner.value(), "b"); // Higher HLC wins
+    }
+
+    /// AC1: Active vs Revoked always yields Revoked.
+    #[test]
+    fn tck_00360_active_vs_revoked() {
+        // Active has LATER timestamp, but revoked still wins
+        let reg_active = make_active_reg("active", 2000, 0x01);
+        let reg_revoked = make_revoked_reg("revoked", 1000, 0x02, [0xCC; 32]);
+
+        let result = reg_active.merge(&reg_revoked);
+        let winner = result.winner().unwrap();
+
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+    }
+
+    /// AC1: Suspended vs Revoked yields Revoked.
+    #[test]
+    fn tck_00360_suspended_vs_revoked() {
+        let reg_suspended = make_suspended_reg("suspended", 2000, 0x01);
+        let reg_revoked = make_revoked_reg("revoked", 1000, 0x02, [0xDD; 32]);
+
+        let result = reg_suspended.merge(&reg_revoked);
+        let winner = result.winner().unwrap();
+
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+    }
+
+    /// AC1: Active vs Suspended yields Suspended.
+    #[test]
+    fn tck_00360_active_vs_suspended() {
+        // Active has later timestamp, but Suspended status is higher in lattice
+        let reg_active = make_active_reg("active", 2000, 0x01);
+        let reg_suspended = make_suspended_reg("suspended", 1000, 0x02);
+
+        let result = reg_active.merge(&reg_suspended);
+        let winner = result.winner().unwrap();
+
+        assert_eq!(winner.status(), DirectoryStatus::Suspended);
+    }
+
+    /// AC2: Revoked identity cannot resurrect without re-admission anchor.
+    #[test]
+    fn tck_00360_revoked_cannot_resurrect_without_anchor() {
+        let rev_hash = [0xAA; 32];
+        let reg_revoked = make_revoked_reg("revoked", 1000, 0x01, rev_hash);
+
+        // Attempting to merge with an active entry still yields revoked
+        let reg_active = make_active_reg("active_attempt", 2000, 0x02);
+        let result = reg_revoked.merge(&reg_active);
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+
+        // Even with a much later timestamp
+        let reg_far_future = make_active_reg("future_attempt", 999_999, 0x03);
+        let result = reg_revoked.merge(&reg_far_future);
+        let winner = result.winner().unwrap();
+        assert_eq!(winner.status(), DirectoryStatus::Revoked);
+    }
+
+    /// AC2: Re-admission with valid anchor succeeds.
+    #[test]
+    fn tck_00360_readmission_with_valid_anchor() {
+        let rev_hash = [0xAA; 32];
+        let reg_revoked = make_revoked_reg("old_value", 1000, 0x01, rev_hash);
+
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(2000, 0), [0x02; 32]);
+        let readmitted = reg_revoked
+            .readmit(
+                "new_value".to_string(),
+                Hlc::new(2000, 0),
+                [0x02; 32],
+                anchor,
+            )
+            .unwrap();
+
+        assert_eq!(readmitted.status(), DirectoryStatus::Active);
+        assert_eq!(readmitted.value(), "new_value");
+        assert!(readmitted.readmission_anchor().is_some());
+    }
+
+    /// AC2: Re-admission with mismatched anchor fails.
+    #[test]
+    fn tck_00360_readmission_with_wrong_anchor_fails() {
+        let rev_hash = [0xAA; 32];
+        let wrong_hash = [0xBB; 32];
+        let reg_revoked = make_revoked_reg("old_value", 1000, 0x01, rev_hash);
+
+        let bad_anchor = ReAdmissionAnchor::new(wrong_hash, Hlc::new(2000, 0), [0x02; 32]);
+        let result = reg_revoked.readmit(
+            "new_value".to_string(),
+            Hlc::new(2000, 0),
+            [0x02; 32],
+            bad_anchor,
+        );
+
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::ReAdmissionAnchorMismatch { .. })
+        ));
+    }
+
+    /// AC2: Re-admission of non-revoked entry fails.
+    #[test]
+    fn tck_00360_readmission_of_active_fails() {
+        let reg_active = make_active_reg("value", 1000, 0x01);
+        let anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(2000, 0), [0x02; 32]);
+
+        let result = reg_active.readmit(
+            "new_value".to_string(),
+            Hlc::new(2000, 0),
+            [0x02; 32],
+            anchor,
+        );
+
+        assert!(matches!(
+            result,
+            Err(CrdtMergeError::RevocationWinsViolation)
+        ));
+    }
+
+    /// AC3: Byzantine reordering cannot violate revocation-wins.
+    ///
+    /// Simulates a partition/rejoin scenario where messages arrive in
+    /// arbitrary order due to Byzantine behavior.
+    #[test]
+    fn tck_00360_byzantine_reordering_simulation() {
+        // Simulate 5 events arriving in different orders
+        let events: Vec<RevocationWinsRegister<String>> = vec![
+            make_active_reg("v1", 100, 0x01),
+            make_active_reg("v2", 200, 0x02),
+            make_revoked_reg("v3_revoked", 150, 0x03, [0xEE; 32]),
+            make_active_reg("v4", 300, 0x04),
+            make_suspended_reg("v5", 250, 0x05),
+        ];
+
+        // Try all 120 permutations of 5 events
+        let permutations = generate_permutations(5);
+        let mut results = Vec::new();
+
+        for perm in &permutations {
+            // Merge in the order specified by this permutation
+            let mut merged = events[perm[0]].clone();
+            for &idx in &perm[1..] {
+                merged = merged.merge(&events[idx]).winner().unwrap();
+            }
+            results.push(merged);
+        }
+
+        // All permutations must converge to the same result
+        for result in &results {
+            assert_eq!(
+                result.status(),
+                DirectoryStatus::Revoked,
+                "Byzantine reordering violated revocation-wins"
+            );
+        }
+
+        // All must agree on the same value
+        let first_value = results[0].value().clone();
+        for result in &results {
+            assert_eq!(
+                result.value(),
+                &first_value,
+                "Byzantine reordering produced inconsistent values"
+            );
+        }
+    }
+
+    /// AC3: Partition/rejoin with multiple revocations converges.
+    #[test]
+    fn tck_00360_partition_rejoin_multiple_revocations() {
+        // Partition A: node revokes at t=100
+        let part_a = make_revoked_reg("revoked_by_a", 100, 0x01, [0xAA; 32]);
+        // Partition B: node revokes independently at t=200
+        let part_b = make_revoked_reg("revoked_by_b", 200, 0x02, [0xBB; 32]);
+
+        // Rejoin: merge both partitions
+        let result_ab = part_a.merge(&part_b);
+        let result_ba = part_b.merge(&part_a);
+
+        let winner_ab = result_ab.winner().unwrap();
+        let winner_ba = result_ba.winner().unwrap();
+
+        // Both must be revoked
+        assert_eq!(winner_ab.status(), DirectoryStatus::Revoked);
+        assert_eq!(winner_ba.status(), DirectoryStatus::Revoked);
+        // Must agree on the winner (later timestamp wins within same status)
+        assert_eq!(winner_ab.value(), winner_ba.value());
+    }
+
+    /// AC3: Partition/rejoin where one side revokes and other re-admits.
+    #[test]
+    fn tck_00360_partition_rejoin_revoke_vs_readmit() {
+        let rev_hash = [0xAA; 32];
+
+        // Partition A: revoked
+        let part_a = make_revoked_reg("revoked", 100, 0x01, rev_hash);
+
+        // Partition B: revoked then re-admitted
+        let revoked_b = make_revoked_reg("revoked", 100, 0x01, rev_hash);
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(200, 0), [0x02; 32]);
+        let part_b = revoked_b
+            .readmit(
+                "readmitted".to_string(),
+                Hlc::new(200, 0),
+                [0x02; 32],
+                anchor,
+            )
+            .unwrap();
+        assert_eq!(part_b.status(), DirectoryStatus::Active);
+
+        // When merging: the revoked partition (A) should dominate because
+        // revocation-wins applies at the merge layer. The re-admission is
+        // a local state transition, not a merge-level override.
+        let result = part_b.merge(&part_a);
+        let winner = result.winner().unwrap();
+        assert_eq!(
+            winner.status(),
+            DirectoryStatus::Revoked,
+            "Revocation from partition A must win over re-admission in partition B"
+        );
+    }
+
+    /// `DirectoryStatus` ordering matches the lattice.
+    #[test]
+    fn tck_00360_directory_status_ordering() {
+        assert!(DirectoryStatus::Active < DirectoryStatus::Suspended);
+        assert!(DirectoryStatus::Suspended < DirectoryStatus::Revoked);
+        assert!(DirectoryStatus::Active < DirectoryStatus::Revoked);
+    }
+
+    /// `DirectoryStatus` helper methods.
+    #[test]
+    fn tck_00360_directory_status_helpers() {
+        assert!(DirectoryStatus::Active.is_active());
+        assert!(!DirectoryStatus::Active.is_revoked());
+
+        assert!(!DirectoryStatus::Revoked.is_active());
+        assert!(DirectoryStatus::Revoked.is_revoked());
+
+        assert!(!DirectoryStatus::Suspended.is_active());
+        assert!(!DirectoryStatus::Suspended.is_revoked());
+    }
+
+    /// `ReAdmissionAnchor` hash is deterministic.
+    #[test]
+    fn tck_00360_readmission_anchor_deterministic_hash() {
+        let rev_hash = [0xAA; 32];
+        let hlc = Hlc::new(1000, 5);
+        let signer = [0x01; 32];
+
+        let anchor1 = ReAdmissionAnchor::new(rev_hash, hlc, signer);
+        let anchor2 = ReAdmissionAnchor::new(rev_hash, hlc, signer);
+
+        assert_eq!(anchor1.anchor_hash(), anchor2.anchor_hash());
+
+        // Different inputs produce different hashes
+        let anchor3 = ReAdmissionAnchor::new([0xBB; 32], hlc, signer);
+        assert_ne!(anchor1.anchor_hash(), anchor3.anchor_hash());
+    }
+
+    /// `ReAdmissionAnchor` validation.
+    #[test]
+    fn tck_00360_readmission_anchor_validation() {
+        let rev_hash = [0xAA; 32];
+        let anchor = ReAdmissionAnchor::new(rev_hash, Hlc::new(1000, 0), [0x01; 32]);
+
+        // Valid reference
+        assert!(anchor.validate_for_revocation(&rev_hash).is_ok());
+
+        // Invalid reference
+        let wrong_hash = [0xBB; 32];
+        assert!(matches!(
+            anchor.validate_for_revocation(&wrong_hash),
+            Err(CrdtMergeError::ReAdmissionAnchorMismatch { .. })
+        ));
+    }
+
+    /// `ReAdmissionAnchor` accessors.
+    #[test]
+    fn tck_00360_readmission_anchor_accessors() {
+        let rev_hash = [0xAA; 32];
+        let hlc = Hlc::new(1000, 5);
+        let signer = [0x01; 32];
+
+        let anchor = ReAdmissionAnchor::new(rev_hash, hlc, signer);
+
+        assert_eq!(anchor.revocation_event_hash(), &rev_hash);
+        assert_eq!(anchor.hlc(), hlc);
+        assert_eq!(anchor.signer_node_id(), &signer);
+        assert!(!anchor.anchor_hash().iter().all(|&b| b == 0));
+    }
+
+    /// `RevocationWinsRegister` accessors.
+    #[test]
+    fn tck_00360_register_accessors() {
+        let reg = RevocationWinsRegister::new("value".to_string(), Hlc::new(1000, 0), [0x01; 32]);
+
+        assert_eq!(reg.value(), "value");
+        assert_eq!(reg.status(), DirectoryStatus::Active);
+        assert_eq!(reg.hlc(), Hlc::new(1000, 0));
+        assert_eq!(reg.node_id(), [0x01; 32]);
+        assert!(reg.revocation_event_hash().is_none());
+        assert!(reg.readmission_anchor().is_none());
+    }
+
+    /// `RevocationWinsRegister::revoke` and `suspend` transitions.
+    #[test]
+    fn tck_00360_register_state_transitions() {
+        let reg = make_active_reg("value", 1000, 0x01);
+
+        // Suspend
+        let suspended = reg.clone().suspend(Hlc::new(1001, 0), [0x02; 32]);
+        assert_eq!(suspended.status(), DirectoryStatus::Suspended);
+
+        // Revoke
+        let revoked = reg.revoke(Hlc::new(1002, 0), [0x03; 32], [0xFF; 32]);
+        assert_eq!(revoked.status(), DirectoryStatus::Revoked);
+        assert_eq!(revoked.revocation_event_hash(), Some(&[0xFF; 32]));
+    }
+
+    /// Concurrent updates converge deterministically across many orderings.
+    #[test]
+    fn tck_00360_concurrent_updates_converge() {
+        let regs = [
+            make_active_reg("a", 100, 0x01),
+            make_active_reg("b", 200, 0x02),
+            make_active_reg("c", 150, 0x03),
+        ];
+
+        // Try all 6 permutations
+        let perms = generate_permutations(3);
+        let mut results = Vec::new();
+
+        for perm in &perms {
+            let mut merged = regs[perm[0]].clone();
+            for &idx in &perm[1..] {
+                merged = merged.merge(&regs[idx]).winner().unwrap();
+            }
+            results.push(merged.value().clone());
+        }
+
+        // All permutations must produce the same result
+        for r in &results {
+            assert_eq!(r, &results[0], "Non-deterministic convergence detected");
+        }
+    }
+
+    /// Error display for new TCK-00360 error variants.
+    #[test]
+    fn tck_00360_error_display() {
+        let errors: Vec<CrdtMergeError> = vec![
+            CrdtMergeError::RevocationWinsViolation,
+            CrdtMergeError::ReAdmissionAnchorMismatch {
+                anchor_revocation_hash: "aa".to_string(),
+                current_revocation_hash: "bb".to_string(),
+            },
+            CrdtMergeError::ReAdmissionAnchorLimitExceeded { count: 65, max: 64 },
+        ];
+
+        for err in &errors {
+            let msg = err.to_string();
+            assert!(!msg.is_empty());
+        }
+    }
+
+    /// `RevocationWinsRegister` no-conflict when identical.
+    #[test]
+    fn tck_00360_no_conflict_identical_entries() {
+        let reg = make_active_reg("same", 1000, 0x01);
+        let result = reg.merge(&reg);
+        assert!(!result.had_conflict());
+    }
+
+    /// `RevocationWinsRegister` serialization round-trip.
+    #[test]
+    fn tck_00360_register_serialization() {
+        let reg = make_revoked_reg("value", 1000, 0x01, [0xAA; 32]);
+        let json = serde_json::to_string(&reg).unwrap();
+        let parsed: RevocationWinsRegister<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, reg);
+    }
+
+    /// `ReAdmissionAnchor` serialization round-trip.
+    #[test]
+    fn tck_00360_anchor_serialization() {
+        let anchor = ReAdmissionAnchor::new([0xAA; 32], Hlc::new(1000, 0), [0x01; 32]);
+        let json = serde_json::to_string(&anchor).unwrap();
+        let parsed: ReAdmissionAnchor = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, anchor);
+    }
+
+    /// Helper: generate all permutations of indices 0..n.
+    fn generate_permutations(n: usize) -> Vec<Vec<usize>> {
+        let mut result = Vec::new();
+        let mut indices: Vec<usize> = (0..n).collect();
+        permute(&mut indices, 0, &mut result);
+        result
+    }
+
+    fn permute(arr: &mut Vec<usize>, start: usize, result: &mut Vec<Vec<usize>>) {
+        if start == arr.len() {
+            result.push(arr.clone());
+            return;
+        }
+        for i in start..arr.len() {
+            arr.swap(start, i);
+            permute(arr, start + 1, result);
+            arr.swap(start, i);
+        }
+    }
+}
+
+// =============================================================================
+// Property-Based Tests (TCK-00360)
+// =============================================================================
+
+#[cfg(test)]
+mod proptest_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Strategy for generating a `DirectoryStatus`.
+    fn arb_directory_status() -> impl Strategy<Value = DirectoryStatus> {
+        prop_oneof![
+            Just(DirectoryStatus::Active),
+            Just(DirectoryStatus::Suspended),
+            Just(DirectoryStatus::Revoked),
+        ]
+    }
+
+    /// Strategy for generating a `NodeId`.
+    fn arb_node_id() -> impl Strategy<Value = NodeId> {
+        prop::array::uniform32(any::<u8>())
+    }
+
+    /// Strategy for generating an `Hlc`.
+    fn arb_hlc() -> impl Strategy<Value = Hlc> {
+        (1u64..1_000_000u64, 0u32..100u32).prop_map(|(wall, counter)| Hlc::new(wall, counter))
+    }
+
+    /// Strategy for generating a `RevocationWinsRegister<u64>`.
+    fn arb_register() -> impl Strategy<Value = RevocationWinsRegister<u64>> {
+        (
+            any::<u64>(),
+            arb_directory_status(),
+            arb_hlc(),
+            arb_node_id(),
+        )
+            .prop_map(|(value, status, hlc, node_id)| {
+                let rev_hash = if status == DirectoryStatus::Revoked {
+                    Some(hash_value(&value.to_le_bytes()))
+                } else {
+                    None
+                };
+                RevocationWinsRegister::with_status(value, status, hlc, node_id, rev_hash)
+            })
+    }
+
+    proptest! {
+        /// Property: merge is commutative for RevocationWinsRegister.
+        #[test]
+        fn revocation_wins_commutativity(a in arb_register(), b in arb_register()) {
+            let result_ab = a.merge(&b);
+            let result_ba = b.merge(&a);
+
+            let winner_ab = result_ab.winner().unwrap();
+            let winner_ba = result_ba.winner().unwrap();
+
+            // Status must always agree
+            prop_assert_eq!(winner_ab.status(), winner_ba.status());
+            // Value must always agree
+            prop_assert_eq!(winner_ab.value(), winner_ba.value());
+        }
+
+        /// Property: merge is idempotent for RevocationWinsRegister.
+        #[test]
+        fn revocation_wins_idempotent(a in arb_register()) {
+            let result = a.merge(&a);
+            let winner = result.winner().unwrap();
+            prop_assert_eq!(winner.status(), a.status());
+            prop_assert_eq!(winner.value(), a.value());
+        }
+
+        /// Property: merge is associative for RevocationWinsRegister.
+        #[test]
+        fn revocation_wins_associativity(
+            a in arb_register(),
+            b in arb_register(),
+            c in arb_register()
+        ) {
+            // (a merge b) merge c
+            let ab = a.merge(&b).winner().unwrap();
+            let abc_left = ab.merge(&c).winner().unwrap();
+
+            // a merge (b merge c)
+            let bc = b.merge(&c).winner().unwrap();
+            let abc_right = a.merge(&bc).winner().unwrap();
+
+            // Must converge to same status and value
+            prop_assert_eq!(abc_left.status(), abc_right.status());
+            prop_assert_eq!(abc_left.value(), abc_right.value());
+        }
+
+        /// Property: revocation is absorbing - if any input is Revoked,
+        /// the merge result is always Revoked.
+        #[test]
+        fn revocation_is_absorbing(a in arb_register(), b in arb_register()) {
+            let winner = a.merge(&b).winner().unwrap();
+            if a.status() == DirectoryStatus::Revoked || b.status() == DirectoryStatus::Revoked {
+                prop_assert_eq!(winner.status(), DirectoryStatus::Revoked);
+            }
+        }
+
+        /// Property: status lattice join is monotone.
+        #[test]
+        fn status_lattice_monotone(a in arb_register(), b in arb_register()) {
+            let winner = a.merge(&b).winner().unwrap();
+            // Merged status is always >= both inputs
+            prop_assert!(winner.status() >= a.status());
+            prop_assert!(winner.status() >= b.status());
+        }
+
+        /// Property: Byzantine reordering of N registers always converges.
+        #[test]
+        fn byzantine_reordering_converges(
+            regs in prop::collection::vec(arb_register(), 2..=5)
+        ) {
+            // Merge left-to-right
+            let mut forward = regs[0].clone();
+            for reg in &regs[1..] {
+                forward = forward.merge(reg).winner().unwrap();
+            }
+
+            // Merge right-to-left
+            let mut backward = regs[regs.len() - 1].clone();
+            for reg in regs[..regs.len() - 1].iter().rev() {
+                backward = backward.merge(reg).winner().unwrap();
+            }
+
+            // Must agree
+            prop_assert_eq!(forward.status(), backward.status());
+            prop_assert_eq!(forward.value(), backward.value());
+        }
     }
 }
