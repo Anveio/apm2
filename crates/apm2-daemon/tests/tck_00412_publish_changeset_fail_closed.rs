@@ -6,7 +6,7 @@
 //! - CAS missing: publish fails closed.
 //! - Ownership, validation, and digest integrity checks reject before mutation.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use apm2_core::fac::{ChangeKind, ChangeSetBundleV1, FileChange, GitObjectRef, HashAlgo};
 use apm2_daemon::cas::{DurableCas, DurableCasConfig};
@@ -436,5 +436,116 @@ fn tck_00412_publish_changeset_rejects_digest_mismatch() {
         count_changeset_events(dispatcher, &work_id),
         0,
         "digest mismatch rejection must happen before ledger emission"
+    );
+}
+
+/// Verifies that concurrent publish requests for the same `(work_id,
+/// changeset_digest)` produce exactly one ledger entry and all threads observe
+/// identical bindings.
+///
+/// This exercises the defense-in-depth between the application-level semantic
+/// idempotency check (`find_changeset_published_replay`) and the database-level
+/// `idx_unique_changeset_published` partial unique index. Under concurrent
+/// dispatch, at most one thread wins the INSERT race; all others hit either the
+/// application-level fast-path or the database UNIQUE constraint followed by
+/// the race-safe replay fallback.
+#[test]
+fn tck_00412_publish_changeset_concurrent_publish_exactly_once() {
+    const NUM_THREADS: usize = 8;
+
+    let conn = make_sqlite_conn();
+    let (_cas_root, cas_path) = make_secure_cas_dir();
+    let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+
+    let state = DispatcherState::with_persistence_and_cas(
+        session_registry,
+        None,
+        Arc::clone(&conn),
+        &cas_path,
+    )
+    .expect("production state with CAS should initialize");
+
+    let dispatcher = state.privileged_dispatcher();
+    let ctx = make_privileged_ctx(1000, 1000);
+    let work_id = claim_work(dispatcher, &ctx);
+
+    let bundle_bytes = serde_json::to_vec(&make_valid_bundle("cs-concurrent")).unwrap();
+    let barrier = Barrier::new(NUM_THREADS);
+
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..NUM_THREADS)
+            .map(|_| {
+                s.spawn(|| {
+                    let thread_ctx = make_privileged_ctx(1000, 1000);
+                    let request = PublishChangeSetRequest {
+                        work_id: work_id.clone(),
+                        bundle_bytes: bundle_bytes.clone(),
+                    };
+                    let encoded = encode_publish_changeset_request(&request);
+
+                    // Synchronize all threads to maximize contention.
+                    barrier.wait();
+
+                    let response = dispatcher
+                        .dispatch(&encoded, &thread_ctx)
+                        .expect("concurrent publish should dispatch");
+
+                    match response {
+                        PrivilegedResponse::PublishChangeSet(resp) => {
+                            Some((resp.changeset_digest, resp.cas_hash, resp.event_id))
+                        },
+                        // CAS-level races (concurrent temp-file rename for the
+                        // same content hash) may produce transient storage errors.
+                        // These are expected under contention and do not indicate
+                        // a ledger idempotency failure.
+                        PrivilegedResponse::Error(err) => {
+                            assert!(
+                                err.message.contains("CAS storage failed"),
+                                "unexpected error: {}",
+                                err.message
+                            );
+                            None
+                        },
+                        other => panic!("Expected PublishChangeSet or CAS error, got {other:?}"),
+                    }
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread should not panic"))
+            .collect()
+    });
+
+    // Collect only successful publish responses.
+    let successes: Vec<_> = results.into_iter().flatten().collect();
+    assert!(
+        !successes.is_empty(),
+        "at least one thread must succeed with PublishChangeSet"
+    );
+
+    // All successful threads must observe the same canonical bindings.
+    let (ref expected_digest, ref expected_cas_hash, ref expected_event_id) = successes[0];
+    for (i, (digest, cas_hash, event_id)) in successes.iter().enumerate() {
+        assert_eq!(
+            digest, expected_digest,
+            "thread {i} returned different changeset_digest"
+        );
+        assert_eq!(
+            cas_hash, expected_cas_hash,
+            "thread {i} returned different cas_hash"
+        );
+        assert_eq!(
+            event_id, expected_event_id,
+            "thread {i} returned different event_id"
+        );
+    }
+
+    // Exactly one ledger entry must exist.
+    assert_eq!(
+        count_changeset_events(dispatcher, &work_id),
+        1,
+        "concurrent publish must produce exactly one changeset_published event"
     );
 }
