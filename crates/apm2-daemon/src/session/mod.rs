@@ -725,6 +725,46 @@ impl SessionStopConditionsStore {
         entries.get(session_id).cloned()
     }
 
+    /// Removes and returns stop conditions for a session, if present.
+    ///
+    /// Used by spawn rollback paths to capture evicted stop conditions
+    /// before removal and restore them if a later spawn step fails.
+    #[must_use]
+    pub fn remove_and_return(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::episode::envelope::StopConditions> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        entries.remove(session_id)
+    }
+
+    /// Restores stop conditions for a session.
+    ///
+    /// If the session already has an entry, this is a no-op (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the store is at capacity and the session is not
+    /// already present.
+    pub fn restore(
+        &self,
+        session_id: &str,
+        conditions: crate::episode::envelope::StopConditions,
+    ) -> Result<(), TelemetryStoreError> {
+        let mut entries = self.entries.write().expect("lock poisoned");
+        if entries.contains_key(session_id) {
+            return Ok(());
+        }
+        if entries.len() >= MAX_TELEMETRY_SESSIONS {
+            return Err(TelemetryStoreError::AtCapacity {
+                session_id: session_id.to_string(),
+                max: MAX_TELEMETRY_SESSIONS,
+            });
+        }
+        entries.insert(session_id.to_string(), conditions);
+        Ok(())
+    }
+
     /// Removes stop conditions for a session.
     ///
     /// TCK-00351 BLOCKER 3 FIX: Must be called from the same termination
@@ -1148,6 +1188,32 @@ mod telemetry_tests {
         store.remove("sess-1");
         assert!(store.is_empty());
         assert!(store.get("sess-1").is_none());
+    }
+
+    #[test]
+    fn test_stop_conditions_store_remove_and_restore() {
+        let store = SessionStopConditionsStore::new();
+        let original = crate::episode::envelope::StopConditions {
+            max_episodes: 7,
+            escalation_predicate: "severity>=high".to_string(),
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+        };
+        store.register("sess-1", original.clone()).unwrap();
+
+        let removed = store
+            .remove_and_return("sess-1")
+            .expect("entry should be removed");
+        assert_eq!(removed.max_episodes, 7);
+        assert_eq!(removed.escalation_predicate, "severity>=high");
+        assert!(store.get("sess-1").is_none());
+
+        store
+            .restore("sess-1", removed)
+            .expect("restore should succeed");
+        let restored = store.get("sess-1").expect("entry should be restored");
+        assert_eq!(restored.max_episodes, original.max_episodes);
+        assert_eq!(restored.escalation_predicate, original.escalation_predicate);
     }
 
     #[test]

@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(not(test))]
+use std::time::Duration;
 
 use apm2_core::config::EcosystemConfig;
 use apm2_core::credentials::CredentialStore;
@@ -39,7 +41,9 @@ use crate::episode::{
     new_shared_broker_with_cas,
 };
 use crate::gate::{GateOrchestrator, GateOrchestratorEvent, MergeExecutor, SessionTerminatedInfo};
-use crate::governance::GovernancePolicyResolver;
+use crate::governance::{
+    GovernanceFreshnessConfig, GovernanceFreshnessMonitor, GovernancePolicyResolver,
+};
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use crate::metrics::SharedMetricsRegistry;
@@ -162,6 +166,12 @@ pub struct DispatcherState {
     /// mutate stop flags at runtime (e.g., set emergency stop) and the
     /// pre-actuation gate immediately sees the change.
     stop_authority: Option<Arc<crate::episode::preactuation::StopAuthority>>,
+
+    /// Governance freshness monitor wired to the shared stop authority.
+    ///
+    /// When present, periodic freshness checks toggle
+    /// `governance_uncertain` fail-closed behavior in pre-actuation.
+    governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 }
 
 impl DispatcherState {
@@ -269,6 +279,7 @@ impl DispatcherState {
             gate_orchestrator: None,
             merge_executor: None,
             stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -354,6 +365,7 @@ impl DispatcherState {
             gate_orchestrator: None,
             merge_executor: None,
             stop_authority: None,
+            governance_freshness_monitor: None,
         }
     }
 
@@ -519,12 +531,10 @@ impl DispatcherState {
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
         //
-        // TCK-00351 BLOCKER 2 FIX: Wire a deferred budget tracker sentinel
-        // so the gate marks `budget_checked=true` in the receipt.  Actual
-        // per-episode budget enforcement is handled by EpisodeRuntime which
-        // tracks budgets from the episode envelope.  Without this sentinel,
-        // the receipt would claim `budget_checked=false`, which the replay
-        // verifier flags as a violation (EVID-0305).
+        // TCK-00351 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
+        // The gate evaluates budget availability but records
+        // `budget_checked=false` because enforcement is deferred to
+        // EpisodeRuntime.
         let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
         let deferred_budget = Arc::new(crate::episode::budget_tracker::BudgetTracker::deferred());
         let preactuation_gate = Arc::new(
@@ -533,14 +543,8 @@ impl DispatcherState {
                 Some(deferred_budget),
             ),
         );
-
-        // TODO(TCK-00364): Wire GovernanceFreshnessMonitor into production
-        // path.  The monitor periodically probes governance service health
-        // and calls stop_authority.set_governance_uncertain(true) when the
-        // response is stale beyond the freshness threshold, activating the
-        // deadline-based fail-closed denial in the pre-actuation gate.
-        // Currently the governance_uncertain flag is only set in tests;
-        // production wiring is deferred to TCK-00364 (FreshnessPolicyV1).
+        let governance_freshness_monitor =
+            Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
 
         // TCK-00303: Share subscription registry for HEF resource governance
         // TCK-00344: Wire session registry for SessionStatus queries
@@ -565,6 +569,7 @@ impl DispatcherState {
             // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
+            governance_freshness_monitor: Some(governance_freshness_monitor),
         }
     }
 
@@ -779,12 +784,10 @@ impl DispatcherState {
         // TCK-00351 BLOCKER 1 & 2 FIX: Create production pre-actuation gate
         // with real StopAuthority and fail-closed budget enforcement.
         //
-        // TCK-00351 BLOCKER 2 FIX: Wire a deferred budget tracker sentinel
-        // so the gate marks `budget_checked=true` in the receipt.  Actual
-        // per-episode budget enforcement is handled by EpisodeRuntime which
-        // tracks budgets from the episode envelope.  Without this sentinel,
-        // the receipt would claim `budget_checked=false`, which the replay
-        // verifier flags as a violation (EVID-0305).
+        // TCK-00351 MAJOR 2 FIX: Wire a deferred budget tracker sentinel.
+        // The gate evaluates budget availability but records
+        // `budget_checked=false` because enforcement is deferred to
+        // EpisodeRuntime.
         let stop_authority = Arc::new(crate::episode::preactuation::StopAuthority::new());
         let deferred_budget = Arc::new(crate::episode::budget_tracker::BudgetTracker::deferred());
         let preactuation_gate = Arc::new(
@@ -793,14 +796,8 @@ impl DispatcherState {
                 Some(deferred_budget),
             ),
         );
-
-        // TODO(TCK-00364): Wire GovernanceFreshnessMonitor into production
-        // path.  The monitor periodically probes governance service health
-        // and calls stop_authority.set_governance_uncertain(true) when the
-        // response is stale beyond the freshness threshold, activating the
-        // deadline-based fail-closed denial in the pre-actuation gate.
-        // Currently the governance_uncertain flag is only set in tests;
-        // production wiring is deferred to TCK-00364 (FreshnessPolicyV1).
+        let governance_freshness_monitor =
+            Self::wire_governance_freshness_monitor(Arc::clone(&stop_authority));
 
         // TCK-00316: Wire SessionDispatcher with all production dependencies
         // TCK-00344: Wire session registry for SessionStatus queries
@@ -830,7 +827,46 @@ impl DispatcherState {
             // TCK-00351 MAJOR 2 FIX: Store shared stop authority for
             // runtime mutation by operator/governance control plane.
             stop_authority: Some(stop_authority),
+            governance_freshness_monitor: Some(governance_freshness_monitor),
         })
+    }
+
+    /// Wires governance freshness monitoring to a shared stop authority.
+    ///
+    /// Performs an immediate check and, in non-test builds, starts a periodic
+    /// background loop that keeps `governance_uncertain` current.
+    fn wire_governance_freshness_monitor(
+        stop_authority: Arc<crate::episode::preactuation::StopAuthority>,
+    ) -> Arc<GovernanceFreshnessMonitor> {
+        let config = GovernanceFreshnessConfig::default();
+        #[cfg(not(test))]
+        let poll_interval_ms = config.poll_interval_ms;
+        let monitor = Arc::new(GovernanceFreshnessMonitor::new(stop_authority, config));
+
+        // Seed uncertainty state immediately on construction.
+        let _ = monitor.check_freshness();
+
+        #[cfg(not(test))]
+        Self::spawn_governance_freshness_loop(Arc::clone(&monitor), poll_interval_ms);
+
+        monitor
+    }
+
+    /// Spawns a detached background loop for periodic governance freshness
+    /// checks.
+    #[cfg(not(test))]
+    fn spawn_governance_freshness_loop(
+        monitor: Arc<GovernanceFreshnessMonitor>,
+        poll_interval_ms: u64,
+    ) {
+        let _ = std::thread::Builder::new()
+            .name("apm2-governance-freshness".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(poll_interval_ms));
+                    let _ = monitor.check_freshness();
+                }
+            });
     }
 
     /// Sets the daemon state for process management (TCK-00342).
@@ -960,6 +996,13 @@ impl DispatcherState {
         &self,
     ) -> Option<&Arc<crate::episode::preactuation::StopAuthority>> {
         self.stop_authority.as_ref()
+    }
+
+    /// Returns the governance freshness monitor when wired in production
+    /// constructors.
+    #[must_use]
+    pub const fn governance_freshness_monitor(&self) -> Option<&Arc<GovernanceFreshnessMonitor>> {
+        self.governance_freshness_monitor.as_ref()
     }
 }
 
@@ -1220,5 +1263,57 @@ impl DaemonState {
     /// Iterate over all runners mutably.
     pub fn runners_mut(&mut self) -> impl Iterator<Item = (&RunnerKey, &mut ProcessRunner)> {
         self.runners.iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::episode::envelope::StopConditions;
+    use crate::episode::preactuation::{
+        DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS, PreActuationDenial, PreActuationGate,
+    };
+
+    #[test]
+    fn production_wiring_stale_governance_transitions_to_deny() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = state
+            .governance_freshness_monitor()
+            .expect("production constructor must wire governance freshness monitor");
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
+        );
+
+        // Force stale governance and run a freshness check.
+        monitor.last_success_ms().store(0, Ordering::Release);
+        assert!(
+            !monitor.check_freshness(),
+            "monitor should report stale governance"
+        );
+        assert!(
+            authority.governance_uncertain(),
+            "stale governance must set uncertainty on shared authority"
+        );
+
+        // Gate using the same authority must deny once the uncertainty deadline
+        // has elapsed.
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
+        let denial = gate
+            .check(
+                &StopConditions::default(),
+                0,
+                false,
+                false,
+                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
+                1_000,
+            )
+            .expect_err("stale governance should deny via StopUncertain");
+        assert!(matches!(denial, PreActuationDenial::StopUncertain));
     }
 }

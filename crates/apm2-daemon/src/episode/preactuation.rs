@@ -688,12 +688,14 @@ impl PreActuationGate {
         let stop_checked = true;
 
         // --- Step 2: Evaluate budget ---
-        // TCK-00351 v3 FIX: Track whether a real budget tracker performed the
-        // check.  When no tracker is present and require_budget=false (legacy/
-        // test mode), we allow through but set budget_checked=false in the
-        // receipt so downstream consumers know budget was NOT actually verified.
-        // Only set budget_checked=true when a real tracker is wired.
-        let has_real_tracker = self.budget_tracker.is_some();
+        // Track whether budget was actually enforced at pre-actuation.
+        // A deferred tracker performs availability plumbing but defers
+        // enforcement to EpisodeRuntime, so receipts must report
+        // budget_checked=false to avoid proof-semantics drift.
+        let has_real_tracker = self
+            .budget_tracker
+            .as_ref()
+            .is_some_and(|tracker| !tracker.is_deferred());
         let budget_status = self.evaluate_budget();
         match budget_status {
             BudgetStatus::Available => {},
@@ -2166,6 +2168,27 @@ mod tests {
         assert!(
             !receipt.budget_checked,
             "budget_checked must be false when no tracker is wired"
+        );
+    }
+
+    /// Deferred trackers must not claim pre-actuation budget enforcement.
+    #[test]
+    fn test_budget_checked_false_with_deferred_tracker() {
+        use crate::episode::budget_tracker::BudgetTracker;
+
+        let authority = Arc::new(StopAuthority::new());
+        let tracker = Arc::new(BudgetTracker::deferred());
+        let gate = PreActuationGate::production_gate(Arc::clone(&authority), Some(tracker));
+
+        let conditions = StopConditions::default();
+        let receipt = gate
+            .check(&conditions, 0, false, false, 0, 100)
+            .expect("gate should clear with deferred tracker");
+
+        assert!(receipt.stop_checked, "stop should always be checked");
+        assert!(
+            !receipt.budget_checked,
+            "budget_checked must be false when tracker enforcement is deferred"
         );
     }
 

@@ -4135,6 +4135,68 @@ impl Default for PrivilegedDispatcher {
 /// lease expiration. 1 hour is a sensible default for development.
 pub const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 3600;
 
+/// Stop-condition policy floor for untrusted `SpawnEpisode` inputs.
+///
+/// This enforces authoritative minimum constraints before requester-supplied
+/// stop conditions are persisted.
+#[derive(Debug, Clone, Copy)]
+struct StopConditionPolicy {
+    /// Maximum allowed value for `max_episodes`.
+    ///
+    /// Values above this policy floor are rejected. A value of `0` means no
+    /// floor is configured for this dimension.
+    max_episodes_floor: u64,
+}
+
+impl StopConditionPolicy {
+    /// Fail-closed policy floor used when no governance-provided floor is
+    /// available.
+    const fn fail_closed_default() -> Self {
+        Self {
+            // Transitional policy ceiling: requester cannot bypass with
+            // unlimited `max_episodes=0` and cannot exceed this floor.
+            max_episodes_floor: 10,
+        }
+    }
+
+    /// Validates request stop conditions against the policy floor and returns
+    /// canonicalized conditions to persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when request values violate the floor.
+    fn validate_against_floor(
+        self,
+        request_max_episodes: Option<u64>,
+        request_escalation_predicate: Option<&str>,
+    ) -> Result<crate::episode::envelope::StopConditions, String> {
+        // Fail-closed request default: missing max_episodes is constrained.
+        let resolved_max_episodes = request_max_episodes.unwrap_or(1);
+
+        if self.max_episodes_floor > 0 {
+            if resolved_max_episodes == 0 {
+                return Err(format!(
+                    "max_episodes=0 is not allowed by policy floor; expected 1..={}",
+                    self.max_episodes_floor
+                ));
+            }
+            if resolved_max_episodes > self.max_episodes_floor {
+                return Err(format!(
+                    "max_episodes={} exceeds policy floor max={}",
+                    resolved_max_episodes, self.max_episodes_floor
+                ));
+            }
+        }
+
+        Ok(crate::episode::envelope::StopConditions {
+            max_episodes: resolved_max_episodes,
+            escalation_predicate: request_escalation_predicate.unwrap_or("").to_string(),
+            goal_predicate: String::new(),
+            failure_predicate: String::new(),
+        })
+    }
+}
+
 impl PrivilegedDispatcher {
     /// Creates a new dispatcher with default decode configuration (TEST ONLY).
     ///
@@ -5085,9 +5147,10 @@ impl PrivilegedDispatcher {
 
     /// Rolls back a partially-completed spawn registration.
     ///
-    /// Removes the newly-registered session, cleans up its telemetry, and
-    /// restores any sessions/telemetry that were evicted during the
-    /// registration.  Optionally removes the manifest if it was registered.
+    /// Removes the newly-registered session, cleans up its telemetry/stop
+    /// conditions, and restores evicted session/telemetry/manifest/stop
+    /// entries captured before failure. Optionally removes the manifest if it
+    /// was registered.
     ///
     /// Returns `Some(warning)` if any rollback step failed (indicating
     /// partial failure), or `None` if rollback was clean.
@@ -5102,6 +5165,7 @@ impl PrivilegedDispatcher {
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         remove_manifest: bool,
     ) -> Option<String> {
         let mut warnings: Vec<String> = Vec::new();
@@ -5169,6 +5233,21 @@ impl PrivilegedDispatcher {
             }
         }
 
+        // 5. Restore evicted stop conditions captured before eviction cleanup.
+        // This keeps rollback atomic across session/telemetry/manifest/stop stores.
+        if let Some(ref store) = self.stop_conditions_store {
+            for (sid, conditions) in evicted_stop_conditions {
+                if let Err(e) = store.restore(sid, conditions.clone()) {
+                    warn!(
+                        session_id = %sid,
+                        error = %e,
+                        "Rollback: failed to restore evicted stop conditions"
+                    );
+                    warnings.push(format!("restore_stop_conditions({sid}): {e}"));
+                }
+            }
+        }
+
         if warnings.is_empty() {
             None
         } else {
@@ -5200,6 +5279,8 @@ impl PrivilegedDispatcher {
     ///   restored.
     /// * `evicted_manifests` — Manifests captured from evicted sessions, to be
     ///   restored.
+    /// * `evicted_stop_conditions` — Stop conditions captured from evicted
+    ///   sessions, to be restored.
     /// * `timestamp_ns` — HTF timestamp for the episode stop event.
     /// * `context` — Human-readable label for log messages identifying the
     ///   failure site (e.g. "peer credentials failure").
@@ -5211,6 +5292,7 @@ impl PrivilegedDispatcher {
         evicted_sessions: &[SessionState],
         evicted_telemetry: &[(String, std::sync::Arc<crate::session::SessionTelemetry>)],
         evicted_manifests: &[(String, std::sync::Arc<crate::episode::CapabilityManifest>)],
+        evicted_stop_conditions: &[(String, crate::episode::envelope::StopConditions)],
         timestamp_ns: u64,
         context: &str,
     ) -> Option<String> {
@@ -5242,6 +5324,7 @@ impl PrivilegedDispatcher {
             evicted_sessions,
             evicted_telemetry,
             evicted_manifests,
+            evicted_stop_conditions,
             true,
         );
         if let Some(ref rw) = rollback_warn {
@@ -5525,6 +5608,27 @@ impl PrivilegedDispatcher {
             }
         }
 
+        // TCK-00351 BLOCKER 2: Validate caller-supplied stop conditions
+        // against an authoritative policy floor before persisting.
+        let stop_policy = StopConditionPolicy::fail_closed_default();
+        let resolved_stop_conditions = match stop_policy.validate_against_floor(
+            request.max_episodes,
+            request.escalation_predicate.as_deref(),
+        ) {
+            Ok(conditions) => conditions,
+            Err(e) => {
+                warn!(
+                    work_id = %request.work_id,
+                    max_episodes = ?request.max_episodes,
+                    "SpawnEpisode rejected: stop-condition policy floor violation"
+                );
+                return Ok(PrivilegedResponse::error(
+                    PrivilegedErrorCode::CapabilityRequestRejected,
+                    format!("invalid stop conditions: {e}"),
+                ));
+            },
+        };
+
         // =====================================================================
         // TCK-00258: SoD Custody Domain Validation
         //
@@ -5710,16 +5814,21 @@ impl PrivilegedDispatcher {
                 })
                 .collect();
 
-        // Step 2c: TCK-00351 BLOCKER 3 FIX: Clean up stop conditions for
-        // evicted sessions to prevent unbounded store growth.  Unlike
-        // telemetry and manifests, stop conditions are immutable once
-        // registered and don't need rollback restoration -- the evicted
-        // session is gone and its conditions are no longer relevant.
-        if let Some(ref store) = self.stop_conditions_store {
-            for evicted in &evicted_sessions {
-                store.remove(&evicted.session_id);
-            }
-        }
+        // Step 2c: Capture and remove stop conditions for evicted sessions.
+        // These are restored if a later spawn step fails (atomic rollback).
+        let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> = self
+            .stop_conditions_store
+            .as_ref()
+            .map_or_else(Vec::new, |store| {
+                evicted_sessions
+                    .iter()
+                    .filter_map(|s| {
+                        store
+                            .remove_and_return(&s.session_id)
+                            .map(|c| (s.session_id.clone(), c))
+                    })
+                    .collect()
+            });
 
         // Step 3: Register telemetry with started_at_ns.
         // The wall-clock timestamp is stored as audit metadata only;
@@ -5742,6 +5851,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5772,27 +5882,17 @@ impl PrivilegedDispatcher {
         // The pre-actuation gate reads from this store to enforce
         // max_episodes / escalation_predicate limits.
         //
-        // TCK-00351 BLOCKER 1 FIX: Derive stop conditions from the
-        // authoritative SpawnEpisodeRequest fields instead of using
-        // StopConditions::default() (which is permissive: max_episodes=0
-        // means unlimited).  When the request does not carry stop condition
-        // fields, we fall back to fail-closed defaults (max_episodes=1)
-        // so that sessions without explicit limits are constrained rather
-        // than unlimited.
+        // TCK-00351 BLOCKER 1+2 FIX: Persist policy-validated stop
+        // conditions derived from authoritative request fields.
         if let Some(ref store) = self.stop_conditions_store {
-            let conditions = crate::episode::envelope::StopConditions {
-                max_episodes: request.max_episodes.unwrap_or(1),
-                escalation_predicate: request.escalation_predicate.clone().unwrap_or_default(),
-                goal_predicate: String::new(),
-                failure_predicate: String::new(),
-            };
-            if let Err(e) = store.register(&session_id, conditions) {
+            if let Err(e) = store.register(&session_id, resolved_stop_conditions) {
                 // Rollback session, telemetry, and restore evicted entries.
                 let rollback_warn = self.rollback_spawn(
                     &session_id,
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5842,6 +5942,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5874,6 +5975,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     false,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -5923,6 +6025,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_stop_conditions,
                         false,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -5981,6 +6084,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -6011,6 +6115,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -6084,6 +6189,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_stop_conditions,
                         true,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -6146,6 +6252,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -6209,6 +6316,7 @@ impl PrivilegedDispatcher {
                         &evicted_sessions,
                         &evicted_telemetry,
                         &evicted_manifests,
+                        &evicted_stop_conditions,
                         true,
                     );
                     if let Some(ref rw) = rollback_warn {
@@ -6254,6 +6362,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     true,
                 );
                 if let Some(ref rw) = rollback_warn {
@@ -6295,6 +6404,7 @@ impl PrivilegedDispatcher {
                     &evicted_sessions,
                     &evicted_telemetry,
                     &evicted_manifests,
+                    &evicted_stop_conditions,
                     timestamp_ns,
                     "update_episode_id failure",
                 );
@@ -6336,6 +6446,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 timestamp_ns,
                 "peer credentials failure",
             );
@@ -6370,6 +6481,7 @@ impl PrivilegedDispatcher {
                 &evicted_sessions,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 timestamp_ns,
                 "event emission failure",
             );
@@ -14098,11 +14210,16 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_stop_conditions: Vec<(
+                String,
+                crate::episode::envelope::StopConditions,
+            )> = Vec::new();
             let result = dispatcher.rollback_spawn(
                 "S-EPID-FAIL",
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_stop_conditions,
                 true,
             );
             assert!(result.is_none(), "Rollback should succeed without warnings");
@@ -14362,12 +14479,15 @@ mod tests {
             let evicted_sessions = vec![evicted_session_state];
             let evicted_telem: Vec<(String, Arc<crate::session::SessionTelemetry>)> = Vec::new();
             let evicted_manifests = vec![("S-ROLLBACK-M".to_string(), evicted_manifest)];
+            let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
+                Vec::new();
 
             let result = dispatcher.rollback_spawn(
                 "S-NEW-M",
                 &evicted_sessions,
                 &evicted_telem,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 true,
             );
             assert!(result.is_none(), "Rollback should succeed: {result:?}");
@@ -14509,6 +14629,10 @@ mod tests {
                 Vec::new();
             let no_evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
                 Vec::new();
+            let no_evicted_stop_conditions: Vec<(
+                String,
+                crate::episode::envelope::StopConditions,
+            )> = Vec::new();
 
             let result = dispatcher.rollback_spawn_with_episode_stop(
                 None,
@@ -14516,6 +14640,7 @@ mod tests {
                 &no_evicted_sessions,
                 &no_evicted_telemetry,
                 &no_evicted_manifests,
+                &no_evicted_stop_conditions,
                 999_000,
                 "test context",
             );
@@ -14617,6 +14742,8 @@ mod tests {
                 .collect();
             assert_eq!(evicted_telemetry.len(), 1);
             assert_eq!(evicted_manifests.len(), 1);
+            let evicted_stop_conditions: Vec<(String, crate::episode::envelope::StopConditions)> =
+                Vec::new();
 
             // Register telemetry and manifest for the new session
             store.register("S-NEW", 999).unwrap();
@@ -14630,6 +14757,7 @@ mod tests {
                 &evicted,
                 &evicted_telemetry,
                 &evicted_manifests,
+                &evicted_stop_conditions,
                 999_000,
                 "test eviction restore",
             );
@@ -14664,6 +14792,191 @@ mod tests {
             assert!(
                 manifest_store.get_manifest("S-0").is_some(),
                 "Evicted manifest must be restored by unified rollback"
+            );
+        }
+
+        /// TCK-00351 BLOCKER 1: Regression for non-atomic stop-condition
+        /// rollback.
+        ///
+        /// Simulates: spawn -> eviction -> post-eviction failure -> rollback,
+        /// and verifies the evicted session's original stop conditions are
+        /// restored.
+        #[test]
+        fn test_failed_spawn_restores_evicted_stop_conditions() {
+            use crate::episode::envelope::StopConditions;
+            use crate::episode::registry::{InMemorySessionRegistry, MAX_SESSIONS};
+            use crate::session::{
+                SessionRegistry, SessionState, SessionStopConditionsStore, SessionTelemetryStore,
+            };
+
+            let registry = Arc::new(InMemorySessionRegistry::new());
+            let telemetry = Arc::new(SessionTelemetryStore::new());
+            let stop_store = Arc::new(SessionStopConditionsStore::new());
+
+            let dispatcher = PrivilegedDispatcher::new()
+                .with_session_registry(
+                    Arc::clone(&registry) as Arc<dyn SessionRegistry + Send + Sync>
+                )
+                .with_telemetry_store(Arc::clone(&telemetry))
+                .with_stop_conditions_store(Arc::clone(&stop_store));
+
+            let original_conditions = StopConditions {
+                max_episodes: 3,
+                escalation_predicate: "severity>=high".to_string(),
+                goal_predicate: String::new(),
+                failure_predicate: String::new(),
+            };
+
+            // Fill to capacity with sessions, telemetry, and stop conditions.
+            for i in 0..MAX_SESSIONS {
+                let sid = format!("S-{i}");
+                let session = SessionState {
+                    session_id: sid.clone(),
+                    work_id: format!("W-{i}"),
+                    role: 1,
+                    ephemeral_handle: format!("H-{i}"),
+                    lease_id: format!("L-{i}"),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![0u8; 32],
+                    episode_id: None,
+                };
+                registry.register_session(session).unwrap();
+                telemetry.register(&sid, i as u64).unwrap();
+                let conditions = if i == 0 {
+                    original_conditions.clone()
+                } else {
+                    StopConditions::max_episodes(1)
+                };
+                stop_store.register(&sid, conditions).unwrap();
+            }
+
+            // Register one more session to evict S-0.
+            let new_session = SessionState {
+                session_id: "S-NEW-STOP".to_string(),
+                work_id: "W-NEW-STOP".to_string(),
+                role: 1,
+                ephemeral_handle: "H-NEW-STOP".to_string(),
+                lease_id: "L-NEW-STOP".to_string(),
+                policy_resolved_ref: String::new(),
+                capability_manifest_hash: vec![0u8; 32],
+                episode_id: None,
+            };
+            let evicted = registry.register_session(new_session).unwrap();
+            assert_eq!(evicted.len(), 1);
+            assert_eq!(evicted[0].session_id, "S-0");
+
+            // Capture evicted telemetry and stop conditions as spawn path does.
+            let evicted_telemetry: Vec<_> = evicted
+                .iter()
+                .filter_map(|s| {
+                    telemetry
+                        .remove_and_return(&s.session_id)
+                        .map(|t| (s.session_id.clone(), t))
+                })
+                .collect();
+            let evicted_stop_conditions: Vec<_> = evicted
+                .iter()
+                .filter_map(|s| {
+                    stop_store
+                        .remove_and_return(&s.session_id)
+                        .map(|c| (s.session_id.clone(), c))
+                })
+                .collect();
+            assert_eq!(evicted_telemetry.len(), 1);
+            assert_eq!(evicted_stop_conditions.len(), 1);
+
+            // Register resources for the newly spawned session.
+            telemetry.register("S-NEW-STOP", 999).unwrap();
+            stop_store
+                .register("S-NEW-STOP", StopConditions::max_episodes(1))
+                .unwrap();
+
+            // Simulate spawn failure rollback.
+            let evicted_manifests: Vec<(String, Arc<crate::episode::CapabilityManifest>)> =
+                Vec::new();
+            let result = dispatcher.rollback_spawn(
+                "S-NEW-STOP",
+                &evicted,
+                &evicted_telemetry,
+                &evicted_manifests,
+                &evicted_stop_conditions,
+                false,
+            );
+            assert!(result.is_none(), "Rollback should succeed: {result:?}");
+
+            // New session should be fully removed.
+            assert!(registry.get_session("S-NEW-STOP").is_none());
+            assert!(telemetry.get("S-NEW-STOP").is_none());
+            assert!(stop_store.get("S-NEW-STOP").is_none());
+
+            // Evicted session and its original stop conditions should be restored.
+            assert!(registry.get_session("S-0").is_some());
+            let restored = stop_store
+                .get("S-0")
+                .expect("evicted stop conditions must be restored");
+            assert_eq!(restored.max_episodes, original_conditions.max_episodes);
+            assert_eq!(
+                restored.escalation_predicate,
+                original_conditions.escalation_predicate
+            );
+        }
+
+        /// TCK-00351 BLOCKER 2: caller tampering with permissive stop values
+        /// (`max_episodes=0`) is rejected by policy-floor validation.
+        #[test]
+        fn test_spawn_rejects_untrusted_max_episodes_zero() {
+            let dispatcher = PrivilegedDispatcher::new();
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let claim_request = ClaimWorkRequest {
+                actor_id: "tamper-actor".to_string(),
+                role: WorkRole::Implementer.into(),
+                credential_signature: vec![1, 2, 3],
+                nonce: vec![4, 5, 6],
+            };
+            let claim_frame = encode_claim_work_request(&claim_request);
+            let claim_response = dispatcher.dispatch(&claim_frame, &ctx).unwrap();
+            let (work_id, lease_id) = match claim_response {
+                PrivilegedResponse::ClaimWork(resp) => (resp.work_id, resp.lease_id),
+                other => panic!("expected ClaimWork response, got {other:?}"),
+            };
+
+            let tampered_spawn = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: work_id.clone(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some(lease_id),
+                max_episodes: Some(0),
+                escalation_predicate: None,
+            };
+            let frame = encode_spawn_episode_request(&tampered_spawn);
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                    assert!(
+                        err.message.contains("max_episodes=0"),
+                        "tamper rejection should mention max_episodes floor: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected tamper rejection, got {other:?}"),
+            }
+
+            assert!(
+                dispatcher
+                    .session_registry()
+                    .get_session_by_work_id(&work_id)
+                    .is_none(),
+                "rejected tampered spawn must not register a session"
             );
         }
     }
