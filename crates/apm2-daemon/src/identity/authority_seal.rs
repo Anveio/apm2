@@ -4122,4 +4122,162 @@ mod tests {
             "Weighted keyset must fail verification with wrong weights, got: {result:?}"
         );
     }
+
+    /// Weighted keyset verification must be key-order independent: verifying
+    /// with permuted keys and correspondingly permuted weights must succeed
+    /// because `KeySetIdV1::from_descriptor` canonicalizes (key, weight) pairs.
+    #[test]
+    fn verify_quorum_multisig_weighted_keyset_order_independent() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+
+        // Create keyset with order [A, B] and weights [10, 20].
+        let weights_ab: &[u64] = &[10, 20];
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Multisig,
+            2,
+            &[member_a, member_b],
+            Some(weights_ab),
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumMultisig,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Verify with REVERSED key order [B, A] and correspondingly reversed
+        // weights [20, 10]. This must succeed because from_descriptor sorts
+        // (key, weight) pairs canonically by key binary.
+        let keys_reversed = [signer_b.verifying_key(), signer_a.verifying_key()];
+        let weights_ba: &[u64] = &[20, 10];
+        let result = seal.verify_quorum_multisig(
+            &keys_reversed,
+            "apm2.test.v1",
+            &subject_hash,
+            false,
+            Some(weights_ba),
+        );
+        assert!(
+            result.is_ok(),
+            "Weighted keyset verification must be order-independent: \
+             permuted keys with correspondingly permuted weights must pass. Got: {result:?}"
+        );
+    }
+
+    /// Weighted keyset threshold verification must be key-order independent.
+    #[test]
+    fn verify_quorum_threshold_weighted_keyset_order_independent() {
+        let signer_a = Signer::generate();
+        let signer_b = Signer::generate();
+        let signer_c = Signer::generate();
+        let cell_id = test_cell_id();
+
+        let member_a =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_a.public_key_bytes());
+        let member_b =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_b.public_key_bytes());
+        let member_c =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &signer_c.public_key_bytes());
+
+        // Create keyset with order [A, B, C] and weights [10, 20, 30].
+        let weights_abc: &[u64] = &[10, 20, 30];
+        let keyset_id = KeySetIdV1::from_descriptor(
+            "ed25519",
+            SetTag::Threshold,
+            2,
+            &[member_a, member_b, member_c],
+            Some(weights_abc),
+        )
+        .unwrap();
+
+        let subject_kind = SubjectKind::new("apm2.test.v1").unwrap();
+        let subject_hash = [0x42; HASH_SIZE];
+        let ledger_anchor = LedgerAnchorV1::ConsensusIndex { index: 5 };
+
+        let seal_unsigned = AuthoritySealV1::new(
+            cell_id.clone(),
+            IssuerId::Quorum(keyset_id.clone()),
+            subject_kind.clone(),
+            subject_hash,
+            ledger_anchor.clone(),
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![vec![0u8; 64], vec![0u8; 64]],
+        )
+        .unwrap();
+
+        let preimage = seal_unsigned.domain_separated_preimage();
+        let sig_a = signer_a.sign(&preimage);
+        let sig_b = signer_b.sign(&preimage);
+
+        let seal = AuthoritySealV1::new(
+            cell_id,
+            IssuerId::Quorum(keyset_id),
+            subject_kind,
+            subject_hash,
+            ledger_anchor,
+            ZERO_TIME_ENVELOPE_REF,
+            SealKind::QuorumThreshold,
+            vec![sig_a.to_bytes().to_vec(), sig_b.to_bytes().to_vec()],
+        )
+        .unwrap();
+
+        // Verify with REVERSED key order [C, B, A] and correspondingly
+        // reversed weights [30, 20, 10]. This must succeed because
+        // from_descriptor sorts (key, weight) pairs canonically.
+        let keys_reversed = [
+            signer_c.verifying_key(),
+            signer_b.verifying_key(),
+            signer_a.verifying_key(),
+        ];
+        let weights_cba: &[u64] = &[30, 20, 10];
+        let result = seal.verify_quorum_threshold(
+            &keys_reversed,
+            2,
+            "apm2.test.v1",
+            &subject_hash,
+            false,
+            Some(weights_cba),
+        );
+        assert!(
+            result.is_ok(),
+            "Weighted keyset threshold verification must be order-independent: \
+             permuted keys with correspondingly permuted weights must pass. Got: {result:?}"
+        );
+    }
 }
