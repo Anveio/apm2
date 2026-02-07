@@ -1040,9 +1040,69 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         }
     }
 
+    fn normalize_path_for_defect(path: &std::path::Path) -> String {
+        apm2_core::context::normalize_path(path.to_string_lossy().as_ref())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+    }
+
+    fn normalized_path_in_scope(normalized_path: &str, normalized_scope: &str) -> bool {
+        if normalized_path == normalized_scope {
+            return true;
+        }
+        if normalized_scope == "/" {
+            return normalized_path.starts_with('/');
+        }
+        normalized_path.starts_with(normalized_scope)
+            && normalized_path.as_bytes().get(normalized_scope.len()) == Some(&b'/')
+    }
+
+    fn collect_listfiles_admitted_paths(
+        context_manifest: &ContextPackManifest,
+        scope: &std::path::Path,
+        verified_content: &mut VerifiedToolContent,
+    ) -> Result<(), BrokerError> {
+        let scope_normalized = apm2_core::context::normalize_path(scope.to_string_lossy().as_ref())
+            .map_err(|e| BrokerError::Internal {
+                message: format!("TOCTOU ListFiles scope normalization failed: {e}"),
+            })?;
+
+        for entry in context_manifest.entries() {
+            let entry_path = entry.path();
+            if !Self::normalized_path_in_scope(entry_path, &scope_normalized) {
+                continue;
+            }
+
+            // ListFiles uses verified_content as a manifest-admission marker map.
+            verified_content.insert(entry_path.to_string(), Vec::new());
+
+            // Include ancestor directories so parent listings can reveal admitted
+            // descendants without exposing non-admitted siblings.
+            let mut current = std::path::Path::new(entry_path).parent();
+            while let Some(parent) = current {
+                let normalized_parent = apm2_core::context::normalize_path(
+                    parent.to_string_lossy().as_ref(),
+                )
+                .map_err(|e| BrokerError::Internal {
+                    message: format!("TOCTOU ListFiles ancestor normalization failed: {e}"),
+                })?;
+                if !Self::normalized_path_in_scope(&normalized_parent, &scope_normalized) {
+                    break;
+                }
+                verified_content.insert(normalized_parent.clone(), Vec::new());
+                if normalized_parent == scope_normalized {
+                    break;
+                }
+                current = parent.parent();
+            }
+        }
+
+        Ok(())
+    }
+
     async fn collect_search_verified_content(
         &self,
         scope: &std::path::Path,
+        manifest_id: &str,
         risk_tier: super::envelope::RiskTier,
         terminate_on_toctou: bool,
         defects: &mut Vec<FirewallViolationDefect>,
@@ -1073,8 +1133,16 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                     }
                     verified_content.insert(normalized, bytes);
                 },
-                Ok(None) => {},
-                Err(err) if err.is_toctou_mismatch() && !terminate_on_toctou => {},
+                Ok(None) => {
+                    defects.push(FirewallViolationDefect::toctou_mismatch(
+                        risk_tier.tier(),
+                        manifest_id,
+                        &Self::normalize_path_for_defect(scope),
+                    ));
+                },
+                Err(err) if err.is_toctou_mismatch() && !terminate_on_toctou => {
+                    // Defect already emitted by verify_toctou_with_defects.
+                },
                 Err(err) => return Err(err),
             }
             return Ok(());
@@ -1151,8 +1219,17 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                             total_bytes = total_bytes.saturating_add(bytes_len);
                             verified_content.insert(normalized, bytes);
                         },
-                        Ok(None) => {},
-                        Err(err) if err.is_toctou_mismatch() && !terminate_on_toctou => {},
+                        Ok(None) => {
+                            defects.push(FirewallViolationDefect::toctou_mismatch(
+                                risk_tier.tier(),
+                                manifest_id,
+                                &Self::normalize_path_for_defect(&entry_path),
+                            ));
+                        },
+                        Err(err) if err.is_toctou_mismatch() && !terminate_on_toctou => {
+                            // Defect already emitted by
+                            // verify_toctou_with_defects.
+                        },
                         Err(err) => return Err(err),
                     }
                 } else if file_type.is_dir() {
@@ -1920,6 +1997,7 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                 if let Err(e) = self
                                     .collect_search_verified_content(
                                         path.as_path(),
+                                        &context_manifest.manifest_id,
                                         request.risk_tier,
                                         terminate_on_toctou,
                                         &mut defects,
@@ -1944,6 +2022,36 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
                                             rule_id: "CONTEXT_FIREWALL".to_string(),
                                             reason: format!(
                                                 "Search TOCTOU verification failed: {e}"
+                                            ),
+                                        },
+                                        rule_id: Some("CONTEXT_FIREWALL".to_string()),
+                                        policy_hash: self.policy.policy_hash(),
+                                    });
+                                }
+                            } else if request.tool_class == super::tool_class::ToolClass::ListFiles
+                            {
+                                if let Err(e) = Self::collect_listfiles_admitted_paths(
+                                    context_manifest.as_ref(),
+                                    path.as_path(),
+                                    &mut verified_content,
+                                ) {
+                                    warn!(
+                                        path = %path_str,
+                                        risk_tier = request.risk_tier.tier(),
+                                        error = %e,
+                                        "ListFiles admission collection failed"
+                                    );
+
+                                    if terminate_on_toctou {
+                                        respond!(make_terminate("CONTEXT_TOCTOU_MISMATCH"));
+                                    }
+
+                                    respond!(ToolDecision::Deny {
+                                        request_id: request.request_id.clone(),
+                                        reason: DenyReason::PolicyDenied {
+                                            rule_id: "CONTEXT_FIREWALL".to_string(),
+                                            reason: format!(
+                                                "ListFiles TOCTOU admission collection failed: {e}"
                                             ),
                                         },
                                         rule_id: Some("CONTEXT_FIREWALL".to_string()),
@@ -2506,6 +2614,20 @@ mod tests {
         Capability {
             capability_id: id.to_string(),
             tool_class: ToolClass::Search,
+            scope: CapabilityScope {
+                root_paths: paths,
+                allowed_patterns: Vec::new(),
+                size_limits: super::super::scope::SizeLimits::default_limits(),
+                network_policy: None,
+            },
+            risk_tier_required: RiskTier::Tier0,
+        }
+    }
+
+    fn make_listfiles_capability(id: &str, paths: Vec<PathBuf>) -> Capability {
+        Capability {
+            capability_id: id.to_string(),
+            tool_class: ToolClass::ListFiles,
             scope: CapabilityScope {
                 root_paths: paths,
                 allowed_patterns: Vec::new(),
@@ -4941,17 +5063,10 @@ policy:
             .unwrap();
 
         // Capability allowing ListFiles
-        let manifest = make_manifest(vec![Capability {
-            capability_id: "cap-ls".to_string(),
-            tool_class: ToolClass::ListFiles,
-            scope: CapabilityScope {
-                root_paths: vec![PathBuf::from("/workspace")],
-                allowed_patterns: Vec::new(),
-                size_limits: super::super::scope::SizeLimits::default_limits(),
-                network_policy: None,
-            },
-            risk_tier_required: RiskTier::Tier0,
-        }]);
+        let manifest = make_manifest(vec![make_listfiles_capability(
+            "cap-ls",
+            vec![PathBuf::from("/workspace")],
+        )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Request ListFiles for allowed path
@@ -4988,17 +5103,10 @@ policy:
             .unwrap();
 
         // Capability allowing ListFiles
-        let manifest = make_manifest(vec![Capability {
-            capability_id: "cap-ls".to_string(),
-            tool_class: ToolClass::ListFiles,
-            scope: CapabilityScope {
-                root_paths: vec![PathBuf::from("/workspace")],
-                allowed_patterns: Vec::new(),
-                size_limits: super::super::scope::SizeLimits::default_limits(),
-                network_policy: None,
-            },
-            risk_tier_required: RiskTier::Tier0,
-        }]);
+        let manifest = make_manifest(vec![make_listfiles_capability(
+            "cap-ls",
+            vec![PathBuf::from("/workspace")],
+        )]);
         broker.initialize_with_manifest(manifest).await.unwrap();
 
         // Request ListFiles for denied path
@@ -5501,6 +5609,87 @@ policy:
     }
 
     #[tokio::test]
+    async fn test_listfiles_response_collects_manifest_admitted_paths_for_context_mode() {
+        use tempfile::tempdir;
+
+        let broker: ToolBroker<StubManifestLoader> = ToolBroker::new(test_config_without_policy());
+
+        let temp_dir = tempdir().expect("temp dir");
+        let scope_dir = temp_dir.path().join("scope");
+        let nested_dir = scope_dir.join("nested");
+        tokio::fs::create_dir_all(&nested_dir)
+            .await
+            .expect("create nested scope");
+
+        let allowed_path = nested_dir.join("allowed.txt");
+        tokio::fs::write(&allowed_path, b"allowed")
+            .await
+            .expect("write allowed file");
+        let blocked_path = scope_dir.join("blocked.txt");
+        tokio::fs::write(&blocked_path, b"blocked")
+            .await
+            .expect("write blocked file");
+
+        let scope_path = scope_dir.to_string_lossy().to_string();
+        let nested_path = nested_dir.to_string_lossy().to_string();
+        let allowed_path_str = allowed_path.to_string_lossy().to_string();
+        let allowed_hash = *blake3::hash(b"allowed").as_bytes();
+
+        let context_manifest = make_context_manifest(
+            vec![
+                (scope_path.as_str(), [0x11; 32]),
+                (allowed_path_str.as_str(), allowed_hash),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        broker
+            .initialize_with_context_manifest(context_manifest)
+            .await
+            .unwrap();
+
+        let manifest = make_manifest(vec![make_listfiles_capability(
+            "cap-ls",
+            vec![temp_dir.path().to_path_buf()],
+        )]);
+        broker.initialize_with_manifest(manifest).await.unwrap();
+
+        let request = make_request(
+            "req-listfiles-context-admitted",
+            ToolClass::ListFiles,
+            Some(&scope_path),
+        );
+        let response = broker
+            .request_with_response(&request, timestamp_ns(0), None)
+            .await
+            .expect("broker response");
+
+        assert!(
+            response.decision.is_allowed(),
+            "listfiles should be allowed for admitted scope"
+        );
+        assert!(
+            response.toctou_verification_required,
+            "listfiles should require TOCTOU-constrained execution under context firewall"
+        );
+        assert!(
+            response.verified_content.get(&allowed_path_str).is_some(),
+            "admitted file path must be propagated to execution context"
+        );
+        assert!(
+            response.verified_content.get(&nested_path).is_some(),
+            "ancestor directory should be present so parent listing can reveal admitted descendants"
+        );
+        assert!(
+            response
+                .verified_content
+                .get(&blocked_path.to_string_lossy())
+                .is_none(),
+            "non-manifest sibling must not be admitted"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_response_marks_toctou_required_when_manifest_active_and_verified_empty() {
         use tempfile::tempdir;
 
@@ -5555,6 +5744,20 @@ policy:
         assert!(
             response.verified_content.is_empty(),
             "no file entries are admitted, so verified content should be empty"
+        );
+        assert!(
+            !response.defects.is_empty(),
+            "search exclusions must emit defects for observability"
+        );
+        assert_eq!(
+            response.defects[0].violation_type,
+            apm2_core::context::firewall::FirewallViolationType::ToctouMismatch,
+            "manifest exclusions should be surfaced as TOCTOU-class defects"
+        );
+        assert!(
+            response.defects[0].path.ends_with("/scope/note.txt"),
+            "defect path should identify excluded file, got: {}",
+            response.defects[0].path
         );
     }
 

@@ -2372,18 +2372,11 @@ impl ListFilesHandler {
     fn count_lines(data: &[u8]) -> usize {
         data.iter().filter(|&&b| b == b'\n').count()
     }
-}
 
-#[async_trait]
-impl ToolHandler for ListFilesHandler {
-    fn tool_class(&self) -> ToolClass {
-        ToolClass::ListFiles
-    }
-
-    async fn execute(
+    async fn execute_impl(
         &self,
         args: &ToolArgs,
-        _credential: Option<&Credential>,
+        verified_content: Option<&VerifiedToolContent>,
     ) -> Result<ToolResultData, ToolHandlerError> {
         use super::tool_handler::{
             LISTFILES_DEFAULT_ENTRIES, LISTFILES_MAX_ENTRIES, NAVIGATION_OUTPUT_MAX_BYTES,
@@ -2468,6 +2461,14 @@ impl ToolHandler for ListFilesHandler {
                 }
             }
 
+            if let Some(verified) = verified_content {
+                let normalized = ReadFileHandler::normalized_verified_path(&entry.path())?;
+                if verified.get(&normalized).is_none() {
+                    // Fail-closed in context-firewall mode: omit non-admitted entries.
+                    continue;
+                }
+            }
+
             // Include type indicator
             let file_type = entry.file_type().await.ok();
             let type_indicator = if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
@@ -2518,6 +2519,35 @@ impl ToolHandler for ListFilesHandler {
             BudgetDelta::single_call().with_bytes_io(output_len as u64),
             io_duration,
         ))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ListFilesHandler {
+    fn tool_class(&self) -> ToolClass {
+        ToolClass::ListFiles
+    }
+
+    async fn execute(
+        &self,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        self.execute_impl(args, None).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &ExecutionContext,
+        args: &ToolArgs,
+        _credential: Option<&Credential>,
+    ) -> Result<ToolResultData, ToolHandlerError> {
+        let verified = if ctx.toctou_verification_required {
+            Some(&ctx.verified_content)
+        } else {
+            None
+        };
+        self.execute_impl(args, verified).await
     }
 
     fn validate(&self, args: &ToolArgs) -> Result<(), ToolHandlerError> {
@@ -3894,6 +3924,54 @@ mod tests {
         assert!(
             output.is_empty(),
             "search must fail-closed to empty output without verified bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listfiles_handler_filters_to_verified_entries_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        let allowed = scope.join("allowed.txt");
+        let blocked = scope.join("blocked.txt");
+        std::fs::write(&allowed, "allowed").expect("write allowed file");
+        std::fs::write(&blocked, "blocked").expect("write blocked file");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized_allowed =
+            apm2_core::context::normalize_path(allowed.to_string_lossy().as_ref())
+                .expect("normalize allowed path");
+        verified.insert(normalized_allowed, Vec::new());
+
+        let handler = ListFilesHandler::with_root(root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("scope"),
+            pattern: None,
+            max_entries: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-listfiles-verified")
+                .expect("valid episode id"),
+            "req-listfiles-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("listfiles should succeed");
+        let output = result.output_str().expect("utf8 output");
+
+        assert!(
+            output.lines().any(|line| line == "allowed.txt"),
+            "admitted file should be listed, got: {output}"
+        );
+        assert!(
+            !output.lines().any(|line| line.starts_with("blocked.txt")),
+            "non-admitted file must be suppressed, got: {output}"
         );
     }
 
