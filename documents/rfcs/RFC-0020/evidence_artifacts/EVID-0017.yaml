@@ -43,9 +43,10 @@ evidence_artifact:
     construction time. Zero authority_seal_hash is rejected.
 
     Multiproof verification: the verifier validates the seal signature
-    once (O(1) signature checks) and trusts the construction-time
-    inclusion proof validation for all K receipts, achieving O(1)
-    signature + O(K log B) hashing verification cost per RFC-0020 §9.5.3.
+    once (O(1) signature checks) and independently re-verifies every
+    inclusion proof at verification time for all K receipts, achieving
+    O(1) signature + O(K log B) hashing verification cost per RFC-0020
+    §9.5.3.
 
     Canonical bytes: both ReceiptPointerV1 and ReceiptMultiProofV1
     produce deterministic canonical byte representations suitable for

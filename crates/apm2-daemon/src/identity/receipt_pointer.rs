@@ -985,10 +985,27 @@ impl ReceiptPointerVerifier {
         if multiproof.receipt_hashes.is_empty() {
             return Err(ReceiptPointerError::EmptyMultiproof);
         }
+        if multiproof.receipt_hashes.len() > MAX_MULTIPROOF_LEAVES {
+            return Err(ReceiptPointerError::TooManyLeaves {
+                count: multiproof.receipt_hashes.len(),
+                max: MAX_MULTIPROOF_LEAVES,
+            });
+        }
         if multiproof.individual_proofs.len() != multiproof.receipt_hashes.len() {
             return Err(ReceiptPointerError::TooManyProofNodes {
                 count: multiproof.individual_proofs.len(),
                 max: multiproof.receipt_hashes.len(),
+            });
+        }
+        let total_nodes: usize = multiproof
+            .individual_proofs
+            .iter()
+            .map(|proof| proof.siblings.len())
+            .sum();
+        if total_nodes > MAX_MULTIPROOF_NODES {
+            return Err(ReceiptPointerError::TooManyProofNodes {
+                count: total_nodes,
+                max: MAX_MULTIPROOF_NODES,
             });
         }
 
@@ -1000,6 +1017,9 @@ impl ReceiptPointerVerifier {
                 expected: multiproof.authority_seal_hash,
                 actual: actual_seal_hash,
             });
+        }
+        if multiproof.batch_root_hash != *seal.subject_hash() {
+            return Err(ReceiptPointerError::MultiproofRootMismatch);
         }
 
         // Verify the seal authenticates the batch root for the first
@@ -1857,6 +1877,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verify_multiproof_rejects_batch_root_mismatch() {
+        let signer = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+        let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        // Tamper the declared batch root while keeping proofs + seal hash.
+        let tampered_root = [0xEE; 32];
+        let tampered = ReceiptMultiProofV1::new_unchecked(tampered_root, hashes, seal_hash, proofs);
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &tampered,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::MultiproofRootMismatch)),
+            "expected MultiproofRootMismatch, got: {result:?}",
+        );
+    }
+
     /// SECURITY: `verify_multiproof` must independently verify every
     /// inclusion proof -- not just the first. A multiproof where the
     /// first proof is valid but a subsequent proof has a tampered leaf
@@ -2069,6 +2116,79 @@ mod tests {
             "canonical bytes {} should be < {}",
             bytes.len(),
             MAX_RECEIPT_MULTIPROOF_BYTES,
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_too_many_leaves_at_verification_boundary() {
+        let signer = Signer::generate();
+        let seal_root = [0xAB; 32];
+        let seal = make_batch_seal(&signer, &seal_root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        // Bypass constructor validation to simulate oversized decoded data.
+        let oversized_receipts = vec![[0x11; 32]; MAX_MULTIPROOF_LEAVES + 1];
+        let oversized = ReceiptMultiProofV1::new_unchecked(
+            seal_root,
+            oversized_receipts,
+            seal_hash,
+            Vec::new(),
+        );
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &oversized,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::TooManyLeaves { .. })),
+            "expected TooManyLeaves, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_too_many_nodes_at_verification_boundary() {
+        let signer = Signer::generate();
+        let receipt_hash = [0x42; 32];
+        let seal_root = [0xAC; 32];
+        let seal = make_batch_seal(&signer, &seal_root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        let oversized_siblings: Vec<MerkleProofSibling> = (0..=MAX_MULTIPROOF_NODES)
+            .map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = (i & 0xFF) as u8;
+                MerkleProofSibling {
+                    hash: [byte; 32],
+                    is_left: false,
+                }
+            })
+            .collect();
+        let oversized_proof = MerkleInclusionProof {
+            leaf_hash: compute_receipt_leaf_hash(&receipt_hash),
+            siblings: oversized_siblings,
+        };
+        let oversized = ReceiptMultiProofV1::new_unchecked(
+            seal_root,
+            vec![receipt_hash],
+            seal_hash,
+            vec![oversized_proof],
+        );
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &oversized,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::TooManyProofNodes { .. })),
+            "expected TooManyProofNodes, got: {result:?}",
         );
     }
 
