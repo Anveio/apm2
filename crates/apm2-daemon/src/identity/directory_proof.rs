@@ -2117,21 +2117,26 @@ pub(crate) enum InvalidationReason {
 /// invalidated heads.
 ///
 /// **Audit invariant:** Every cache mutation emits a
-/// [`VerifierCacheAuditEvent`] into the audit log, enabling deterministic
+/// `VerifierCacheAuditEvent` into the audit log, enabling deterministic
 /// post-hoc reconstruction of all invalidation decisions.
 ///
 /// **Bounded audit buffer (REQ-0013 / security review R1):** The audit log
 /// is bounded to `max_audit_events` entries. When the log reaches capacity,
 /// old events are dropped and an `AuditOverflow` sentinel is emitted so
 /// that consumers know events were lost. Callers SHOULD drain the log
-/// periodically via [`drain_audit_log`] to avoid overflow.
+/// periodically via `drain_audit_log` to avoid overflow.
 #[allow(dead_code)]
-#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedHeadCache {
+pub struct VerifiedHeadCache {
     heads: HashMap<[u8; HASH_BYTES], VerifiedHead>,
     admission_order: VecDeque<[u8; HASH_BYTES]>,
     max_entries: usize,
+    /// Persistent high-water mark of the highest epoch ever admitted per cell.
+    ///
+    /// This survives eviction (both capacity and staleness sweeps) so that
+    /// a stale epoch cannot be re-admitted after all heads for a cell have
+    /// been removed from the live cache. Bounded to `max_entries` cells.
+    max_seen_epochs: HashMap<CellIdV1, u64>,
     /// Bounded audit log of cache mutations.
     audit_log: VecDeque<VerifierCacheAuditEvent>,
     /// Maximum number of audit events retained before overflow.
@@ -2152,11 +2157,12 @@ impl VerifiedHeadCache {
     ///
     /// The audit log is bounded to [`DEFAULT_MAX_AUDIT_EVENTS`] entries.
     #[must_use]
-    pub(crate) fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize) -> Self {
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
             max_entries: max_entries.max(1),
+            max_seen_epochs: HashMap::new(),
             audit_log: VecDeque::new(),
             max_audit_events: DEFAULT_MAX_AUDIT_EVENTS,
         }
@@ -2167,11 +2173,12 @@ impl VerifiedHeadCache {
     /// Use this in tests or constrained environments where the default
     /// audit capacity is too large or too small.
     #[must_use]
-    pub(crate) fn with_audit_capacity(max_entries: usize, max_audit_events: usize) -> Self {
+    pub fn with_audit_capacity(max_entries: usize, max_audit_events: usize) -> Self {
         Self {
             heads: HashMap::new(),
             admission_order: VecDeque::new(),
             max_entries: max_entries.max(1),
+            max_seen_epochs: HashMap::new(),
             audit_log: VecDeque::new(),
             max_audit_events: max_audit_events.max(1),
         }
@@ -2247,7 +2254,7 @@ impl VerifiedHeadCache {
     /// If the cache is at capacity after insertion, the oldest entry
     /// (by FIFO admission order) is evicted and a `CapacityEviction`
     /// audit event is emitted.
-    pub(crate) fn admit_head(
+    pub fn admit_head(
         &mut self,
         head_hash: [u8; HASH_BYTES],
         head: HolonDirectoryHeadV1,
@@ -2265,23 +2272,19 @@ impl VerifiedHeadCache {
         let directory_epoch = head.directory_epoch();
 
         // --- Monotonic epoch guard: reject stale re-admissions ---
-        // Check BEFORE any state mutation (transactional admission pattern).
-        let max_cached_epoch = self
-            .heads
-            .values()
-            .filter(|vh| vh.head.cell_id() == &cell_id)
-            .map(|vh| vh.verified_at)
-            .max();
-        if let Some(cached_epoch) = max_cached_epoch {
-            if directory_epoch < cached_epoch {
+        // Check the persistent high-water mark BEFORE any state mutation.
+        // This survives eviction so that previously-seen epochs cannot be
+        // re-admitted after all heads for a cell are removed from the cache.
+        if let Some(&high_water) = self.max_seen_epochs.get(&cell_id) {
+            if directory_epoch < high_water {
                 self.push_audit_event(VerifierCacheAuditEvent::StaleAdmissionRejected {
                     cell_id,
                     rejected_epoch: directory_epoch,
-                    cached_epoch,
+                    cached_epoch: high_water,
                 });
                 return Err(IdentityProofError::StaleEpochRejected {
                     admitted_epoch: directory_epoch,
-                    cached_epoch,
+                    cached_epoch: high_water,
                 });
             }
         }
@@ -2338,6 +2341,24 @@ impl VerifiedHeadCache {
             }
         }
 
+        // Update persistent high-water mark for this cell.
+        // The map is bounded to `max_entries` cells; if we exceed that,
+        // evict the cell with the lowest high-water epoch.
+        let hwm = self.max_seen_epochs.entry(cell_id.clone()).or_insert(0);
+        if directory_epoch > *hwm {
+            *hwm = directory_epoch;
+        }
+        if self.max_seen_epochs.len() > self.max_entries {
+            if let Some(min_cell) = self
+                .max_seen_epochs
+                .iter()
+                .min_by_key(|(_, e)| **e)
+                .map(|(c, _)| c.clone())
+            {
+                self.max_seen_epochs.remove(&min_cell);
+            }
+        }
+
         self.push_audit_event(VerifierCacheAuditEvent::HeadAdmitted {
             head_hash,
             directory_epoch,
@@ -2361,7 +2382,7 @@ impl VerifiedHeadCache {
     /// the O(1) signature/quorum checks that were already performed
     /// during head admission. This is the core cost reduction that
     /// makes the cache worthwhile.
-    pub(crate) fn verify_identity(
+    pub fn verify_identity(
         &self,
         head_hash: &[u8; HASH_BYTES],
         proof: &IdentityProofV1,
@@ -2539,13 +2560,18 @@ impl VerifiedHeadCache {
     }
 
     /// Returns `true` if the cache contains a head with the given hash.
-    pub(crate) fn contains_head(&self, head_hash: &[u8; HASH_BYTES]) -> bool {
+    pub fn contains_head(&self, head_hash: &[u8; HASH_BYTES]) -> bool {
         self.heads.contains_key(head_hash)
     }
 
     /// Returns the number of currently cached heads.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.heads.len()
+    }
+
+    /// Returns `true` if the cache contains no heads.
+    pub fn is_empty(&self) -> bool {
+        self.heads.is_empty()
     }
 
     /// Returns the number of audit events currently retained.
@@ -5382,6 +5408,96 @@ mod tests {
         assert_eq!(
             rejection_count, 5,
             "expected 5 StaleAdmissionRejected events"
+        );
+    }
+
+    // --- Stale epoch re-admission after eviction (CQ MAJOR regression) ---
+
+    #[test]
+    fn stale_epoch_rejected_after_capacity_eviction() {
+        // Regression: admit epoch 20, evict ALL heads via capacity, then
+        // attempt to admit epoch 10 for the same cell. The persistent
+        // high-water mark must reject it even though no heads remain.
+        let cell_cert = make_cell_certificate();
+        let other_cert = make_other_cell_certificate();
+        let third_genesis = CellGenesisV1::new(
+            [0x44; 32],
+            PolicyRootId::Single(make_public_key_id(0xDD)),
+            "third.cap.cell.internal",
+        )
+        .unwrap();
+        let third_cell_id = CellIdV1::from_genesis(&third_genesis);
+
+        // Cache with capacity 2 so head1 is evicted when head2 + head3 fill it.
+        let mut cache = VerifiedHeadCache::new(2);
+
+        let head1 = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let hash1 = head1.content_hash().unwrap();
+        cache.admit_head(hash1, head1).unwrap();
+
+        // Fill cache with two other-cell heads, evicting head1 by capacity.
+        let head2 = make_epoch_head(other_cert.cell_id().clone(), 1, 0xB1);
+        let hash2 = head2.content_hash().unwrap();
+        cache.admit_head(hash2, head2).unwrap();
+
+        let head3 = make_epoch_head(third_cell_id, 2, 0xC1);
+        let hash3 = head3.content_hash().unwrap();
+        cache.admit_head(hash3, head3).unwrap();
+
+        // head1 should be evicted by now.
+        assert!(
+            !cache.contains_head(&hash1),
+            "head1 must be capacity-evicted"
+        );
+        assert_eq!(cache.len(), 2);
+
+        // Attempt to admit a stale epoch for the original cell.
+        let stale = make_epoch_head(cell_cert.cell_id().clone(), 10, 0xA2);
+        let stale_hash = stale.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 10,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected after capacity eviction, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn stale_epoch_rejected_after_staleness_eviction() {
+        // Regression: admit epoch 20, evict it via evict_stale(30), then
+        // attempt to admit epoch 15. Must reject.
+        let cell_cert = make_cell_certificate();
+
+        let mut cache = VerifiedHeadCache::new(8);
+
+        let head = make_epoch_head(cell_cert.cell_id().clone(), 20, 0xA1);
+        let hash = head.content_hash().unwrap();
+        cache.admit_head(hash, head).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Evict via staleness sweep.
+        let evicted = cache.evict_stale(30);
+        assert_eq!(evicted, 1);
+        assert_eq!(cache.len(), 0);
+
+        // Attempt to admit a stale epoch.
+        let stale = make_epoch_head(cell_cert.cell_id().clone(), 15, 0xA2);
+        let stale_hash = stale.content_hash().unwrap();
+        let err = cache.admit_head(stale_hash, stale).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::StaleEpochRejected {
+                    admitted_epoch: 15,
+                    cached_epoch: 20,
+                }
+            ),
+            "expected StaleEpochRejected after staleness eviction, got: {err:?}"
         );
     }
 }
