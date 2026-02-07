@@ -38,15 +38,20 @@ use crate::util::{current_branch, main_worktree, ticket_yaml_path, validate_tick
 /// - Rebase fails (conflicts need manual resolution)
 /// - Push or PR creation fails
 pub fn run(emit_receipt_only: bool, allow_github_write: bool) -> Result<()> {
-    // TCK-00408: If the CLI --emit-receipt-only flag is set, propagate it to
-    // the environment so that all downstream code (including ReviewerSpawner)
-    // picks up the emit-only cutover policy without requiring explicit flag
-    // threading through every function signature.
+    // TCK-00408: If the CLI --emit-receipt-only flag is set, propagate the
+    // *resolved* cutover policy to the environment so that all downstream code
+    // (including ReviewerSpawner) picks up the same policy without requiring
+    // explicit flag threading through every function signature.
+    //
+    // We resolve through effective_cutover_policy_with_flag first so that an
+    // explicit XTASK_CUTOVER_POLICY=legacy env var is respected as terminal
+    // and not overridden by the CLI flag.
     if emit_receipt_only {
+        let resolved = crate::util::effective_cutover_policy_with_flag(emit_receipt_only);
         // SAFETY: single-threaded xtask entry point; no concurrent env reads.
         #[allow(unsafe_code)]
         unsafe {
-            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, "emit_only");
+            std::env::set_var(crate::util::XTASK_CUTOVER_POLICY_ENV, resolved.env_value());
         }
     }
 
@@ -501,6 +506,7 @@ fn extract_ticket_title(content: &str) -> Option<String> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use serial_test::serial;
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -729,5 +735,49 @@ ticket_meta:
             output.contains("description=Waiting for security review"),
             "xshell should preserve spaces in interpolated value. Got: {output}"
         );
+    }
+
+    /// TCK-00408: Explicit `XTASK_CUTOVER_POLICY=legacy` must not be
+    /// overridden when `--emit-receipt-only` is passed.
+    ///
+    /// This is a regression test for the policy-precedence bug where
+    /// `push::run` force-set the env var to `emit_only` before resolution,
+    /// breaking the terminal precedence contract.
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_push_respects_explicit_legacy_policy_with_emit_receipt_flag() {
+        use crate::util::{
+            CutoverPolicy, XTASK_CUTOVER_POLICY_ENV, effective_cutover_policy_with_flag,
+        };
+
+        // Simulate: operator explicitly sets XTASK_CUTOVER_POLICY=legacy
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, "legacy");
+        }
+
+        // The push path now resolves policy through effective_cutover_policy_with_flag
+        // *before* writing back to the env var. Explicit "legacy" must win.
+        let resolved = effective_cutover_policy_with_flag(true);
+        assert_eq!(
+            resolved,
+            CutoverPolicy::Legacy,
+            "Explicit XTASK_CUTOVER_POLICY=legacy must override --emit-receipt-only CLI flag"
+        );
+
+        // After writing back (as push::run does), the env var must still be "legacy"
+        unsafe {
+            std::env::set_var(XTASK_CUTOVER_POLICY_ENV, resolved.env_value());
+        }
+        assert_eq!(
+            std::env::var(XTASK_CUTOVER_POLICY_ENV).unwrap(),
+            "legacy",
+            "Env var must remain 'legacy' after push policy resolution"
+        );
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var(XTASK_CUTOVER_POLICY_ENV);
+        }
     }
 }
