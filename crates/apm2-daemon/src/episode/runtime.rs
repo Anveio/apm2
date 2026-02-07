@@ -1363,8 +1363,19 @@ impl EpisodeRuntime {
                         episode_id = %episode_id,
                         error = %e,
                         "failed to terminate orphaned adapter process \
-                         on missing episode"
+                         on missing episode; escalating to SIGKILL"
                     );
+                    // SECURITY: Escalate to SIGKILL to prevent orphaned
+                    // processes when control-channel terminate fails.
+                    if let Err(kill_err) = crate::episode::adapter::escalate_sigkill(&handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed for orphaned adapter process \
+                             on missing episode; process death NOT confirmed"
+                        );
+                    }
                 }
                 return Err(EpisodeError::NotFound {
                     id: episode_id.as_str().to_string(),
@@ -1384,8 +1395,20 @@ impl EpisodeRuntime {
                     warn!(
                         episode_id = %episode_id,
                         error = %e,
-                        "failed to terminate orphaned adapter process"
+                        "failed to terminate orphaned adapter process; \
+                         escalating to SIGKILL"
                     );
+                    // SECURITY: Escalate to SIGKILL to prevent orphaned
+                    // processes when control-channel terminate fails.
+                    if let Err(kill_err) = crate::episode::adapter::escalate_sigkill(&handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed for orphaned adapter process; \
+                             process death NOT confirmed"
+                        );
+                    }
                 }
                 return Err(EpisodeError::Internal {
                     message: format!(
@@ -1508,7 +1531,18 @@ impl EpisodeRuntime {
         // success. On mark_terminated failure the runtime state stays
         // Running so callers can retry.
 
-        let harness_handle_opt = {
+        // SECURITY: Fail-closed terminal transition. Process death MUST be
+        // confirmed before committing terminal state. The sequence is:
+        // 1. Validate transition + extract fields (inside lock)
+        // 2. Mark session terminated (inside lock)
+        // 3. Take harness handle (inside lock, state stays Running)
+        // 4. Drop lock
+        // 5. Kill subprocess (outside lock)
+        // 6. On kill success: re-acquire lock, commit Terminated state
+        // 7. On kill failure: re-acquire lock, restore handle, return error
+
+        // Phase 1: Validate and prepare (inside lock).
+        let (created_at_ns, started_at_ns, envelope_hash, harness_handle_opt) = {
             let mut episodes = self.episodes.write().await;
 
             let entry =
@@ -1587,29 +1621,15 @@ impl EpisodeRuntime {
                 });
             }
 
-            // TCK-00399: Take the harness handle before transitioning to
-            // Terminated. Termination of the agent process happens after
-            // the state transition (outside the lock) to avoid holding the
-            // write lock during potentially slow I/O.
+            // TCK-00399: Take the harness handle. State stays Running until
+            // process death is confirmed (fail-closed). The terminal
+            // transition is committed in Phase 3 below.
             let harness_handle = entry.harness_handle.take();
 
-            // Session persisted successfully (or no registry) -- now commit
-            // the runtime terminal transition.
-            entry.state = EpisodeState::Terminated {
-                created_at_ns,
-                started_at_ns,
-                terminated_at_ns: timestamp_ns,
-                envelope_hash,
-                termination_class,
-            };
-            entry.handle = None;
-
-            harness_handle
+            (created_at_ns, started_at_ns, envelope_hash, harness_handle)
         };
 
-        // TCK-00399: Terminate the agent CLI process if a harness handle
-        // was stored. Uses SIGTERM + grace period + SIGKILL to guarantee
-        // process termination.
+        // Phase 2: Kill subprocess outside the lock.
         if let Some(ref harness_handle) = harness_handle_opt {
             let runner_handle = harness_handle.real_runner_handle();
             let grace_period = harness_handle.terminate_grace_period();
@@ -1628,21 +1648,60 @@ impl EpisodeRuntime {
                     );
                 },
                 Err(e) => {
-                    // Log but do not fail the stop flow. The process may
-                    // have already exited naturally via the event stream.
                     warn!(
                         episode_id = %episode_id,
                         error = %e,
-                        "agent process termination error during episode stop \
-                         (process may have already exited)"
+                        "agent process termination error during episode stop; \
+                         escalating to SIGKILL"
                     );
                     // SECURITY: Escalate to direct SIGKILL to prevent
                     // orphaned processes when the control channel fails.
-                    crate::episode::adapter::escalate_sigkill(harness_handle).await;
+                    // Fail-closed: if SIGKILL also fails, restore the
+                    // harness handle and abort the terminal transition.
+                    if let Err(kill_err) =
+                        crate::episode::adapter::escalate_sigkill(harness_handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed during episode stop; \
+                             process death NOT confirmed -- restoring handle \
+                             and aborting terminal transition"
+                        );
+                        // Restore the harness handle so a future retry can
+                        // attempt termination again.
+                        {
+                            let mut episodes = self.episodes.write().await;
+                            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                                entry.harness_handle = harness_handle_opt;
+                            }
+                        }
+                        return Err(EpisodeError::Internal {
+                            message: format!(
+                                "episode {episode_id} stop failed: subprocess kill \
+                                 unconfirmed after SIGKILL escalation: {kill_err}"
+                            ),
+                        });
+                    }
                 },
             }
         }
         drop(harness_handle_opt);
+
+        // Phase 3: Commit terminal state transition (process death confirmed).
+        {
+            let mut episodes = self.episodes.write().await;
+            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                entry.state = EpisodeState::Terminated {
+                    created_at_ns,
+                    started_at_ns,
+                    terminated_at_ns: timestamp_ns,
+                    envelope_hash,
+                    termination_class,
+                };
+                entry.handle = None;
+            }
+        }
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
@@ -1876,11 +1935,11 @@ impl EpisodeRuntime {
         reason: QuarantineReason,
         timestamp_ns: u64,
     ) -> Result<(), EpisodeError> {
-        // BLOCKER 1 fix: Make lifecycle transition and mark_terminated
-        // effectively atomic. Mark session terminated FIRST, then commit
-        // the runtime terminal transition only on success.
+        // SECURITY: Fail-closed terminal transition (same pattern as stop).
+        // Process death MUST be confirmed before committing terminal state.
 
-        let quarantine_harness_handle = {
+        // Phase 1: Validate and prepare (inside lock).
+        let (created_at_ns, started_at_ns, envelope_hash, quarantine_harness_handle) = {
             let mut episodes = self.episodes.write().await;
 
             let entry =
@@ -1944,26 +2003,14 @@ impl EpisodeRuntime {
                 });
             }
 
-            // TCK-00399: Take the harness handle before transitioning to
-            // Quarantined. Termination happens outside the lock.
+            // Take harness handle; state stays Running until process
+            // death is confirmed.
             let harness_handle = entry.harness_handle.take();
 
-            // Session persisted successfully (or no registry) -- now commit
-            // the runtime terminal transition.
-            entry.state = EpisodeState::Quarantined {
-                created_at_ns,
-                started_at_ns,
-                quarantined_at_ns: timestamp_ns,
-                envelope_hash,
-                reason: reason.clone(),
-            };
-            entry.handle = None;
-
-            harness_handle
+            (created_at_ns, started_at_ns, envelope_hash, harness_handle)
         };
 
-        // TCK-00399: Terminate the agent CLI process if a harness handle
-        // was stored (same pattern as stop()).
+        // Phase 2: Kill subprocess outside the lock.
         if let Some(ref harness_handle) = quarantine_harness_handle {
             let runner_handle = harness_handle.real_runner_handle();
             let grace_period = harness_handle.terminate_grace_period();
@@ -1985,16 +2032,53 @@ impl EpisodeRuntime {
                     warn!(
                         episode_id = %episode_id,
                         error = %e,
-                        "agent process termination error during episode quarantine \
-                         (process may have already exited)"
+                        "agent process termination error during episode quarantine; \
+                         escalating to SIGKILL"
                     );
-                    // SECURITY: Escalate to direct SIGKILL to prevent
-                    // orphaned processes when the control channel fails.
-                    crate::episode::adapter::escalate_sigkill(harness_handle).await;
+                    // SECURITY: Escalate to direct SIGKILL. If this also
+                    // fails, restore the handle and abort the transition.
+                    if let Err(kill_err) =
+                        crate::episode::adapter::escalate_sigkill(harness_handle).await
+                    {
+                        error!(
+                            episode_id = %episode_id,
+                            error = %kill_err,
+                            "SIGKILL escalation failed during episode quarantine; \
+                             process death NOT confirmed -- restoring handle \
+                             and aborting terminal transition"
+                        );
+                        {
+                            let mut episodes = self.episodes.write().await;
+                            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                                entry.harness_handle = quarantine_harness_handle;
+                            }
+                        }
+                        return Err(EpisodeError::Internal {
+                            message: format!(
+                                "episode {episode_id} quarantine failed: subprocess kill \
+                                 unconfirmed after SIGKILL escalation: {kill_err}"
+                            ),
+                        });
+                    }
                 },
             }
         }
         drop(quarantine_harness_handle);
+
+        // Phase 3: Commit terminal state transition (process death confirmed).
+        {
+            let mut episodes = self.episodes.write().await;
+            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                entry.state = EpisodeState::Quarantined {
+                    created_at_ns,
+                    started_at_ns,
+                    quarantined_at_ns: timestamp_ns,
+                    envelope_hash,
+                    reason: reason.clone(),
+                };
+                entry.handle = None;
+            }
+        }
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
@@ -3119,6 +3203,20 @@ mod tests {
             .await
             .unwrap();
 
+        // Pre-mark the mock handle as terminated (the mock uses a fake
+        // PID 99999 with no start-time binding).  With fail-closed
+        // semantics, stop() refuses to commit terminal state unless the
+        // process is confirmed dead.  Marking terminated simulates the
+        // child process already having exited.
+        {
+            let episodes = runtime.episodes.read().await;
+            let entry = episodes.get(episode_id.as_str()).unwrap();
+            if let Some(ref handle) = entry.harness_handle {
+                let runner = handle.real_runner_handle();
+                runner.lock().await.mark_terminated();
+            }
+        }
+
         // Stop the episode -- this should extract and drop the harness handle
         runtime
             .stop(
@@ -3128,6 +3226,54 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // Verify episode is terminated
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(
+            state.is_terminal(),
+            "episode should be terminated after stop"
+        );
+    }
+
+    /// Verifies fail-closed semantics: `stop()` succeeds when the mock
+    /// process (PID 99999) does not exist -- ESRCH confirms the process
+    /// is dead even when PID binding validation fails (no /proc entry).
+    /// The terminal transition should proceed because process death is
+    /// confirmed.
+    #[tokio::test]
+    async fn test_stop_confirms_death_via_esrch_for_nonexistent_pid() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        runtime
+            .spawn_adapter(&episode_id, config, &adapter)
+            .await
+            .unwrap();
+
+        // Do NOT mark handle as terminated. The mock uses fake PID 99999
+        // which does not exist. escalate_sigkill should detect ESRCH
+        // (process does not exist) and confirm death.
+        let result = runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "stop should succeed when ESRCH confirms process death: {result:?}"
+        );
 
         // Verify episode is terminated
         let state = runtime.observe(&episode_id).await.unwrap();

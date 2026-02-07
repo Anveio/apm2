@@ -7252,6 +7252,42 @@ impl PrivilegedDispatcher {
             );
         }
 
+        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
+        // missing. Same pattern as ClaimWork. SpawnEpisode emits authoritative
+        // ledger events (SessionStarted + WorkTransitioned), and recording
+        // "unknown" as the actor identity would break the accountability chain.
+        //
+        // SECURITY: Validate peer credentials BEFORE any side-effectful
+        // operations (adapter process spawn). Unauthorized requests must be
+        // rejected before triggering subprocess spawn.
+        //
+        // TCK-00384 review fix: Stop the running episode before returning on
+        // this failure path.  The original `?` operator would exit without
+        // stopping the episode, leaking a running runtime episode.
+        let Some(peer_creds) = ctx.peer_credentials() else {
+            // TCK-00384 review fix: unified post-start rollback stops the
+            // episode and cleans up session/telemetry/manifest.
+            let rollback_warn = self.rollback_spawn_with_episode_stop(
+                episode_id_opt.as_ref(),
+                &session_id,
+                &evicted_sessions,
+                &evicted_telemetry,
+                &evicted_manifests,
+                &evicted_stop_conditions,
+                timestamp_ns,
+                "peer credentials failure",
+            );
+            let msg = rollback_warn.map_or_else(
+                || "peer credentials required for episode spawn".to_string(),
+                |rw| format!("peer credentials required for episode spawn (rollback partial failure: {rw})"),
+            );
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                msg,
+            ));
+        };
+        let actor_id = derive_actor_id(peer_creds);
+
         // TCK-00399: Spawn agent CLI process via adapter registry.
         //
         // After the episode is created and Running, load the adapter profile
@@ -7382,38 +7418,6 @@ impl PrivilegedDispatcher {
                 ));
             }
         }
-
-        // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
-        // missing. Same pattern as ClaimWork. SpawnEpisode emits authoritative
-        // ledger events (SessionStarted + WorkTransitioned), and recording
-        // "unknown" as the actor identity would break the accountability chain.
-        //
-        // TCK-00384 review fix: Stop the running episode before returning on
-        // this failure path.  The original `?` operator would exit without
-        // stopping the episode, leaking a running runtime episode.
-        let Some(peer_creds) = ctx.peer_credentials() else {
-            // TCK-00384 review fix: unified post-start rollback stops the
-            // episode and cleans up session/telemetry/manifest.
-            let rollback_warn = self.rollback_spawn_with_episode_stop(
-                episode_id_opt.as_ref(),
-                &session_id,
-                &evicted_sessions,
-                &evicted_telemetry,
-                &evicted_manifests,
-                &evicted_stop_conditions,
-                timestamp_ns,
-                "peer credentials failure",
-            );
-            let msg = rollback_warn.map_or_else(
-                || "peer credentials required for episode spawn".to_string(),
-                |rw| format!("peer credentials required for episode spawn (rollback partial failure: {rw})"),
-            );
-            return Ok(PrivilegedResponse::error(
-                PrivilegedErrorCode::CapabilityRequestRejected,
-                msg,
-            ));
-        };
-        let actor_id = derive_actor_id(peer_creds);
 
         // TCK-00358: Resolve identity proof profile hash for SessionStarted.
         // Primary path: the session-open handler in main.rs sets the profile

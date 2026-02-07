@@ -756,7 +756,7 @@ impl PtyRunnerHandle {
         self.terminated
     }
 
-    fn mark_terminated(&mut self) {
+    pub(crate) fn mark_terminated(&mut self) {
         self.terminated = true;
         self.control_tx = None;
     }
@@ -1011,32 +1011,57 @@ pub(crate) async fn terminate_with_handle(
 /// underlying PID after validating PID identity via `/proc` start-time binding.
 /// If the process has already exited or the PID has been recycled, this is a
 /// safe no-op.
-pub(crate) async fn escalate_sigkill(harness_handle: &HarnessHandle) {
+///
+/// Returns `Ok(())` when the process is confirmed dead (SIGKILL delivered or
+/// ESRCH indicates it already exited). Returns `Err` when process death
+/// cannot be confirmed (PID validation failure, SIGKILL delivery failure).
+/// Callers MUST NOT emit terminal semantics (Stopped/Quarantined events)
+/// when this returns `Err`.
+pub(crate) async fn escalate_sigkill(harness_handle: &HarnessHandle) -> AdapterResult<()> {
     let runner_handle = harness_handle.real_runner_handle();
     let mut guard = runner_handle.lock().await;
 
     if guard.is_terminated() {
-        return;
+        return Ok(());
     }
 
     let pid = guard.pid;
     let start_time_ticks = guard.start_time_ticks;
 
-    // Validate PID identity before sending a raw signal. If validation
-    // fails the PID may have been recycled and we must not kill a random
-    // process.
-    if let Err(e) = validate_pid_binding(pid, start_time_ticks) {
-        tracing::warn!(
-            pid,
-            error = %e,
-            "escalate_sigkill: skipping -- PID binding validation failed"
-        );
-        return;
-    }
-
     // Linux PIDs fit in i32 (max_pid <= 4_194_304).
     #[allow(clippy::cast_possible_wrap)]
     let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+
+    // Validate PID identity before sending a raw signal. If validation
+    // fails the PID may have been recycled and we must not kill a random
+    // process. However, if /proc/<pid>/stat is gone (process already
+    // exited), validation fails but the process is confirmed dead via
+    // kill(pid, 0) => ESRCH.
+    if let Err(e) = validate_pid_binding(pid, start_time_ticks) {
+        // Check if the process is already gone. kill(pid, 0) is a
+        // no-op probe that returns ESRCH if the PID does not exist.
+        if nix::sys::signal::kill(nix_pid, None) == Err(nix::errno::Errno::ESRCH) {
+            tracing::debug!(
+                pid,
+                "escalate_sigkill: PID binding validation failed but \
+                 process already exited (ESRCH); confirming death"
+            );
+            guard.mark_terminated();
+            return Ok(());
+        }
+        // Process still exists but PID binding failed -- PID may
+        // have been recycled. Do NOT send SIGKILL.
+        tracing::warn!(
+            pid,
+            error = %e,
+            "escalate_sigkill: skipping -- PID binding validation \
+             failed and process still exists (possible PID reuse)"
+        );
+        return Err(AdapterError::terminate_failed(format!(
+            "escalate_sigkill: PID binding validation failed for pid {pid}: {e}"
+        )));
+    }
+
     match nix::sys::signal::kill(nix_pid, Signal::SIGKILL) {
         Ok(()) => {
             tracing::warn!(
@@ -1044,11 +1069,13 @@ pub(crate) async fn escalate_sigkill(harness_handle: &HarnessHandle) {
                 "escalate_sigkill: sent SIGKILL directly (control-channel fallback)"
             );
             guard.mark_terminated();
+            Ok(())
         },
         Err(nix::errno::Errno::ESRCH) => {
             // Process already exited -- mark terminated so we don't retry.
             tracing::debug!(pid, "escalate_sigkill: process already exited (ESRCH)");
             guard.mark_terminated();
+            Ok(())
         },
         Err(e) => {
             tracing::error!(
@@ -1056,6 +1083,9 @@ pub(crate) async fn escalate_sigkill(harness_handle: &HarnessHandle) {
                 error = %e,
                 "escalate_sigkill: SIGKILL delivery failed"
             );
+            Err(AdapterError::terminate_failed(format!(
+                "escalate_sigkill: SIGKILL delivery failed for pid {pid}: {e}"
+            )))
         },
     }
 }

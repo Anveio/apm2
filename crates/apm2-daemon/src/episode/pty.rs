@@ -68,7 +68,7 @@ use nix::libc;
 use nix::pty::{Winsize, openpty};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, close, execvp, fork, setsid};
+use nix::unistd::{ForkResult, Pid, close, fork, setsid};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -543,6 +543,56 @@ impl PtyRunner {
             arg_cstrings.push(cstr);
         }
 
+        // SECURITY: Pre-fork preparation of all exec inputs to avoid
+        // async-signal-unsafe operations (heap allocation, CString::new,
+        // clearenv, setenv) in the post-fork child. After fork() in a
+        // multi-threaded process, only async-signal-safe functions may be
+        // called before exec.
+
+        // Pre-fork: prepare cwd CString if configured.
+        let cwd_cstr: Option<CString> = match &config.cwd {
+            Some(cwd) => Some(CString::new(cwd.as_os_str().as_bytes()).map_err(|_| {
+                PtyError::InvalidCommand("cwd path contains null byte".to_string())
+            })?),
+            None => None,
+        };
+
+        // Pre-fork: build envp array for execve. Each entry is
+        // "KEY=VALUE\0" as a CString. The array is terminated by a null
+        // pointer. We keep the owning Vec<CString> alive across the fork
+        // so the pointers remain valid in the child.
+        let env_cstrings: Vec<CString> = config
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let mut entry = Vec::with_capacity(k.as_bytes().len() + 1 + v.as_bytes().len());
+                entry.extend_from_slice(k.as_bytes());
+                entry.push(b'=');
+                entry.extend_from_slice(v.as_bytes());
+                // SAFETY: k and v are CStrings (no interior NUL); the only
+                // added byte is '=' which is not NUL.
+                CString::new(entry).expect("env key=value should not contain NUL")
+            })
+            .collect();
+        let use_custom_env = !config.env.is_empty();
+
+        // Pre-fork: build the raw pointer array for execve envp parameter.
+        // Must be null-terminated.
+        let envp_ptrs: Vec<*const libc::c_char> = {
+            let mut ptrs: Vec<*const libc::c_char> =
+                env_cstrings.iter().map(|c| c.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+            ptrs
+        };
+
+        // Pre-fork: build the raw pointer array for execvp/execve argv.
+        let argv_ptrs: Vec<*const libc::c_char> = {
+            let mut ptrs: Vec<*const libc::c_char> =
+                arg_cstrings.iter().map(|c| c.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+            ptrs
+        };
+
         // Create PTY pair
         let (cols, rows) = config.window_size();
         let winsize = Winsize {
@@ -559,7 +609,8 @@ impl PtyRunner {
 
         // Fork child process
         // SAFETY: We perform minimal operations in the child before exec.
-        // The child sets up the session/terminal and execs immediately.
+        // All CStrings, argv, envp, and cwd are prepared above (pre-fork).
+        // The child only calls async-signal-safe functions before exec.
         let fork_result = unsafe { fork() }.map_err(PtyError::Fork)?;
 
         match fork_result {
@@ -622,59 +673,40 @@ impl PtyRunner {
 
                 // SECURITY: Apply HarnessConfig cwd before exec to prevent
                 // child from inheriting daemon's working directory.
-                // SAFETY: chdir is safe in the child post-fork.
-                if let Some(ref cwd) = config.cwd {
-                    // SAFETY: _exit is safe to call from the child process
-                    #[allow(clippy::manual_let_else, clippy::option_if_let_else)]
-                    let cwd_cstr = match CString::new(cwd.as_os_str().as_bytes()) {
-                        Ok(c) => c,
-                        Err(_) => unsafe { libc::_exit(1) },
-                    };
-                    // SAFETY: chdir with a valid CString is safe.
+                // SAFETY: chdir is async-signal-safe. The CString was
+                // prepared pre-fork so no allocation occurs here.
+                if let Some(ref cwd) = cwd_cstr {
                     unsafe {
-                        if libc::chdir(cwd_cstr.as_ptr()) != 0 {
+                        if libc::chdir(cwd.as_ptr()) != 0 {
                             libc::_exit(1);
                         }
                     }
                 }
 
-                // SECURITY: Apply HarnessConfig env before exec to prevent
-                // child from inheriting daemon's environment variables.
-                // SAFETY: clearenv/setenv are safe in the child post-fork
-                // (single-threaded context after fork).
-                if !config.env.is_empty() {
-                    // SAFETY: clearenv is safe in the post-fork child
-                    // (single-threaded).
-                    // SECURITY: Fail-closed -- if clearenv() fails, the child
-                    // would inherit the daemon's ambient env, violating
-                    // containment.
-                    unsafe {
-                        if libc::clearenv() != 0 {
-                            libc::_exit(1);
-                        }
+                // SECURITY: Apply HarnessConfig env via execve envp instead
+                // of clearenv/setenv (which are NOT async-signal-safe).
+                // The envp array was fully constructed pre-fork.
+                //
+                // When custom env is configured, use execve with the
+                // precomputed envp to atomically replace the environment.
+                // When no custom env, use execvp for PATH resolution with
+                // inherited environment.
+                unsafe {
+                    if use_custom_env {
+                        // execve: no PATH search, uses precomputed envp.
+                        // program_cstr is already an absolute/resolved path.
+                        libc::execve(
+                            program_cstr.as_ptr(),
+                            argv_ptrs.as_ptr(),
+                            envp_ptrs.as_ptr(),
+                        );
+                    } else {
+                        // execvp: PATH search, inherits parent environment.
+                        libc::execvp(program_cstr.as_ptr(), argv_ptrs.as_ptr());
                     }
-                    for (key, value) in &config.env {
-                        // SAFETY: setenv with valid CStrings is safe.
-                        // SECURITY: Fail-closed -- if setenv() fails, the
-                        // child runs with an incomplete env, which is unsafe.
-                        unsafe {
-                            if libc::setenv(key.as_ptr(), value.as_ptr(), 1) != 0 {
-                                libc::_exit(1);
-                            }
-                        }
-                    }
+                    // exec only returns on failure
+                    libc::_exit(127);
                 }
-
-                // Execute the program
-                // This replaces the current process image
-                // SAFETY: _exit is safe to call from the child process
-                if execvp(&program_cstr, &arg_cstrings).is_err() {
-                    unsafe { libc::_exit(127) }; // 127 = command not found convention
-                }
-
-                // execvp never returns on success, but if it somehow does, exit
-                // SAFETY: _exit is safe to call from the child process
-                unsafe { libc::_exit(1) };
             },
             ForkResult::Parent { child } => {
                 // Parent process
