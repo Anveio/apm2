@@ -125,12 +125,34 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
+      - name: Check review gate result
+        id: gate
+        run: |
+          # If pre-filter was skipped (untrusted commenter), gate is not
+          # applicable. Do NOT post any status — an untrusted actor must
+          # never be able to write a passing required status.
+          if [[ "${{ needs.pre-filter.result }}" == "skipped" ]]; then
+            echo "Pre-filter skipped (not a trusted actor or not a PR comment)"
+            echo "should_post=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "should_post=true" >> "$GITHUB_OUTPUT"
+          if [[ "${{ needs.review-gate.result }}" != "success" ]]; then
+            echo "Review gate failed"
+            echo "state=failure" >> "$GITHUB_OUTPUT"
+            echo "description=Review gate evaluation failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "Review gate passed"
+          echo "state=success" >> "$GITHUB_OUTPUT"
+          echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
+
       # Resolve the PR head SHA so we can post a commit status to it.
-      # pull_request_target binds GITHUB_SHA to the base branch, not the PR
-      # head, so the workflow check context alone is not associated with the
-      # PR head commit.
+      # Only resolve when the gate actually ran (avoids API calls on
+      # non-PR issue_comment events where pre-filter was skipped).
       - name: Resolve PR head SHA
         id: head
+        if: always() && steps.gate.outputs.should_post == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -142,31 +164,15 @@ jobs:
             echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check review gate result
-        id: gate
-        run: |
-          # If pre-filter was skipped (untrusted commenter), gate is not applicable
-          if [[ "${{ needs.pre-filter.result }}" == "skipped" ]]; then
-            echo "Pre-filter skipped (not a trusted actor or not a PR comment)"
-            echo "state=success" >> "$GITHUB_OUTPUT"
-            echo "description=Pre-filter skipped (not applicable)" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "${{ needs.review-gate.result }}" != "success" ]]; then
-            echo "Review gate failed"
-            echo "state=failure" >> "$GITHUB_OUTPUT"
-            echo "description=Review gate evaluation failed" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          echo "Review gate passed"
-          echo "state=success" >> "$GITHUB_OUTPUT"
-          echo "description=Review gate passed" >> "$GITHUB_OUTPUT"
-
       # Post a commit status to the PR head SHA so branch protection can
       # find the check on the correct commit (pull_request_target runs
       # report on the base SHA, not the PR head).
+      # Only post when the gate actually ran (trusted actor triggered it).
       - name: Post review gate status to PR head
-        if: always() && steps.head.outputs.sha != ''
+        if: >-
+          always() &&
+          steps.gate.outputs.should_post == 'true' &&
+          steps.head.outputs.sha != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
