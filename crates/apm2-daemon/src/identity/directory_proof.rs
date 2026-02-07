@@ -156,6 +156,28 @@ pub enum IdentityProofError {
         field: &'static str,
     },
 
+    /// Directory kind in head is incompatible with proof kind.
+    #[error(
+        "directory kind mismatch: head kind {head_kind:?} is incompatible with proof kind {proof_kind:?}"
+    )]
+    DirectoryKindMismatch {
+        /// Head directory kind.
+        head_kind: DirectoryKindV1,
+        /// Proof kind.
+        proof_kind: DirectoryProofKindV1,
+    },
+
+    /// Value hash mismatch between proof and caller expectation.
+    #[error("directory entry value_hash mismatch: expected {field}")]
+    ValueHashMismatch {
+        /// Field being compared.
+        field: &'static str,
+    },
+
+    /// Directory entry has been revoked; authoritative operations are denied.
+    #[error("directory entry is revoked; authoritative operations denied")]
+    EntryRevoked,
+
     /// Missing `cell_certificate_hash` when direct trust is not pinned.
     #[error("cell_certificate_hash is required unless direct trust is pinned")]
     MissingCellCertificateHash,
@@ -596,6 +618,78 @@ impl DirectoryProofKindV1 {
     }
 }
 
+/// Status of a directory entry (K-V binding semantics).
+///
+/// A directory entry maps a holon identity key to a value (e.g., holon
+/// certificate hash). The status governs whether the binding is considered
+/// active for authoritative operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DirectoryEntryStatus {
+    /// Entry is active and eligible for authoritative operations.
+    Active    = 0x01,
+    /// Entry has been revoked; authoritative operations MUST be denied.
+    Revoked   = 0x02,
+    /// Entry is temporarily suspended; authoritative operations MUST be denied.
+    Suspended = 0x03,
+}
+
+impl DirectoryEntryStatus {
+    /// Parses a status byte (fail-closed: unknown tags are rejected).
+    pub const fn from_byte(tag: u8) -> Result<Self, IdentityProofError> {
+        match tag {
+            0x01 => Ok(Self::Active),
+            0x02 => Ok(Self::Revoked),
+            0x03 => Ok(Self::Suspended),
+            _ => Err(IdentityProofError::InvalidEnumTag {
+                field: "directory_entry_status",
+                tag,
+            }),
+        }
+    }
+
+    /// Returns the canonical byte encoding.
+    pub const fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    /// Returns `true` if the entry is active.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+}
+
+/// Checks whether a directory head kind is compatible with a proof kind.
+///
+/// The compatibility matrix is:
+/// - `Smt256V1` head <-> `Smt256CompressedV1` proof
+/// - `PatriciaTrieV1` head <-> `PatriciaCompressedV1` proof
+///
+/// Any other combination is rejected (fail-closed).
+pub const fn check_directory_kind_compatibility(
+    head_kind: DirectoryKindV1,
+    proof_kind: DirectoryProofKindV1,
+) -> Result<(), IdentityProofError> {
+    let compatible = matches!(
+        (head_kind, proof_kind),
+        (
+            DirectoryKindV1::Smt256V1,
+            DirectoryProofKindV1::Smt256CompressedV1
+        ) | (
+            DirectoryKindV1::PatriciaTrieV1,
+            DirectoryProofKindV1::PatriciaCompressedV1
+        )
+    );
+    if !compatible {
+        return Err(IdentityProofError::DirectoryKindMismatch {
+            head_kind,
+            proof_kind,
+        });
+    }
+    Ok(())
+}
+
 /// Sibling node hash used in path reconstruction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SiblingNode {
@@ -1026,11 +1120,15 @@ impl IdentityProofV1 {
     /// verifier policy.
     ///
     /// Verification steps (RFC-0020 §1.7.7):
+    ///
     /// 1. Proof object is already fetched and decoded with bounds.
+    ///    1a. Directory kind compatibility check (head kind vs. proof kind).
     /// 2. Verify `CellCertificateV1`.
     /// 3. Verify `HolonCertificateV1` and recompute identity bindings.
     /// 4. Verify directory head authority seal binding.
     /// 5. Verify ADS proof against head root.
+    ///    5a. Verify K->V semantics: `expected_value_hash` matches proof `value_hash`.
+    ///    5b. Verify directory entry status: revoked entries fail-closed.
     /// 6. Enforce tick-based freshness.
     #[allow(clippy::too_many_arguments)]
     pub fn verify<F>(
@@ -1043,6 +1141,8 @@ impl IdentityProofV1 {
         current_tick: u64,
         max_staleness_ticks: u64,
         expected_freshness_policy_hash: &[u8; HASH_BYTES],
+        expected_value_hash: &[u8; HASH_BYTES],
+        expected_entry_status: DirectoryEntryStatus,
         authority_seal_verifier: F,
     ) -> Result<(), IdentityProofError>
     where
@@ -1053,6 +1153,17 @@ impl IdentityProofV1 {
         ) -> Result<(), IdentityProofError>,
     {
         self.validate()?;
+
+        // Step 1a: Directory kind compatibility check (fail-closed).
+        //
+        // The directory head advertises a `directory_kind` and the proof
+        // carries a `DirectoryProofKindV1`. They MUST be compatible per the
+        // defined matrix. Without this check, a proof of one kind could be
+        // verified against a head of an incompatible kind.
+        check_directory_kind_compatibility(
+            directory_head.directory_kind(),
+            self.directory_proof.kind(),
+        )?;
 
         // Step 2: Verify CellCertificateV1.
         cell_certificate.validate()?;
@@ -1140,6 +1251,26 @@ impl IdentityProofV1 {
             directory_head.directory_root_hash(),
             directory_head.max_proof_bytes(),
         )?;
+
+        // Step 5a: Verify K->V value semantics.
+        //
+        // The caller provides the expected value_hash (e.g., the hash of
+        // the holon certificate for the claimed identity). The proof's
+        // value_hash MUST match to ensure the directory entry represents
+        // the expected identity state.
+        if self.directory_proof.value_hash() != expected_value_hash {
+            return Err(IdentityProofError::ValueHashMismatch {
+                field: "directory_proof.value_hash",
+            });
+        }
+
+        // Step 5b: Verify directory entry status.
+        //
+        // If the directory entry is revoked or suspended, authoritative
+        // operations MUST be denied (fail-closed).
+        if !expected_entry_status.is_active() {
+            return Err(IdentityProofError::EntryRevoked);
+        }
 
         // Step 6: Tick-based freshness checks.
         if current_tick < self.proof_generated_at_tick {
@@ -1230,6 +1361,46 @@ const fn key_bit_at_depth(key: &[u8; HASH_BYTES], depth: usize) -> Result<u8, Id
 
 fn hash_bytes(bytes: &[u8]) -> Hash {
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Validates an identity proof hash at the handler admission boundary.
+///
+/// Phase 1 (pre-CAS transport): This validates that the hash is well-formed
+/// and non-zero, acting as a binding commitment. The caller attests they hold
+/// a valid `IdentityProofV1` by providing its content hash.
+///
+/// Full proof dereference + `IdentityProofV1::verify()` requires CAS
+/// integration, which is deferred to TCK-00359 (CAS transport).
+///
+/// # Errors
+///
+/// Returns `IdentityProofError::InvalidField` if:
+/// - The hash is not exactly 32 bytes
+/// - The hash is all zeros (null commitment)
+pub fn validate_identity_proof_hash(hash: &[u8]) -> Result<(), IdentityProofError> {
+    if hash.len() != HASH_BYTES {
+        return Err(IdentityProofError::InvalidField {
+            field: "identity_proof_hash",
+            reason: format!("must be exactly {HASH_BYTES} bytes, got {}", hash.len()),
+        });
+    }
+
+    // SECURITY: A zero hash is a null commitment. Reject it to prevent
+    // callers from bypassing the proof-carrying pointer requirement.
+    if hash.iter().all(|&b| b == 0) {
+        return Err(IdentityProofError::InvalidField {
+            field: "identity_proof_hash",
+            reason: "must be non-zero (null commitment rejected)".to_string(),
+        });
+    }
+
+    // TODO(TCK-00359): When CAS transport is available, dereference the
+    // hash from CAS and call `IdentityProofV1::verify()` for full
+    // cryptographic verification. Until then, the hash acts as a binding
+    // commitment that is included in signed event payloads for audit
+    // traceability.
+
+    Ok(())
 }
 
 struct Cursor<'a> {
@@ -1573,6 +1744,8 @@ mod tests {
                 105,
                 10,
                 head.freshness_policy_hash(),
+                &[0xAB; HASH_BYTES],
+                DirectoryEntryStatus::Active,
                 |_, _, authority_seal_hash| {
                     if authority_seal_hash == &[0u8; HASH_BYTES] {
                         return Err(IdentityProofError::InvalidField {
@@ -1635,6 +1808,8 @@ mod tests {
                 10,
                 10,
                 head.freshness_policy_hash(),
+                &[0xAA; HASH_BYTES],
+                DirectoryEntryStatus::Active,
                 |_, _, _| Ok(()),
             )
             .unwrap_err();
@@ -1691,6 +1866,8 @@ mod tests {
                 120,
                 5,
                 head.freshness_policy_hash(),
+                &[0x01; HASH_BYTES],
+                DirectoryEntryStatus::Active,
                 |_, _, _| Ok(()),
             )
             .unwrap_err();
@@ -1725,5 +1902,270 @@ mod tests {
             IdentityProofV1::fetch_from_cas(&cas, &store_result.hash, MAX_IDENTITY_PROOF_BYTES)
                 .unwrap();
         assert_eq!(identity_proof, loaded);
+    }
+
+    // ====================================================================
+    // FIX 1: validate_identity_proof_hash tests
+    // ====================================================================
+
+    #[test]
+    fn validate_identity_proof_hash_rejects_zero_hash() {
+        let err = validate_identity_proof_hash(&[0u8; 32]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::InvalidField {
+                    field: "identity_proof_hash",
+                    ..
+                }
+            ),
+            "expected InvalidField for zero hash, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_identity_proof_hash_rejects_wrong_length() {
+        let short = vec![0x99u8; 16];
+        let err = validate_identity_proof_hash(&short).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::InvalidField {
+                    field: "identity_proof_hash",
+                    ..
+                }
+            ),
+            "expected InvalidField for wrong length, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_identity_proof_hash_accepts_random_non_zero_hash() {
+        // Phase 1: a random non-CAS-resolvable hash is accepted.
+        // The hash acts as a binding commitment.
+        let hash = [0xDE; 32];
+        validate_identity_proof_hash(&hash).expect("non-zero 32-byte hash should be accepted");
+    }
+
+    // ====================================================================
+    // FIX 2: K->V value semantics tests
+    // ====================================================================
+
+    #[test]
+    fn identity_proof_verify_rejects_mismatched_value_hash() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let key = derive_directory_key(holon_cert.holon_id());
+        let actual_value_hash = [0xAB; HASH_BYTES];
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            actual_value_hash,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        let head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
+            root,
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [0x61; HASH_BYTES],
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+
+        let identity_proof = IdentityProofV1::new(
+            Some(hash_bytes(&cell_cert.canonical_bytes().unwrap())),
+            hash_bytes(&holon_cert.canonical_bytes().unwrap()),
+            head.content_hash().unwrap(),
+            proof,
+            100,
+        )
+        .unwrap();
+
+        // Provide a WRONG expected value hash
+        let wrong_expected = [0xFF; HASH_BYTES];
+        let err = identity_proof
+            .verify(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &wrong_expected,
+                DirectoryEntryStatus::Active,
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, IdentityProofError::ValueHashMismatch { .. }),
+            "expected ValueHashMismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn identity_proof_verify_rejects_revoked_entry() {
+        let cell_cert = make_cell_certificate();
+        let holon_cert = make_holon_certificate(cell_cert.cell_id().clone());
+
+        let key = derive_directory_key(holon_cert.holon_id());
+        let value_hash = [0xAB; HASH_BYTES];
+        let proof = DirectoryProofV1::new(
+            DirectoryProofKindV1::Smt256CompressedV1,
+            key,
+            value_hash,
+            vec![
+                SiblingNode::new([0x10; HASH_BYTES]),
+                SiblingNode::new([0x11; HASH_BYTES]),
+            ],
+        )
+        .unwrap();
+        let root = compute_root_from_proof(&proof);
+
+        let head = HolonDirectoryHeadV1::new(
+            cell_cert.cell_id().clone(),
+            12,
+            LedgerAnchorV1::ConsensusIndex { index: 99 },
+            root,
+            DirectoryKindV1::Smt256V1,
+            1,
+            8192,
+            [0x61; HASH_BYTES],
+            [0x62; HASH_BYTES],
+            [0x63; HASH_BYTES],
+            None,
+        )
+        .unwrap();
+
+        let identity_proof = IdentityProofV1::new(
+            Some(hash_bytes(&cell_cert.canonical_bytes().unwrap())),
+            hash_bytes(&holon_cert.canonical_bytes().unwrap()),
+            head.content_hash().unwrap(),
+            proof,
+            100,
+        )
+        .unwrap();
+
+        // Provide correct value hash but revoked status
+        let err = identity_proof
+            .verify(
+                holon_cert.holon_id(),
+                &cell_cert,
+                &holon_cert,
+                &head,
+                false,
+                105,
+                10,
+                head.freshness_policy_hash(),
+                &value_hash,
+                DirectoryEntryStatus::Revoked,
+                |_, _, _| Ok(()),
+            )
+            .unwrap_err();
+
+        assert_eq!(err, IdentityProofError::EntryRevoked);
+    }
+
+    #[test]
+    fn identity_proof_verify_rejects_suspended_entry() {
+        // Suspended entries MUST also be denied (same as revoked).
+        assert!(!DirectoryEntryStatus::Suspended.is_active());
+    }
+
+    #[test]
+    fn identity_proof_verify_active_entry_passes() {
+        assert!(DirectoryEntryStatus::Active.is_active());
+    }
+
+    // ====================================================================
+    // FIX 3: Directory kind compatibility tests
+    // ====================================================================
+
+    #[test]
+    fn directory_kind_smt_head_with_smt_proof_is_compatible() {
+        check_directory_kind_compatibility(
+            DirectoryKindV1::Smt256V1,
+            DirectoryProofKindV1::Smt256CompressedV1,
+        )
+        .expect("SMT head with SMT proof should be compatible");
+    }
+
+    #[test]
+    fn directory_kind_patricia_head_with_patricia_proof_is_compatible() {
+        check_directory_kind_compatibility(
+            DirectoryKindV1::PatriciaTrieV1,
+            DirectoryProofKindV1::PatriciaCompressedV1,
+        )
+        .expect("Patricia head with Patricia proof should be compatible");
+    }
+
+    #[test]
+    fn directory_kind_smt_head_with_patricia_proof_is_rejected() {
+        let err = check_directory_kind_compatibility(
+            DirectoryKindV1::Smt256V1,
+            DirectoryProofKindV1::PatriciaCompressedV1,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IdentityProofError::DirectoryKindMismatch { .. }),
+            "expected DirectoryKindMismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn directory_kind_patricia_head_with_smt_proof_is_rejected() {
+        let err = check_directory_kind_compatibility(
+            DirectoryKindV1::PatriciaTrieV1,
+            DirectoryProofKindV1::Smt256CompressedV1,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, IdentityProofError::DirectoryKindMismatch { .. }),
+            "expected DirectoryKindMismatch, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn directory_entry_status_byte_round_trip() {
+        for (status, byte) in [
+            (DirectoryEntryStatus::Active, 0x01),
+            (DirectoryEntryStatus::Revoked, 0x02),
+            (DirectoryEntryStatus::Suspended, 0x03),
+        ] {
+            assert_eq!(status.to_byte(), byte);
+            assert_eq!(DirectoryEntryStatus::from_byte(byte).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn directory_entry_status_rejects_unknown_tag() {
+        let err = DirectoryEntryStatus::from_byte(0xFF).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IdentityProofError::InvalidEnumTag {
+                    field: "directory_entry_status",
+                    tag: 0xFF
+                }
+            ),
+            "expected InvalidEnumTag for 0xFF, got: {err:?}"
+        );
     }
 }

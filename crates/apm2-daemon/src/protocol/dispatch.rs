@@ -502,6 +502,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `artifact_bundle_hash` - CAS hash of the artifact bundle
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds since epoch
+    /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     ///
     /// # Returns
     ///
@@ -511,6 +512,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     ///
     /// Returns `LedgerEventError` if signing, CAS validation, or persistence
     /// fails.
+    #[allow(clippy::too_many_arguments)]
     fn emit_review_receipt(
         &self,
         episode_id: &str,
@@ -519,6 +521,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         artifact_bundle_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a `ReviewBlockedRecorded` ledger event (TCK-00389).
@@ -821,6 +824,7 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `reviewer_actor_id` - Actor ID of the reviewer
     /// * `timestamp_ns` - HTF-compliant timestamp in nanoseconds
     /// * `bindings` - Envelope bindings to include in the receipt
+    /// * `identity_proof_hash` - Identity proof hash binding (32 bytes)
     ///
     /// # Errors
     ///
@@ -836,6 +840,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         bindings: &crate::episode::EnvelopeBindings,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Fail-closed: validate bindings before emission
         bindings
@@ -853,6 +858,7 @@ pub trait LedgerEventEmitter: Send + Sync {
             artifact_bundle_hash,
             reviewer_actor_id,
             timestamp_ns,
+            identity_proof_hash,
         )
     }
 }
@@ -1688,6 +1694,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         artifact_bundle_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -1698,6 +1705,10 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing.
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
@@ -1706,6 +1717,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         // Use JCS (RFC 8785) canonicalization for deterministic signing
@@ -2264,6 +2276,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         bindings: &crate::episode::EnvelopeBindings,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -2277,6 +2290,8 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
 
         // Include bindings in the signed payload
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound.
         let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
@@ -2289,6 +2304,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             "envelope_hash": env_hex,
             "capability_manifest_hash": cap_hex,
             "view_commitment_hash": view_hex,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_bytes =
@@ -7632,13 +7648,17 @@ impl PrivilegedDispatcher {
 
         // REQ-0010: Identity-bearing authoritative requests MUST carry
         // proof-carrying pointers.
-        if request.identity_proof_hash.len() != 32 {
+        //
+        // SECURITY (TCK-00356 Fix 1): Validate the identity proof hash using
+        // the centralized validator which enforces non-zero commitment and
+        // correct length. Phase 1 (pre-CAS transport) validates the hash as
+        // a binding commitment; full proof dereference requires CAS
+        // integration (TCK-00359).
+        if let Err(e) = crate::identity::validate_identity_proof_hash(&request.identity_proof_hash)
+        {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "identity_proof_hash must be exactly 32 bytes, got {}",
-                    request.identity_proof_hash.len()
-                ),
+                format!("identity_proof_hash validation failed: {e}"),
             ));
         }
 
@@ -7900,6 +7920,15 @@ impl PrivilegedDispatcher {
         };
 
         // ---- Phase 4: Emit event based on verdict ----
+        //
+        // SECURITY (TCK-00356 Fix 1): Convert identity_proof_hash to a
+        // fixed-size array for inclusion in signed event payloads.
+        let identity_proof_hash_arr: [u8; 32] = request
+            .identity_proof_hash
+            .as_slice()
+            .try_into()
+            .expect("validated to be 32 bytes by validate_identity_proof_hash above");
+
         let (event_type, signed_event) = match verdict {
             ReviewReceiptVerdict::Approve => {
                 let changeset_digest: [u8; 32] = request
@@ -7915,6 +7944,9 @@ impl PrivilegedDispatcher {
 
                 // SECURITY (v6 Finding 1): Use authenticated reviewer identity
                 // for event actor attribution, not the caller-supplied value.
+                //
+                // SECURITY (TCK-00356 Fix 1): identity_proof_hash is passed
+                // into the event emitter so it is included in the signed payload.
                 let event = self
                     .event_emitter
                     .emit_review_receipt(
@@ -7924,6 +7956,7 @@ impl PrivilegedDispatcher {
                         &artifact_bundle_hash,
                         &authenticated_reviewer_id,
                         timestamp_ns,
+                        &identity_proof_hash_arr,
                     )
                     .map_err(|e| ProtocolError::Serialization {
                         reason: format!("review receipt emission failed: {e}"),
@@ -8827,13 +8860,17 @@ impl PrivilegedDispatcher {
 
         // REQ-0010: Identity-bearing authoritative requests MUST carry
         // proof-carrying pointers.
-        if request.identity_proof_hash.len() != 32 {
+        //
+        // SECURITY (TCK-00356 Fix 1): Validate the identity proof hash using
+        // the centralized validator which enforces non-zero commitment and
+        // correct length. Phase 1 (pre-CAS transport) validates the hash as
+        // a binding commitment; full proof dereference requires CAS
+        // integration (TCK-00359).
+        if let Err(e) = crate::identity::validate_identity_proof_hash(&request.identity_proof_hash)
+        {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
-                format!(
-                    "identity_proof_hash must be exactly 32 bytes, got {}",
-                    request.identity_proof_hash.len()
-                ),
+                format!("identity_proof_hash validation failed: {e}"),
             ));
         }
 
@@ -9428,6 +9465,10 @@ impl PrivilegedDispatcher {
         // caller-controlled `delegatee_actor_id`. The delegatee is included
         // as a separate field in the event payload so the audit trail records
         // BOTH who performed the delegation and who received the sublease.
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed event payload so it is audit-bound and cannot be
+        // stripped post-signing.
         let event_payload = serde_json::json!({
             "parent_lease_id": request.parent_lease_id,
             "sublease_id": sublease.lease_id,
@@ -9437,6 +9478,7 @@ impl PrivilegedDispatcher {
             "work_id": sublease.work_id,
             "expires_at": sublease.expires_at,
             "issued_at": sublease.issued_at,
+            "identity_proof_hash": hex::encode(&request.identity_proof_hash),
         });
         // SECURITY (v10 MAJOR — Fail-closed serialization):
         //
@@ -18299,12 +18341,43 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert!(
                         err.message
-                            .contains("identity_proof_hash must be exactly 32 bytes"),
-                        "Expected identity_proof_hash error, got: {}",
+                            .contains("identity_proof_hash validation failed"),
+                        "Expected identity_proof_hash validation error, got: {}",
                         err.message
                     );
                 },
                 other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_zero_identity_proof_hash_rejected() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-006c", "W-006c", "gate-006c", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-006c".to_string(),
+                receipt_id: "RR-006c".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x00; 32],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("null commitment rejected"),
+                        "Expected null commitment rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for zero identity proof hash, got {other:?}"),
             }
         }
 
@@ -19304,12 +19377,50 @@ mod tests {
                 PrivilegedResponse::Error(err) => {
                     assert!(
                         err.message
-                            .contains("identity_proof_hash must be exactly 32 bytes"),
-                        "Expected identity_proof_hash error, got: {}",
+                            .contains("identity_proof_hash validation failed"),
+                        "Expected identity_proof_hash validation error, got: {}",
                         err.message
                     );
                 },
                 other => panic!("Expected error for missing identity proof hash, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_zero_identity_proof_hash_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-002".to_string(),
+                delegatee_actor_id: "child-executor-002".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-zero-proof".to_string(),
+                identity_proof_hash: vec![0x00; 32],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message.contains("null commitment rejected"),
+                        "Expected null commitment rejection, got: {}",
+                        err.message
+                    );
+                },
+                other => {
+                    panic!("Expected error for zero identity proof hash, got {other:?}")
+                },
             }
         }
 

@@ -797,6 +797,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         artifact_bundle_hash: &[u8; 32],
         reviewer_actor_id: &str,
         timestamp_ns: u64,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // TCK-00321: Use REVIEW_RECEIPT_RECORDED_PREFIX from apm2_core::fac for
         // protocol compatibility across daemon/core boundary.
@@ -809,6 +810,10 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // SECURITY: timestamp_ns is included in signed payload to prevent temporal
         // malleability per LAW-09 (Temporal Pinning & Freshness) and RS-40
         // (Time & Monotonicity)
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound and cannot be stripped
+        // post-signing.
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
@@ -817,6 +822,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         // TCK-00321: Use JCS (RFC 8785) canonicalization for signing.
@@ -1674,6 +1680,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         reviewer_actor_id: &str,
         timestamp_ns: u64,
         bindings: &crate::episode::EnvelopeBindings,
+        identity_proof_hash: &[u8; 32],
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Fail-closed: validate bindings before emission
         bindings
@@ -1687,6 +1694,9 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // TCK-00350: Include envelope bindings in signed payload.
         // This ensures receipts carry immutable proof of the envelope,
         // capability manifest, and view commitment that were active.
+        //
+        // SECURITY (TCK-00356 Fix 1): identity_proof_hash is included in
+        // the signed payload so it is audit-bound.
         let (env_hex, cap_hex, view_hex) = bindings.to_hex_map();
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
@@ -1699,6 +1709,7 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "envelope_hash": env_hex,
             "capability_manifest_hash": cap_hex,
             "view_commitment_hash": view_hex,
+            "identity_proof_hash": hex::encode(identity_proof_hash),
         });
 
         let payload_string = payload_json.to_string();
@@ -2792,6 +2803,7 @@ mod tests {
         let artifact = [0xCDu8; 32];
 
         // Emit a review receipt with a specific receipt_id
+        let identity_proof = [0x99u8; 32];
         let event1 = emitter
             .emit_review_receipt(
                 "episode-001",
@@ -2800,6 +2812,7 @@ mod tests {
                 &artifact,
                 "reviewer-actor-x",
                 1_000_000_000,
+                &identity_proof,
             )
             .expect("first emit should succeed");
 
