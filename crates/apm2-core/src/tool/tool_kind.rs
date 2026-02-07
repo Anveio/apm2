@@ -499,7 +499,7 @@ impl fmt::Display for GitOpKind {
 ///
 /// Rejects:
 /// - Empty refs
-/// - Refs exceeding [`MAX_GIT_REF_LEN`]
+/// - Refs exceeding the maximum length (256 bytes)
 /// - Refs containing shell metacharacters
 /// - Refs containing git-forbidden characters (space, `~`, `^`, `:`, `?`, `*`,
 ///   `[`, `\`, DEL)
