@@ -139,6 +139,7 @@ pub mod budget_tracker;
 pub mod executor;
 pub mod handlers;
 pub mod tool_handler;
+pub(crate) mod verified_content;
 
 // TCK-00311: Workspace snapshot and apply
 pub mod workspace;

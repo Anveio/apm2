@@ -62,6 +62,7 @@ use super::error::EpisodeId;
 use super::executor::ContentAddressedStore;
 use super::runtime::Hash;
 use super::tool_class::ToolClass;
+use super::verified_content::normalized_verified_content_key;
 use crate::evidence::keychain::{GitHubCredentialStore, SshCredentialStore};
 use crate::metrics::SharedMetricsRegistry;
 
@@ -977,12 +978,10 @@ impl<L: ManifestLoader + Send + Sync> ToolBroker<L> {
         risk_tier: super::envelope::RiskTier,
         defects: &mut Vec<FirewallViolationDefect>,
     ) -> Result<Option<(String, Vec<u8>)>, BrokerError> {
-        let path_str = path.to_string_lossy();
-        let normalized = apm2_core::context::normalize_path(path_str.as_ref()).map_err(|e| {
-            BrokerError::Internal {
+        let normalized =
+            normalized_verified_content_key(path).map_err(|e| BrokerError::Internal {
                 message: format!("TOCTOU path normalization failed: {e}"),
-            }
-        })?;
+            })?;
 
         let file = tokio::fs::File::open(&normalized)
             .await

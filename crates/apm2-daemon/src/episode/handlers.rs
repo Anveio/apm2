@@ -46,6 +46,7 @@ use super::decision::{BudgetDelta, Credential, MAX_TOOL_OUTPUT_SIZE, VerifiedToo
 use super::executor::{ContentAddressedStore, ExecutionContext};
 use super::tool_class::ToolClass;
 use super::tool_handler::{ToolArgs, ToolHandler, ToolHandlerError, ToolResultData};
+use super::verified_content::normalized_verified_content_lookup_keys;
 
 // =============================================================================
 // Platform-Specific O_NOFOLLOW Support (TCK-00319 TOCTOU Mitigation)
@@ -441,15 +442,20 @@ impl ReadFileHandler {
         Self { root: root.into() }
     }
 
-    fn normalized_verified_path(path: &Path) -> Result<String, ToolHandlerError> {
-        apm2_core::context::normalize_path(path.to_string_lossy().as_ref()).map_err(|e| {
+    fn verified_content_lookup<'a>(
+        verified: &'a VerifiedToolContent,
+        path: &Path,
+        canonical_root: &Path,
+    ) -> Result<Option<&'a [u8]>, ToolHandlerError> {
+        let keys = normalized_verified_content_lookup_keys(path, canonical_root).map_err(|e| {
             ToolHandlerError::ExecutionFailed {
                 message: format!(
-                    "failed to normalize verified content path '{}': {e}",
+                    "failed to derive verified content lookup keys for '{}': {e}",
                     path.display()
                 ),
             }
-        })
+        })?;
+        Ok(keys.into_iter().find_map(|key| verified.get(&key)))
     }
 
     async fn execute_impl(
@@ -488,8 +494,9 @@ impl ReadFileHandler {
         let limit = read_args.limit.unwrap_or(10 * 1024 * 1024);
 
         let (buffer, bytes_read) = if let Some(verified) = verified_content {
-            let normalized = Self::normalized_verified_path(&validated_path)?;
-            if let Some(content) = verified.get(&normalized) {
+            if let Some(content) =
+                Self::verified_content_lookup(verified, &validated_path, &canonical_root)?
+            {
                 let start = read_args
                     .offset
                     .and_then(|offset| usize::try_from(offset).ok())
@@ -2462,8 +2469,13 @@ impl ListFilesHandler {
             }
 
             if let Some(verified) = verified_content {
-                let normalized = ReadFileHandler::normalized_verified_path(&entry.path())?;
-                if verified.get(&normalized).is_none() {
+                if ReadFileHandler::verified_content_lookup(
+                    verified,
+                    &entry.path(),
+                    &canonical_root,
+                )?
+                .is_none()
+                {
                     // Fail-closed in context-firewall mode: omit non-admitted entries.
                     continue;
                 }
@@ -2827,14 +2839,16 @@ impl SearchHandler {
     /// Searches a file for the query and returns matching lines.
     async fn search_file(
         path: &Path,
+        canonical_root: &Path,
         display_path: &str,
         query: &str,
         out: &mut SearchOutputState,
         verified_content: Option<&VerifiedToolContent>,
     ) -> Result<bool, ToolHandlerError> {
         let content = if let Some(verified) = verified_content {
-            let normalized = ReadFileHandler::normalized_verified_path(path)?;
-            let Some(bytes) = verified.get(&normalized) else {
+            let Some(bytes) =
+                ReadFileHandler::verified_content_lookup(verified, path, canonical_root)?
+            else {
                 // Fail-closed: files without pre-verified bytes are excluded.
                 return Ok(false);
             };
@@ -2978,6 +2992,18 @@ impl SearchHandler {
                     break;
                 }
 
+                if let Some(verified) = verified_content {
+                    if ReadFileHandler::verified_content_lookup(
+                        verified,
+                        &target.path,
+                        &canonical_root,
+                    )?
+                    .is_none()
+                    {
+                        continue;
+                    }
+                }
+
                 // Bound total bytes scanned (economics / DoS control)
                 if scanned_bytes.saturating_add(target.size) > SEARCH_MAX_TOTAL_BYTES {
                     return Err(ToolHandlerError::InvalidArgs {
@@ -2991,6 +3017,7 @@ impl SearchHandler {
 
                 bounds_exceeded = Self::search_file(
                     &target.path,
+                    &canonical_root,
                     &target.display_path,
                     query,
                     &mut out,
@@ -3894,6 +3921,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_handler_accepts_workspace_relative_verified_key_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let src_dir = root.join("src");
+        std::fs::create_dir(&src_dir).expect("create src");
+        std::fs::write(src_dir.join("main.rs"), "fn main() {}\n").expect("write file");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("src/main.rs")
+            .expect("normalize workspace-relative path");
+        verified.insert(normalized, b"fn main() {}\n".to_vec());
+
+        let handler = ReadFileHandler::with_root(root);
+        let args = ToolArgs::Read(ReadArgs {
+            path: PathBuf::from("src/main.rs"),
+            offset: None,
+            limit: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-read-relative-verified")
+                .expect("valid episode id"),
+            "req-read-relative-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("read should use verified bytes");
+        assert_eq!(
+            result.output_str().expect("utf8 output"),
+            "fn main() {}\n",
+            "workspace-relative verified key should be accepted"
+        );
+    }
+
+    #[tokio::test]
     async fn test_search_handler_returns_empty_with_empty_verified_content_when_toctou_required() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let root = temp_dir.path();
@@ -3924,6 +3990,46 @@ mod tests {
         assert!(
             output.is_empty(),
             "search must fail-closed to empty output without verified bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_accepts_workspace_relative_verified_keys_when_toctou_required() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::write(scope.join("note.txt"), "needle line").expect("write file");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("scope/note.txt")
+            .expect("normalize workspace-relative path");
+        verified.insert(normalized, b"needle line".to_vec());
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("scope"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-search-relative-verified")
+                .expect("valid episode id"),
+            "req-search-relative-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("search should use verified bytes");
+        let output = result.output_str().expect("utf8 output");
+        assert!(
+            output.contains("scope/note.txt:1:needle line"),
+            "expected search match from workspace-relative verified key, got: {output}"
         );
     }
 
@@ -3968,6 +4074,52 @@ mod tests {
         assert!(
             output.lines().any(|line| line == "allowed.txt"),
             "admitted file should be listed, got: {output}"
+        );
+        assert!(
+            !output.lines().any(|line| line.starts_with("blocked.txt")),
+            "non-admitted file must be suppressed, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listfiles_handler_accepts_workspace_relative_verified_keys_when_toctou_required()
+    {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::write(scope.join("allowed.txt"), "allowed").expect("write allowed");
+        std::fs::write(scope.join("blocked.txt"), "blocked").expect("write blocked");
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("scope/allowed.txt")
+            .expect("normalize workspace-relative path");
+        verified.insert(normalized, Vec::new());
+
+        let handler = ListFilesHandler::with_root(root);
+        let args = ToolArgs::ListFiles(ListFilesArgs {
+            path: PathBuf::from("scope"),
+            pattern: None,
+            max_entries: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-listfiles-relative-verified")
+                .expect("valid episode id"),
+            "req-listfiles-relative-verified",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("listfiles should succeed");
+        let output = result.output_str().expect("utf8 output");
+
+        assert!(
+            output.lines().any(|line| line == "allowed.txt"),
+            "workspace-relative admitted file should be listed, got: {output}"
         );
         assert!(
             !output.lines().any(|line| line.starts_with("blocked.txt")),
@@ -4616,6 +4768,60 @@ mod tests {
         assert!(
             result.budget_consumed.bytes_io >= result.output.len() as u64,
             "expected bytes_io to include output bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_toctou_budget_skips_unverified_files() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let root = temp_dir.path();
+        let scope = root.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+
+        let admitted = scope.join("z-admitted.txt");
+        std::fs::write(&admitted, "needle line").expect("write admitted file");
+
+        let excluded_size = (SEARCH_MAX_TOTAL_BYTES / 4).saturating_add(1);
+        for idx in 0..4 {
+            let excluded = scope.join(format!("a-excluded-{idx}.bin"));
+            let file = std::fs::File::create(&excluded).expect("create excluded file");
+            file.set_len(excluded_size)
+                .expect("set excluded file length");
+        }
+
+        let mut verified = VerifiedToolContent::default();
+        let normalized = apm2_core::context::normalize_path("scope/z-admitted.txt")
+            .expect("normalize admitted key");
+        verified.insert(normalized, b"needle line".to_vec());
+
+        let handler = SearchHandler::with_root(root);
+        let args = ToolArgs::Search(SearchArgs {
+            query: "needle".to_string(),
+            scope: PathBuf::from("scope"),
+            max_bytes: None,
+            max_lines: None,
+        });
+        let ctx = ExecutionContext::new(
+            crate::episode::error::EpisodeId::new("ep-handler-search-budget-unverified-skip")
+                .expect("valid episode id"),
+            "req-search-budget-unverified-skip",
+            1,
+        )
+        .with_verified_content(verified)
+        .with_toctou_verification_required(true);
+
+        let result = handler
+            .execute_with_context(&ctx, &args, None)
+            .await
+            .expect("excluded files must not consume TOCTOU search budget");
+        let output = result.output_str().expect("utf8 output");
+        assert!(
+            output.contains("scope/z-admitted.txt:1:needle line"),
+            "expected admitted file match, got: {output}"
+        );
+        assert!(
+            result.budget_consumed.bytes_io < SEARCH_MAX_TOTAL_BYTES,
+            "budget must not include excluded file sizes"
         );
     }
 
