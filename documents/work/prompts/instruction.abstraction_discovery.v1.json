@@ -39,7 +39,7 @@
     "reasoning_mode_selection": {
       "selector_ref": "dcp://apm2.agents/mor/selector@1",
       "selector_file": "documents/skills/modes-of-reasoning/assets/selector.json",
-      "instruction": "Before beginning Phase 1, read the selector file and choose reasoning modes for the DIAGNOSE and GENERALIZE phases. Use the selector's heuristics and patterns to pick the best fit for each phase. Document your selection rationale in the report.",
+      "instruction": "Performed in Phase 0 BOOTSTRAP. Read the selector file and choose reasoning modes for the DIAGNOSE and GENERALIZE phases. Use the selector's heuristics and patterns to pick the best fit for each phase. Document your selection rationale in the report.",
       "selection_procedure": [
         "1. Read documents/skills/modes-of-reasoning/assets/selector.json",
         "2. For DIAGNOSE phase: match against heuristics with {task: 'diagnosis'} and patterns.codebase_grounding. Load the top-scoring mode's asset file from documents/skills/modes-of-reasoning/assets/{id}-{name}.json and follow its proc steps.",
@@ -74,11 +74,16 @@
     "procedure": [
       {
         "phase": 0,
-        "name": "MODE SELECT",
-        "action": "Read documents/skills/modes-of-reasoning/assets/selector.json. Using its heuristics and patterns, select the best reasoning mode for the DIAGNOSE phase (default: abductive/13) and the GENERALIZE phase (default: explanation-based-learning/16). Load each selected mode's full definition from documents/skills/modes-of-reasoning/assets/{id}-{name}.json. Record selections and rationale.",
+        "name": "BOOTSTRAP",
+        "action": "Read all dependency artifacts and select reasoning modes. Steps: (1) Read the alien engineering protocol to internalize AEP clauses, dominance order, and lexicon. (2) Read the reasoning mode selector and choose modes for DIAGNOSE and GENERALIZE phases. (3) Load each selected mode's full asset file and internalize its proc steps. (4) Record selections and rationale.",
+        "required_reading": [
+          {"ref": "dcp://apm2.local/instructions/alien_engineering_protocol/master@v1", "file": "documents/work/prompts/instruction.alien_engineering_protocol.v1.json", "note": "Internalize AEP clauses, dominance order, and required_reading chain. Follow its required_reading to load theory bundles (principles.json, laws.json, unified_theory.json, defects.json) as needed for Phase 6 self-check."},
+          {"ref": "dcp://apm2.agents/mor/selector@1", "file": "documents/skills/modes-of-reasoning/assets/selector.json", "note": "Use heuristics and patterns to select modes for DIAGNOSE and GENERALIZE phases."},
+          {"note": "After mode selection, load the chosen mode asset files from documents/skills/modes-of-reasoning/assets/{id}-{name}.json"}
+        ],
         "tools": ["read"],
-        "output": "mode_selection: { diagnose_mode: {id, name, rationale}, generalize_mode: {id, name, rationale} }",
-        "budget": {"tc": 10, "ms": 60000}
+        "output": "bootstrap_context: { aep_clauses_internalized: bool, mode_selection: { diagnose_mode: {id, name, rationale}, generalize_mode: {id, name, rationale} } }",
+        "budget": {"tc": 20, "ms": 120000}
       },
       {
         "phase": 1,
@@ -136,7 +141,7 @@
     },
     "output_format": {
       "required_sections": [
-        "## Reasoning Mode Selection",
+        "## Bootstrap: Dependencies & Reasoning Mode Selection",
         "## PR Survey Table",
         "## Duplication Clusters",
         "## Diagnosis",
