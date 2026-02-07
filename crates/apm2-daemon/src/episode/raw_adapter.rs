@@ -1035,6 +1035,72 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_raw_adapter_terminate_failure_keeps_handle_operable() {
+        let adapter = RawAdapter::new();
+        let config = HarnessConfig::new("cat", "episode-terminate-retry");
+        let (handle, mut events) = adapter.spawn(config).await.unwrap();
+
+        let runner_handle = handle.real_runner_handle();
+        let (pid, actual_start_time) = {
+            let guard = runner_handle.lock().await;
+            (
+                guard.pid,
+                guard
+                    .start_time_ticks
+                    .expect("expected start-time binding for retry test"),
+            )
+        };
+
+        {
+            let mut guard = runner_handle.lock().await;
+            guard.start_time_ticks = None;
+        }
+
+        let first_terminate = adapter.terminate(&handle).await;
+        assert!(
+            first_terminate.is_err(),
+            "first terminate should fail when start-time binding is missing"
+        );
+
+        adapter
+            .send_input(&handle, b"still alive after failed terminate\n")
+            .await
+            .unwrap();
+        let observed_output = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let HarnessEvent::Output { chunk, .. } = event {
+                    if String::from_utf8_lossy(&chunk)
+                        .contains("still alive after failed terminate")
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .expect("timed out waiting for output after failed terminate");
+        assert!(
+            observed_output,
+            "handle should remain usable after failed terminate"
+        );
+
+        {
+            let mut guard = runner_handle.lock().await;
+            guard.start_time_ticks = Some(actual_start_time);
+        }
+
+        adapter.terminate(&handle).await.unwrap();
+
+        if let Some(expected_start) = super::super::adapter::read_proc_start_time(pid) {
+            assert_ne!(
+                expected_start, actual_start_time,
+                "original process identity must not remain alive after successful retry terminate"
+            );
+        }
+    }
+
     #[test]
     fn test_mock_output_event() {
         let event = test_helpers::mock_output_event(b"test data", 1);

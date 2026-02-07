@@ -845,12 +845,22 @@ pub(crate) async fn terminate_with_handle(
         ))
     })?;
 
+    // IMPORTANT: Only mark the handle as terminated AFTER confirming a
+    // successful exit status.  If `terminate_runner()` returned `Err` (e.g.
+    // signal delivery failed while the child is still alive), the `?`
+    // operators below propagate the error *before* reaching
+    // `mark_terminated()`, preserving the handle's control channel so the
+    // caller can retry `terminate()` or `send_input()`.  Marking terminated
+    // before checking the result would leak subprocesses and exhaust adapter
+    // concurrency slots with no retry path.
+    let mapped_exit_status = map_pty_exit_status(terminate_result?)?;
+
     {
         let mut guard = runner_handle.lock().await;
         guard.mark_terminated();
     }
 
-    map_pty_exit_status(terminate_result?)
+    Ok(mapped_exit_status)
 }
 
 /// Processes a control message for a PTY runner.
@@ -1745,5 +1755,118 @@ mod tests {
     fn test_harness_handle_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<HarnessHandle>();
+    }
+
+    /// Regression test: when `terminate_with_handle` fails (e.g. because
+    /// `terminate_runner` returned an error while the child is still alive),
+    /// the handle must NOT be marked as terminated.  The caller must be able
+    /// to retry `terminate()` or `send_input()` through the same handle.
+    ///
+    /// This guards against the original bug where `mark_terminated()` was
+    /// called unconditionally before checking the termination result, which
+    /// permanently invalidated the handle even on transient failures.
+    #[tokio::test]
+    async fn terminate_failure_preserves_handle_for_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (control_tx, mut control_rx) =
+            mpsc::channel::<PtyControlCommand>(PTY_CONTROL_CHANNEL_CAPACITY);
+
+        // Build a real PtyRunnerHandle with a plausible (fake) PID and a
+        // non-None start_time_ticks so the pre-flight checks pass.
+        let runner_handle = Arc::new(Mutex::new(PtyRunnerHandle::new(
+            99999,
+            Some(42),
+            control_tx,
+        )));
+
+        // Track how many Terminate commands the mock task receives.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_inner = Arc::clone(&call_count);
+
+        // Spawn a mock "PTY control task" that:
+        //   1st Terminate  -> responds with Err (simulating signal failure)
+        //   2nd Terminate  -> responds with Ok(Exited(0))
+        let mock_task = tokio::spawn(async move {
+            while let Some(cmd) = control_rx.recv().await {
+                match cmd {
+                    PtyControlCommand::Terminate {
+                        respond_to,
+                        grace_period: _,
+                    } => {
+                        let n = call_count_inner.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            // First call: simulate a terminate failure
+                            let _ = respond_to.send(Err(AdapterError::terminate_failed(
+                                "mock SIGTERM delivery failed",
+                            )));
+                        } else {
+                            // Second call: simulate successful termination
+                            let _ = respond_to.send(Ok(super::super::pty::ExitStatus::Exited(0)));
+                        }
+                    },
+                    PtyControlCommand::SendInput { respond_to, .. } => {
+                        let _ = respond_to.send(Ok(()));
+                    },
+                }
+            }
+        });
+
+        // --- First terminate attempt: should FAIL ---
+        let result = terminate_with_handle(1, Arc::clone(&runner_handle)).await;
+        assert!(
+            result.is_err(),
+            "first terminate should fail, got: {result:?}"
+        );
+
+        // Handle must NOT be marked terminated — still operable.
+        {
+            let guard = runner_handle.lock().await;
+            assert!(
+                !guard.is_terminated(),
+                "handle must NOT be terminated after a failed terminate attempt"
+            );
+            assert!(
+                guard.control_channel().is_some(),
+                "control channel must still be available after a failed terminate attempt"
+            );
+        }
+
+        // --- Verify handle is still operable: send_input should work ---
+        let input_result =
+            send_input_with_handle(1, Arc::clone(&runner_handle), b"ping".to_vec()).await;
+        assert!(
+            input_result.is_ok(),
+            "send_input should succeed on a non-terminated handle, got: {input_result:?}"
+        );
+
+        // --- Second terminate attempt: should SUCCEED ---
+        let result = terminate_with_handle(1, Arc::clone(&runner_handle)).await;
+        assert!(
+            result.is_ok(),
+            "second terminate should succeed, got: {result:?}"
+        );
+
+        // Handle must NOW be marked terminated.
+        {
+            let guard = runner_handle.lock().await;
+            assert!(
+                guard.is_terminated(),
+                "handle must be terminated after a successful terminate"
+            );
+            assert!(
+                guard.control_channel().is_none(),
+                "control channel must be removed after successful terminate"
+            );
+        }
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "mock task should have received exactly 2 Terminate commands"
+        );
+
+        // Clean up the mock task.
+        mock_task.abort();
     }
 }
