@@ -120,50 +120,39 @@ impl SqliteLedgerEventEmitter {
         // guarantee.
         //
         // MIGRATION: Quarantine historical duplicate `receipt_id` rows before
-        // creating the unique index. This preserves forensic evidence by
-        // moving duplicate rows out of `ledger_events` rather than deleting
-        // them permanently.
+        // creating the unique index. Quarantine entries are keyed by stable
+        // `event_id` (never persistent `rowid`) so startup replays are safe
+        // even if SQLite rowids are recycled over time.
         //
         // The migration is idempotent:
         // - quarantine table is created with `IF NOT EXISTS`
-        // - rows already quarantined are not re-inserted
+        // - legacy rowid-based tables are upgraded once to event_id-keyed schema
+        // - rows already quarantined are skipped with `INSERT OR IGNORE`
+        Self::ensure_receipt_quarantine_table(conn)?;
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS ledger_events_quarantine ( \
-                 rowid_orig INTEGER NOT NULL, \
-                 event_id TEXT NOT NULL, \
-                 event_type TEXT NOT NULL, \
-                 work_id TEXT NOT NULL, \
-                 actor_id TEXT NOT NULL, \
-                 payload BLOB NOT NULL, \
-                 signature BLOB NOT NULL, \
-                 timestamp_ns INTEGER NOT NULL, \
-                 quarantine_reason TEXT NOT NULL DEFAULT 'receipt_id_dedupe_migration' \
-             )",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO ledger_events_quarantine \
-                 (rowid_orig, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
-             SELECT le.rowid, le.event_id, le.event_type, le.work_id, le.actor_id, \
+            "INSERT OR IGNORE INTO ledger_events_quarantine \
+                 (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns) \
+             SELECT le.event_id, le.event_type, le.work_id, le.actor_id, \
                     le.payload, le.signature, le.timestamp_ns \
              FROM ledger_events le \
              INNER JOIN ( \
-                 SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS rid, \
+                 SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS receipt_id, \
                         MIN(rowid) AS keep_rowid \
                  FROM ledger_events \
                  WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
                  AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
                  GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
                  HAVING COUNT(*) > 1 \
-             ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.rid \
+             ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.receipt_id \
              WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+             AND json_extract(CAST(le.payload AS TEXT), '$.receipt_id') IS NOT NULL \
              AND le.rowid != dups.keep_rowid \
-             AND le.rowid NOT IN (SELECT rowid_orig FROM ledger_events_quarantine)",
+             ",
             [],
         )?;
         conn.execute(
-            "DELETE FROM ledger_events WHERE rowid IN ( \
-                 SELECT rowid_orig FROM ledger_events_quarantine \
+            "DELETE FROM ledger_events WHERE event_id IN ( \
+                 SELECT event_id FROM ledger_events_quarantine \
                  WHERE quarantine_reason = 'receipt_id_dedupe_migration' \
              )",
             [],
@@ -172,6 +161,82 @@ impl SqliteLedgerEventEmitter {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
              ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
              WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_receipt_quarantine_table(conn: &Connection) -> rusqlite::Result<()> {
+        let table_exists: bool = conn.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'ledger_events_quarantine' \
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if !table_exists {
+            return Self::create_receipt_quarantine_table(conn);
+        }
+
+        let mut has_rowid_orig = false;
+        let mut has_event_id_primary_key = false;
+        let mut stmt = conn.prepare("PRAGMA table_info('ledger_events_quarantine')")?;
+        let columns = stmt.query_map([], |row| {
+            let name: String = row.get(1)?;
+            let pk: i64 = row.get(5)?;
+            Ok((name, pk))
+        })?;
+
+        for column in columns {
+            let (name, pk) = column?;
+            if name == "rowid_orig" {
+                has_rowid_orig = true;
+            }
+            if name == "event_id" && pk == 1 {
+                has_event_id_primary_key = true;
+            }
+        }
+
+        if has_rowid_orig || !has_event_id_primary_key {
+            conn.execute(
+                "DROP TABLE IF EXISTS ledger_events_quarantine_rowid_backup",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE ledger_events_quarantine \
+                 RENAME TO ledger_events_quarantine_rowid_backup",
+                [],
+            )?;
+            Self::create_receipt_quarantine_table(conn)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO ledger_events_quarantine \
+                     (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, quarantine_reason) \
+                 SELECT event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns, \
+                        COALESCE(quarantine_reason, 'receipt_id_dedupe_migration') \
+                 FROM ledger_events_quarantine_rowid_backup \
+                 WHERE event_id IS NOT NULL",
+                [],
+            )?;
+            conn.execute("DROP TABLE ledger_events_quarantine_rowid_backup", [])?;
+        }
+
+        Ok(())
+    }
+
+    fn create_receipt_quarantine_table(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS ledger_events_quarantine ( \
+                 event_id TEXT NOT NULL PRIMARY KEY, \
+                 event_type TEXT NOT NULL, \
+                 work_id TEXT NOT NULL, \
+                 actor_id TEXT NOT NULL, \
+                 payload BLOB NOT NULL, \
+                 signature BLOB NOT NULL, \
+                 timestamp_ns INTEGER NOT NULL, \
+                 quarantine_reason TEXT NOT NULL DEFAULT 'receipt_id_dedupe_migration' \
+             )",
             [],
         )?;
         Ok(())
@@ -2957,6 +3022,232 @@ mod tests {
             "Must return the same event_id as the original blocked emission"
         );
         assert_eq!(found.event_type, "review_blocked_recorded");
+    }
+
+    /// Regression: startup migration upgrades rowid-based quarantine tables
+    /// and never deletes by unstable `rowid`.
+    #[test]
+    fn init_schema_migrates_rowid_quarantine_table_without_rowid_deletes() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "legit-event-id",
+                "unrelated_event",
+                "work-001",
+                "actor-001",
+                br#"{"ok":true}"#.as_slice(),
+                b"sig".as_slice(),
+                1_i64
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events_quarantine (
+                rowid_orig INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL,
+                quarantine_reason TEXT NOT NULL DEFAULT 'receipt_id_dedupe_migration'
+            )",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO ledger_events_quarantine
+                (rowid_orig, event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                1_i64,
+                "legacy-quarantined-event-id",
+                "review_receipt_recorded",
+                "work-legacy",
+                "actor-legacy",
+                br#"{"receipt_id":"RR-LEGACY-001"}"#.as_slice(),
+                b"legacy-sig".as_slice(),
+                2_i64
+            ],
+        )
+        .unwrap();
+
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let legit_event_still_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events WHERE event_id = 'legit-event-id'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            legit_event_still_exists,
+            "event_id-based cleanup must not delete unrelated rows that share historic rowids"
+        );
+
+        let has_rowid_orig_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('ledger_events_quarantine')
+                    WHERE name = 'rowid_orig'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_rowid_orig_column,
+            "quarantine table must no longer persist rowid_orig"
+        );
+
+        let has_event_id_primary_key: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('ledger_events_quarantine')
+                    WHERE name = 'event_id' AND pk = 1
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_event_id_primary_key,
+            "quarantine table must be keyed by event_id"
+        );
+    }
+
+    /// Regression: duplicate receipt migration quarantines by `event_id`,
+    /// preserves the canonical first event, and remains idempotent.
+    #[test]
+    fn init_schema_quarantines_duplicate_receipts_by_event_id_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                work_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                signature BLOB NOT NULL,
+                timestamp_ns INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let duplicate_payload = br#"{"receipt_id":"RR-DUPE-001"}"#;
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-event-keep",
+                "review_receipt_recorded",
+                "work-a",
+                "actor-a",
+                duplicate_payload.as_slice(),
+                b"sig-a".as_slice(),
+                10_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ledger_events
+                (event_id, event_type, work_id, actor_id, payload, signature, timestamp_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "receipt-event-duplicate",
+                "review_receipt_recorded",
+                "work-b",
+                "actor-b",
+                duplicate_payload.as_slice(),
+                b"sig-b".as_slice(),
+                11_i64
+            ],
+        )
+        .unwrap();
+
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let keep_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events WHERE event_id = 'receipt-event-keep'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(keep_exists, "canonical first receipt event must remain");
+
+        let duplicate_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ledger_events WHERE event_id = 'receipt-event-duplicate'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !duplicate_exists,
+            "duplicate receipt event must be removed from ledger_events"
+        );
+
+        let duplicate_quarantined_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_quarantine
+                 WHERE event_id = 'receipt-event-duplicate'
+                 AND quarantine_reason = 'receipt_id_dedupe_migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_quarantined_count, 1,
+            "duplicate receipt event must be quarantined exactly once"
+        );
+
+        SqliteLedgerEventEmitter::init_schema(&conn).unwrap();
+
+        let duplicate_quarantined_count_after_rerun: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ledger_events_quarantine
+                 WHERE event_id = 'receipt-event-duplicate'
+                 AND quarantine_reason = 'receipt_id_dedupe_migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate_quarantined_count_after_rerun, 1,
+            "idempotent reruns must not duplicate quarantine entries"
+        );
     }
 
     /// Verifies that `emit_review_blocked_receipt` includes replay-critical
