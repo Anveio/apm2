@@ -54,22 +54,40 @@ check_dependencies
 # Direct gh api calls to set statuses bypass the gate.
 log_info "Checking for deprecated direct status-write patterns in review scripts..."
 
-DEPRECATED_PATTERNS=(
-    'gh api.*statuses.*--method POST(?!.*\$reviewed_sha)'
+# Patterns that indicate direct status-write commands.
+# We search broadly, then filter out approved uses that bind to $reviewed_sha.
+STATUS_WRITE_PATTERNS=(
+    'gh api.*statuses.*--method POST'
     'gh api.*statuses.*state=.success'
     'gh api.*check-runs.*--method POST'
     'gh pr review.*--approve'
 )
 
-for pattern in "${DEPRECATED_PATTERNS[@]}"; do
-    # Search only in review prompt/script files, not in this lint script itself
-    matches=$(rg -l "$pattern" "$REVIEW_DIR" 2>/dev/null || true)
+for pattern in "${STATUS_WRITE_PATTERNS[@]}"; do
+    # Search only in review prompt/script files, not in this lint script itself.
+    # Do NOT suppress rg errors — the script must fail-closed on regex failure.
+    rg_exit=0
+    matches=$(rg -l "$pattern" "$REVIEW_DIR" 2>&1) || rg_exit=$?
+    if [[ $rg_exit -eq 2 ]]; then
+        log_error "ripgrep failed on pattern: $pattern"
+        exit 2
+    fi
+    if [[ $rg_exit -eq 1 ]]; then
+        # exit code 1 means no matches — continue to next pattern
+        continue
+    fi
     if [[ -n "$matches" ]]; then
-        # Filter: allow if it's within an approved action block that uses reviewed_sha
         for match_file in $matches; do
-            # Check if the file's status-write is properly bound to reviewed_sha
-            # The approved pattern: gh api statuses/$reviewed_sha
-            violating_lines=$(rg -n "$pattern" "$match_file" 2>/dev/null || true)
+            # Get all matching lines; fail-closed on rg error
+            rg_exit=0
+            violating_lines=$(rg -n "$pattern" "$match_file" 2>&1) || rg_exit=$?
+            if [[ $rg_exit -eq 2 ]]; then
+                log_error "ripgrep failed on pattern: $pattern in $match_file"
+                exit 2
+            fi
+            if [[ $rg_exit -eq 1 ]]; then
+                continue
+            fi
             if [[ -n "$violating_lines" ]]; then
                 # Allow the approved pattern: posting status with $reviewed_sha
                 safe=$(echo "$violating_lines" | grep -c '\$reviewed_sha\|"$reviewed_sha"' || true)

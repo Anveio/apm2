@@ -124,7 +124,11 @@ for entry in $proto_enums; do
     rs_count=$(count_rs_enum_variants "$GENERATED_RS" "$enum_name")
 
     if [[ $rs_count -eq 0 ]]; then
-        log_warn "Enum ${enum_name} not found in generated Rust code (may use different naming)"
+        log_error "Enum ${enum_name} defined in proto but not found in generated Rust code"
+        log_error "  Proto: ${PROTO_FILE}"
+        log_error "  Rust:  ${GENERATED_RS}"
+        log_error "  Run 'cargo build -p apm2-daemon' to regenerate."
+        VIOLATIONS=1
         continue
     fi
 

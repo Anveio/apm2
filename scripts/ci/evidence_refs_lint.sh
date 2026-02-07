@@ -71,7 +71,8 @@ while IFS= read -r evid_file; do
     rfc=$(echo "$evid_file" | sed -n 's|.*documents/rfcs/\([^/]*\)/.*|\1|p')
     evid_basename=$(basename "$evid_file" .yaml)
 
-    all_req_ids=$(grep -A100 'requirement_ids:' "$evid_file" 2>/dev/null | \
+    # Extract all requirement_ids from the full file (not truncated by line count)
+    all_req_ids=$(sed -n '/requirement_ids:/,/^[^[:space:]-]/p' "$evid_file" 2>/dev/null | \
         grep -oP 'REQ-[A-Z]*[0-9]+' | sort -u || true)
 
     for req_id in $all_req_ids; do
@@ -96,7 +97,8 @@ while IFS= read -r req_file; do
 
     req_status=$(grep -oP '^\s*status:\s*"?\K[A-Z_]+' "$req_file" 2>/dev/null || echo "UNKNOWN")
 
-    evid_ids=$(grep -A100 'evidence_ids:' "$req_file" 2>/dev/null | \
+    # Extract all evidence_ids from the full file (not truncated by line count)
+    evid_ids=$(sed -n '/evidence_ids:/,/^[^[:space:]-]/p' "$req_file" 2>/dev/null | \
         grep -oP 'EVID-[A-Z]*[0-9]+' | sort -u || true)
 
     for evid_id in $evid_ids; do
