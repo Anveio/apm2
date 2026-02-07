@@ -30,6 +30,7 @@ log_info() { echo -e "${GREEN}INFO:${NC} $*"; }
 
 VIOLATIONS=0
 RFC_DIR="documents/rfcs"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 log_info "=== Test/Source Reference Lint (TCK-00409) ==="
 echo
@@ -59,6 +60,13 @@ while IFS= read -r evid_file; do
                 # - Strip trailing :line-number ranges (like "file.rs:482-567")
                 file_path=$(echo "$ref_path" | awk '{print $1}' | sed 's/:[0-9].*$//')
                 if [[ -n "$file_path" ]] && ! [[ "$file_path" =~ ^# ]]; then
+                    # Validate path is within the repository root (prevent path traversal)
+                    resolved="$(realpath -m "$file_path")"
+                    if [[ "$resolved" != "$REPO_ROOT"/* ]]; then
+                        log_error "Path traversal: ${evid_file} references '${file_path}' which is outside repo root"
+                        VIOLATIONS=1
+                        continue
+                    fi
                     if [[ ! -e "$file_path" ]]; then
                         log_error "Missing source_ref: ${evid_file} references '${file_path}' which does not exist"
                         VIOLATIONS=1

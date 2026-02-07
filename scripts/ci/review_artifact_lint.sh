@@ -120,17 +120,23 @@ for prompt_file in "${REVIEW_PROMPTS[@]}"; do
         continue
     fi
 
-    # Verify the metadata template contains head_sha binding
-    if ! grep -q 'head_sha.*MUST.*reviewed_sha\|head_sha.*equal.*reviewed_sha' "$prompt_file" 2>/dev/null; then
-        if ! grep -q '"head_sha"' "$prompt_file" 2>/dev/null; then
-            log_error "Review prompt ${prompt_file} missing head_sha metadata field"
-            VIOLATIONS=1
-        fi
+    # Verify the metadata template contains head_sha field AND exact-binding constraint
+    if ! grep -q '"head_sha"' "$prompt_file" 2>/dev/null; then
+        log_error "Review prompt ${prompt_file} missing head_sha metadata field"
+        VIOLATIONS=1
+    fi
+    if ! grep -q 'head_sha.*MUST.*equal\|head_sha.*MUST.*reviewed_sha\|head_sha.*equal.*reviewed_sha' "$prompt_file" 2>/dev/null; then
+        log_error "Review prompt ${prompt_file} missing exact-binding constraint for head_sha (must require equality to reviewed_sha)"
+        VIOLATIONS=1
     fi
 
-    # Verify the metadata template contains pr_number binding
+    # Verify the metadata template contains pr_number field AND exact-binding constraint
     if ! grep -q '"pr_number"' "$prompt_file" 2>/dev/null; then
         log_error "Review prompt ${prompt_file} missing pr_number metadata field"
+        VIOLATIONS=1
+    fi
+    if ! grep -q 'pr_number.*MUST.*equal\|pr_number.*MUST.*match\|pr_number.*exact' "$prompt_file" 2>/dev/null; then
+        log_error "Review prompt ${prompt_file} missing exact-binding constraint for pr_number (must require exact match)"
         VIOLATIONS=1
     fi
 
