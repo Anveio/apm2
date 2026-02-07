@@ -14,11 +14,13 @@
 //!
 //! # Runtime Wiring
 //!
-//! TODO(TCK-00375): Wire `AdmissionGate::check` into the daemon episode
-//! spawn path so that Tier3+ actuation is rejected at runtime when no
-//! admitted capsule profile is present. Currently the gate is validated
-//! in unit tests only; runtime integration is deferred to TCK-00375 and
-//! TCK-00376.
+//! TCK-00375 landed context firewall TOCTOU hash enforcement.
+//! TCK-00376 landed no-bypass path ratchet enforcement in the daemon
+//! broker (`PathRatchet`). The ratchet verifies that broker, capability,
+//! context firewall, and capsule admission checks have all been performed
+//! before allowing tool actuation at Tier2+. Capsule admission is
+//! currently validated in unit tests; runtime capsule wiring will follow
+//! in a future ticket.
 
 use std::collections::BTreeSet;
 
@@ -1136,10 +1138,11 @@ impl AdmissionGate {
     ///
     /// # Runtime Wiring
     ///
-    /// NOTE: Runtime integration of this gate into the daemon episode spawn
-    /// path is deferred to TCK-00375 and TCK-00376. Currently the gate is
-    /// exercised only in unit tests and must be called explicitly by the
-    /// daemon spawn logic once those tickets land.
+    /// TCK-00376 landed the `PathRatchet` in the daemon broker which tracks
+    /// capsule admission status as one of the mandatory enforcement
+    /// components at Tier2+. The `AdmissionGate::check` is validated in
+    /// unit tests; full runtime spawn-path wiring follows in a future
+    /// ticket.
     ///
     /// # Errors
     ///
