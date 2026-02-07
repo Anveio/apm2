@@ -28,7 +28,7 @@ Instructions — policies, directives, configurations, behavioral constraints �
 
 ## Problem (PHY-03, PHY-05, INV-F-02)
 
-Three instruction specs exist (AEP, BSP, RFC-0021 refinement) as static JSON files under documents/work/prompts/. The CAC schema (cac.instruction_spec.v1) validates their structure. RFC-0011 (CAC v1) defines the context-as-code pipeline. The schema_registry module exists in apm2-core.
+Three instruction specs exist (AEP, BSP, RFC-0021 refinement) as static JSON files under documents/prompts/. The CAC schema (cac.instruction_spec.v1) validates their structure. RFC-0011 (CAC v1) defines the context-as-code pipeline. The schema_registry module exists in apm2-core.
 
 But there is no normative protocol for how instruction specs are versioned, deployed, resolved at runtime, signed by the principal, rolled back, or retired. The instruction specs are the system's DNA — they govern what every agent does. Without lifecycle governance, the system has no way to:
 

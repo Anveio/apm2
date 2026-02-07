@@ -38,7 +38,7 @@
         "documents/rfcs/RFC-0019",
         "documents/rfcs/RFC-0020",
         "proto/kernel_events.proto",
-        "documents/work/prompts/instruction.alien_engineering_protocol.v1.json"
+        "documents/prompts/instruction.alien_engineering_protocol.v1.json"
       ]
     },
     "lex": {
@@ -114,7 +114,7 @@
         "documents/theory/principles.json",
         "documents/theory/laws.json",
         "documents/theory/unified_theory.json",
-        "documents/work/prompts/instruction.alien_engineering_protocol.v1.json",
+        "documents/prompts/instruction.alien_engineering_protocol.v1.json",
         "documents/rfcs/RFC-0021/HOLONIC_VENTURE_PROVING_INTERFACE.md",
         "documents/rfcs/RFC-0021/00_meta.yaml",
         "documents/rfcs/RFC-0021/01_problem_and_imports.yaml",

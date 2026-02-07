@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_rfc_codex_loop.sh — Codex-driven RFC drafting and refinement pipeline
 #
-# Each RFC has a seed file (evidence/rfcs/RFC-NNNN/seed.md) containing all
+# Each RFC has a seed file (documents/rfcs/RFC-NNNN/seed.md) containing all
 # RFC-specific context: framing, innovation vectors, required reading,
 # objectives, protocol objects, threat model, theory bindings, and rollout.
 #
@@ -57,7 +57,7 @@ commit_progress() {
   log "Committed: RFC-${rfc_num} ${label}"
 }
 
-seed_path() { echo "$EVIDENCE_DIR/RFC-${1}/seed.md"; }
+seed_path() { echo "$RFCS_DIR/RFC-${1}/seed.md"; }
 
 read_seed() {
   local path
