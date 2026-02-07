@@ -54,6 +54,10 @@ evidence_artifact:
     Canonical bytes: both ReceiptPointerV1 and ReceiptMultiProofV1
     produce deterministic canonical byte representations suitable for
     content-addressing. Direct and batch canonical bytes are distinct.
+
+    Focused receipt-pointer test inventory: at least 57 tests (currently
+    60 after boundary-regression additions; updated from the earlier
+    35-test baseline).
   requirement_ids:
     - "REQ-0017"
   source_refs:

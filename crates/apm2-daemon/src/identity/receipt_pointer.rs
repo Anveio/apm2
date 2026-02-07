@@ -114,6 +114,15 @@ pub enum ReceiptPointerError {
         tag: u8,
     },
 
+    /// The pointer kind does not match verifier entry-point expectations.
+    #[error("pointer kind mismatch: expected {expected:?}, got {actual:?}")]
+    PointerKindMismatch {
+        /// Pointer kind expected by the verifier entry point.
+        expected: PointerKind,
+        /// Actual pointer kind encoded in the pointer.
+        actual: PointerKind,
+    },
+
     /// The receipt hash is missing (all zeros).
     #[error("receipt hash must not be zero")]
     ZeroReceiptHash,
@@ -542,6 +551,23 @@ fn validate_canonical_receipt_hashes(receipt_hashes: &[Hash]) -> Result<(), Rece
     Ok(())
 }
 
+/// Estimate canonical serialized size for `ReceiptMultiProofV1`.
+#[must_use]
+fn estimate_multiproof_serialized_size(
+    receipt_count: usize,
+    individual_proofs: &[MerkleInclusionProof],
+) -> usize {
+    RECEIPT_MULTIPROOF_DOMAIN_SEPARATOR.len()
+        + 32 // batch_root_hash
+        + 32 // authority_seal_hash
+        + 4  // receipt_count
+        + receipt_count * 32
+        + individual_proofs
+            .iter()
+            .map(|proof| 32 + 4 + proof.siblings.len() * 33)
+            .sum::<usize>()
+}
+
 impl ReceiptMultiProofV1 {
     /// Construct a validated multiproof.
     ///
@@ -617,15 +643,8 @@ impl ReceiptMultiProofV1 {
         // Enforce MAX_RECEIPT_MULTIPROOF_BYTES: estimated serialized size
         // must not exceed the bound. Check BEFORE expensive proof
         // verification.
-        let estimated_size = RECEIPT_MULTIPROOF_DOMAIN_SEPARATOR.len()
-            + 32 // batch_root_hash
-            + 32 // authority_seal_hash
-            + 4  // receipt_count
-            + receipt_hashes.len() * 32
-            + individual_proofs
-                .iter()
-                .map(|p| 32 + 4 + p.siblings.len() * 33)
-                .sum::<usize>();
+        let estimated_size =
+            estimate_multiproof_serialized_size(receipt_hashes.len(), &individual_proofs);
         if estimated_size > MAX_RECEIPT_MULTIPROOF_BYTES {
             return Err(ReceiptPointerError::SizeExceeded {
                 max: MAX_RECEIPT_MULTIPROOF_BYTES,
@@ -961,7 +980,10 @@ impl ReceiptPointerVerifier {
         require_temporal: bool,
     ) -> Result<VerificationResult, ReceiptPointerError> {
         if pointer.pointer_kind != PointerKind::Direct {
-            return Err(ReceiptPointerError::UnexpectedInclusionProof);
+            return Err(ReceiptPointerError::PointerKindMismatch {
+                expected: PointerKind::Direct,
+                actual: pointer.pointer_kind,
+            });
         }
 
         // Bind authority_seal_hash: compute hash from seal canonical bytes
@@ -1026,7 +1048,10 @@ impl ReceiptPointerVerifier {
         require_temporal: bool,
     ) -> Result<VerificationResult, ReceiptPointerError> {
         if pointer.pointer_kind != PointerKind::Batch {
-            return Err(ReceiptPointerError::MissingInclusionProof);
+            return Err(ReceiptPointerError::PointerKindMismatch {
+                expected: PointerKind::Batch,
+                actual: pointer.pointer_kind,
+            });
         }
 
         // Bind authority_seal_hash: compute hash from seal canonical bytes
@@ -1178,6 +1203,16 @@ impl ReceiptPointerVerifier {
             return Err(ReceiptPointerError::TooManyProofNodes {
                 count: total_nodes,
                 max: MAX_MULTIPROOF_NODES,
+            });
+        }
+        let estimated_size = estimate_multiproof_serialized_size(
+            multiproof.receipt_hashes.len(),
+            &multiproof.individual_proofs,
+        );
+        if estimated_size > MAX_RECEIPT_MULTIPROOF_BYTES {
+            return Err(ReceiptPointerError::SizeExceeded {
+                max: MAX_RECEIPT_MULTIPROOF_BYTES,
+                actual: estimated_size,
             });
         }
 
@@ -2360,6 +2395,64 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn verify_direct_rejects_non_direct_pointer_kind() {
+        let signer = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32]];
+        let (_root, proofs) = build_merkle_tree(&receipt_hashes);
+        let seal_hash = [0xAA; 32];
+        let batch_pointer =
+            ReceiptPointerV1::new_batch(receipt_hashes[0], seal_hash, proofs[0].clone()).unwrap();
+        let direct_seal = make_direct_seal(&signer, &receipt_hashes[0]);
+
+        let result = ReceiptPointerVerifier::verify_direct(
+            &batch_pointer,
+            &direct_seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::PointerKindMismatch {
+                    expected: PointerKind::Direct,
+                    actual: PointerKind::Batch,
+                })
+            ),
+            "expected PointerKindMismatch(Direct, Batch), got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_batch_rejects_non_batch_pointer_kind() {
+        let signer = Signer::generate();
+        let receipt_hash = [0x42; 32];
+        let seal_hash = [0xAA; 32];
+        let direct_pointer = ReceiptPointerV1::new_direct(receipt_hash, seal_hash).unwrap();
+        let batch_seal = make_batch_seal(&signer, &[0xBB; 32]);
+
+        let result = ReceiptPointerVerifier::verify_batch(
+            &direct_pointer,
+            &batch_seal,
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(ReceiptPointerError::PointerKindMismatch {
+                    expected: PointerKind::Batch,
+                    actual: PointerKind::Direct,
+                })
+            ),
+            "expected PointerKindMismatch(Batch, Direct), got: {result:?}",
+        );
+    }
+
     // ────────── Seal-hash binding negative tests ──────────
 
     #[test]
@@ -2752,6 +2845,66 @@ mod tests {
             matches!(result, Err(ReceiptPointerError::TooManyProofNodes { .. })),
             "expected TooManyProofNodes, got: {result:?}",
         );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_oversized_serialized_input_at_verification_boundary() {
+        let signer = Signer::generate();
+        let seal_root = [0xAD; 32];
+        let seal = make_batch_seal(&signer, &seal_root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+
+        // 16k receipts with zero-sibling proofs exceed the 1 MiB multiproof
+        // byte cap but still satisfy leaf/node cardinality bounds.
+        let receipt_count = 16_000usize;
+        let receipt_hashes: Vec<Hash> = (0..receipt_count)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                #[allow(clippy::cast_possible_truncation)]
+                let index = i as u32;
+                hash[..4].copy_from_slice(&index.to_be_bytes());
+                hash
+            })
+            .collect();
+        let individual_proofs: Vec<MerkleInclusionProof> = receipt_hashes
+            .iter()
+            .map(|receipt_hash| MerkleInclusionProof {
+                leaf_hash: compute_receipt_leaf_hash(receipt_hash),
+                siblings: Vec::new(),
+            })
+            .collect();
+        let estimated_size =
+            estimate_multiproof_serialized_size(receipt_hashes.len(), &individual_proofs);
+        assert!(
+            estimated_size > MAX_RECEIPT_MULTIPROOF_BYTES,
+            "test setup must exceed multiproof byte cap: estimated_size={estimated_size}, max={MAX_RECEIPT_MULTIPROOF_BYTES}",
+        );
+
+        // Bypass constructor validation to simulate decoded untrusted input.
+        let oversized = ReceiptMultiProofV1::new_unchecked(
+            seal_root,
+            receipt_hashes,
+            seal_hash,
+            individual_proofs,
+        );
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &oversized,
+            &seal,
+            BatchSealVerifier::SingleKey(&signer.verifying_key()),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        match result {
+            Err(ReceiptPointerError::SizeExceeded { max, actual }) => {
+                assert_eq!(max, MAX_RECEIPT_MULTIPROOF_BYTES);
+                assert!(
+                    actual > max,
+                    "expected actual size {actual} to exceed max {max}",
+                );
+            },
+            other => panic!("expected SizeExceeded, got: {other:?}"),
+        }
     }
 
     #[test]
