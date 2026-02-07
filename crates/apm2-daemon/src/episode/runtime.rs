@@ -45,8 +45,10 @@ use super::decision::{Credential, SessionTerminationInfo, ToolResult};
 use super::error::{EpisodeError, EpisodeId};
 use super::executor::{ContentAddressedStore, ExecutionContext, SharedToolExecutor, ToolExecutor};
 use super::handle::{SessionHandle, StopSignal};
+use super::registry::AdapterRegistry;
 use super::state::{EpisodeState, QuarantineReason, TerminationClass};
 use super::tool_handler::{ToolArgs, ToolHandler};
+use crate::episode::adapter::{HarnessEvent, HarnessHandle};
 use crate::htf::HolonicClock;
 use crate::protocol::dispatch::LedgerEventEmitter;
 use crate::session::SessionRegistry;
@@ -443,6 +445,12 @@ struct EpisodeEntry {
     /// `ToolResultData` in deterministic tool sequence order. Used for
     /// downstream indexing (TCK-00327: `ToolLogIndexV1`).
     result_hashes: Vec<Hash>,
+    /// TCK-00399: Harness handle for the spawned agent CLI process.
+    ///
+    /// Stored for lifecycle management: `stop()` calls
+    /// `adapter.terminate()` via this handle. Set after a successful
+    /// `AdapterRegistry::spawn()` and cleared on termination.
+    harness_handle: Option<HarnessHandle>,
 }
 
 /// Episode runtime for managing daemon-hosted episodes.
@@ -541,6 +549,11 @@ pub struct EpisodeRuntime {
     /// (normal, crash, timeout, quarantined, budget-exhausted) produce a
     /// `TERMINATED + reason/exit_code` status in the session registry.
     session_registry: Option<Arc<dyn SessionRegistry>>,
+    /// TCK-00399: Adapter registry for spawning agent CLI processes.
+    ///
+    /// When present, `spawn_adapter()` uses this registry to look up the
+    /// appropriate `HarnessAdapter` and spawn the agent process.
+    adapter_registry: Option<Arc<AdapterRegistry>>,
 }
 
 impl EpisodeRuntime {
@@ -569,6 +582,8 @@ impl EpisodeRuntime {
             ledger_emitter: None,
             // TCK-00385: No session registry by default (tests don't need it)
             session_registry: None,
+            // TCK-00399: No adapter registry by default
+            adapter_registry: None,
         }
     }
 
@@ -601,6 +616,8 @@ impl EpisodeRuntime {
             ledger_emitter: None,
             // TCK-00385: No session registry by default
             session_registry: None,
+            // TCK-00399: No adapter registry by default
+            adapter_registry: None,
         }
     }
 
@@ -751,6 +768,13 @@ impl EpisodeRuntime {
     #[must_use]
     pub fn with_session_registry(mut self, registry: Arc<dyn SessionRegistry>) -> Self {
         self.session_registry = Some(registry);
+        self
+    }
+
+    /// Sets the adapter registry for spawning agent CLI processes (TCK-00399).
+    #[must_use]
+    pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
+        self.adapter_registry = Some(registry);
         self
     }
 
@@ -958,6 +982,7 @@ impl EpisodeRuntime {
                     handle: None,
                     executor: None,
                     result_hashes: Vec::new(), // TCK-00320: Accumulate result hashes
+                    harness_handle: None,      // TCK-00399: Set after spawn_adapter()
                 },
             );
         }
@@ -1265,6 +1290,147 @@ impl EpisodeRuntime {
         Ok(handle)
     }
 
+    /// Spawns an agent CLI process for the given episode (TCK-00399).
+    ///
+    /// Validates the episode is in RUNNING state, calls
+    /// `HarnessAdapter::spawn()`, stores the `HarnessHandle` in the episode
+    /// entry, and launches a background bridge task to consume the
+    /// `HarnessEventStream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EpisodeError` if the episode is not in RUNNING state or
+    /// if adapter spawning fails.
+    pub async fn spawn_adapter(
+        &self,
+        episode_id: &EpisodeId,
+        config: crate::episode::adapter::HarnessConfig,
+        adapter: &dyn crate::episode::adapter::HarnessAdapter,
+    ) -> Result<(), EpisodeError> {
+        // Validate episode is in Running state
+        {
+            let episodes = self.episodes.read().await;
+            let entry =
+                episodes
+                    .get(episode_id.as_str())
+                    .ok_or_else(|| EpisodeError::NotFound {
+                        id: episode_id.as_str().to_string(),
+                    })?;
+            if !matches!(entry.state, EpisodeState::Running { .. }) {
+                return Err(EpisodeError::Internal {
+                    message: format!(
+                        "cannot spawn adapter for episode {} in state {}; expected Running",
+                        episode_id,
+                        entry.state.state_name()
+                    ),
+                });
+            }
+        }
+
+        // Spawn the agent process
+        let (handle, event_stream) =
+            adapter
+                .spawn(config)
+                .await
+                .map_err(|e| EpisodeError::Internal {
+                    message: format!("adapter spawn failed for episode {episode_id}: {e}"),
+                })?;
+
+        info!(
+            episode_id = %episode_id,
+            handle_id = handle.id(),
+            "agent process spawned via adapter"
+        );
+
+        // Store the harness handle in the episode entry
+        {
+            let mut episodes = self.episodes.write().await;
+            if let Some(entry) = episodes.get_mut(episode_id.as_str()) {
+                entry.harness_handle = Some(handle);
+            }
+        }
+
+        // Spawn background bridge task to consume the event stream.
+        // Tool-request intents are captured with explicit stub markers
+        // (tool execution is deferred to TCK-00401).
+        let bridge_episode_id = episode_id.clone();
+        tokio::spawn(async move {
+            Self::event_stream_bridge(bridge_episode_id, event_stream).await;
+        });
+
+        Ok(())
+    }
+
+    /// Background bridge task that consumes a `HarnessEventStream`.
+    ///
+    /// Tool-request intents are logged with stub markers. Actual tool
+    /// execution is deferred to TCK-00401.
+    async fn event_stream_bridge(
+        episode_id: EpisodeId,
+        mut event_stream: crate::episode::adapter::HarnessEventStream,
+    ) {
+        let mut tool_request_count: u64 = 0;
+
+        while let Some(event) = event_stream.recv().await {
+            match &event {
+                HarnessEvent::ToolRequest {
+                    request_id, tool, ..
+                } => {
+                    tool_request_count += 1;
+                    debug!(
+                        episode_id = %episode_id,
+                        request_id = %request_id,
+                        tool = %tool,
+                        "[STUB] tool-request intent captured (execution deferred to TCK-00401)"
+                    );
+                },
+                HarnessEvent::Terminated {
+                    exit_code,
+                    classification,
+                } => {
+                    info!(
+                        episode_id = %episode_id,
+                        exit_code = ?exit_code,
+                        classification = %classification,
+                        tool_requests_captured = tool_request_count,
+                        "agent process terminated"
+                    );
+                    break;
+                },
+                HarnessEvent::Output { seq, .. } => {
+                    if *seq == 0 {
+                        debug!(
+                            episode_id = %episode_id,
+                            "first output event received from agent process"
+                        );
+                    }
+                },
+                HarnessEvent::Error { code, message } => {
+                    warn!(
+                        episode_id = %episode_id,
+                        code = %code,
+                        message = %message,
+                        "error event from agent process"
+                    );
+                },
+                HarnessEvent::Progress { message, percent } => {
+                    debug!(
+                        episode_id = %episode_id,
+                        message = %message,
+                        percent = ?percent,
+                        "progress event from agent process"
+                    );
+                },
+            }
+        }
+
+        debug!(
+            episode_id = %episode_id,
+            tool_request_count,
+            "event stream bridge task completed"
+        );
+    }
+
     /// Stops an episode, transitioning it from RUNNING to TERMINATED.
     ///
     /// # Arguments
@@ -1295,7 +1461,7 @@ impl EpisodeRuntime {
         // success. On mark_terminated failure the runtime state stays
         // Running so callers can retry.
 
-        {
+        let harness_handle_opt = {
             let mut episodes = self.episodes.write().await;
 
             let entry =
@@ -1374,6 +1540,12 @@ impl EpisodeRuntime {
                 });
             }
 
+            // TCK-00399: Take the harness handle before transitioning to
+            // Terminated. Termination of the agent process happens after
+            // the state transition (outside the lock) to avoid holding the
+            // write lock during potentially slow I/O.
+            let harness_handle = entry.harness_handle.take();
+
             // Session persisted successfully (or no registry) -- now commit
             // the runtime terminal transition.
             entry.state = EpisodeState::Terminated {
@@ -1384,7 +1556,43 @@ impl EpisodeRuntime {
                 termination_class,
             };
             entry.handle = None;
+
+            harness_handle
+        };
+
+        // TCK-00399: Terminate the agent CLI process if a harness handle
+        // was stored. Uses SIGTERM + grace period + SIGKILL to guarantee
+        // process termination.
+        if let Some(ref harness_handle) = harness_handle_opt {
+            let runner_handle = harness_handle.real_runner_handle();
+            let grace_period = harness_handle.terminate_grace_period();
+            match crate::episode::adapter::terminate_with_handle(
+                harness_handle.id(),
+                runner_handle,
+                grace_period,
+            )
+            .await
+            {
+                Ok(status) => {
+                    info!(
+                        episode_id = %episode_id,
+                        exit_status = ?status,
+                        "agent process terminated during episode stop"
+                    );
+                },
+                Err(e) => {
+                    // Log but do not fail the stop flow. The process may
+                    // have already exited naturally via the event stream.
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "agent process termination error during episode stop \
+                         (process may have already exited)"
+                    );
+                },
+            }
         }
+        drop(harness_handle_opt);
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
@@ -1622,7 +1830,7 @@ impl EpisodeRuntime {
         // effectively atomic. Mark session terminated FIRST, then commit
         // the runtime terminal transition only on success.
 
-        {
+        let quarantine_harness_handle = {
             let mut episodes = self.episodes.write().await;
 
             let entry =
@@ -1686,6 +1894,10 @@ impl EpisodeRuntime {
                 });
             }
 
+            // TCK-00399: Take the harness handle before transitioning to
+            // Quarantined. Termination happens outside the lock.
+            let harness_handle = entry.harness_handle.take();
+
             // Session persisted successfully (or no registry) -- now commit
             // the runtime terminal transition.
             entry.state = EpisodeState::Quarantined {
@@ -1696,7 +1908,40 @@ impl EpisodeRuntime {
                 reason: reason.clone(),
             };
             entry.handle = None;
+
+            harness_handle
+        };
+
+        // TCK-00399: Terminate the agent CLI process if a harness handle
+        // was stored (same pattern as stop()).
+        if let Some(ref harness_handle) = quarantine_harness_handle {
+            let runner_handle = harness_handle.real_runner_handle();
+            let grace_period = harness_handle.terminate_grace_period();
+            match crate::episode::adapter::terminate_with_handle(
+                harness_handle.id(),
+                runner_handle,
+                grace_period,
+            )
+            .await
+            {
+                Ok(status) => {
+                    info!(
+                        episode_id = %episode_id,
+                        exit_status = ?status,
+                        "agent process terminated during episode quarantine"
+                    );
+                },
+                Err(e) => {
+                    warn!(
+                        episode_id = %episode_id,
+                        error = %e,
+                        "agent process termination error during episode quarantine \
+                         (process may have already exited)"
+                    );
+                },
+            }
         }
+        drop(quarantine_harness_handle);
 
         // Emit event (INV-ER002)
         if self.config.emit_events {
@@ -2656,6 +2901,187 @@ mod tests {
             result,
             Err(EpisodeError::InvalidTransition { .. })
         ));
+    }
+
+    // =========================================================================
+    // TCK-00399: Adapter spawning tests
+    // =========================================================================
+
+    /// Mock adapter for testing `spawn_adapter` without real PTY processes.
+    struct MockAdapter;
+
+    impl crate::episode::adapter::HarnessAdapter for MockAdapter {
+        fn adapter_type(&self) -> crate::episode::adapter::AdapterType {
+            crate::episode::adapter::AdapterType::Raw
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn spawn(
+            &self,
+            config: crate::episode::adapter::HarnessConfig,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::episode::adapter::AdapterResult<(
+                            crate::episode::adapter::HarnessHandle,
+                            crate::episode::adapter::HarnessEventStream,
+                        )>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+                // Create a dummy control channel (never consumed)
+                let (control_tx, _control_rx) =
+                    tokio::sync::mpsc::channel::<crate::episode::adapter::PtyControlCommand>(1);
+                let inner = crate::episode::adapter::create_real_handle_inner(
+                    99999, // fake PID
+                    None, control_tx,
+                );
+                let handle = crate::episode::adapter::HarnessHandle::new(
+                    1,
+                    config.episode_id.clone(),
+                    config.terminate_grace_period,
+                    inner,
+                );
+
+                // Send a terminated event after a short delay to complete the bridge
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let _ = event_tx
+                        .send(crate::episode::adapter::HarnessEvent::Terminated {
+                            exit_code: Some(0),
+                            classification:
+                                crate::episode::adapter::TerminationClassification::Success,
+                        })
+                        .await;
+                });
+
+                Ok((handle, event_rx))
+            })
+        }
+
+        fn send_input(
+            &self,
+            _handle: &crate::episode::adapter::HarnessHandle,
+            _input: &[u8],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::episode::adapter::AdapterResult<()>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn terminate(
+            &self,
+            _handle: &crate::episode::adapter::HarnessHandle,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = crate::episode::adapter::AdapterResult<std::process::ExitStatus>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                // Cannot construct ExitStatus directly, so this is best-effort.
+                // In practice, terminate is called via terminate_with_handle which
+                // uses the real handle; mock tests avoid this path.
+                Err(crate::episode::adapter::AdapterError::TerminateFailed {
+                    reason: "mock terminate not implemented".to_string(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_adapter_requires_running_state() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+
+        // Episode is in Created state, not Running. spawn_adapter should fail.
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        let result = runtime.spawn_adapter(&episode_id, config, &adapter).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("expected Running"),
+            "Error should mention expected Running, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_adapter_success() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        let result = runtime.spawn_adapter(&episode_id, config, &adapter).await;
+        assert!(result.is_ok(), "spawn_adapter should succeed: {result:?}");
+
+        // Verify harness_handle is stored
+        let episodes = runtime.episodes.read().await;
+        let entry = episodes.get(episode_id.as_str()).unwrap();
+        assert!(
+            entry.harness_handle.is_some(),
+            "harness_handle should be stored after spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_clears_harness_handle() {
+        let runtime = EpisodeRuntime::new(test_config());
+        let episode_id = runtime
+            .create(test_envelope_hash(), test_timestamp())
+            .await
+            .unwrap();
+        runtime
+            .start(&episode_id, "lease-1", test_timestamp() + 1000)
+            .await
+            .unwrap();
+
+        let config = crate::episode::adapter::HarnessConfig::new("echo", episode_id.as_str());
+        let adapter = MockAdapter;
+        runtime
+            .spawn_adapter(&episode_id, config, &adapter)
+            .await
+            .unwrap();
+
+        // Stop the episode -- this should extract and drop the harness handle
+        runtime
+            .stop(
+                &episode_id,
+                TerminationClass::Success,
+                test_timestamp() + 2000,
+            )
+            .await
+            .unwrap();
+
+        // Verify episode is terminated
+        let state = runtime.observe(&episode_id).await.unwrap();
+        assert!(
+            state.is_terminal(),
+            "episode should be terminated after stop"
+        );
     }
 
     #[tokio::test]

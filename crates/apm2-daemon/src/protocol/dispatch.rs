@@ -4603,6 +4603,13 @@ pub struct PrivilegedDispatcher {
     /// Only governance transport/communication failures call
     /// `record_failure()`.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
+
+    /// TCK-00399: Adapter registry for spawning agent CLI processes.
+    ///
+    /// When present, `handle_spawn_episode` loads the adapter profile from
+    /// CAS, builds a `HarnessConfig`, and spawns the agent process via the
+    /// appropriate `HarnessAdapter`.
+    adapter_registry: Option<Arc<crate::episode::AdapterRegistry>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4744,6 +4751,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -4806,6 +4814,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -4887,6 +4896,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -4945,6 +4955,7 @@ impl PrivilegedDispatcher {
             stop_conditions_store: None,
             stop_authority: None,
             governance_freshness_monitor: None,
+            adapter_registry: None,
         }
     }
 
@@ -5055,6 +5066,13 @@ impl PrivilegedDispatcher {
         monitor: Arc<GovernanceFreshnessMonitor>,
     ) -> Self {
         self.governance_freshness_monitor = Some(monitor);
+        self
+    }
+
+    /// Sets the adapter registry for spawning agent CLI processes (TCK-00399).
+    #[must_use]
+    pub fn with_adapter_registry(mut self, registry: Arc<crate::episode::AdapterRegistry>) -> Self {
+        self.adapter_registry = Some(registry);
         self
     }
 
@@ -5959,6 +5977,93 @@ impl PrivilegedDispatcher {
     /// authoritative role spec binding yet, so this may return `None`.
     const fn derive_role_spec_hash(_claim: &WorkClaim) -> Option<[u8; 32]> {
         None
+    }
+
+    /// Builds a `HarnessConfig` from an adapter profile and spawn parameters
+    /// (TCK-00399).
+    ///
+    /// # Security
+    ///
+    /// - Session token is passed via env only (WVR-0002), NEVER in argv
+    /// - Security-critical env vars cannot be overridden by the profile
+    /// - `workspace_root` path traversal is prevented by
+    ///   `HarnessConfig::validate()`
+    fn build_harness_config(
+        profile: &apm2_core::fac::AgentAdapterProfileV1,
+        episode_id: &str,
+        workspace_root: &str,
+        prompt: &str,
+        session_token: &secrecy::SecretString,
+    ) -> Result<crate::episode::HarnessConfig, String> {
+        use secrecy::ExposeSecret;
+
+        /// Environment variable names that MUST NOT be overridden by
+        /// adapter profiles (privilege escalation / library injection).
+        const FORBIDDEN_ENV_KEYS: &[&str] = &[
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ];
+
+        // Expand args_template placeholders.
+        // SECURITY: session_token MUST NEVER appear in argv (WVR-0002).
+        #[allow(clippy::literal_string_with_formatting_args)]
+        let expanded_args: Vec<String> = profile
+            .args_template
+            .iter()
+            .map(|arg| {
+                arg.replace("{workspace}", workspace_root)
+                    .replace("{prompt}", prompt)
+            })
+            .collect();
+
+        // Defense-in-depth: verify session_token is not in any arg.
+        let token_str = session_token.expose_secret();
+        for (i, arg) in expanded_args.iter().enumerate() {
+            if arg.contains(token_str) {
+                return Err(format!(
+                    "security violation: session_token found in argv[{i}] \
+                     after template expansion"
+                ));
+            }
+        }
+
+        let mut config = crate::episode::HarnessConfig::new(&profile.command, episode_id)
+            .with_args(expanded_args)
+            .with_cwd(workspace_root);
+
+        // Expand and set env vars from profile template.
+        for (key, value_template) in &profile.env_template {
+            if FORBIDDEN_ENV_KEYS
+                .iter()
+                .any(|&k| k.eq_ignore_ascii_case(key))
+            {
+                return Err(format!(
+                    "security violation: adapter profile overrides \
+                     forbidden env var '{key}'"
+                ));
+            }
+            #[allow(clippy::literal_string_with_formatting_args)]
+            let expanded_value = value_template
+                .replace("{workspace}", workspace_root)
+                .replace("{prompt}", prompt);
+            config = config.with_env(key, expanded_value);
+        }
+
+        // WVR-0002: Pass session token via environment only.
+        config = config.with_secret_env("APM2_SESSION_TOKEN", session_token.clone());
+
+        if profile.requires_pty {
+            config = config.with_pty_size(120, 40);
+        }
+
+        config
+            .validate()
+            .map_err(|e| format!("harness config validation failed: {e}"))?;
+
+        Ok(config)
     }
 
     /// Handles `SpawnEpisode` requests (IPC-PRIV-002).
@@ -7101,6 +7206,74 @@ impl PrivilegedDispatcher {
                 workspace_root = %request.workspace_root,
                 "Episode created, started, and bound to session"
             );
+        }
+
+        // TCK-00399: Spawn agent CLI process via adapter registry.
+        //
+        // After the episode is created and Running, load the adapter profile
+        // from CAS, build a HarnessConfig with template expansion, and spawn
+        // the agent process. Best-effort: if no adapter registry is
+        // configured (tests, legacy paths), the episode proceeds without a
+        // spawned agent process.
+        if let (Some(episode_id), Some(registry)) = (&episode_id_opt, &self.adapter_registry) {
+            let spawn_result: Result<(), String> = (|| {
+                let cas = self
+                    .cas
+                    .as_ref()
+                    .ok_or_else(|| "adapter spawn requires CAS configuration".to_string())?;
+
+                let profile = apm2_core::fac::AgentAdapterProfileV1::load_from_cas(
+                    cas.as_ref(),
+                    &adapter_profile_hash,
+                )
+                .map_err(|e| format!("adapter profile load failed: {e}"))?;
+
+                let adapter_type = match profile.adapter_mode {
+                    apm2_core::fac::AdapterMode::StructuredOutput => {
+                        crate::episode::AdapterType::ClaudeCode
+                    },
+                    _ => crate::episode::AdapterType::Raw,
+                };
+
+                let adapter = registry.get(adapter_type).ok_or_else(|| {
+                    format!("adapter type {adapter_type} not registered in registry")
+                })?;
+
+                // Build HarnessConfig. Prompt is empty -- actual prompt
+                // delivery is via stdin/PTY, not in argv.
+                let session_token_secret = secrecy::SecretString::from(session_token_json.clone());
+                let config = Self::build_harness_config(
+                    &profile,
+                    episode_id.as_str(),
+                    &request.workspace_root,
+                    "",
+                    &session_token_secret,
+                )?;
+
+                if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+                    tokio::task::block_in_place(|| {
+                        rt_handle.block_on(async {
+                            self.episode_runtime
+                                .spawn_adapter(episode_id, config, adapter)
+                                .await
+                                .map_err(|e| format!("adapter spawn failed: {e}"))
+                        })
+                    })?;
+                }
+
+                Ok(())
+            })();
+
+            if let Err(e) = spawn_result {
+                // Log but do NOT fail SpawnEpisode. The episode is valid
+                // and running -- operator can retry or start process
+                // externally. This matches gradual rollout strategy.
+                warn!(
+                    episode_id = %episode_id,
+                    error = %e,
+                    "adapter process spawn failed (episode remains running)"
+                );
+            }
         }
 
         // TCK-00395 Security MAJOR 2: Fail closed when peer credentials are
@@ -22568,6 +22741,133 @@ mod tests {
                 },
                 other => panic!("Expected SpawnEpisode or Error, got: {other:?}"),
             }
+        }
+    }
+
+    // =========================================================================
+    // TCK-00399: build_harness_config tests
+    // =========================================================================
+
+    mod build_harness_config_tests {
+        use apm2_core::fac::AgentAdapterProfileV1;
+        use secrecy::ExposeSecret;
+
+        use super::*;
+
+        /// Creates a test profile by mutating the builtin `claude_code_profile`
+        /// (which already passes all validation). We just override templates.
+        fn test_profile_with_templates() -> AgentAdapterProfileV1 {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec![
+                "--workspace".to_string(),
+                "{workspace}".to_string(),
+                "--prompt".to_string(),
+                "{prompt}".to_string(),
+            ];
+            profile.env_template = vec![
+                ("MY_WORKSPACE".to_string(), "{workspace}".to_string()),
+                ("MY_PROMPT".to_string(), "{prompt}".to_string()),
+            ];
+            profile
+        }
+
+        #[test]
+        fn test_template_expansion() {
+            let profile = test_profile_with_templates();
+            let token = secrecy::SecretString::from("test-token-123".to_string());
+
+            let config = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/home/user/workspace",
+                "do something",
+                &token,
+            )
+            .expect("build_harness_config should succeed");
+
+            // Check args were expanded
+            assert_eq!(config.args[0], "--workspace");
+            assert_eq!(config.args[1], "/home/user/workspace");
+            assert_eq!(config.args[2], "--prompt");
+            assert_eq!(config.args[3], "do something");
+
+            // Check env was expanded
+            assert_eq!(
+                config.env.get("MY_WORKSPACE").unwrap().expose_secret(),
+                "/home/user/workspace"
+            );
+            assert_eq!(
+                config.env.get("MY_PROMPT").unwrap().expose_secret(),
+                "do something"
+            );
+
+            // Check session token is in env (WVR-0002)
+            assert_eq!(
+                config
+                    .env
+                    .get("APM2_SESSION_TOKEN")
+                    .unwrap()
+                    .expose_secret(),
+                "test-token-123"
+            );
+        }
+
+        #[test]
+        fn test_forbidden_env_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.env_template = vec![("PATH".to_string(), "/malicious/path".to_string())];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("forbidden env var"),
+                "Error should mention forbidden env var"
+            );
+        }
+
+        #[test]
+        fn test_ld_preload_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.env_template = vec![("LD_PRELOAD".to_string(), "/evil.so".to_string())];
+            let token = secrecy::SecretString::from("token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("LD_PRELOAD"));
+        }
+
+        #[test]
+        fn test_session_token_in_argv_rejected() {
+            let mut profile = apm2_core::fac::builtin_profiles::claude_code_profile();
+            profile.args_template = vec!["--token".to_string(), "secret-token".to_string()];
+            // Token value matches an argv value
+            let token = secrecy::SecretString::from("secret-token".to_string());
+
+            let result = PrivilegedDispatcher::build_harness_config(
+                &profile,
+                "ep-001",
+                "/workspace",
+                "",
+                &token,
+            );
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("session_token found in argv"),
+                "Error should mention session_token in argv"
+            );
         }
     }
 }

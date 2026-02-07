@@ -722,6 +722,75 @@ impl crate::episode::executor::ContentAddressedStore for DurableCas {
 }
 
 // =============================================================================
+// Core ContentAddressedStore trait implementation (apm2_core::evidence)
+// =============================================================================
+
+/// Bridges `DurableCas` to the core CAS trait used by `apm2_core` types
+/// (e.g., `AgentAdapterProfileV1::load_from_cas`).
+///
+/// This allows the same `DurableCas` instance to be shared with components
+/// that require `apm2_core::evidence::ContentAddressedStore` (fallible API).
+impl apm2_core::evidence::ContentAddressedStore for DurableCas {
+    fn store(
+        &self,
+        content: &[u8],
+    ) -> Result<apm2_core::evidence::StoreResult, apm2_core::evidence::CasError> {
+        Self::store(self, content)
+            .map(|r| apm2_core::evidence::StoreResult {
+                hash: r.hash,
+                size: r.size,
+                is_new: r.is_new,
+            })
+            .map_err(durable_to_core_error)
+    }
+
+    fn retrieve(&self, hash: &Hash) -> Result<Vec<u8>, apm2_core::evidence::CasError> {
+        Self::retrieve(self, hash).map_err(durable_to_core_error)
+    }
+
+    fn exists(&self, hash: &Hash) -> Result<bool, apm2_core::evidence::CasError> {
+        Ok(Self::exists(self, hash))
+    }
+
+    fn size(&self, hash: &Hash) -> Result<usize, apm2_core::evidence::CasError> {
+        Self::size(self, hash).map_err(durable_to_core_error)
+    }
+}
+
+/// Maps `DurableCasError` to `apm2_core::evidence::CasError`.
+fn durable_to_core_error(e: DurableCasError) -> apm2_core::evidence::CasError {
+    match e {
+        DurableCasError::NotFound { hash } => apm2_core::evidence::CasError::NotFound { hash },
+        DurableCasError::HashMismatch { expected, actual } => {
+            apm2_core::evidence::CasError::HashMismatch { expected, actual }
+        },
+        DurableCasError::Collision { hash } => apm2_core::evidence::CasError::Collision { hash },
+        DurableCasError::ContentTooLarge { size, max_size } => {
+            apm2_core::evidence::CasError::ContentTooLarge { size, max_size }
+        },
+        DurableCasError::EmptyContent => apm2_core::evidence::CasError::EmptyContent,
+        DurableCasError::InvalidHash { expected, actual } => {
+            apm2_core::evidence::CasError::InvalidHash { expected, actual }
+        },
+        DurableCasError::StorageFull {
+            current_size,
+            new_size,
+            max_size,
+        } => apm2_core::evidence::CasError::StorageFull {
+            current_size,
+            new_size,
+            max_size,
+        },
+        DurableCasError::Io { context, source } => apm2_core::evidence::CasError::StorageError {
+            message: format!("{context}: {source}"),
+        },
+        DurableCasError::InitializationFailed { message } => {
+            apm2_core::evidence::CasError::StorageError { message }
+        },
+    }
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
