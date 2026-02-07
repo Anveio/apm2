@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
+use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 
 use super::{
@@ -124,6 +125,35 @@ pub enum CertificateError {
     UnknownPurposeTag {
         /// Rejected token.
         tag: String,
+    },
+
+    /// Delegation is not yet valid at the verifier's current tick.
+    #[error(
+        "delegation not yet valid: current_tick ({current_tick}) < issued_at_envelope_ref ({issued_at_envelope_ref})"
+    )]
+    DelegationNotYetValid {
+        /// The verifier's current HTF tick.
+        current_tick: u64,
+        /// The delegation's issued-at envelope reference.
+        issued_at_envelope_ref: u64,
+    },
+
+    /// Delegation has expired at the verifier's current tick.
+    #[error(
+        "delegation expired: current_tick ({current_tick}) >= expires_at_tick ({expires_at_tick})"
+    )]
+    DelegationExpired {
+        /// The verifier's current HTF tick.
+        current_tick: u64,
+        /// The delegation's expiry tick.
+        expires_at_tick: u64,
+    },
+
+    /// Ed25519 public key bytes are not a valid curve point.
+    #[error("malformed Ed25519 key bytes for {field}: not a valid curve point")]
+    MalformedKeyBytes {
+        /// Field name.
+        field: &'static str,
     },
 }
 
@@ -478,6 +508,20 @@ impl HolonCertificateV1 {
             });
         }
 
+        // Fail-closed: verify genesis key bytes are a valid Ed25519 curve point.
+        VerifyingKey::from_bytes(&self.genesis_public_key_bytes).map_err(|_| {
+            CertificateError::MalformedKeyBytes {
+                field: "genesis_public_key_bytes",
+            }
+        })?;
+
+        // Fail-closed: verify operational key bytes are a valid Ed25519 curve point.
+        VerifyingKey::from_bytes(&self.operational_public_key_bytes).map_err(|_| {
+            CertificateError::MalformedKeyBytes {
+                field: "operational_public_key_bytes",
+            }
+        })?;
+
         validate_key_roles(
             &self.genesis_public_key_id,
             &self.operational_public_key_id,
@@ -806,6 +850,8 @@ fn validate_spiffe_binding(
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::SigningKey;
+
     use super::*;
     use crate::identity::{CellGenesisV1, SetTag};
 
@@ -845,8 +891,14 @@ mod tests {
         let policy_root = PolicyRootId::Single(make_public_key_id(0xAB));
         let cell_id = make_cell_id([0x22; 32], &policy_root, "cell.example.internal");
 
-        let genesis_key_bytes = [0x55u8; 32];
-        let operational_key_bytes = [0x66u8; 32];
+        // Derive valid Ed25519 public key bytes from signing keys so they are
+        // well-formed curve points.
+        let genesis_key_bytes = SigningKey::from_bytes(&[0x55u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let operational_key_bytes = SigningKey::from_bytes(&[0x66u8; 32])
+            .verifying_key()
+            .to_bytes();
         let genesis_key_id =
             PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &genesis_key_bytes);
         let operational_key_id =
@@ -1079,7 +1131,11 @@ mod tests {
         let policy_root = PolicyRootId::Single(make_public_key_id(0xAB));
         let cell_id = make_cell_id([0x22; 32], &policy_root, "cell.example.internal");
 
-        let root_key_bytes = [0x33u8; 32];
+        // Use a valid Ed25519 public key (derived from a signing key) so that
+        // the well-formedness check passes and the role-overlap check fires.
+        let root_key_bytes = SigningKey::from_bytes(&[0x33u8; 32])
+            .verifying_key()
+            .to_bytes();
         let root_key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &root_key_bytes);
         let holon_id = HolonIdV1::from_genesis(
             &HolonGenesisV1::new(
@@ -1257,6 +1313,88 @@ mod tests {
             CertificateError::KeyRoleOverlap {
                 left: "genesis",
                 right: "session"
+            }
+        );
+    }
+
+    // ---- Ed25519 key-bytes well-formedness adversarial tests ----
+
+    #[test]
+    fn holon_certificate_rejects_genesis_key_not_on_curve() {
+        let cert = make_holon_certificate();
+
+        // y=2 (LE: [0x02, 0x00, ...]) is not on the Ed25519 curve — the
+        // corresponding x^2 is a quadratic non-residue mod p.
+        let mut bad_genesis_bytes = [0x00u8; 32];
+        bad_genesis_bytes[0] = 0x02;
+        let bad_genesis_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &bad_genesis_bytes);
+
+        // Build a holon_id from this bad genesis so the key-id binding check
+        // passes — the well-formedness check should fire before holon_id
+        // binding.
+        let holon_id = HolonIdV1::from_genesis(
+            &HolonGenesisV1::new(
+                cert.cell_id().clone(),
+                bad_genesis_id.clone(),
+                bad_genesis_bytes.to_vec(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+
+        let err = HolonCertificateV1::new(
+            holon_id,
+            cert.cell_id().clone(),
+            bad_genesis_id,
+            &bad_genesis_bytes,
+            cert.operational_public_key_id().clone(),
+            cert.operational_public_key_bytes(),
+            None,
+            None,
+            cert.endpoint_hints().to_vec(),
+            cert.purposes().to_vec(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::MalformedKeyBytes {
+                field: "genesis_public_key_bytes",
+            }
+        );
+    }
+
+    #[test]
+    fn holon_certificate_rejects_operational_key_not_on_curve() {
+        let cert = make_holon_certificate();
+
+        // y=2 (LE: [0x02, 0x00, ...]) is not on the Ed25519 curve — the
+        // corresponding x^2 is a quadratic non-residue mod p.
+        let mut bad_operational_bytes = [0x00u8; 32];
+        bad_operational_bytes[0] = 0x02;
+        let bad_operational_id =
+            PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &bad_operational_bytes);
+
+        let err = HolonCertificateV1::new(
+            cert.holon_id().clone(),
+            cert.cell_id().clone(),
+            cert.genesis_public_key_id().clone(),
+            cert.genesis_public_key_bytes(),
+            bad_operational_id,
+            &bad_operational_bytes,
+            None,
+            None,
+            cert.endpoint_hints().to_vec(),
+            cert.purposes().to_vec(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            CertificateError::MalformedKeyBytes {
+                field: "operational_public_key_bytes",
             }
         );
     }
