@@ -107,6 +107,23 @@ impl SqliteLedgerEventEmitter {
              WHERE event_type = 'SubleaseIssued'",
             [],
         )?;
+        // SECURITY (v13 Finding 2 — Receipt Uniqueness Constraint):
+        //
+        // Enforce at-most-once semantics for review receipt events at the
+        // database level. The `receipt_id` is stored as a field in the JSON
+        // payload. A partial unique index on `json_extract(payload, '$.receipt_id')`
+        // for review receipt event types prevents concurrent duplicate
+        // `IngestReviewReceipt` calls from creating multiple receipt events.
+        // This converts the check-then-act pattern into defense-in-depth:
+        // application-level `get_event_by_receipt_id` provides the fast-path,
+        // while the database constraint provides the authoritative uniqueness
+        // guarantee.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
+             ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
+             WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded')",
+            [],
+        )?;
         Ok(())
     }
 
@@ -817,9 +834,11 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         let payload_json = serde_json::json!({
             "event_type": "review_receipt_recorded",
             "episode_id": episode_id,
+            "lease_id": episode_id,
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
             "artifact_bundle_hash": hex::encode(artifact_bundle_hash),
+            "verdict": "APPROVE",
             "reviewer_actor_id": reviewer_actor_id,
             "timestamp_ns": timestamp_ns,
             "identity_proof_hash": hex::encode(identity_proof_hash),
@@ -886,9 +905,12 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         Ok(signed_event)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_review_blocked_receipt(
         &self,
+        lease_id: &str,
         receipt_id: &str,
+        changeset_digest: &[u8; 32],
         reason_code: u32,
         blocked_log_hash: &[u8; 32],
         reviewer_actor_id: &str,
@@ -904,7 +926,10 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
         // post-signing, matching the APPROVE path's payload binding.
         let payload_json = serde_json::json!({
             "event_type": "review_blocked_recorded",
+            "lease_id": lease_id,
             "receipt_id": receipt_id,
+            "changeset_digest": hex::encode(changeset_digest),
+            "verdict": "BLOCKED",
             "reason_code": reason_code,
             "blocked_log_hash": hex::encode(blocked_log_hash),
             "reviewer_actor_id": reviewer_actor_id,
@@ -2848,12 +2873,15 @@ mod tests {
     fn test_get_event_by_receipt_id_finds_blocked_receipts() {
         let emitter = test_emitter();
 
+        let changeset_digest = [0x42u8; 32];
         let blocked_log_hash = [0xEEu8; 32];
 
         let identity_proof_hash = [0xDDu8; 32];
         let blocked_event = emitter
             .emit_review_blocked_receipt(
+                "lease-blocked-001",
                 "RR-BLOCKED-001",
+                &changeset_digest,
                 42,
                 &blocked_log_hash,
                 "reviewer-actor-y",
@@ -2880,12 +2908,15 @@ mod tests {
     #[test]
     fn test_blocked_receipt_payload_contains_identity_proof_hash() {
         let emitter = test_emitter();
+        let changeset_digest = [0x42u8; 32];
         let blocked_log_hash = [0xAAu8; 32];
         let identity_proof_hash = [0xBBu8; 32];
 
         let event = emitter
             .emit_review_blocked_receipt(
+                "lease-blocked-iph",
                 "RR-BLOCKED-IPH",
+                &changeset_digest,
                 99,
                 &blocked_log_hash,
                 "reviewer-actor-z",
