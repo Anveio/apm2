@@ -486,8 +486,7 @@ impl DispatcherState {
             // TCK-00399: Create adapter registry so SpawnEpisode can spawn
             // adapter processes (fail-closed: registry is required).
             let mut adapter_registry = crate::episode::AdapterRegistry::new();
-            adapter_registry
-                .register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
+            adapter_registry.register(Box::new(crate::episode::raw_adapter::RawAdapter::new()));
             adapter_registry.register(Box::new(
                 crate::episode::claude_code::ClaudeCodeAdapter::new(),
             ));
