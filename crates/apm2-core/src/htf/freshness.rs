@@ -61,7 +61,8 @@ pub const DEFAULT_TIER3_MAX_HEAD_AGE_TICKS: u64 = 10_000;
 /// Default maximum head age in ticks for Tier4 (critical operations).
 pub const DEFAULT_TIER4_MAX_HEAD_AGE_TICKS: u64 = 1_000;
 
-/// Maximum number of audit events retained per evaluator call (denial-of-service bound).
+/// Maximum number of audit events retained per evaluator call
+/// (denial-of-service bound).
 pub const MAX_AUDIT_EVENTS: usize = 16;
 
 /// Domain separator for freshness audit event hashing.
