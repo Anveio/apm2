@@ -288,6 +288,7 @@ impl RawAdapter {
 
         let handle_id = Self::next_handle_id();
         let episode_id = config.episode_id.clone();
+        let terminate_grace_period = config.terminate_grace_period;
 
         // Create PTY configuration from harness config
         let (cols, rows) = config.pty_size;
@@ -424,7 +425,8 @@ impl RawAdapter {
             // Permit is automatically released when dropped here
         });
 
-        let handle = HarnessHandle::new(handle_id, episode_id, handle_inner);
+        let handle =
+            HarnessHandle::new(handle_id, episode_id, terminate_grace_period, handle_inner);
 
         Ok((handle, rx))
     }
@@ -481,7 +483,8 @@ impl HarnessAdapter for RawAdapter {
     ) -> Pin<Box<dyn std::future::Future<Output = AdapterResult<ExitStatus>> + Send + '_>> {
         let handle_id = handle.id();
         let runner_handle = handle.real_runner_handle();
-        Box::pin(async move { terminate_with_handle(handle_id, runner_handle).await })
+        let grace_period = handle.terminate_grace_period();
+        Box::pin(async move { terminate_with_handle(handle_id, runner_handle, grace_period).await })
     }
 }
 

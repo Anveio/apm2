@@ -314,6 +314,19 @@ impl fmt::Display for AdapterType {
     }
 }
 
+/// Default terminate grace period (3 seconds).
+///
+/// This is the time allowed between sending SIGTERM and escalating to SIGKILL
+/// during process termination. The value is intentionally conservative: long
+/// enough for well-behaved processes to clean up, short enough to avoid
+/// stalling the daemon on unresponsive children.
+const DEFAULT_TERMINATE_GRACE_PERIOD: Duration = Duration::from_secs(3);
+
+/// Returns the default terminate grace period for serde deserialization.
+const fn default_terminate_grace_period() -> Duration {
+    DEFAULT_TERMINATE_GRACE_PERIOD
+}
+
 /// Configuration for spawning a harness process.
 ///
 /// # Security
@@ -355,6 +368,40 @@ pub struct HarnessConfig {
 
     /// Episode ID for tracking.
     pub episode_id: String,
+
+    /// Grace period between SIGTERM and SIGKILL during process termination.
+    ///
+    /// When terminating a harness process, the adapter first sends SIGTERM and
+    /// waits up to this duration for the process to exit gracefully. If the
+    /// process is still running after this period, SIGKILL is sent.
+    ///
+    /// Defaults to 3 seconds if not specified.
+    #[serde(
+        default = "default_terminate_grace_period",
+        with = "serde_duration_secs"
+    )]
+    pub terminate_grace_period: Duration,
+}
+
+/// Serde helper for serializing/deserializing [`Duration`] as seconds (f64).
+mod serde_duration_secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(duration.as_secs_f64())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        let secs = f64::deserialize(deserializer)?;
+        if secs < 0.0 {
+            return Err(serde::de::Error::custom(
+                "terminate_grace_period must be non-negative",
+            ));
+        }
+        Ok(Duration::from_secs_f64(secs))
+    }
 }
 
 impl fmt::Debug for HarnessConfig {
@@ -367,6 +414,7 @@ impl fmt::Debug for HarnessConfig {
             .field("env", &format!("<{} redacted entries>", self.env.len()))
             .field("pty_size", &self.pty_size)
             .field("episode_id", &self.episode_id)
+            .field("terminate_grace_period", &self.terminate_grace_period)
             .finish()
     }
 }
@@ -387,6 +435,7 @@ impl HarnessConfig {
             env: HashMap::new(),
             pty_size: default_pty_size(),
             episode_id: episode_id.into(),
+            terminate_grace_period: DEFAULT_TERMINATE_GRACE_PERIOD,
         }
     }
 
@@ -425,6 +474,16 @@ impl HarnessConfig {
     #[must_use]
     pub const fn with_pty_size(mut self, cols: u16, rows: u16) -> Self {
         self.pty_size = (cols, rows);
+        self
+    }
+
+    /// Set the terminate grace period.
+    ///
+    /// This is the time between sending SIGTERM and escalating to SIGKILL
+    /// during process termination. Defaults to 3 seconds.
+    #[must_use]
+    pub const fn with_terminate_grace_period(mut self, grace_period: Duration) -> Self {
+        self.terminate_grace_period = grace_period;
         self
     }
 
@@ -650,7 +709,6 @@ impl HarnessConfig {
 }
 
 const PTY_CONTROL_CHANNEL_CAPACITY: usize = 8;
-const TERMINATE_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SEND_INPUT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const TERMINATE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -717,6 +775,9 @@ pub struct HarnessHandle {
     /// Episode ID for tracking.
     pub(crate) episode_id: String,
 
+    /// Grace period between SIGTERM and SIGKILL during termination.
+    pub(crate) terminate_grace_period: Duration,
+
     /// Adapter-specific internal state.
     pub(crate) inner: HarnessHandleInner,
 }
@@ -731,10 +792,16 @@ pub(crate) enum HarnessHandleInner {
 impl HarnessHandle {
     /// Create a new harness handle.
     #[allow(clippy::missing_const_for_fn)] // String param prevents const fn on stable
-    pub(crate) fn new(id: u64, episode_id: String, inner: HarnessHandleInner) -> Self {
+    pub(crate) fn new(
+        id: u64,
+        episode_id: String,
+        terminate_grace_period: Duration,
+        inner: HarnessHandleInner,
+    ) -> Self {
         Self {
             id,
             episode_id,
+            terminate_grace_period,
             inner,
         }
     }
@@ -749,6 +816,12 @@ impl HarnessHandle {
     #[must_use]
     pub fn episode_id(&self) -> &str {
         &self.episode_id
+    }
+
+    /// Returns the configured terminate grace period.
+    #[must_use]
+    pub const fn terminate_grace_period(&self) -> Duration {
+        self.terminate_grace_period
     }
 
     pub(crate) fn real_runner_handle(&self) -> Arc<Mutex<PtyRunnerHandle>> {
@@ -851,9 +924,13 @@ pub(crate) async fn send_input_with_handle(
 }
 
 /// Terminates a spawned harness process via the real handle.
+///
+/// The `grace_period` controls how long to wait after SIGTERM before
+/// escalating to SIGKILL.
 pub(crate) async fn terminate_with_handle(
     handle_id: u64,
     runner_handle: Arc<Mutex<PtyRunnerHandle>>,
+    grace_period: Duration,
 ) -> AdapterResult<ExitStatus> {
     let (control_tx, pid) = {
         let guard = runner_handle.lock().await;
@@ -886,7 +963,7 @@ pub(crate) async fn terminate_with_handle(
     let (respond_to, response_rx) = oneshot::channel();
     control_tx
         .send(PtyControlCommand::Terminate {
-            grace_period: TERMINATE_GRACE_PERIOD,
+            grace_period,
             respond_to,
         })
         .await
@@ -1810,10 +1887,19 @@ mod tests {
     fn test_harness_handle_accessors() {
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(1);
         let inner = create_real_handle_inner(4242, Some(123), control_tx);
-        let handle = HarnessHandle::new(42, "episode-abc".to_string(), inner);
+        let handle = HarnessHandle::new(
+            42,
+            "episode-abc".to_string(),
+            DEFAULT_TERMINATE_GRACE_PERIOD,
+            inner,
+        );
 
         assert_eq!(handle.id(), 42);
         assert_eq!(handle.episode_id(), "episode-abc");
+        assert_eq!(
+            handle.terminate_grace_period(),
+            DEFAULT_TERMINATE_GRACE_PERIOD
+        );
     }
 
     #[test]
@@ -1878,7 +1964,12 @@ mod tests {
         });
 
         // --- First terminate attempt: should FAIL ---
-        let result = terminate_with_handle(1, Arc::clone(&runner_handle)).await;
+        let result = terminate_with_handle(
+            1,
+            Arc::clone(&runner_handle),
+            DEFAULT_TERMINATE_GRACE_PERIOD,
+        )
+        .await;
         assert!(
             result.is_err(),
             "first terminate should fail, got: {result:?}"
@@ -1906,7 +1997,12 @@ mod tests {
         );
 
         // --- Second terminate attempt: should SUCCEED ---
-        let result = terminate_with_handle(1, Arc::clone(&runner_handle)).await;
+        let result = terminate_with_handle(
+            1,
+            Arc::clone(&runner_handle),
+            DEFAULT_TERMINATE_GRACE_PERIOD,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "second terminate should succeed, got: {result:?}"
@@ -2038,6 +2134,84 @@ mod tests {
         assert!(
             result.is_ok(),
             "empty payload must be accepted, got: {result:?}"
+        );
+
+        mock_task.abort();
+    }
+
+    // ========================================================================
+    // UT-00396-03: Configured terminate grace period is honored
+    // ========================================================================
+
+    /// Verifies that when `HarnessConfig` is given a custom
+    /// `terminate_grace_period`, that value flows through to the
+    /// `PtyControlCommand::Terminate` message sent on the control channel.
+    #[test]
+    fn harness_config_default_terminate_grace_period() {
+        let config = HarnessConfig::new("echo", "ep-1");
+        assert_eq!(
+            config.terminate_grace_period,
+            Duration::from_secs(3),
+            "default terminate_grace_period must be 3s"
+        );
+    }
+
+    #[test]
+    fn harness_config_custom_terminate_grace_period() {
+        let custom = Duration::from_secs(10);
+        let config = HarnessConfig::new("echo", "ep-1").with_terminate_grace_period(custom);
+        assert_eq!(
+            config.terminate_grace_period, custom,
+            "with_terminate_grace_period must override the default"
+        );
+    }
+
+    /// End-to-end test: a custom grace period set on `HarnessConfig` must be
+    /// delivered inside the `PtyControlCommand::Terminate` message when
+    /// `terminate_with_handle` is called with that value.
+    #[tokio::test]
+    async fn terminate_with_handle_uses_configured_grace_period() {
+        let custom_grace = Duration::from_millis(7777);
+
+        let (control_tx, mut control_rx) =
+            mpsc::channel::<PtyControlCommand>(PTY_CONTROL_CHANNEL_CAPACITY);
+
+        let runner_handle = Arc::new(Mutex::new(PtyRunnerHandle::new(
+            99998,
+            Some(99),
+            control_tx,
+        )));
+
+        // Spawn a mock task that captures the grace_period from the Terminate
+        // command and responds with a successful exit.
+        let (observed_tx, observed_rx) = oneshot::channel::<Duration>();
+        let mock_task = tokio::spawn(async move {
+            let mut observed_sender = Some(observed_tx);
+            while let Some(cmd) = control_rx.recv().await {
+                if let PtyControlCommand::Terminate {
+                    grace_period,
+                    respond_to,
+                } = cmd
+                {
+                    if let Some(sender) = observed_sender.take() {
+                        let _ = sender.send(grace_period);
+                    }
+                    let _ = respond_to.send(Ok(super::super::pty::ExitStatus::Exited(0)));
+                }
+            }
+        });
+
+        // Call terminate_with_handle with the custom grace period.
+        let result = terminate_with_handle(1, Arc::clone(&runner_handle), custom_grace).await;
+        assert!(result.is_ok(), "terminate should succeed, got: {result:?}");
+
+        // Verify the mock task received the correct grace period.
+        let observed = observed_rx
+            .await
+            .expect("mock task should have sent grace_period");
+        assert_eq!(
+            observed, custom_grace,
+            "terminate_with_handle must forward the configured grace period to the control command"
         );
 
         mock_task.abort();
