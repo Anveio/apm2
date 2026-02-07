@@ -5,6 +5,7 @@
 //!
 //! # Commands
 //!
+//! - `apm2 fac check` - Run deterministic local FAC gates with receipt pointers
 //! - `apm2 fac work status <work_id>` - Show work status from ledger
 //! - `apm2 fac episode inspect <episode_id>` - Show episode details and tool
 //!   log index
@@ -32,7 +33,11 @@
 //! - TCK-00333: FAC productivity CLI/scripts (ledger/CAS oriented debug UX)
 //! - RFC-0019: FAC v0 requirements
 
+use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use apm2_core::fac::{
     PROJECTION_ARTIFACT_SCHEMA_IDENTIFIER, REVIEW_ARTIFACT_SCHEMA_IDENTIFIER,
@@ -40,6 +45,9 @@ use apm2_core::fac::{
     ToolLogIndexV1,
 };
 use apm2_core::ledger::{EventRecord, Ledger, LedgerError};
+use apm2_daemon::gate::GateType;
+use apm2_daemon::projection::GitHubAdapterConfig;
+use apm2_daemon::telemetry::is_cgroup_v2_available;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -64,6 +72,12 @@ const DEFAULT_LEDGER_FILENAME: &str = "ledger.db";
 
 /// Default CAS path relative to data directory.
 const DEFAULT_CAS_DIRNAME: &str = "cas";
+
+/// Default timeout for bounded FAC check gate execution.
+const DEFAULT_FAC_CHECK_TIMEOUT_SECS: u64 = 900;
+
+/// Default kill escalation delay for bounded FAC check gate execution.
+const DEFAULT_FAC_CHECK_KILL_AFTER_SECS: u64 = 20;
 
 // =============================================================================
 // Command Types
@@ -91,6 +105,12 @@ pub struct FacCommand {
 /// FAC subcommands.
 #[derive(Debug, Subcommand)]
 pub enum FacSubcommand {
+    /// Run deterministic local FAC gates with receipt-pointer output.
+    ///
+    /// Executes fail-closed local gates (test safety, bounded test runner,
+    /// workspace integrity) and emits receipt pointers for each gate.
+    Check(CheckArgs),
+
     /// Show work status from ledger.
     ///
     /// Displays the current status of a work item including claims, episodes,
@@ -121,6 +141,38 @@ pub enum FacSubcommand {
     /// Analyzes ledger to determine restart point for interrupted work.
     /// Returns the last committed anchor and pending operations.
     Resume(ResumeArgs),
+}
+
+/// Arguments for `apm2 fac check`.
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// Workspace root containing scripts/ci guardrail scripts.
+    #[arg(long, default_value = ".")]
+    pub workspace_root: PathBuf,
+
+    /// Directory where gate receipt logs are written.
+    #[arg(long)]
+    pub receipts_dir: Option<PathBuf>,
+
+    /// Wall timeout for bounded gate execution (seconds).
+    #[arg(long, default_value_t = DEFAULT_FAC_CHECK_TIMEOUT_SECS)]
+    pub timeout_seconds: u64,
+
+    /// TERM->KILL escalation delay for bounded gate execution (seconds).
+    #[arg(long, default_value_t = DEFAULT_FAC_CHECK_KILL_AFTER_SECS)]
+    pub kill_after_seconds: u64,
+
+    /// Memory ceiling forwarded to bounded runner.
+    #[arg(long, default_value = "4G")]
+    pub memory_max: String,
+
+    /// PID/task ceiling forwarded to bounded runner.
+    #[arg(long, default_value_t = 1536)]
+    pub pids_max: u64,
+
+    /// CPU quota forwarded to bounded runner.
+    #[arg(long, default_value = "200%")]
+    pub cpu_quota: String,
 }
 
 /// Arguments for `apm2 fac work`.
@@ -380,6 +432,42 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// Per-gate result emitted by `fac check`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacCheckGateResult {
+    /// Gate identifier aligned with gate orchestrator type IDs.
+    pub gate_id: String,
+    /// Human-readable gate label.
+    pub gate_label: String,
+    /// Execution status (`PASS`, `FAIL`, or `SKIPPED`).
+    pub status: String,
+    /// Process exit code (`None` when skipped).
+    pub exit_code: Option<i32>,
+    /// Command line used for the gate.
+    pub command: String,
+    /// Receipt pointer (gate log file path).
+    pub receipt_pointer: String,
+}
+
+/// Deterministic local FAC check response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FacCheckResponse {
+    /// Workspace used for gate execution.
+    pub workspace_root: String,
+    /// Directory containing gate receipt logs.
+    pub receipts_dir: String,
+    /// Whether cgroup v2 was available at runtime.
+    pub cgroup_v2_available: bool,
+    /// Projection context name used by GitHub projection adapter.
+    pub projection_context: String,
+    /// Overall pass/fail verdict.
+    pub passed: bool,
+    /// Gate results in deterministic execution order.
+    pub gates: Vec<FacCheckGateResult>,
+}
+
 // =============================================================================
 // Command Execution
 // =============================================================================
@@ -391,6 +479,7 @@ pub fn run_fac(cmd: &FacCommand) -> u8 {
     let cas_path = resolve_cas_path(cmd.cas_path.as_deref());
 
     match &cmd.subcommand {
+        FacSubcommand::Check(args) => run_check(args, json_output),
         FacSubcommand::Work(args) => match &args.subcommand {
             WorkSubcommand::Status(status_args) => {
                 run_work_status(status_args, &ledger_path, json_output)
@@ -413,6 +502,327 @@ pub fn run_fac(cmd: &FacCommand) -> u8 {
         },
         FacSubcommand::Resume(args) => run_resume(args, &ledger_path, json_output),
     }
+}
+
+/// Execute deterministic local FAC gates (`fac check`).
+fn run_check(args: &CheckArgs, json_output: bool) -> u8 {
+    if args.timeout_seconds == 0 || args.kill_after_seconds == 0 || args.pids_max == 0 {
+        return output_error(
+            json_output,
+            "invalid_limits",
+            "timeout_seconds, kill_after_seconds, and pids_max must be > 0",
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let workspace_root = if args.workspace_root.is_absolute() {
+        args.workspace_root.clone()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&args.workspace_root)
+    };
+
+    if !workspace_root.is_dir() {
+        return output_error(
+            json_output,
+            "invalid_workspace_root",
+            &format!(
+                "workspace_root does not exist or is not a directory: {}",
+                workspace_root.display()
+            ),
+            exit_codes::VALIDATION_ERROR,
+        );
+    }
+
+    let cgroup_v2_available = is_cgroup_v2_available();
+    if !cgroup_v2_available {
+        return output_error(
+            json_output,
+            "cgroup_unavailable",
+            "cgroup v2 is unavailable; FAC local gate execution fails closed",
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let receipts_dir = args.receipts_dir.clone().map_or_else(
+        || {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            workspace_root
+                .join("target")
+                .join("fac_check_receipts")
+                .join(timestamp.to_string())
+        },
+        |dir| {
+            if dir.is_absolute() {
+                dir
+            } else {
+                workspace_root.join(dir)
+            }
+        },
+    );
+
+    if let Err(e) = fs::create_dir_all(&receipts_dir) {
+        return output_error(
+            json_output,
+            "receipts_dir_error",
+            &format!(
+                "failed to create receipts_dir {}: {e}",
+                receipts_dir.display()
+            ),
+            exit_codes::GENERIC_ERROR,
+        );
+    }
+
+    let test_safety_script = workspace_root.join("scripts/ci/test_safety_guard.sh");
+    let bounded_tests_script = workspace_root.join("scripts/ci/run_bounded_tests.sh");
+    let workspace_guard_script = workspace_root.join("scripts/ci/workspace_integrity_guard.sh");
+
+    for required in [
+        &test_safety_script,
+        &bounded_tests_script,
+        &workspace_guard_script,
+    ] {
+        if !required.is_file() {
+            return output_error(
+                json_output,
+                "missing_script",
+                &format!("required FAC check script missing: {}", required.display()),
+                exit_codes::GENERIC_ERROR,
+            );
+        }
+    }
+
+    let projection_context = GitHubAdapterConfig::new("https://api.github.com", "apm2", "apm2")
+        .map_or_else(|_| "apm2/gates".to_string(), |cfg| cfg.context);
+
+    let bounded_runner_cmd = vec![
+        bounded_tests_script.display().to_string(),
+        "--timeout-seconds".to_string(),
+        args.timeout_seconds.to_string(),
+        "--kill-after-seconds".to_string(),
+        args.kill_after_seconds.to_string(),
+        "--memory-max".to_string(),
+        args.memory_max.clone(),
+        "--pids-max".to_string(),
+        args.pids_max.to_string(),
+        "--cpu-quota".to_string(),
+        args.cpu_quota.clone(),
+        "--".to_string(),
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+        "--workspace".to_string(),
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        "ci".to_string(),
+    ];
+
+    let workspace_snapshot = receipts_dir.join("workspace_integrity.snapshot.tsv");
+    let workspace_guard_cmd = vec![
+        workspace_guard_script.display().to_string(),
+        "--snapshot-file".to_string(),
+        workspace_snapshot.display().to_string(),
+        "--".to_string(),
+        bounded_tests_script.display().to_string(),
+        "--timeout-seconds".to_string(),
+        args.timeout_seconds.to_string(),
+        "--kill-after-seconds".to_string(),
+        args.kill_after_seconds.to_string(),
+        "--memory-max".to_string(),
+        args.memory_max.clone(),
+        "--pids-max".to_string(),
+        args.pids_max.to_string(),
+        "--cpu-quota".to_string(),
+        args.cpu_quota.clone(),
+        "--".to_string(),
+        "cargo".to_string(),
+        "nextest".to_string(),
+        "run".to_string(),
+        "-p".to_string(),
+        "apm2-cli".to_string(),
+        "--all-features".to_string(),
+        "--config-file".to_string(),
+        ".config/nextest.toml".to_string(),
+        "--profile".to_string(),
+        "ci".to_string(),
+    ];
+
+    let gate_plans = vec![
+        (
+            GateType::Security,
+            vec![test_safety_script.display().to_string()],
+        ),
+        (GateType::Aat, bounded_runner_cmd),
+        (GateType::Quality, workspace_guard_cmd),
+    ];
+
+    let mut gates = Vec::with_capacity(gate_plans.len());
+    let mut gate_blocked = false;
+
+    for (gate_type, command) in gate_plans {
+        let gate_id = gate_type.as_gate_id().to_string();
+        let gate_label = gate_label(gate_type).to_string();
+        let command_display = format_command(&command);
+        let receipt_path = receipts_dir.join(format!("{gate_id}.log"));
+        let receipt_pointer = receipt_path.display().to_string();
+
+        if gate_blocked {
+            let _ = fs::write(
+                &receipt_path,
+                format!("status=SKIPPED\nreason=previous gate failed\ncommand={command_display}\n"),
+            );
+            gates.push(FacCheckGateResult {
+                gate_id,
+                gate_label,
+                status: "SKIPPED".to_string(),
+                exit_code: None,
+                command: command_display,
+                receipt_pointer,
+            });
+            continue;
+        }
+
+        let execution = execute_gate_command(&workspace_root, &command, &receipt_path);
+        if !execution.success {
+            gate_blocked = true;
+        }
+
+        gates.push(FacCheckGateResult {
+            gate_id,
+            gate_label,
+            status: if execution.success {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            },
+            exit_code: Some(execution.exit_code),
+            command: command_display,
+            receipt_pointer,
+        });
+    }
+
+    let passed = gates.iter().all(|gate| gate.status == "PASS");
+    let response = FacCheckResponse {
+        workspace_root: workspace_root.display().to_string(),
+        receipts_dir: receipts_dir.display().to_string(),
+        cgroup_v2_available,
+        projection_context,
+        passed,
+        gates,
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("FAC Check");
+        println!("  Workspace:          {}", response.workspace_root);
+        println!("  Receipts Dir:       {}", response.receipts_dir);
+        println!("  Cgroup v2:          {}", response.cgroup_v2_available);
+        println!("  Projection Context: {}", response.projection_context);
+        println!(
+            "  Verdict:            {}",
+            if response.passed { "PASS" } else { "FAIL" }
+        );
+        for gate in &response.gates {
+            println!(
+                "  Gate {} ({}) => {} [receipt: {}]",
+                gate.gate_id, gate.gate_label, gate.status, gate.receipt_pointer
+            );
+        }
+    }
+
+    if response.passed {
+        exit_codes::SUCCESS
+    } else {
+        exit_codes::GENERIC_ERROR
+    }
+}
+
+/// Human-readable label for a gate type used by `fac check`.
+const fn gate_label(gate_type: GateType) -> &'static str {
+    match gate_type {
+        GateType::Security => "test-safety-guard",
+        GateType::Aat => "bounded-test-runner",
+        GateType::Quality => "workspace-integrity-guard",
+    }
+}
+
+/// Executed gate command status.
+struct GateCommandExecution {
+    success: bool,
+    exit_code: i32,
+}
+
+/// Runs a gate command and writes a receipt log.
+fn execute_gate_command(
+    workspace_root: &Path,
+    command: &[String],
+    receipt_path: &Path,
+) -> GateCommandExecution {
+    if command.is_empty() {
+        let _ = fs::write(receipt_path, "status=FAIL\nerror=empty command\n");
+        return GateCommandExecution {
+            success: false,
+            exit_code: 127,
+        };
+    }
+
+    let mut log_body = format!("$ {}\n", format_command(command));
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]).current_dir(workspace_root);
+
+    match cmd.output() {
+        Ok(output) => {
+            let exit_code = output.status.code().unwrap_or(1);
+            let _ = writeln!(log_body, "exit_code={exit_code}");
+            log_body.push_str("=== stdout ===\n");
+            log_body.push_str(&String::from_utf8_lossy(&output.stdout));
+            log_body.push_str("\n=== stderr ===\n");
+            log_body.push_str(&String::from_utf8_lossy(&output.stderr));
+            let _ = fs::write(receipt_path, log_body);
+
+            GateCommandExecution {
+                success: output.status.success(),
+                exit_code,
+            }
+        },
+        Err(e) => {
+            log_body.push_str("exit_code=127\n");
+            let _ = writeln!(log_body, "error={e}");
+            let _ = fs::write(receipt_path, log_body);
+            GateCommandExecution {
+                success: false,
+                exit_code: 127,
+            }
+        },
+    }
+}
+
+/// Formats a command vector into a shell-like printable string.
+fn format_command(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|arg| {
+            if arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./:%=".contains(c))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\"'\"'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Resolves the ledger path from explicit path, env var, or default.
@@ -1732,6 +2142,49 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let restored: ResumeResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.restart_action, "RESUME_EPISODE");
+    }
+
+    #[test]
+    fn test_fac_check_response_serialization() {
+        let response = FacCheckResponse {
+            workspace_root: "/tmp/ws".to_string(),
+            receipts_dir: "/tmp/ws/receipts".to_string(),
+            cgroup_v2_available: true,
+            projection_context: "apm2/gates".to_string(),
+            passed: false,
+            gates: vec![FacCheckGateResult {
+                gate_id: "gate-security".to_string(),
+                gate_label: "test-safety-guard".to_string(),
+                status: "FAIL".to_string(),
+                exit_code: Some(1),
+                command: "./scripts/ci/test_safety_guard.sh".to_string(),
+                receipt_pointer: "/tmp/ws/receipts/gate-security.log".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let restored: FacCheckResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.projection_context, "apm2/gates");
+        assert_eq!(restored.gates.len(), 1);
+        assert!(!restored.passed);
+    }
+
+    #[test]
+    fn test_gate_label_mapping() {
+        assert_eq!(gate_label(GateType::Security), "test-safety-guard");
+        assert_eq!(gate_label(GateType::Aat), "bounded-test-runner");
+        assert_eq!(gate_label(GateType::Quality), "workspace-integrity-guard");
+    }
+
+    #[test]
+    fn test_format_command_quotes_args() {
+        let cmd = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "echo hello world".to_string(),
+        ];
+        let rendered = format_command(&cmd);
+        assert_eq!(rendered, "bash -lc 'echo hello world'");
     }
 
     #[test]

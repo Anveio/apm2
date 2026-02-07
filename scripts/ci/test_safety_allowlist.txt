@@ -1,0 +1,18 @@
+# Test Safety Guard allowlist entries.
+#
+# Format:
+#   RULE_ID|path
+#   RULE_ID|path:line
+#   *|path
+#   *|path:line
+#   RULE_ID|re:<bash-regex>
+#
+# Notes:
+# - `RULE_ID` values come from scripts/ci/test_safety_guard.sh.
+# - `*` matches every rule.
+# - Regex entries are matched against:
+#     RULE_ID|path:line|line_text
+# - Keep entries as narrow as possible to preserve fail-closed behavior.
+
+# Security test fixture intentionally embeds a destructive shell payload string.
+TSG001|crates/apm2-daemon/tests/tck_00318_security.rs:19
