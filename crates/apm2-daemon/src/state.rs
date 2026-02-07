@@ -1637,6 +1637,30 @@ mod tests {
     }
 
     #[test]
+    fn production_constructor_binds_deferred_budget_receipt_fields() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+        let gate = state
+            .session_dispatcher()
+            .preactuation_gate_for_test()
+            .expect("production constructor must wire pre-actuation gate");
+
+        let receipt = gate
+            .check(&StopConditions::default(), 0, false, false, 0, 1_000)
+            .expect("production pre-actuation gate should produce receipt");
+
+        assert!(receipt.stop_checked, "stop proof must be bound in receipt");
+        assert!(
+            !receipt.budget_checked,
+            "production constructor wires deferred pre-actuation budget enforcement"
+        );
+        assert!(
+            receipt.budget_enforcement_deferred,
+            "deferred budget enforcement marker must be bound in receipt"
+        );
+    }
+
+    #[test]
     fn update_stop_flags_emergency_stop_denies_subsequent_request_tool() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let conn = Connection::open_in_memory().expect("sqlite in-memory should open");

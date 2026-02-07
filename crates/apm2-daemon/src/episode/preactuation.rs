@@ -59,14 +59,30 @@ pub const DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS: u64 = 30_000;
 /// deny.
 pub(crate) const WVR_0001_EXPIRY_EPOCH_SECS: u64 = 1_775_520_000;
 
+#[must_use]
+const fn wvr_0001_active_for_epoch_secs(now_secs: u64) -> bool {
+    now_secs < WVR_0001_EXPIRY_EPOCH_SECS
+}
+
 /// Returns whether WVR-0001 transitional bypass is currently active.
 #[must_use]
 pub(crate) fn transitional_waiver_active() -> bool {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now_secs < WVR_0001_EXPIRY_EPOCH_SECS
+    let now_secs = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(error) => {
+            // Fail-closed: if wall clock is invalid/regressed we cannot safely
+            // validate waiver expiry.
+            tracing::error!(
+                waiver = "WVR-0001",
+                error = ?error,
+                "system clock error during waiver expiry check; \
+                 treating waiver as expired (fail-closed)"
+            );
+            return false;
+        },
+    };
+
+    wvr_0001_active_for_epoch_secs(now_secs)
 }
 
 // =============================================================================
@@ -780,6 +796,8 @@ impl PreActuationGate {
                 if gov_transitional_resolver {
                     // WVR-0001: Time-bounded transitional governance bypass.
                     if !transitional_waiver_active() {
+                        // Includes fail-closed clock-error path from
+                        // `transitional_waiver_active()`.
                         return Err(PreActuationDenial::StopUncertain);
                     }
                     tracing::warn!(
@@ -804,7 +822,7 @@ impl PreActuationGate {
         // Track whether budget was actually enforced at pre-actuation.
         // A deferred tracker performs availability plumbing but defers
         // enforcement to EpisodeRuntime, so receipts must report
-        // budget_checked=false to avoid proof-semantics drift.
+        // budget_checked=false to avoid proof-semantics drift (WVR-0002).
         let has_real_tracker = self
             .budget_tracker
             .as_ref()
@@ -820,6 +838,7 @@ impl PreActuationGate {
         let budget_enforcement_deferred = !budget_checked;
         if budget_enforcement_deferred {
             tracing::debug!(
+                waiver = "WVR-0002",
                 "pre-actuation budget enforcement deferred; budget proof delegated to episode runtime"
             );
         }
@@ -1069,7 +1088,7 @@ impl std::error::Error for ReplayViolation {}
 ///
 /// # Phase-1 Budget Constraint
 ///
-/// In Phase 1 wiring, production constructors may use
+/// Under WVR-0002, Phase 1 wiring allows production constructors to use
 /// [`BudgetTracker::deferred`](crate::episode::budget_tracker::BudgetTracker::deferred),
 /// which yields `budget_checked=false` and
 /// `budget_enforcement_deferred=true`. This verifier accepts that tuple
@@ -1119,9 +1138,9 @@ impl ReplayVerifier {
                     if !stop_checked {
                         return Err(ReplayViolation::StopNotChecked { index: i });
                     }
-                    // Phase-1: deferred budget enforcement is an accepted
-                    // proof state while real pre-actuation tracker wiring is
-                    // pending (TCK-00346).
+                    // WVR-0002 (bound to TCK-00346): deferred budget
+                    // enforcement is accepted only when explicitly bound via
+                    // `budget_enforcement_deferred=true`.
                     if !budget_checked && !budget_enforcement_deferred {
                         return Err(ReplayViolation::BudgetNotChecked { index: i });
                     }
@@ -2146,17 +2165,33 @@ mod tests {
 
     #[test]
     fn test_gate_uncertain_transitional_mode_waiver_currently_active() {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Intentional expiry tripwire: this test starts failing on or after
-        // 2026-04-07 to force waiver renewal/replacement.
-        assert!(
-            now_secs < WVR_0001_EXPIRY_EPOCH_SECS,
-            "WVR-0001 has expired; transitional bypass must be renewed/replaced"
-        );
-        assert!(transitional_waiver_active());
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(now) => {
+                // Intentional expiry tripwire: this test starts failing on or
+                // after 2026-04-07 to force waiver renewal/replacement.
+                assert!(
+                    wvr_0001_active_for_epoch_secs(now.as_secs()),
+                    "WVR-0001 has expired; transitional bypass must be renewed/replaced"
+                );
+                assert!(transitional_waiver_active());
+            },
+            Err(_) => {
+                // Fail-closed contract: an invalid system clock means waiver
+                // status cannot be validated and must be treated as expired.
+                assert!(!transitional_waiver_active());
+            },
+        }
+    }
+
+    #[test]
+    fn test_wvr_0001_expiry_contract_fails_closed_at_or_after_expiry() {
+        assert!(wvr_0001_active_for_epoch_secs(
+            WVR_0001_EXPIRY_EPOCH_SECS.saturating_sub(1)
+        ));
+        assert!(!wvr_0001_active_for_epoch_secs(WVR_0001_EXPIRY_EPOCH_SECS));
+        assert!(!wvr_0001_active_for_epoch_secs(
+            WVR_0001_EXPIRY_EPOCH_SECS.saturating_add(1)
+        ));
     }
 
     // =========================================================================

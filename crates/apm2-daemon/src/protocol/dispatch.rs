@@ -266,6 +266,29 @@ pub struct WorkTransition<'a> {
     pub timestamp_ns: u64,
 }
 
+/// Parameters for a stop-flag mutation audit event (TCK-00351).
+///
+/// This captures the immutable evidence payload for `UpdateStopFlags` so
+/// emergency/governance stop mutations are queryable from the ledger.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // Captures explicit before/after stop-flag state for audit evidence.
+pub struct StopFlagsMutation<'a> {
+    /// Actor identity derived from peer credentials.
+    pub actor_id: &'a str,
+    /// Emergency stop flag value before mutation.
+    pub emergency_stop_previous: bool,
+    /// Emergency stop flag value after mutation.
+    pub emergency_stop_current: bool,
+    /// Governance stop flag value before mutation.
+    pub governance_stop_previous: bool,
+    /// Governance stop flag value after mutation.
+    pub governance_stop_current: bool,
+    /// HTF-compliant timestamp in nanoseconds since epoch.
+    pub timestamp_ns: u64,
+    /// Request-scoped context (connection identity + requested fields).
+    pub request_context: &'a serde_json::Value,
+}
+
 /// Trait for emitting signed events to the ledger.
 ///
 /// Per TCK-00253 acceptance criteria:
@@ -360,6 +383,23 @@ pub trait LedgerEventEmitter: Send + Sync {
         payload: &[u8],
         actor_id: &str,
         timestamp_ns: u64,
+    ) -> Result<SignedLedgerEvent, LedgerEventError>;
+
+    /// Returns whether emitted events are durably persisted.
+    ///
+    /// `false` indicates in-memory/test-only emitters where audit evidence
+    /// does not survive process restart.
+    fn has_durable_storage(&self) -> bool {
+        true
+    }
+
+    /// Emits a signed `StopFlagsMutated` event to the ledger (TCK-00351).
+    ///
+    /// This records runtime stop-flag mutations performed by the privileged
+    /// `UpdateStopFlags` endpoint.
+    fn emit_stop_flags_mutated(
+        &self,
+        mutation: &StopFlagsMutation<'_>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a signed `DefectRecorded` event to the ledger (TCK-00307).
@@ -859,6 +899,12 @@ pub const WORK_TRANSITIONED_DOMAIN_PREFIX: &[u8] = b"apm2.event.work_transitione
 /// This prefix is for ledger-level JCS-canonicalized JSON events.
 pub const SESSION_TERMINATED_LEDGER_DOMAIN_PREFIX: &[u8] = b"apm2.event.session_terminated_ledger:";
 
+/// Domain separation prefix for `StopFlagsMutated` ledger events (TCK-00351).
+pub const STOP_FLAGS_MUTATED_DOMAIN_PREFIX: &[u8] = b"apm2.event.stop_flags_mutated:";
+
+/// Ledger indexing key for daemon stop-flag mutation events.
+pub const STOP_FLAGS_MUTATED_WORK_ID: &str = "daemon.stop_flags";
+
 /// Domain separation prefix for `ChangeSetPublished` ledger events (TCK-00394).
 ///
 /// Per RFC-0017 DD-006: domain prefixes prevent cross-context replay.
@@ -1287,6 +1333,96 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             event_type = %event_type,
             actor_id = %actor_id,
             "SessionEvent signed and persisted"
+        );
+
+        Ok(signed_event)
+    }
+
+    fn has_durable_storage(&self) -> bool {
+        false
+    }
+
+    fn emit_stop_flags_mutated(
+        &self,
+        mutation: &StopFlagsMutation<'_>,
+    ) -> Result<SignedLedgerEvent, LedgerEventError> {
+        use ed25519_dalek::Signer;
+
+        let event_id = format!("EVT-{}", uuid::Uuid::new_v4());
+
+        let payload_json = serde_json::json!({
+            "event_type": "stop_flags_mutated",
+            "actor_id": mutation.actor_id,
+            "emergency_stop_previous": mutation.emergency_stop_previous,
+            "emergency_stop_current": mutation.emergency_stop_current,
+            "governance_stop_previous": mutation.governance_stop_previous,
+            "governance_stop_current": mutation.governance_stop_current,
+            "request_context": mutation.request_context,
+            "timestamp_ns": mutation.timestamp_ns,
+        });
+
+        let payload_string = payload_json.to_string();
+        let canonical_payload =
+            canonicalize_json(&payload_string).map_err(|e| LedgerEventError::SigningFailed {
+                message: format!("JCS canonicalization failed: {e}"),
+            })?;
+        let payload_bytes = canonical_payload.as_bytes().to_vec();
+
+        let mut canonical_bytes =
+            Vec::with_capacity(STOP_FLAGS_MUTATED_DOMAIN_PREFIX.len() + payload_bytes.len());
+        canonical_bytes.extend_from_slice(STOP_FLAGS_MUTATED_DOMAIN_PREFIX);
+        canonical_bytes.extend_from_slice(&payload_bytes);
+
+        let signature = self.signing_key.sign(&canonical_bytes);
+
+        let signed_event = SignedLedgerEvent {
+            event_id: event_id.clone(),
+            event_type: "stop_flags_mutated".to_string(),
+            work_id: STOP_FLAGS_MUTATED_WORK_ID.to_string(),
+            actor_id: mutation.actor_id.to_string(),
+            payload: payload_bytes,
+            signature: signature.to_bytes().to_vec(),
+            timestamp_ns: mutation.timestamp_ns,
+        };
+
+        {
+            let mut guard = self.events.write().expect("lock poisoned");
+            let mut events_by_work = self.events_by_work_id.write().expect("lock poisoned");
+            let (order, events) = &mut *guard;
+
+            while events.len() >= MAX_LEDGER_EVENTS {
+                if let Some(oldest_key) = order.first().cloned() {
+                    order.remove(0);
+                    if let Some(evicted_event) = events.remove(&oldest_key) {
+                        if let Some(work_id_events) = events_by_work.get_mut(&evicted_event.work_id)
+                        {
+                            work_id_events.retain(|id| id != &oldest_key);
+                            if work_id_events.is_empty() {
+                                events_by_work.remove(&evicted_event.work_id);
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            order.push(event_id.clone());
+            events.insert(event_id.clone(), signed_event.clone());
+            events_by_work
+                .entry(STOP_FLAGS_MUTATED_WORK_ID.to_string())
+                .or_default()
+                .push(event_id);
+        }
+
+        info!(
+            event_id = %signed_event.event_id,
+            actor_id = %mutation.actor_id,
+            emergency_stop_previous = mutation.emergency_stop_previous,
+            emergency_stop_current = mutation.emergency_stop_current,
+            governance_stop_previous = mutation.governance_stop_previous,
+            governance_stop_current = mutation.governance_stop_current,
+            "StopFlagsMutated event signed and persisted"
         );
 
         Ok(signed_event)
@@ -6841,6 +6977,13 @@ impl PrivilegedDispatcher {
     /// Handles `UpdateStopFlags` requests (IPC-PRIV-018, TCK-00351).
     ///
     /// Mutates the shared runtime stop flags used by pre-actuation gating.
+    ///
+    /// # Audit Trail
+    ///
+    /// After mutation, this emits a `stop_flags_mutated` ledger event on a
+    /// best-effort basis. Emission failures are logged but do NOT roll back
+    /// the stop mutation. The stop mutation is the safety-critical path and
+    /// must take effect even when ledger infrastructure is unavailable.
     fn handle_update_stop_flags(
         &self,
         payload: &[u8],
@@ -6893,6 +7036,61 @@ impl PrivilegedDispatcher {
             governance_stop_current = governance_stop_active,
             "UpdateStopFlags applied"
         );
+
+        // Best-effort audit evidence emission. Never roll back the stop
+        // mutation based on ledger availability.
+        if !self.event_emitter.has_durable_storage() {
+            warn!(
+                actor_id = %actor_id,
+                "UpdateStopFlags audit trail is in-memory only; event durability unavailable"
+            );
+        }
+
+        match self.get_htf_timestamp_ns() {
+            Ok(timestamp_ns) => {
+                let request_context = serde_json::json!({
+                    "endpoint": "UpdateStopFlags",
+                    "connection_id": ctx.connection_id(),
+                    "connection_phase": format!("{:?}", ctx.phase()),
+                    "peer_uid": peer.uid,
+                    "peer_gid": peer.gid,
+                    "peer_pid": peer.pid,
+                    "requested_updates": {
+                        "emergency_stop_active": request.emergency_stop_active,
+                        "governance_stop_active": request.governance_stop_active,
+                    },
+                });
+
+                let mutation = StopFlagsMutation {
+                    actor_id: actor_id.as_str(),
+                    emergency_stop_previous: prev_emergency,
+                    emergency_stop_current: emergency_stop_active,
+                    governance_stop_previous: prev_governance,
+                    governance_stop_current: governance_stop_active,
+                    timestamp_ns,
+                    request_context: &request_context,
+                };
+
+                if let Err(error) = self.event_emitter.emit_stop_flags_mutated(&mutation) {
+                    warn!(
+                        actor_id = %actor_id,
+                        error = %error,
+                        emergency_stop_current = emergency_stop_active,
+                        governance_stop_current = governance_stop_active,
+                        "UpdateStopFlags mutation applied but ledger audit emission failed"
+                    );
+                }
+            },
+            Err(error) => {
+                warn!(
+                    actor_id = %actor_id,
+                    error = %error,
+                    emergency_stop_current = emergency_stop_active,
+                    governance_stop_current = governance_stop_active,
+                    "UpdateStopFlags mutation applied but audit timestamp acquisition failed"
+                );
+            },
+        }
 
         Ok(PrivilegedResponse::UpdateStopFlags(
             UpdateStopFlagsResponse {
@@ -10616,6 +10814,36 @@ mod tests {
                 other => panic!("expected UpdateStopFlags response, got {other:?}"),
             }
             assert!(authority.emergency_stop_active());
+
+            let events = dispatcher
+                .event_emitter()
+                .get_events_by_work_id(STOP_FLAGS_MUTATED_WORK_ID);
+            assert_eq!(events.len(), 1, "expected one stop-flags audit event");
+            let event = &events[0];
+            assert_eq!(event.event_type, "stop_flags_mutated");
+
+            let payload: serde_json::Value =
+                serde_json::from_slice(&event.payload).expect("payload should be valid JSON");
+            assert_eq!(
+                payload["actor_id"],
+                derive_actor_id(&PeerCredentials {
+                    uid: 1000,
+                    gid: 1000,
+                    pid: Some(12345),
+                })
+            );
+            assert_eq!(payload["emergency_stop_previous"], false);
+            assert_eq!(payload["emergency_stop_current"], true);
+            assert_eq!(payload["governance_stop_previous"], false);
+            assert_eq!(payload["governance_stop_current"], false);
+            assert_eq!(
+                payload["request_context"]["endpoint"], "UpdateStopFlags",
+                "request context must include endpoint"
+            );
+            assert_eq!(
+                payload["request_context"]["requested_updates"]["emergency_stop_active"],
+                true
+            );
         }
 
         #[test]

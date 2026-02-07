@@ -1002,6 +1002,14 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         self
     }
 
+    /// Returns the configured pre-actuation gate (tests only).
+    #[cfg(test)]
+    pub const fn preactuation_gate_for_test(
+        &self,
+    ) -> Option<&Arc<crate::episode::preactuation::PreActuationGate>> {
+        self.preactuation_gate.as_ref()
+    }
+
     /// Sets the stop authority for authoritative stop-state reads
     /// (TCK-00351).
     ///
