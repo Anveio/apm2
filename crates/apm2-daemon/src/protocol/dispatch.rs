@@ -7630,6 +7630,18 @@ impl PrivilegedDispatcher {
             ));
         }
 
+        // REQ-0010: Identity-bearing authoritative requests MUST carry
+        // proof-carrying pointers.
+        if request.identity_proof_hash.len() != 32 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "identity_proof_hash must be exactly 32 bytes, got {}",
+                    request.identity_proof_hash.len()
+                ),
+            ));
+        }
+
         // Validate changeset_digest is exactly 32 bytes
         if request.changeset_digest.len() != 32 {
             return Ok(PrivilegedResponse::error(
@@ -8810,6 +8822,18 @@ impl PrivilegedDispatcher {
             return Ok(PrivilegedResponse::error(
                 PrivilegedErrorCode::CapabilityRequestRejected,
                 format!("delegatee_actor_id exceeds maximum length of {MAX_ID_LENGTH} bytes"),
+            ));
+        }
+
+        // REQ-0010: Identity-bearing authoritative requests MUST carry
+        // proof-carrying pointers.
+        if request.identity_proof_hash.len() != 32 {
+            return Ok(PrivilegedResponse::error(
+                PrivilegedErrorCode::CapabilityRequestRejected,
+                format!(
+                    "identity_proof_hash must be exactly 32 bytes, got {}",
+                    request.identity_proof_hash.len()
+                ),
             ));
         }
 
@@ -17909,6 +17933,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -17940,6 +17965,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1, // APPLY_FAILED
                 blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -17983,6 +18009,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18029,6 +18056,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18062,6 +18090,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18096,6 +18125,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18135,6 +18165,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18165,6 +18196,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18195,6 +18227,7 @@ mod tests {
                 verdict: 0, // UNSPECIFIED
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18225,6 +18258,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18235,6 +18269,38 @@ mod tests {
                         err.message
                             .contains("changeset_digest must be exactly 32 bytes"),
                         "Expected changeset_digest length error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_ingest_review_receipt_missing_identity_proof_hash_rejected() {
+            let (dispatcher, ctx) =
+                setup_dispatcher_with_lease("lease-006b", "W-006b", "gate-006b", "reviewer");
+
+            let request = IngestReviewReceiptRequest {
+                lease_id: "lease-006b".to_string(),
+                receipt_id: "RR-006b".to_string(),
+                reviewer_actor_id: "reviewer".to_string(),
+                changeset_digest: vec![0x42; 32],
+                artifact_bundle_hash: vec![0x33; 32],
+                verdict: ReviewReceiptVerdict::Approve.into(),
+                blocked_reason_code: 0,
+                blocked_log_hash: vec![],
+                identity_proof_hash: vec![],
+            };
+            let frame = encode_ingest_review_receipt_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("identity_proof_hash must be exactly 32 bytes"),
+                        "Expected identity_proof_hash error, got: {}",
                         err.message
                     );
                 },
@@ -18256,6 +18322,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 1,
                 blocked_log_hash: vec![], // Missing log hash for BLOCKED
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18287,6 +18354,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Blocked.into(),
                 blocked_reason_code: 0, // Zero is invalid for BLOCKED
                 blocked_log_hash: vec![0x55; 32],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18325,6 +18393,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18360,6 +18429,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18397,6 +18467,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18453,6 +18524,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18502,6 +18574,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18609,6 +18682,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18656,6 +18730,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18700,6 +18775,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18744,6 +18820,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18800,6 +18877,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18842,6 +18920,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -18889,6 +18968,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
 
             // First submission should succeed
@@ -19022,6 +19102,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19067,6 +19148,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-002".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19105,6 +19187,7 @@ mod tests {
                 requested_expiry_ns: 3_000_000_000_000, /* Exceeds parent's expires_at (3_000_000
                                                          * ms) */
                 sublease_id: "sublease-overflow".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19140,6 +19223,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-003".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19175,6 +19259,7 @@ mod tests {
                 delegatee_actor_id: String::new(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-004".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19188,6 +19273,43 @@ mod tests {
                     );
                 },
                 other => panic!("Expected error for empty delegatee_actor_id, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delegate_sublease_missing_identity_proof_hash_rejected() {
+            let signer = Arc::new(apm2_core::crypto::Signer::generate());
+            let orch = Arc::new(crate::gate::GateOrchestrator::new(
+                crate::gate::GateOrchestratorConfig::default(),
+                signer,
+            ));
+            let dispatcher = PrivilegedDispatcher::new().with_gate_orchestrator(orch);
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = DelegateSubleaseRequest {
+                parent_lease_id: "parent-lease-001".to_string(),
+                delegatee_actor_id: "child-executor-001".to_string(),
+                requested_expiry_ns: 1_900_000_000_000,
+                sublease_id: "sublease-no-proof".to_string(),
+                identity_proof_hash: vec![],
+            };
+            let frame = encode_delegate_sublease_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert!(
+                        err.message
+                            .contains("identity_proof_hash must be exactly 32 bytes"),
+                        "Expected identity_proof_hash error, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("Expected error for missing identity proof hash, got {other:?}"),
             }
         }
 
@@ -19206,6 +19328,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-005".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19245,6 +19368,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-006".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19308,6 +19432,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-authz".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19348,6 +19473,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-no-creds".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19417,6 +19543,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-evt".to_string(),
                 requested_expiry_ns: 1_900_000_000_000, // ns
                 sublease_id: "sublease-evt-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19461,6 +19588,7 @@ mod tests {
                 delegatee_actor_id: "child-executor-dup".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-dup-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -19573,6 +19701,7 @@ mod tests {
                 delegatee_actor_id: "child-001".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "shared-sublease-id".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame1 = encode_delegate_sublease_request(&req1);
             let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
@@ -19588,6 +19717,7 @@ mod tests {
                 delegatee_actor_id: "child-002".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "shared-sublease-id".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame2 = encode_delegate_sublease_request(&req2);
             let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -19623,6 +19753,7 @@ mod tests {
                 delegatee_actor_id: "child-exp".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-exp-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame1 = encode_delegate_sublease_request(&req1);
             let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
@@ -19637,6 +19768,7 @@ mod tests {
                 delegatee_actor_id: "child-exp".to_string(),
                 requested_expiry_ns: 1_800_000_000_000, // Different expiry
                 sublease_id: "sublease-exp-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame2 = encode_delegate_sublease_request(&req2);
             let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -19732,6 +19864,7 @@ mod tests {
                 delegatee_actor_id: "child-lin".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-lineage-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame1 = encode_delegate_sublease_request(&req1);
             let resp1 = dispatcher.dispatch(&frame1, &ctx).unwrap();
@@ -19750,6 +19883,7 @@ mod tests {
                 delegatee_actor_id: "child-lin".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-lineage-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame2 = encode_delegate_sublease_request(&req2);
             let resp2 = dispatcher.dispatch(&frame2, &ctx).unwrap();
@@ -19930,6 +20064,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -20003,6 +20138,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_ingest_review_receipt_request(&request);
 
@@ -20072,6 +20208,7 @@ mod tests {
                 delegatee_actor_id: "child-sql-exec".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-sql-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -20113,6 +20250,7 @@ mod tests {
                 delegatee_actor_id: "child-sql".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-sql-invalid".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -20205,6 +20343,7 @@ mod tests {
                 delegatee_actor_id: "child-prod-exec".to_string(),
                 requested_expiry_ns: 1_900_000_000_000,
                 sublease_id: "sublease-prod-001".to_string(),
+                identity_proof_hash: vec![0x99; 32],
             };
             let frame = encode_delegate_sublease_request(&request);
 
@@ -20278,6 +20417,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let review_frame = encode_ingest_review_receipt_request(&review_request);
 
@@ -20395,6 +20535,7 @@ mod tests {
                 verdict: ReviewReceiptVerdict::Approve.into(),
                 blocked_reason_code: 0,
                 blocked_log_hash: vec![],
+                identity_proof_hash: vec![0x99; 32],
             };
             let review_frame = encode_ingest_review_receipt_request(&review_request);
 
