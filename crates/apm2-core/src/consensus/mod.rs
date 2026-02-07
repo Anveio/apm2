@@ -68,9 +68,11 @@
 pub mod anti_entropy;
 pub mod bft;
 pub mod bft_machine;
+pub mod bisimulation;
 pub mod crdt;
 pub mod discovery;
 pub mod equivocation;
+pub mod functor;
 pub mod genesis;
 pub mod handlers;
 pub mod merkle;
@@ -81,6 +83,7 @@ pub mod relay;
 pub mod replication;
 pub mod tunnel;
 
+// Bisimulation gate for recursive holon composition (TCK-00367)
 // BFT consensus (Chained HotStuff)
 // Anti-entropy and Merkle tree (TCK-00191)
 pub use anti_entropy::{
@@ -102,6 +105,12 @@ pub use bft_machine::{
     BftAction, BftEvent, BftMachine, MAX_BUFFERED_MESSAGES, MAX_PENDING_ACTIONS, MSG_BFT_NEW_VIEW,
     MSG_BFT_PROPOSAL, MSG_BFT_QC, MSG_BFT_VOTE,
 };
+pub use bisimulation::{
+    BisimulationChecker, BisimulationError, BisimulationResult, BlockingDefect, DepthCheckResult,
+    FlatteningRelation, HsiOperation, MAX_COUNTEREXAMPLE_LENGTH, MAX_RECURSION_DEPTH,
+    MAX_TOTAL_STATES, MAX_TRANSITIONS_PER_STATE, MismatchDirection, ObservableSemantics,
+    PromotionGate, PromotionGateResult, StopKind, TraceStep, Transition, build_linear_composition,
+};
 // HLC-based CRDT merge operators (TCK-00197)
 pub use crdt::{
     ConflictRecord, CrdtMergeError, GCounter, Hlc, HlcWithNodeId, LwwRegister,
@@ -117,6 +126,12 @@ pub use equivocation::{
     ConflictingProposal, DOMAIN_PREFIX_EQUIVOCATION, EquivocationCheckResult, EquivocationDetector,
     EquivocationError, EquivocationEvidence, EquivocationType, MAX_CACHED_PROPOSALS,
     MAX_PROPOSAL_AGE_SECS,
+};
+// Functorial observation law checks for admitted rewrites (TCK-00368)
+pub use functor::{
+    AdmittedRewriteCatalog, FunctorError, FunctorLawChecker, FunctorLawResult, MAX_CATALOG_RULES,
+    MAX_OBSERVATION_POINTS, MAX_PROOF_REF_LEN, MAX_RULE_ID_LEN, ProofStatus, RewriteBlockingDefect,
+    RewriteDefectKind, RewriteGateResult, RewritePromotionGate, RewriteRule,
 };
 pub use genesis::{
     Genesis, GenesisConfig, GenesisConfigBuilder, GenesisError, GenesisValidator, InvitationToken,
