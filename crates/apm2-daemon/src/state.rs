@@ -45,8 +45,8 @@ use crate::governance::{
 use crate::htf::{ClockConfig, HolonicClock};
 use crate::ledger::{SqliteLeaseValidator, SqliteLedgerEventEmitter, SqliteWorkRegistry};
 use crate::metrics::SharedMetricsRegistry;
-use crate::protocol::dispatch::PrivilegedDispatcher;
-use crate::protocol::messages::DecodeConfig;
+use crate::protocol::dispatch::{PolicyResolutionError, PolicyResolver, PrivilegedDispatcher};
+use crate::protocol::messages::{DecodeConfig, WorkRole};
 use crate::protocol::resource_governance::{SharedSubscriptionRegistry, SubscriptionRegistry};
 use crate::protocol::session_dispatch::{
     InMemoryManifestStore, ManifestStore, SessionDispatcher, V1ManifestStore,
@@ -860,12 +860,49 @@ impl DispatcherState {
             std::mem::drop(handle.spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+                    // Active governance health probe:
+                    // resolve policy through the governance resolver on each
+                    // poll cycle, then evaluate freshness using the updated
+                    // watermark.
+                    Self::run_governance_health_probe(&monitor_for_task);
                     monitor_for_task.check_freshness();
                 }
             }));
         }
 
         monitor
+    }
+
+    /// Executes a lightweight active governance health probe.
+    ///
+    /// This probe records monitor state using strict classification:
+    /// - `record_success()` for successful policy resolution
+    /// - `record_failure()` only for governance transport/service failures
+    /// - local resolver contract errors are ignored here (freshness falls back
+    ///   to elapsed-time checks and existing watermark state)
+    fn run_governance_health_probe(monitor: &GovernanceFreshnessMonitor) {
+        let resolver = GovernancePolicyResolver::new();
+        let probe_result = resolver.resolve_for_claim(
+            "governance-health-probe",
+            WorkRole::Coordinator,
+            "governance-freshness-monitor",
+        );
+
+        match probe_result {
+            Ok(_) => monitor.record_success(),
+            Err(PolicyResolutionError::GovernanceFailed { .. }) => {
+                // This qualifies as a governance probe failure because the
+                // resolver reported a governance-side service failure.
+                monitor.record_failure();
+            },
+            Err(
+                PolicyResolutionError::NotFound { .. }
+                | PolicyResolutionError::InvalidCredential { .. },
+            ) => {
+                // Local resolver contract/input errors are not governance
+                // transport failures and must not force a failure sample.
+            },
+        }
     }
 
     /// Sets the daemon state for process management (TCK-00342).
@@ -1326,7 +1363,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn production_wiring_governance_health_then_failure_transitions_to_deny() {
+    async fn production_wiring_periodic_probe_recovers_governance_uncertainty() {
         let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
         let state = DispatcherState::with_persistence(session_registry, None, None, None);
 
@@ -1341,53 +1378,74 @@ mod tests {
                 .expect("production constructor must wire stop authority"),
         );
 
-        monitor.record_success();
-        tokio::time::sleep(std::time::Duration::from_millis(
-            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
-        ))
-        .await;
-        monitor.last_success_ms().store(0, Ordering::Release);
-        tokio::time::sleep(std::time::Duration::from_millis(
-            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
-        ))
-        .await;
+        monitor.record_failure();
         assert!(
             authority.governance_uncertain(),
-            "periodic freshness checks must mark stale governance as uncertain"
+            "explicit governance failure should set uncertainty"
         );
 
-        monitor.record_success();
         tokio::time::sleep(std::time::Duration::from_millis(
             GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
         ))
         .await;
         assert!(
             !authority.governance_uncertain(),
-            "healthy governance should keep uncertainty cleared"
+            "periodic active governance probe should clear uncertainty after a successful probe"
+        );
+    }
+
+    #[test]
+    fn production_wiring_claim_work_success_refreshes_governance_monitor() {
+        let session_registry: Arc<dyn SessionRegistry> = Arc::new(InMemorySessionRegistry::new());
+        let state = DispatcherState::with_persistence(session_registry, None, None, None);
+
+        let monitor = Arc::clone(
+            state
+                .governance_freshness_monitor()
+                .expect("production constructor must wire governance freshness monitor"),
+        );
+        let authority = Arc::clone(
+            state
+                .stop_authority()
+                .expect("production constructor must wire stop authority"),
         );
 
+        // Force uncertain state, then prove ClaimWork success refreshes health.
         monitor.record_failure();
-        tokio::time::sleep(std::time::Duration::from_millis(
-            GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS.saturating_mul(2),
-        ))
-        .await;
         assert!(
             authority.governance_uncertain(),
-            "governance failure should transition uncertainty to deny state"
+            "failure sample should set governance uncertainty"
         );
 
-        let gate = PreActuationGate::production_gate(Arc::clone(&authority), None);
-        let denial = gate
-            .check(
-                &StopConditions::default(),
-                0,
-                false,
-                false,
-                DEFAULT_STOP_UNCERTAINTY_DEADLINE_MS,
-                1_000,
-            )
-            .expect_err("uncertain governance should deny after deadline");
-        assert!(matches!(denial, PreActuationDenial::StopUncertain));
+        let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: Some(12345),
+        }));
+        let claim_request = ClaimWorkRequest {
+            actor_id: "monitor-refresh-actor".to_string(),
+            role: WorkRole::Implementer.into(),
+            credential_signature: vec![1, 2, 3],
+            nonce: vec![4, 5, 6],
+        };
+        let claim_frame = encode_claim_work_request(&claim_request);
+        let claim_response = state
+            .privileged_dispatcher()
+            .dispatch(&claim_frame, &ctx)
+            .expect("ClaimWork dispatch should succeed");
+        assert!(
+            matches!(claim_response, PrivilegedResponse::ClaimWork(_)),
+            "ClaimWork should complete successfully to refresh governance health"
+        );
+
+        assert!(
+            !authority.governance_uncertain(),
+            "ClaimWork success must refresh governance monitor and clear uncertainty"
+        );
+        assert!(
+            monitor.last_success_ms().load(Ordering::Acquire) > 0,
+            "ClaimWork success should update the governance freshness watermark"
+        );
     }
 
     #[test]

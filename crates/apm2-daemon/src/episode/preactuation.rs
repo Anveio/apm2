@@ -965,14 +965,13 @@ impl std::error::Error for ReplayViolation {}
 ///
 /// # Production Integration Status
 ///
-/// TODO(TCK-00356): Integrate `ReplayVerifier::verify` into the production
-/// replay/evidence validation pipeline.  Currently the verifier is only
-/// exercised in unit and integration tests (this module's `tests` section).
-/// The production replay pipeline does not exist yet -- when it is
-/// implemented (TCK-00356: Replay Evidence Pipeline), this verifier MUST
-/// be invoked on every replayed episode trace before the trace is accepted
-/// as valid evidence.  The verifier logic is complete and fully tested;
-/// only the production call site is missing.
+/// Production `RequestTool` handling invokes `ReplayVerifier::verify` in
+/// `SessionDispatcher::handle_broker_decision` before accepting an `Allow`
+/// actuation response.
+///
+/// TODO(TCK-00356, RFC-0020 §3.1.1): Extend this from per-request production
+/// verification to the full replay/evidence ingestion pipeline so multi-entry
+/// historical traces are verified before evidence acceptance.
 pub struct ReplayVerifier;
 
 impl ReplayVerifier {

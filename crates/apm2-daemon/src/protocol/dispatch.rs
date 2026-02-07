@@ -4127,7 +4127,8 @@ pub struct PrivilegedDispatcher {
     /// Governance freshness monitor wired from production `DispatcherState`.
     ///
     /// Successful governance-backed operations call `record_success()`.
-    /// Governance probe/policy lookup failures call `record_failure()`.
+    /// Only governance transport/communication failures call
+    /// `record_failure()`.
     governance_freshness_monitor: Option<Arc<GovernanceFreshnessMonitor>>,
 }
 
@@ -4616,6 +4617,10 @@ impl PrivilegedDispatcher {
     }
 
     /// Records a governance probe failure when monitoring is wired.
+    ///
+    /// IMPORTANT: Callers must use this only for real governance service
+    /// transport/communication failures, never for local validation/state
+    /// precondition errors.
     fn record_governance_probe_failure(&self) {
         if let Some(ref monitor) = self.governance_freshness_monitor {
             monitor.record_failure();
@@ -5057,7 +5062,12 @@ impl PrivilegedDispatcher {
         {
             Ok(resolution) => resolution,
             Err(e) => {
-                self.record_governance_probe_failure();
+                if matches!(&e, PolicyResolutionError::GovernanceFailed { .. }) {
+                    // Governance resolver reported a governance-side failure
+                    // (transport/communication/service error), so this
+                    // qualifies as a governance probe failure signal.
+                    self.record_governance_probe_failure();
+                }
                 warn!(error = %e, "Policy resolution failed");
                 // Return application-level error, not protocol error
                 // Policy resolution failures are logic errors, not serialization errors
@@ -5067,6 +5077,10 @@ impl PrivilegedDispatcher {
                 ));
             },
         };
+
+        // Successful policy resolution is a direct governance-path health
+        // signal, so refresh the governance probe watermark.
+        self.record_governance_probe_success();
 
         // SEC-SCP-FAC-0020: lease_id is redacted from logs to prevent capability
         // leakage
@@ -5594,7 +5608,8 @@ impl PrivilegedDispatcher {
         // Fail-closed: spawn is only allowed if a valid policy resolution exists
         // for the work_id. This is established during ClaimWork.
         let Some(claim) = self.work_registry.get_claim(&request.work_id) else {
-            self.record_governance_probe_failure();
+            // Local precondition failure (no prior ClaimWork / missing local
+            // claim state); this is NOT a governance transport failure.
             warn!(
                 work_id = %request.work_id,
                 "SpawnEpisode rejected: policy resolution not found for work_id"
@@ -6642,7 +6657,8 @@ impl PrivilegedDispatcher {
                 ));
             }
         } else {
-            self.record_governance_probe_failure();
+            // Local state-precondition failure (missing in-process work claim),
+            // not a governance transport/communication failure.
             warn!(
                 session_id = %request.session_id,
                 work_id = %session.work_id,
@@ -10313,6 +10329,115 @@ mod tests {
     /// Uses /tmp which exists on all Unix systems.
     fn test_workspace_root() -> String {
         "/tmp".to_string()
+    }
+
+    mod governance_probe_failure_classification {
+        use super::*;
+        use crate::episode::preactuation::StopAuthority;
+        use crate::governance::GovernanceFreshnessConfig;
+
+        #[test]
+        fn spawn_missing_claim_does_not_record_governance_failure() {
+            let authority = Arc::new(StopAuthority::new());
+            let monitor = Arc::new(GovernanceFreshnessMonitor::new(
+                Arc::clone(&authority),
+                GovernanceFreshnessConfig::default(),
+            ));
+            monitor.record_success();
+
+            let dispatcher =
+                PrivilegedDispatcher::new().with_governance_freshness_monitor(Arc::clone(&monitor));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            let request = SpawnEpisodeRequest {
+                workspace_root: test_workspace_root(),
+                work_id: "W-NO-CLAIM".to_string(),
+                role: WorkRole::Implementer.into(),
+                lease_id: Some("L-NO-CLAIM".to_string()),
+                max_episodes: None,
+                escalation_predicate: None,
+            };
+            let frame = encode_spawn_episode_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::PolicyResolutionMissing as i32
+                    );
+                },
+                other => panic!("expected PolicyResolutionMissing error, got: {other:?}"),
+            }
+
+            assert!(
+                !authority.governance_uncertain(),
+                "local missing-claim path must not set governance uncertainty"
+            );
+        }
+
+        #[test]
+        fn issue_capability_missing_claim_does_not_record_governance_failure() {
+            let authority = Arc::new(StopAuthority::new());
+            let monitor = Arc::new(GovernanceFreshnessMonitor::new(
+                Arc::clone(&authority),
+                GovernanceFreshnessConfig::default(),
+            ));
+            monitor.record_success();
+
+            let dispatcher =
+                PrivilegedDispatcher::new().with_governance_freshness_monitor(Arc::clone(&monitor));
+            let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
+                uid: 1000,
+                gid: 1000,
+                pid: Some(12345),
+            }));
+
+            dispatcher
+                .session_registry
+                .register_session(crate::session::SessionState {
+                    session_id: "S-NO-CLAIM".to_string(),
+                    work_id: "W-NO-CLAIM".to_string(),
+                    role: WorkRole::Implementer.into(),
+                    lease_id: "L-NO-CLAIM".to_string(),
+                    ephemeral_handle: "EH-NO-CLAIM".to_string(),
+                    policy_resolved_ref: String::new(),
+                    capability_manifest_hash: vec![],
+                    episode_id: None,
+                })
+                .expect("session registration should succeed");
+
+            let request = IssueCapabilityRequest {
+                session_id: "S-NO-CLAIM".to_string(),
+                capability_request: Some(super::super::super::messages::CapabilityRequest {
+                    tool_class: "read".to_string(),
+                    read_patterns: vec!["**/*".to_string()],
+                    write_patterns: vec![],
+                    duration_secs: 60,
+                }),
+            };
+            let frame = encode_issue_capability_request(&request);
+
+            let response = dispatcher.dispatch(&frame, &ctx).unwrap();
+            match response {
+                PrivilegedResponse::Error(err) => {
+                    assert_eq!(
+                        err.code,
+                        PrivilegedErrorCode::CapabilityRequestRejected as i32
+                    );
+                },
+                other => panic!("expected CapabilityRequestRejected error, got: {other:?}"),
+            }
+
+            assert!(
+                !authority.governance_uncertain(),
+                "local missing-claim path must not set governance uncertainty"
+            );
+        }
     }
 
     // ========================================================================

@@ -89,6 +89,9 @@ use crate::episode::capability::StubManifestLoader;
 use crate::episode::decision::{BrokerToolRequest, DedupeKey, ToolDecision};
 use crate::episode::envelope::RiskTier;
 use crate::episode::executor::ContentAddressedStore;
+use crate::episode::preactuation::{
+    PreActuationReceipt, ReplayEntry, ReplayEntryKind, ReplayVerifier,
+};
 use crate::episode::registry::TerminationReason;
 use crate::episode::{CapabilityManifest, EpisodeId, EpisodeRuntime, SharedToolBroker, ToolClass};
 use crate::gate::{GateOrchestrator, SessionTerminatedInfo};
@@ -1837,6 +1840,9 @@ impl<M: ManifestStore> SessionDispatcher<M> {
     /// the pre-actuation check. Its fields (`stop_checked`, `budget_checked`,
     /// `timestamp_ns`) are propagated into the `RequestToolResponse` instead
     /// of hardcoded `true` / later clock sample.
+    ///
+    /// Production replay ordering verification runs on `Allow` decisions before
+    /// actuation output is accepted.
     #[allow(
         clippy::unnecessary_wraps,
         clippy::items_after_statements,
@@ -1850,7 +1856,7 @@ impl<M: ManifestStore> SessionDispatcher<M> {
         request_arguments: &[u8],
         timestamp_ns: u64,
         episode_id: &EpisodeId,
-        preactuation_receipt: Option<&crate::episode::preactuation::PreActuationReceipt>,
+        preactuation_receipt: Option<&PreActuationReceipt>,
     ) -> ProtocolResult<SessionResponse> {
         match decision {
             Ok(ToolDecision::Allow {
@@ -1866,6 +1872,25 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                     request_id = %request_id,
                     "Tool request allowed by broker"
                 );
+
+                if let Err(violation) = Self::verify_preactuation_replay_ordering(
+                    preactuation_receipt,
+                    timestamp_ns,
+                    tool_class,
+                    &request_id,
+                ) {
+                    error!(
+                        session_id = %session_id,
+                        tool_class = %tool_class,
+                        request_id = %request_id,
+                        violation = %violation,
+                        "RequestTool denied: replay ordering verification failed (fail-closed)"
+                    );
+                    return Ok(SessionResponse::error(
+                        SessionErrorCode::SessionErrorInternal,
+                        format!("replay ordering verification failed: {violation}"),
+                    ));
+                }
 
                 // TCK-00316: Execute tool via EpisodeRuntime
                 let (result_hash, inline_result) = if let Some(ref runtime) = self.episode_runtime {
@@ -2278,6 +2303,39 @@ impl<M: ManifestStore> SessionDispatcher<M> {
                 ))
             },
         }
+    }
+
+    /// Builds a per-request replay trace and verifies pre-actuation ordering.
+    ///
+    /// This is the production call site for `ReplayVerifier::verify`.
+    fn verify_preactuation_replay_ordering(
+        preactuation_receipt: Option<&PreActuationReceipt>,
+        actuation_timestamp_ns: u64,
+        tool_class: ToolClass,
+        request_id: &str,
+    ) -> Result<(), crate::episode::preactuation::ReplayViolation> {
+        let Some(receipt) = preactuation_receipt else {
+            return Ok(());
+        };
+
+        let trace = [
+            ReplayEntry {
+                timestamp_ns: receipt.timestamp_ns,
+                kind: ReplayEntryKind::PreActuationCheck {
+                    stop_checked: receipt.stop_checked,
+                    budget_checked: receipt.budget_checked,
+                    budget_enforcement_deferred: receipt.budget_enforcement_deferred,
+                },
+            },
+            ReplayEntry {
+                timestamp_ns: actuation_timestamp_ns,
+                kind: ReplayEntryKind::ToolActuation {
+                    tool_class: tool_class.to_string(),
+                    request_id: request_id.to_string(),
+                },
+            },
+        ];
+        ReplayVerifier::verify(&trace)
     }
 
     /// Gets an HTF-compliant monotonic timestamp.
@@ -4512,6 +4570,55 @@ mod tests {
                     );
                 },
                 other => panic!("Expected protocol error for missing clock, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_replay_verifier_rejects_ordering_violation_in_production_path() {
+            let minter = test_minter();
+            let dispatcher = SessionDispatcher::new(minter);
+            let episode_id = EpisodeId::new("session-001").expect("valid episode id");
+
+            let decision = ToolDecision::Allow {
+                request_id: "REQ-ORDER-001".to_string(),
+                capability_id: "cap-read-001".to_string(),
+                rule_id: Some("rule-read".to_string()),
+                policy_hash: [0u8; 32],
+                budget_delta: crate::episode::decision::BudgetDelta::single_call(),
+                credential: None,
+            };
+
+            let receipt = crate::episode::preactuation::PreActuationReceipt {
+                stop_checked: true,
+                budget_checked: true,
+                budget_enforcement_deferred: false,
+                timestamp_ns: 200,
+            };
+
+            // Actuation timestamp is deliberately older than the check timestamp
+            // to trigger ReplayVerifier::OrderingViolation in production wiring.
+            let response = dispatcher
+                .handle_broker_decision(
+                    Ok(decision),
+                    "session-001",
+                    ToolClass::Read,
+                    b"{}",
+                    100,
+                    &episode_id,
+                    Some(&receipt),
+                )
+                .expect("dispatch should return application-level error response");
+
+            match response {
+                SessionResponse::Error(err) => {
+                    assert_eq!(err.code, SessionErrorCode::SessionErrorInternal as i32);
+                    assert!(
+                        err.message.contains("replay ordering verification failed"),
+                        "expected replay verifier failure message, got: {}",
+                        err.message
+                    );
+                },
+                other => panic!("expected replay-verifier error response, got: {other:?}"),
             }
         }
 
