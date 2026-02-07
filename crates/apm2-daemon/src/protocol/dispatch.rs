@@ -4720,6 +4720,13 @@ pub struct PrivilegedDispatcher {
 
     /// TCK-00400: Reverse lookup for profile hash -> profile ID.
     adapter_profile_ids_by_hash: HashMap<[u8; 32], String>,
+
+    /// TCK-00400: Dedicated CAS for adapter profile hash verification at
+    /// selection time. Separate from the publish/ingest `cas` field so that
+    /// `with_persistence` (no durable CAS) can still perform adapter selection
+    /// without inadvertently enabling `PublishChangeSet` (TCK-00412
+    /// fail-closed).
+    adapter_profile_cas: Option<Arc<dyn ContentAddressedStore>>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4870,6 +4877,7 @@ impl PrivilegedDispatcher {
             adapter_selection_policy: None,
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
+            adapter_profile_cas: None,
         }
     }
 
@@ -4941,6 +4949,7 @@ impl PrivilegedDispatcher {
             adapter_selection_policy: None,
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
+            adapter_profile_cas: None,
         }
     }
 
@@ -5031,6 +5040,7 @@ impl PrivilegedDispatcher {
             adapter_selection_policy: None,
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
+            adapter_profile_cas: None,
         }
     }
 
@@ -5098,6 +5108,7 @@ impl PrivilegedDispatcher {
             adapter_selection_policy: None,
             adapter_available_profiles: BTreeSet::new(),
             adapter_profile_ids_by_hash: HashMap::new(),
+            adapter_profile_cas: None,
         }
     }
 
@@ -5194,6 +5205,19 @@ impl PrivilegedDispatcher {
         self
     }
 
+    /// Sets the dedicated CAS for adapter profile hash verification
+    /// (TCK-00400).
+    ///
+    /// This CAS is used to verify that selected adapter profile hashes
+    /// exist at dispatch time. It is intentionally separate from the
+    /// publish/ingest CAS (`with_cas`) so that adapter selection can work
+    /// without enabling `PublishChangeSet` (TCK-00412 fail-closed).
+    #[must_use]
+    pub fn with_adapter_profile_cas(mut self, cas: Arc<dyn ContentAddressedStore>) -> Self {
+        self.adapter_profile_cas = Some(cas);
+        self
+    }
+
     /// Sets the shared V1 manifest store (TCK-00352 Security Review MAJOR 2).
     ///
     /// When set, `handle_spawn_episode` mints a V1 capability manifest and
@@ -5259,14 +5283,21 @@ impl PrivilegedDispatcher {
         self
     }
 
-    /// Sets adapter-selection policy state and adapter availability
-    /// (TCK-00400).
+    /// Sets adapter-selection policy state, adapter availability, and the
+    /// dedicated CAS for profile hash verification (TCK-00400).
+    ///
+    /// `profile_cas` is the CAS instance used to verify that the selected
+    /// adapter profile hash exists at dispatch time. This is intentionally
+    /// separate from the `cas` field (used by `PublishChangeSet`) so that
+    /// `with_persistence` can enable adapter selection without inadvertently
+    /// enabling publish/ingest operations (TCK-00412 fail-closed).
     #[must_use]
     pub fn with_adapter_selection_policy(
         mut self,
         policy: AdapterSelectionPolicy,
         available_profiles: BTreeSet<[u8; 32]>,
         profile_hashes_by_id: HashMap<String, [u8; 32]>,
+        profile_cas: Arc<dyn ContentAddressedStore>,
     ) -> Self {
         self.adapter_selection_policy = Some(Arc::new(Mutex::new(policy)));
         self.adapter_available_profiles = available_profiles;
@@ -5274,6 +5305,7 @@ impl PrivilegedDispatcher {
             .into_iter()
             .map(|(profile_id, profile_hash)| (profile_hash, profile_id))
             .collect();
+        self.adapter_profile_cas = Some(profile_cas);
         self
     }
 
@@ -6313,7 +6345,7 @@ impl PrivilegedDispatcher {
             // (see doc comment above). This check ensures the hash references
             // a valid, previously stored profile -- not that the caller is
             // allowed to use it (that was established upstream).
-            let cas = self.cas.as_ref().ok_or_else(|| {
+            let cas = self.adapter_profile_cas.as_ref().ok_or_else(|| {
                 "adapter_profile_hash validation requires CAS configuration".to_string()
             })?;
             let exists = cas
@@ -6387,7 +6419,7 @@ impl PrivilegedDispatcher {
 
             let selected_hash = decision.selected_profile_hash;
             let cas = self
-                .cas
+                .adapter_profile_cas
                 .as_ref()
                 .ok_or_else(|| "adapter selection requires CAS configuration".to_string())?;
             let exists = cas
@@ -6412,7 +6444,7 @@ impl PrivilegedDispatcher {
             | WorkRole::Unspecified => builtin_profiles::claude_code_profile(),
         };
         // Store in CAS so the hash is resolvable from the ledger.
-        self.cas.as_ref().map_or_else(
+        self.adapter_profile_cas.as_ref().map_or_else(
             || {
                 profile
                     .compute_cas_hash()
@@ -7887,7 +7919,7 @@ impl PrivilegedDispatcher {
             }
 
             let spawn_result: Result<(), SpawnFailure> = (|| {
-                let cas = self.cas.as_ref().ok_or_else(|| {
+                let cas = self.adapter_profile_cas.as_ref().ok_or_else(|| {
                     SpawnFailure::config("adapter spawn requires CAS configuration")
                 })?;
 
@@ -19164,7 +19196,8 @@ mod tests {
         fn dispatcher_with_cas() -> (PrivilegedDispatcher, Arc<MemoryCas>, ConnectionContext) {
             let cas = Arc::new(MemoryCas::default());
             let dispatcher = PrivilegedDispatcher::new()
-                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
+                .with_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>)
+                .with_adapter_profile_cas(Arc::clone(&cas) as Arc<dyn ContentAddressedStore>);
             let ctx = ConnectionContext::privileged_session_open(Some(PeerCredentials {
                 uid: 1000,
                 gid: 1000,

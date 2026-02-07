@@ -856,13 +856,16 @@ impl DispatcherState {
             // TCK-00399: Wire adapter registry for agent CLI process spawning.
             // CAS is intentionally not wired in this constructor: fail-closed
             // publish/ingest handlers require explicit CAS configuration via
-            // with_persistence_and_cas().
+            // with_persistence_and_cas(). The MemoryCas above is used only to
+            // seed builtin adapter profiles at startup; it must NOT be wired
+            // as the dispatcher CAS or PublishChangeSet will incorrectly
+            // succeed without durable storage (TCK-00412).
             .with_adapter_registry(adapter_registry)
-            .with_cas(cas)
             .with_adapter_selection_policy(
                 adapter_selection_policy,
                 available_profile_hashes,
                 profile_hashes,
+                cas,
             )
         } else {
             // Use stubs
@@ -1206,6 +1209,7 @@ impl DispatcherState {
             adapter_selection_policy,
             available_profile_hashes,
             profile_hashes,
+            evidence_cas,
         );
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
