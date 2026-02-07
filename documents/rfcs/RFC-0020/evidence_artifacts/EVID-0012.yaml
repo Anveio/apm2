@@ -11,6 +11,11 @@ evidence_artifact:
     Tier2+ fail-closed semantics, and SessionStarted payloads can persist the
     active identity_proof_profile_hash from connection context wiring.
 
+    Production session-open wiring for identity_proof_profile_hash is deferred
+    under WVR-0003 to TCK-00361. This ticket provides infrastructure (setter,
+    getter, payload serialization, test coverage). The test demonstrates the
+    full wiring path works when the setter is called.
+
     Strict verifier cache invalidation behavior remains out of scope for this
     ticket and is deferred to TCK-00359.
   requirement_ids:
@@ -40,7 +45,10 @@ evidence_artifact:
         - "cargo test -p apm2-daemon identity::directory_proof::tests::test_profile_mismatch_rejected_during_verification"
     - type: "test_output"
       description: |
-        Session-open path profile recording wiring:
+        Session-open path profile recording wiring (infrastructure-only for
+        now; production wiring deferred to TCK-00361 under WVR-0003). Test
+        demonstrates the complete path from context->spawn->SessionStarted
+        payload:
         - test_session_context_records_profile_hash
       ref:
         - "cargo test -p apm2-daemon protocol::dispatch::tests::tck_00397_adapter_profile_binding::test_session_context_records_profile_hash"

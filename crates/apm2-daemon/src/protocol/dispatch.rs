@@ -3308,6 +3308,11 @@ impl ConnectionContext {
     }
 
     /// Sets the active identity proof profile hash for this connection.
+    ///
+    /// This setter provides infrastructure for TCK-00361 (session-open identity
+    /// proof validation). Production wiring is deferred under WVR-0003 (CAS
+    /// dereference for identity proof profiles). Currently exercised via test
+    /// paths; production callers will be added by TCK-00361.
     pub fn set_identity_proof_profile_hash(
         &mut self,
         profile_hash: [u8; 32],
@@ -7141,6 +7146,10 @@ impl PrivilegedDispatcher {
             role_spec_hash.as_ref(),
             timestamp_ns,
             ctx.contract_binding(),
+            // WVR-0003 deferral: identity_proof_profile_hash is currently None
+            // in production sessions. Will be populated when TCK-00361 wires
+            // session-open identity proof validation. The field gracefully
+            // defaults to None/omitted in SessionStarted payload when not set.
             ctx.identity_proof_profile_hash(),
         ) {
             // TCK-00384 review fix: unified post-start rollback stops the
