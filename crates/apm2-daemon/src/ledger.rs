@@ -118,6 +118,29 @@ impl SqliteLedgerEventEmitter {
         // application-level `get_event_by_receipt_id` provides the fast-path,
         // while the database constraint provides the authoritative uniqueness
         // guarantee.
+        //
+        // MIGRATION: Deduplicate historical `receipt_id` rows before creating
+        // the unique index. Keep the first row (minimum `rowid`) for each
+        // duplicated receipt ID and delete any subsequent duplicates.
+        // This migration is idempotent: if no duplicates exist, it deletes
+        // zero rows and is safe to run repeatedly.
+        conn.execute(
+            "DELETE FROM ledger_events WHERE rowid IN ( \
+                 SELECT le.rowid FROM ledger_events le \
+                 INNER JOIN ( \
+                     SELECT json_extract(CAST(payload AS TEXT), '$.receipt_id') AS rid, \
+                            MIN(rowid) AS keep_rowid \
+                     FROM ledger_events \
+                     WHERE event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+                     AND json_extract(CAST(payload AS TEXT), '$.receipt_id') IS NOT NULL \
+                     GROUP BY json_extract(CAST(payload AS TEXT), '$.receipt_id') \
+                     HAVING COUNT(*) > 1 \
+                 ) dups ON json_extract(CAST(le.payload AS TEXT), '$.receipt_id') = dups.rid \
+                 WHERE le.event_type IN ('review_receipt_recorded', 'review_blocked_recorded') \
+                 AND le.rowid != dups.keep_rowid \
+             )",
+            [],
+        )?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_receipt_id \
              ON ledger_events(json_extract(CAST(payload AS TEXT), '$.receipt_id')) \
@@ -930,6 +953,8 @@ impl LedgerEventEmitter for SqliteLedgerEventEmitter {
             "receipt_id": receipt_id,
             "changeset_digest": hex::encode(changeset_digest),
             "verdict": "BLOCKED",
+            "blocked_reason_code": reason_code,
+            // Preserve legacy field for backward compatibility with old readers.
             "reason_code": reason_code,
             "blocked_log_hash": hex::encode(blocked_log_hash),
             "reviewer_actor_id": reviewer_actor_id,
@@ -2903,10 +2928,10 @@ mod tests {
         assert_eq!(found.event_type, "review_blocked_recorded");
     }
 
-    /// Verifies that `emit_review_blocked_receipt` includes
-    /// `identity_proof_hash` in the signed payload (TCK-00356 Fix 2).
+    /// Verifies that `emit_review_blocked_receipt` includes replay-critical
+    /// blocked fields and identity binding in the signed payload.
     #[test]
-    fn test_blocked_receipt_payload_contains_identity_proof_hash() {
+    fn test_blocked_receipt_payload_contains_replay_bindings() {
         let emitter = test_emitter();
         let changeset_digest = [0x42u8; 32];
         let blocked_log_hash = [0xAAu8; 32];
@@ -2928,6 +2953,25 @@ mod tests {
         // Parse the payload and verify identity_proof_hash is present
         let payload: serde_json::Value =
             serde_json::from_slice(&event.payload).expect("payload should be valid JSON");
+
+        let blocked_reason_code = payload
+            .get("blocked_reason_code")
+            .expect("payload must contain blocked_reason_code field");
+        assert_eq!(
+            blocked_reason_code.as_u64().unwrap(),
+            99,
+            "blocked_reason_code in blocked event payload must match the input"
+        );
+
+        let blocked_log = payload
+            .get("blocked_log_hash")
+            .expect("payload must contain blocked_log_hash field");
+        assert_eq!(
+            blocked_log.as_str().unwrap(),
+            hex::encode(blocked_log_hash),
+            "blocked_log_hash in blocked event payload must match the input"
+        );
+
         let iph = payload
             .get("identity_proof_hash")
             .expect("payload must contain identity_proof_hash field");
