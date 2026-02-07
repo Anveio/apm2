@@ -29,16 +29,13 @@ check_logical_line() {
     fi
 
     local lc="${line,,}"
-    # Collapse runs of whitespace so `gh   api` matches `gh api`.
-    local squeezed
-    squeezed="$(echo "$lc" | sed 's/[[:space:]]\+/ /g')"
 
-    if [[ "$squeezed" == *"gh api"* ]] && [[ "$squeezed" == *"/statuses/"* ]]; then
-        if [[ "$squeezed" == *"--method post"* ]] || [[ "$squeezed" == *"--method=post"* ]] ||
-            [[ "$squeezed" == *"-x post"* ]] || [[ "$squeezed" == *"-x=post"* ]] ||
-            [[ "$squeezed" == *"--input"* ]] ||
-            [[ "$squeezed" == *"-f state="* ]] || [[ "$squeezed" == *"--field state="* ]] ||
-            [[ "$squeezed" == *"-f context="* ]] || [[ "$squeezed" == *"--field context="* ]]; then
+    # Use bash regex to match `gh` followed by any flags/args then `api`,
+    # covering: `gh api`, `gh   api`, `gh -R owner/repo api`, etc.
+    # Also check for `/statuses/` anywhere in the same logical line.
+    if [[ "$lc" =~ (^|[[:space:]|;\&])gh[[:space:]] ]] && [[ "$lc" == *"/statuses/"* ]]; then
+        # Check if this is an API call (gh ... api ...) with status-write intent.
+        if [[ "$lc" =~ (^|[[:space:]])gh[[:space:]].*api ]] || [[ "$lc" == *"gh api"* ]]; then
             local rel="${file#"$REPO_ROOT/"}"
             echo "::error file=$rel,line=$line_no::Direct GitHub status-write command string is forbidden in prompts/xtask assets (TCK-00411)."
             VIOLATIONS=1
