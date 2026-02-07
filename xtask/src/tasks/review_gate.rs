@@ -386,8 +386,10 @@ fn parse_comment_metadata(
 ) -> Result<ReviewMetadataV1, String> {
     let body = comment.body.as_deref().unwrap_or_default();
     let marker = category.marker();
+    // Use rfind to select the LAST marker in the body, preventing metadata
+    // shadowing when free-form reason text contains an earlier marker copy.
     let marker_index = body
-        .find(marker)
+        .rfind(marker)
         .ok_or_else(|| "marker not present".to_string())?;
 
     let json = extract_json_after_marker(body, marker, marker_index)?;
@@ -502,12 +504,15 @@ fn parse_comment_timestamp(comment: &IssueComment) -> Result<DateTime<Utc>> {
 }
 
 fn detect_marker_category(body: &str) -> Option<ReviewCategory> {
-    let security = body.find(SECURITY_METADATA_MARKER);
-    let quality = body.find(QUALITY_METADATA_MARKER);
+    // Use rfind to detect the LAST (authoritative) marker, preventing
+    // shadowing when free-form reason text contains earlier marker copies.
+    let security = body.rfind(SECURITY_METADATA_MARKER);
+    let quality = body.rfind(QUALITY_METADATA_MARKER);
 
     match (security, quality) {
         (Some(index), Some(other)) => {
-            if index <= other {
+            // Pick the marker that appears later (more authoritative).
+            if index >= other {
                 Some(ReviewCategory::Security)
             } else {
                 Some(ReviewCategory::CodeQuality)
@@ -985,6 +990,93 @@ mod tests {
         let body = "<!-- apm2-review-metadata:v1:security -->\nno json fence";
         let result = extract_json_after_marker(body, SECURITY_METADATA_MARKER, 0);
         assert!(result.is_err());
+    }
+
+    /// Regression test: metadata shadowing where reason text contains an
+    /// earlier metadata marker with a PASS verdict, but the authoritative
+    /// (last) marker block says FAIL. The gate must parse the LAST marker.
+    #[test]
+    fn parse_comment_metadata_selects_last_marker_not_first() {
+        let shadowed_body = format!(
+            r#"## Security Review
+
+**Status:** DENIED
+
+### Reason
+Some review text that embeds a prior artifact:
+{SECURITY_METADATA_MARKER}
+```json
+{{
+  "schema": "{REVIEW_METADATA_SCHEMA}",
+  "review_type": "security",
+  "pr_number": 464,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "verdict": "PASS",
+  "severity_counts": {{ "blocker": 0, "major": 0, "minor": 0, "nit": 0 }},
+  "reviewer_id": "apm2-codex-security"
+}}
+```
+
+Authoritative metadata below:
+
+{SECURITY_METADATA_MARKER}
+```json
+{{
+  "schema": "{REVIEW_METADATA_SCHEMA}",
+  "review_type": "security",
+  "pr_number": 464,
+  "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "verdict": "FAIL",
+  "severity_counts": {{ "blocker": 1, "major": 0, "minor": 0, "nit": 0 }},
+  "reviewer_id": "apm2-codex-security"
+}}
+```"#
+        );
+
+        let comment = IssueComment {
+            id: 999,
+            body: Some(shadowed_body),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            user: IssueCommentUser {
+                login: "Anveio".to_string(),
+            },
+        };
+
+        let metadata =
+            parse_comment_metadata(&comment, ReviewCategory::Security).expect("should parse");
+        assert_eq!(
+            metadata.verdict,
+            ReviewVerdict::Fail,
+            "Gate must select the LAST (authoritative) metadata block, not the first shadowed one"
+        );
+    }
+
+    /// Regression test: `detect_marker_category` should return the category
+    /// of the last marker when both markers appear (e.g., quality marker
+    /// in reason text and security marker as authoritative).
+    #[test]
+    fn detect_marker_category_selects_last_marker() {
+        // Quality marker appears first (e.g. in quoted reason text), but
+        // security marker appears last (authoritative).
+        let body = format!(
+            "Some text with {QUALITY_METADATA_MARKER}\nmore text\n{SECURITY_METADATA_MARKER}\n```json\n{{}}\n```"
+        );
+        assert_eq!(
+            detect_marker_category(&body),
+            Some(ReviewCategory::Security),
+            "Should detect last marker's category"
+        );
+
+        // Reverse: security first, quality last.
+        let body2 = format!(
+            "Text {SECURITY_METADATA_MARKER}\nmore\n{QUALITY_METADATA_MARKER}\n```json\n{{}}\n```"
+        );
+        assert_eq!(
+            detect_marker_category(&body2),
+            Some(ReviewCategory::CodeQuality),
+            "Should detect last marker's category"
+        );
     }
 
     #[test]
