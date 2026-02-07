@@ -210,6 +210,19 @@ pub enum PtyError {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// Command not found in PATH during pre-fork resolution.
+    ///
+    /// This occurs when the command is a non-absolute path (e.g. `claude`)
+    /// and cannot be found in any directory listed in the configured PATH
+    /// environment variable.
+    #[error("command not found: '{command}' not found in PATH '{path}'")]
+    CommandNotFound {
+        /// The command that was not found.
+        command: String,
+        /// The PATH that was searched.
+        path: String,
+    },
+
     /// PTY write timed out due to sustained backpressure.
     ///
     /// This occurs when the PTY write loop cannot complete within the
@@ -526,7 +539,9 @@ impl PtyRunner {
     {
         let program_path = program.as_ref();
 
-        // Validate program path
+        // Validate program path — this is the original command (may be
+        // relative like "claude").  We use it for argv[0] per POSIX
+        // convention.
         let program_cstr = path_to_cstring(program_path)?;
 
         // Build args as CStrings (program name should be argv[0])
@@ -575,6 +590,39 @@ impl PtyRunner {
             })
             .collect();
         let use_custom_env = !config.env.is_empty();
+
+        // Pre-fork: resolve non-absolute commands via PATH from the custom
+        // environment.  `execve` does NOT perform PATH search, so built-in
+        // adapter profiles that use bare command names (claude, gemini,
+        // codex, ollama) would fail with ENOENT.  We resolve the absolute
+        // path here (pre-fork) so the child can use `execve` with the
+        // resolved path, preserving async-signal-safety.
+        //
+        // The resolved CString is kept separate from program_cstr because
+        // argv[0] should remain the original command name per POSIX
+        // convention.
+        let exec_program_cstr: CString =
+            if use_custom_env && !program_path.as_os_str().as_bytes().starts_with(b"/") {
+                // Extract PATH value from the custom env entries.
+                let env_path = config
+                    .env
+                    .iter()
+                    .find_map(|(k, v)| {
+                        if k.as_bytes() == b"PATH" {
+                            v.to_str().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("");
+
+                let command_str = program_path.to_str().unwrap_or("");
+                let resolved = resolve_executable_in_path(command_str, env_path)?;
+                path_to_cstring(&resolved)?
+            } else {
+                // Absolute path or no custom env — use as-is.
+                program_cstr.clone()
+            };
 
         // Pre-fork: build the raw pointer array for execve envp parameter.
         // Must be null-terminated.
@@ -694,9 +742,11 @@ impl PtyRunner {
                 unsafe {
                     if use_custom_env {
                         // execve: no PATH search, uses precomputed envp.
-                        // program_cstr is already an absolute/resolved path.
+                        // exec_program_cstr was resolved pre-fork to an
+                        // absolute path via resolve_executable_in_path when
+                        // the original command was non-absolute.
                         libc::execve(
-                            program_cstr.as_ptr(),
+                            exec_program_cstr.as_ptr(),
                             argv_ptrs.as_ptr(),
                             envp_ptrs.as_ptr(),
                         );
@@ -1110,6 +1160,58 @@ impl Drop for PtyRunner {
             }
         }
     }
+}
+
+/// Resolves a non-absolute command to an absolute path by searching the
+/// given PATH string (colon-separated directory list).
+///
+/// This is the pre-fork equivalent of the PATH resolution that `execvp`
+/// does internally.  By performing resolution before `fork()`, we:
+///
+/// 1. Return a clear error to the caller instead of getting ENOENT from the
+///    child (which would just `_exit(127)` with no diagnostics).
+/// 2. Allow use of `execve` (which requires an absolute path) in the post-fork
+///    child, preserving async-signal-safety.
+///
+/// # Arguments
+///
+/// * `command` - The command name to resolve (must not be absolute).
+/// * `path_value` - The PATH string to search (colon-separated directories).
+///
+/// # Returns
+///
+/// The absolute path to the executable, or `PtyError::CommandNotFound` if
+/// the command cannot be found or is not executable in any PATH directory.
+fn resolve_executable_in_path(
+    command: &str,
+    path_value: &str,
+) -> Result<std::path::PathBuf, PtyError> {
+    for dir in path_value.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = std::path::PathBuf::from(dir).join(command);
+        // Check that the candidate exists and is executable.
+        // We use access(2) with X_OK which is the same check the kernel
+        // does during execve, minus race conditions that are inherent
+        // to any pre-check.
+        if candidate.is_file() {
+            // Use libc::access to check X_OK (executable permission).
+            if let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) {
+                // SAFETY: c is a valid null-terminated C string pointing to a
+                // valid filesystem path.  access(2) is a standard POSIX call
+                // that only reads the path and does not modify any state.
+                let ret = unsafe { libc::access(c.as_ptr(), libc::X_OK) };
+                if ret == 0 {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(PtyError::CommandNotFound {
+        command: command.to_string(),
+        path: path_value.to_string(),
+    })
 }
 
 /// Converts a path to a `CString`.
