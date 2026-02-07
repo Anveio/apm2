@@ -191,23 +191,20 @@ check_file_for_security_literal() {
     if [[ "$file_basename" == "SECURITY_REVIEW_PROMPT.md" ]]; then
         return 1
     fi
-    local line_num=0
-    while IFS= read -r raw_line; do
-        line_num=$((line_num + 1))
-        # Skip empty lines
-        [[ -z "$raw_line" ]] && continue
-        # Skip comment lines (leading whitespace then #)
-        local stripped="${raw_line#"${raw_line%%[![:space:]]*}"}"
-        [[ "$stripped" == "#"* ]] && continue
-        # Case-insensitive check for the literal context string
-        local lc="${raw_line,,}"
-        if [[ "$lc" == *"ai-review/security"* ]]; then
-            log_error "Forbidden ai-review/security literal in non-exempt review artifact:"
-            log_error "  ${file}:${line_num}: ${raw_line}"
-            log_error "  Only SECURITY_REVIEW_PROMPT.md may reference this context."
-            return 0
-        fi
-    done < "$file"
+    # File-wide literal scan: check the ENTIRE file content for the string
+    # "ai-review/security" (case-insensitive).  This is the primary gate and
+    # cannot be bypassed by splitting tokens across lines, variable
+    # indirection, or any other encoding — the literal must appear somewhere
+    # in the file to be useful, and we catch it here.
+    if grep -qi 'ai-review/security' "$file"; then
+        # Report the first matching line for diagnostic context
+        local match_info
+        match_info=$(grep -ni 'ai-review/security' "$file" | head -1)
+        log_error "Forbidden ai-review/security literal in non-exempt review artifact:"
+        log_error "  ${file}: ${match_info}"
+        log_error "  Only SECURITY_REVIEW_PROMPT.md may reference this context."
+        return 0
+    fi
     return 1
 }
 
@@ -261,9 +258,30 @@ for prompt_file in "${REVIEW_PROMPTS[@]}"; do
         log_error "Review prompt ${prompt_file} missing head_sha metadata field"
         VIOLATIONS=1
     fi
-    if ! grep -q 'head_sha.*MUST.*equal\|head_sha.*MUST.*reviewed_sha\|head_sha.*equal.*reviewed_sha' "$prompt_file" 2>/dev/null; then
+    # Strict positive-only check: require "head_sha MUST equal" without any
+    # negation words (NOT, never, don't, no) between MUST and the binding
+    # keyword.  This prevents "head_sha MUST NOT equal" from being accepted.
+    head_sha_binding=$(grep -i 'head_sha.*MUST' "$prompt_file" 2>/dev/null || true)
+    if [[ -z "$head_sha_binding" ]]; then
         log_error "Review prompt ${prompt_file} missing exact-binding constraint for head_sha (must require equality to reviewed_sha)"
         VIOLATIONS=1
+    else
+        # Check that a positive binding line exists (no negation between MUST and equal/reviewed_sha)
+        has_positive=0
+        while IFS= read -r binding_line; do
+            # Reject if negation words appear after MUST and before the binding keyword
+            if echo "$binding_line" | grep -qiP 'MUST\s+(NOT|never|no)\b'; then
+                continue  # skip negated lines
+            fi
+            if echo "$binding_line" | grep -qi 'MUST.*equal\|MUST.*reviewed_sha'; then
+                has_positive=1
+                break
+            fi
+        done <<< "$head_sha_binding"
+        if [[ $has_positive -eq 0 ]]; then
+            log_error "Review prompt ${prompt_file} head_sha binding constraint is negated or missing positive equality assertion"
+            VIOLATIONS=1
+        fi
     fi
 
     # Verify the metadata template contains pr_number field AND exact-binding constraint
@@ -271,9 +289,27 @@ for prompt_file in "${REVIEW_PROMPTS[@]}"; do
         log_error "Review prompt ${prompt_file} missing pr_number metadata field"
         VIOLATIONS=1
     fi
-    if ! grep -q 'pr_number.*MUST.*equal\|pr_number.*MUST.*match\|pr_number.*exact' "$prompt_file" 2>/dev/null; then
+    # Strict positive-only check: require "pr_number MUST equal/match" without
+    # negation words between MUST and the binding keyword.
+    pr_number_binding=$(grep -i 'pr_number.*MUST' "$prompt_file" 2>/dev/null || true)
+    if [[ -z "$pr_number_binding" ]]; then
         log_error "Review prompt ${prompt_file} missing exact-binding constraint for pr_number (must require exact match)"
         VIOLATIONS=1
+    else
+        has_positive=0
+        while IFS= read -r binding_line; do
+            if echo "$binding_line" | grep -qiP 'MUST\s+(NOT|never|no)\b'; then
+                continue  # skip negated lines
+            fi
+            if echo "$binding_line" | grep -qi 'MUST.*equal\|MUST.*match\|pr_number.*exact'; then
+                has_positive=1
+                break
+            fi
+        done <<< "$pr_number_binding"
+        if [[ $has_positive -eq 0 ]]; then
+            log_error "Review prompt ${prompt_file} pr_number binding constraint is negated or missing positive equality assertion"
+            VIOLATIONS=1
+        fi
     fi
 
     # Verify reviewed_sha is assigned from headRefOid

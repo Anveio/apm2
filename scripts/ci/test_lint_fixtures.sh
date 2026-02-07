@@ -80,12 +80,12 @@ else
     log_fail "Primary gate missed ai-review/security literal in non-exempt file: $(basename "$violation_fixture")"
 fi
 
-# Test 2b-ii: File containing ai-review/security ONLY in comments → MUST PASS
+# Test 2b-ii: File that does NOT contain ai-review/security anywhere → MUST PASS
 permitted_fixture="${FIXTURE_DIR}/review_file_literal_permitted.md"
 if check_file_for_security_literal "$permitted_fixture" "review_file_literal_permitted.md"; then
-    log_fail "Primary gate false positive on comment-only ai-review/security: $(basename "$permitted_fixture")"
+    log_fail "Primary gate false positive on file without ai-review/security: $(basename "$permitted_fixture")"
 else
-    log_pass "Primary gate correctly permits comment-only ai-review/security reference"
+    log_pass "Primary gate correctly permits file without ai-review/security literal"
 fi
 
 # Test 2b-iii: SECURITY_REVIEW_PROMPT.md is always exempt → MUST PASS

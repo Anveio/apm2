@@ -242,7 +242,8 @@ if [[ -d "$TICKET_DIR" ]]; then
         # Extract requirement_ref values
         while IFS= read -r ref_line; do
             # Strip YAML key prefix, quotes, and #anchor
-            ref_path=$(echo "$ref_line" | sed -n 's/.*requirement_ref:[[:space:]]*"\{0,1\}\([^"#]*\).*/\1/p')
+            # Strip YAML key prefix, quotes (single or double), and #anchor
+            ref_path=$(echo "$ref_line" | sed -n "s/.*requirement_ref:[[:space:]]*[\"']\{0,1\}\([^\"'#]*\).*/\1/p")
             if [[ -n "$ref_path" ]]; then
                 # Trim trailing whitespace
                 ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
@@ -268,7 +269,8 @@ if [[ -d "$TICKET_DIR" ]]; then
 
         # Extract artifact_ref values
         while IFS= read -r ref_line; do
-            ref_path=$(echo "$ref_line" | sed -n 's/.*artifact_ref:[[:space:]]*"\{0,1\}\([^"#]*\).*/\1/p')
+            # Strip YAML key prefix, quotes (single or double), and #anchor
+            ref_path=$(echo "$ref_line" | sed -n "s/.*artifact_ref:[[:space:]]*[\"']\{0,1\}\([^\"'#]*\).*/\1/p")
             if [[ -n "$ref_path" ]]; then
                 ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
                 # Containment check: canonicalize and verify path is within repo root
