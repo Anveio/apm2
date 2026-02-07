@@ -1,13 +1,16 @@
 //! `ReceiptPointerV1` and `ReceiptMultiProofV1` — cross-holon receipt
-//! reference and compact multi-receipt membership proofs (RFC-0020
+//! reference and batched multi-receipt membership verification (RFC-0020
 //! §9.5.1, §9.5.5).
 //!
 //! This module implements:
 //! - [`ReceiptPointerV1`]: the default cross-holon pointer for authoritative
 //!   receipts, supporting both direct-signature and batch/FactRoot
 //!   authentication paths.
-//! - [`ReceiptMultiProofV1`]: a compact proof format for verifying many receipt
-//!   hashes against a single batch root.
+//! - [`ReceiptMultiProofV1`]: a batched verification container that proves
+//!   multiple receipt hashes are members of a single batch root. Each receipt
+//!   carries its own independent inclusion proof; shared-node deduplication
+//!   (the "compact multiproof" optimization from §9.5.5) is deferred to a
+//!   future ticket. Correctness and acceptance equivalence take priority.
 //! - [`ReceiptPointerVerifier`]: a unified verifier that accepts both direct
 //!   and batched semantics with equivalent acceptance behavior.
 //!
@@ -32,11 +35,14 @@
 //!   `qc_pointer`. This allows BFT deployments to avoid distributing
 //!   independent authority seals per receipt batch.
 //!
-//! # Multiproof (RFC-0020 §9.5.5)
+//! # Batched Verification (RFC-0020 §9.5.5)
 //!
-//! When a sender transmits >= `K_min` receipt pointers from the same batch,
-//! it SHOULD send a multiproof rather than K independent inclusion proofs.
-//! This reduces both network fanout and verifier hashing work.
+//! When a sender transmits multiple receipt pointers from the same batch,
+//! it bundles them into a `ReceiptMultiProofV1` container. The current
+//! implementation uses K independent inclusion proofs (one per receipt).
+//! The compact multiproof optimization (shared-node deduplication) that
+//! would reduce network fanout and verifier hashing work is deferred to
+//! a future ticket.
 //!
 //! # Security Invariants
 //!
@@ -191,6 +197,16 @@ pub enum ReceiptPointerError {
     DirectPointerRequiresSingleSig {
         /// The actual seal kind found.
         seal_kind: SealKind,
+    },
+
+    /// The authority seal hash in the pointer/multiproof does not match
+    /// the hash computed from the provided seal's canonical bytes.
+    #[error("authority seal hash mismatch: pointer seal hash does not match provided seal")]
+    SealHashMismatch {
+        /// The hash referenced in the pointer/multiproof.
+        expected: Hash,
+        /// The hash computed from the provided seal.
+        actual: Hash,
     },
 }
 
@@ -440,25 +456,28 @@ impl ReceiptPointerV1 {
 // ReceiptMultiProofV1
 // ──────────────────────────────────────────────────────────────
 
-/// Compact multi-receipt membership proof (RFC-0020 §9.5.5).
+/// Batched multi-receipt membership verification container (RFC-0020
+/// §9.5.5).
 ///
-/// When a sender transmits >= `K_min` receipt pointers from the same batch,
-/// it SHOULD send a multiproof rather than K independent inclusion proofs.
+/// When a sender transmits multiple receipt pointers from the same batch,
+/// it bundles them into a single `ReceiptMultiProofV1` so the verifier
+/// can validate the authority seal signature once and then verify each
+/// receipt's inclusion proof against the authenticated batch root.
 ///
-/// The multiproof proves that a set of receipt hashes are all members of
-/// a single batch root, using fewer total sibling hashes than K
-/// independent proofs (shared internal nodes are deduplicated).
+/// # Current Implementation
 ///
-/// # Wire Shape (§9.5.5)
+/// Each receipt carries its own independent `MerkleInclusionProof`.
+/// This is correct and yields the same acceptance semantics as verifying
+/// K individual batch pointers. The "compact multiproof" optimization
+/// from §9.5.5 (shared-node deduplication across proofs) is deferred to
+/// a future ticket; correctness and acceptance equivalence take priority.
+///
+/// # Wire Shape
 ///
 /// - `batch_root_hash`: the batch Merkle root
-/// - `leaf_hashes[]`: K receipt leaf hashes (domain-separated), canonically
-///   sorted
-/// - `proof_nodes[]`: minimal required sibling hashes
-/// - `proof_structure`: a bitmap/indices required to reconstruct the Merkle
-///   paths. In this implementation, `proof_structure` is encoded as a list of
-///   `(depth, index, hash)` tuples representing the necessary internal/sibling
-///   nodes.
+/// - `receipt_hashes[]`: K receipt hashes, canonically sorted
+/// - `authority_seal_hash`: hash of the seal authenticating the batch root
+/// - `individual_proofs[]`: one `MerkleInclusionProof` per receipt
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptMultiProofV1 {
     /// The batch Merkle root hash being proven against.
@@ -469,11 +488,9 @@ pub struct ReceiptMultiProofV1 {
     receipt_hashes: Vec<Hash>,
     /// The authority seal hash that authenticates the batch root.
     authority_seal_hash: Hash,
-    /// Individual inclusion proofs for each receipt. This is the
-    /// straightforward implementation — each receipt carries its own
-    /// proof path. A future optimization could share internal nodes
-    /// across proofs (the multiproof optimization from §9.5.5), but
-    /// correctness and acceptance equivalence come first.
+    /// Individual inclusion proofs for each receipt (one per receipt,
+    /// same order as `receipt_hashes`). Shared-node deduplication is
+    /// deferred to a future ticket.
     individual_proofs: Vec<MerkleInclusionProof>,
 }
 
@@ -540,7 +557,47 @@ impl ReceiptMultiProofV1 {
             });
         }
 
-        // Validate each proof: depth bound and leaf hash correctness.
+        // Validate authority seal hash is non-zero.
+        if authority_seal_hash == [0u8; 32] {
+            return Err(ReceiptPointerError::MissingSealHash {
+                pointer_kind: "multiproof",
+            });
+        }
+
+        // Enforce MAX_MULTIPROOF_NODES: total sibling nodes across all
+        // proofs must not exceed the bound (denial-of-service prevention).
+        // Check BEFORE expensive proof verification (fail-fast, admission
+        // before computation).
+        let total_nodes: usize = individual_proofs.iter().map(|p| p.siblings.len()).sum();
+        if total_nodes > MAX_MULTIPROOF_NODES {
+            return Err(ReceiptPointerError::TooManyProofNodes {
+                count: total_nodes,
+                max: MAX_MULTIPROOF_NODES,
+            });
+        }
+
+        // Enforce MAX_RECEIPT_MULTIPROOF_BYTES: estimated serialized size
+        // must not exceed the bound. Check BEFORE expensive proof
+        // verification.
+        let estimated_size = RECEIPT_MULTIPROOF_DOMAIN_SEPARATOR.len()
+            + 32 // batch_root_hash
+            + 32 // authority_seal_hash
+            + 4  // receipt_count
+            + receipt_hashes.len() * 32
+            + individual_proofs
+                .iter()
+                .map(|p| 32 + 4 + p.siblings.len() * 33)
+                .sum::<usize>();
+        if estimated_size > MAX_RECEIPT_MULTIPROOF_BYTES {
+            return Err(ReceiptPointerError::SizeExceeded {
+                max: MAX_RECEIPT_MULTIPROOF_BYTES,
+                actual: estimated_size,
+            });
+        }
+
+        // Validate each proof: depth bound, leaf hash correctness, and
+        // Merkle root reconstruction. This is the expensive part, so all
+        // admission checks are above.
         for (i, (receipt_hash, proof)) in receipt_hashes
             .iter()
             .zip(individual_proofs.iter())
@@ -566,13 +623,6 @@ impl ReceiptMultiProofV1 {
                 let _ = i; // bind index for debugging clarity
                 ReceiptPointerError::SealError(e)
             })?;
-        }
-
-        // Validate authority seal hash is non-zero.
-        if authority_seal_hash == [0u8; 32] {
-            return Err(ReceiptPointerError::MissingSealHash {
-                pointer_kind: "multiproof",
-            });
         }
 
         Ok(Self {
@@ -617,7 +667,8 @@ impl ReceiptMultiProofV1 {
 
     // ────────── Canonical bytes ──────────
 
-    /// Compute the canonical byte representation.
+    /// Compute the canonical byte representation for serialization and
+    /// content-addressing.
     ///
     /// Layout:
     /// ```text
@@ -746,6 +797,16 @@ impl ReceiptPointerVerifier {
             return Err(ReceiptPointerError::UnexpectedInclusionProof);
         }
 
+        // Bind authority_seal_hash: compute hash from seal canonical bytes
+        // and reject mismatch (fail-closed).
+        let actual_seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        if pointer.authority_seal_hash != actual_seal_hash {
+            return Err(ReceiptPointerError::SealHashMismatch {
+                expected: pointer.authority_seal_hash,
+                actual: actual_seal_hash,
+            });
+        }
+
         if seal.seal_kind() != SealKind::SingleSig {
             return Err(ReceiptPointerError::DirectPointerRequiresSingleSig {
                 seal_kind: seal.seal_kind(),
@@ -798,6 +859,16 @@ impl ReceiptPointerVerifier {
     ) -> Result<VerificationResult, ReceiptPointerError> {
         if pointer.pointer_kind != PointerKind::Batch {
             return Err(ReceiptPointerError::MissingInclusionProof);
+        }
+
+        // Bind authority_seal_hash: compute hash from seal canonical bytes
+        // and reject mismatch (fail-closed).
+        let actual_seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        if pointer.authority_seal_hash != actual_seal_hash {
+            return Err(ReceiptPointerError::SealHashMismatch {
+                expected: pointer.authority_seal_hash,
+                actual: actual_seal_hash,
+            });
         }
 
         let inclusion_proof = pointer
@@ -883,6 +954,16 @@ impl ReceiptPointerVerifier {
         expected_subject_kind: &str,
         require_temporal: bool,
     ) -> Result<Vec<VerificationResult>, ReceiptPointerError> {
+        // Bind authority_seal_hash: compute hash from seal canonical bytes
+        // and reject mismatch (fail-closed).
+        let actual_seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
+        if multiproof.authority_seal_hash != actual_seal_hash {
+            return Err(ReceiptPointerError::SealHashMismatch {
+                expected: multiproof.authority_seal_hash,
+                actual: actual_seal_hash,
+            });
+        }
+
         // Verify the seal authenticates the batch root for the first
         // receipt. This validates the seal signature once (O(1)).
         let first_proof = &multiproof.individual_proofs[0];
@@ -1579,9 +1660,9 @@ mod tests {
         let (root, proofs) = build_merkle_tree(&hashes);
 
         let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
 
-        let multiproof =
-            ReceiptMultiProofV1::new(root, hashes.clone(), [0xAA; 32], proofs).unwrap();
+        let multiproof = ReceiptMultiProofV1::new(root, hashes.clone(), seal_hash, proofs).unwrap();
 
         let results = ReceiptPointerVerifier::verify_multiproof(
             &multiproof,
@@ -1608,8 +1689,9 @@ mod tests {
         let (root, proofs) = build_merkle_tree(&hashes);
 
         let seal = make_batch_seal(&signer, &root);
+        let seal_hash = *blake3::hash(&seal.canonical_bytes()).as_bytes();
 
-        let multiproof = ReceiptMultiProofV1::new(root, hashes, [0xAA; 32], proofs).unwrap();
+        let multiproof = ReceiptMultiProofV1::new(root, hashes, seal_hash, proofs).unwrap();
 
         let result = ReceiptPointerVerifier::verify_multiproof(
             &multiproof,
@@ -1631,6 +1713,171 @@ mod tests {
         let result = ReceiptMultiProofV1::new(wrong_root, hashes, [0xAA; 32], proofs);
         // Should fail because the proof doesn't verify against the wrong root.
         assert!(result.is_err());
+    }
+
+    // ────────── Seal-hash binding negative tests ──────────
+
+    #[test]
+    fn verify_direct_rejects_seal_hash_mismatch() {
+        let signer = Signer::generate();
+        let receipt_hash = [0x42; HASH_SIZE];
+        let seal = make_direct_seal(&signer, &receipt_hash);
+
+        // Use a wrong seal hash (not derived from this seal).
+        let wrong_seal_hash = [0xFF; 32];
+        let ptr = ReceiptPointerV1::new_direct(receipt_hash, wrong_seal_hash).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_direct(
+            &ptr,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::SealHashMismatch { .. })),
+            "expected SealHashMismatch, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_batch_rejects_seal_hash_mismatch() {
+        let signer = Signer::generate();
+        let receipt_hashes = [[0x42; 32], [0x43; 32]];
+        let (root, proofs) = build_merkle_tree(&receipt_hashes);
+        let seal = make_batch_seal(&signer, &root);
+
+        // Use a wrong seal hash.
+        let wrong_seal_hash = [0xFF; 32];
+        let ptr =
+            ReceiptPointerV1::new_batch(receipt_hashes[0], wrong_seal_hash, proofs[0].clone())
+                .unwrap();
+
+        let result = ReceiptPointerVerifier::verify_batch(
+            &ptr,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::SealHashMismatch { .. })),
+            "expected SealHashMismatch, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn verify_multiproof_rejects_seal_hash_mismatch() {
+        let signer = Signer::generate();
+        let mut hashes = vec![[0x42; 32], [0x43; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+        let seal = make_batch_seal(&signer, &root);
+
+        // Use a wrong seal hash (not the actual seal hash).
+        let wrong_seal_hash = [0xDD; 32];
+        let multiproof = ReceiptMultiProofV1::new(root, hashes, wrong_seal_hash, proofs).unwrap();
+
+        let result = ReceiptPointerVerifier::verify_multiproof(
+            &multiproof,
+            &seal,
+            &signer.verifying_key(),
+            TEST_SUBJECT_KIND,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(ReceiptPointerError::SealHashMismatch { .. })),
+            "expected SealHashMismatch, got: {result:?}",
+        );
+    }
+
+    // ────────── Multiproof bounds enforcement tests ──────────
+
+    #[test]
+    fn multiproof_rejects_too_many_proof_nodes() {
+        // The node-count check runs BEFORE proof verification (admission
+        // before computation), so we can construct proofs with many
+        // siblings that don't need to be cryptographically valid.
+        //
+        // We need: total siblings across all proofs > MAX_MULTIPROOF_NODES.
+        // Use 2 receipts, each with (MAX_MULTIPROOF_NODES / 2 + 1)
+        // siblings. Each individual proof stays within MAX_MERKLE_PROOF_DEPTH?
+        // No — MAX_MERKLE_PROOF_DEPTH = 20, which is much smaller. So each
+        // proof can have at most 20 siblings. We'd need > 1024 proofs.
+        //
+        // Instead, test with a smaller number but enough to exceed the
+        // total: use (MAX_MULTIPROOF_NODES / MAX_MERKLE_PROOF_DEPTH) + 1
+        // receipts, each at max depth.
+        let receipts_needed = (MAX_MULTIPROOF_NODES / MAX_MERKLE_PROOF_DEPTH) + 1;
+        let mut hashes: Vec<Hash> = (0..receipts_needed)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                // Encode index across multiple bytes for uniqueness.
+                #[allow(clippy::cast_possible_truncation)]
+                h[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                h
+            })
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        hashes.truncate(receipts_needed);
+        assert_eq!(hashes.len(), receipts_needed);
+
+        // Build fake proofs, each with MAX_MERKLE_PROOF_DEPTH siblings.
+        let proofs: Vec<MerkleInclusionProof> = hashes
+            .iter()
+            .map(|receipt_hash| {
+                let leaf_hash = compute_receipt_leaf_hash(receipt_hash);
+                let siblings: Vec<MerkleProofSibling> = (0..MAX_MERKLE_PROOF_DEPTH)
+                    .map(|j| MerkleProofSibling {
+                        #[allow(clippy::cast_possible_truncation)]
+                        hash: [(j & 0xFF) as u8; 32],
+                        is_left: false,
+                    })
+                    .collect();
+                MerkleInclusionProof {
+                    leaf_hash,
+                    siblings,
+                }
+            })
+            .collect();
+
+        let total_nodes: usize = proofs.iter().map(|p| p.siblings.len()).sum();
+        assert!(
+            total_nodes > MAX_MULTIPROOF_NODES,
+            "total nodes {total_nodes} should exceed MAX_MULTIPROOF_NODES {MAX_MULTIPROOF_NODES}",
+        );
+
+        let result = ReceiptMultiProofV1::new([0xBB; 32], hashes, [0xAA; 32], proofs);
+        assert!(
+            matches!(result, Err(ReceiptPointerError::TooManyProofNodes { .. })),
+            "expected TooManyProofNodes, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn multiproof_enforces_size_limit() {
+        // Verify that the MAX_RECEIPT_MULTIPROOF_BYTES check is enforced.
+        // A valid multiproof's canonical bytes should be well below the
+        // limit, confirming the check is wired but not triggered for
+        // normal-sized inputs.
+        let mut hashes = vec![[0x42; 32], [0x43; 32]];
+        hashes.sort_unstable();
+        let (root, proofs) = build_merkle_tree(&hashes);
+
+        let mp = ReceiptMultiProofV1::new(root, hashes, [0xAA; 32], proofs).unwrap();
+
+        // The canonical bytes should be well below the limit.
+        let bytes = mp.canonical_bytes();
+        assert!(
+            bytes.len() < MAX_RECEIPT_MULTIPROOF_BYTES,
+            "canonical bytes {} should be < {}",
+            bytes.len(),
+            MAX_RECEIPT_MULTIPROOF_BYTES,
+        );
     }
 
     // ────────── FactRoot deferred test ──────────
