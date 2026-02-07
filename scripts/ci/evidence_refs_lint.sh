@@ -5,6 +5,8 @@
 # 1. Every requirement_id in evidence artifacts resolves to an existing REQ-*.yaml
 # 2. Every evidence_id in requirement files resolves to an existing EVID-*.yaml
 #    (requirements with status PROPOSED are allowed forward references)
+# 3. Every requirement_ref / artifact_ref in ticket YAML files resolves to an
+#    existing file on disk (the #anchor suffix is stripped before checking)
 #
 # Known pre-existing broken references are listed in the KNOWN_ISSUES array
 # and produce warnings instead of errors. Remove entries as they are fixed.
@@ -39,6 +41,7 @@ VIOLATIONS=0
 WARNINGS=0
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 RFC_DIR="${REPO_ROOT}/documents/rfcs"
+TICKET_DIR="${REPO_ROOT}/documents/work/tickets"
 
 if [[ ! -d "$RFC_DIR" ]]; then
     log_error "RFC directory not found: ${RFC_DIR} (are you inside the repository?)"
@@ -50,6 +53,51 @@ fi
 # Remove entries from this list as each reference is fixed.
 declare -A KNOWN_ISSUES
 KNOWN_ISSUES["RFC-0020/EVID-0101:REQ-0101"]=1
+
+# Known pre-existing broken ticket refs (ticket_basename:ref_type:file_path triples).
+# These are forward references for evidence artifacts that have not yet been created.
+# Produce warnings instead of hard failures.  Remove entries as each is fixed.
+declare -A KNOWN_TICKET_ISSUES
+KNOWN_TICKET_ISSUES["TCK-00080:artifact_ref:documents/rfcs/RFC-0007/05_evidence_definitions.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00081:artifact_ref:documents/work/tickets/TCK-00081.md"]=1
+KNOWN_TICKET_ISSUES["TCK-00082:artifact_ref:CONTRIBUTING.md"]=1
+KNOWN_TICKET_ISSUES["TCK-00352:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0006.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00359:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0013.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00360:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0014.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00361:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0015.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00361:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0110.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00363:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0017.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00364:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0018.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00364:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0309.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00365:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0019.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00365:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0309.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00366:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0020.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00366:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0309.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00367:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0021.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00367:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0401.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00368:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0022.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00368:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0401.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00369:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0023.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00370:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0024.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00371:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0025.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00372:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0026.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00373:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0027.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00373:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0104.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00375:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0029.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00376:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0030.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00377:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0031.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00377:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0308.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00378:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0032.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00378:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0308.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00379:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0033.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00379:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0308.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00380:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0034.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00380:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0107.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00381:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0035.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00381:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0309.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00382:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0036.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00382:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0401.yaml"]=1
+KNOWN_TICKET_ISSUES["TCK-00382:artifact_ref:documents/rfcs/RFC-0020/evidence_artifacts/EVID-0402.yaml"]=1
 
 log_info "=== Evidence/Requirement Reference Lint (TCK-00409) ==="
 echo
@@ -179,6 +227,60 @@ while IFS= read -r req_file; do
         fi
     done
 done < <(find "$RFC_DIR" -path '*/requirements/REQ-*.yaml' 2>/dev/null || true)
+
+# Check 3: Every requirement_ref / artifact_ref in ticket YAML files resolves to
+# an existing file on disk.  The reference format is:
+#   documents/{rfcs,prds}/XXX/path/to/file.yaml#anchor
+# We strip the #anchor suffix and verify the file path exists relative to REPO_ROOT.
+log_info "Checking ticket requirement_ref and artifact_ref bindings..."
+if [[ -d "$TICKET_DIR" ]]; then
+    while IFS= read -r ticket_file; do
+        ticket_basename=$(basename "$ticket_file")
+
+        ticket_id=$(basename "$ticket_file" .yaml)
+
+        # Extract requirement_ref values
+        while IFS= read -r ref_line; do
+            # Strip YAML key prefix, quotes, and #anchor
+            ref_path=$(echo "$ref_line" | sed -n 's/.*requirement_ref:[[:space:]]*"\{0,1\}\([^"#]*\).*/\1/p')
+            if [[ -n "$ref_path" ]]; then
+                # Trim trailing whitespace
+                ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
+                if [[ ! -f "${REPO_ROOT}/${ref_path}" ]]; then
+                    known_key="${ticket_id}:requirement_ref:${ref_path}"
+                    if [[ -n "${KNOWN_TICKET_ISSUES["${known_key}"]:-}" ]]; then
+                        log_warn "Known ticket issue: ${ticket_file} requirement_ref '${ref_path}' (pre-existing, tracked)"
+                        WARNINGS=$((WARNINGS + 1))
+                    else
+                        log_error "Broken ticket ref: ${ticket_file} requirement_ref '${ref_path}' does not exist"
+                        VIOLATIONS=1
+                    fi
+                fi
+            fi
+        done < <(grep 'requirement_ref:' "$ticket_file" 2>/dev/null || true)
+
+        # Extract artifact_ref values
+        while IFS= read -r ref_line; do
+            ref_path=$(echo "$ref_line" | sed -n 's/.*artifact_ref:[[:space:]]*"\{0,1\}\([^"#]*\).*/\1/p')
+            if [[ -n "$ref_path" ]]; then
+                ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
+                if [[ ! -f "${REPO_ROOT}/${ref_path}" ]]; then
+                    known_key="${ticket_id}:artifact_ref:${ref_path}"
+                    if [[ -n "${KNOWN_TICKET_ISSUES["${known_key}"]:-}" ]]; then
+                        log_warn "Known ticket issue: ${ticket_file} artifact_ref '${ref_path}' (pre-existing, tracked)"
+                        WARNINGS=$((WARNINGS + 1))
+                    else
+                        log_error "Broken ticket ref: ${ticket_file} artifact_ref '${ref_path}' does not exist"
+                        VIOLATIONS=1
+                    fi
+                fi
+            fi
+        done < <(grep 'artifact_ref:' "$ticket_file" 2>/dev/null || true)
+
+    done < <(find "$TICKET_DIR" -name 'TCK-*.yaml' 2>/dev/null || true)
+else
+    log_warn "Ticket directory not found: ${TICKET_DIR} (skipping ticket ref validation)"
+fi
 
 echo
 if [[ $WARNINGS -gt 0 ]]; then

@@ -58,7 +58,8 @@ check_dependencies
 # Check 1: Review prompts must not contain deprecated direct status-write commands.
 # The approved path for setting security review statuses is:
 #   cargo xtask security-review-exec (approve|deny)
-# Direct `gh api` calls to statuses/check-runs for ai-review/security are deprecated.
+# Direct writes to statuses/check-runs for ai-review/security are deprecated,
+# regardless of HTTP client used (gh api, curl, or variable indirection).
 # Note: ai-review/code-quality has no xtask equivalent, so `gh api` writes targeting
 # that context are permitted.
 # Similarly, `gh pr review --approve` bypasses the review gate and is always forbidden.
@@ -68,13 +69,14 @@ log_info "Checking for deprecated direct status-write patterns in review scripts
 # contains a forbidden direct GitHub status write.  Returns 0 (true) if the line
 # is a violation.
 #
-# Strategy (blocklist): any reference to the statuses API endpoint via `gh api`
-# is forbidden UNLESS it exclusively targets ai-review/code-quality (which has
-# no xtask equivalent).  `gh pr review --approve` is always forbidden.
+# Strategy (content-based): instead of enumerating every HTTP client (gh, curl,
+# etc.), we detect violations by the _content_ of the line.  Any line containing
+# `ai-review/security` together with a status/check-run write indicator is
+# forbidden.  The only blessed path is `cargo xtask security-review-exec`.
 #
-# This is intentionally broad: review prompts should never contain raw
-# GitHub API calls to statuses — the approved path for security status is
-# `cargo xtask security-review-exec`.
+# For non-security contexts (e.g. ai-review/code-quality), direct `gh api`
+# writes to statuses/check-runs with unknown or unspecified context are still
+# flagged.  `gh pr review --approve` is always forbidden.
 detect_direct_status_write() {
     local line="$1"
     # Skip comment lines
@@ -90,38 +92,39 @@ detect_direct_status_write() {
         return 0
     fi
 
-    # Rule 2: Any line containing BOTH "gh api" (as substring) AND "statuses/"
-    # is a violation — unless it EXCLUSIVELY targets ai-review/code-quality
-    # (i.e., contains code-quality AND does NOT contain ai-review/security).
-    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"statuses/"* ]]; then
-        if [[ "$lc" == *"ai-review/security"* ]]; then
-            return 0  # violation: security context present (even if code-quality also present)
+    # Rule 2 (content-based): Any line containing ai-review/security AND any
+    # write-indicating context (statuses, check-runs, POST, -X POST, -f, --field,
+    # --method) is a violation — regardless of the HTTP client used (gh, curl,
+    # variable indirection, etc.).
+    # Exception: the blessed xtask path is allowed.
+    if [[ "$lc" == *"ai-review/security"* ]]; then
+        # Allow the blessed xtask path
+        if [[ "$lc" == *"cargo"*"xtask"*"security-review-exec"* ]]; then
+            return 1
         fi
-        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
-            return 1  # permitted: exclusively code-quality
+        # Flag if any status/check-run endpoint or write indicator is present
+        if [[ "$lc" == *"statuses"* || "$lc" == *"check-runs"* \
+           || "$lc" == *"-x post"* || "$lc" == *"-x "* \
+           || "$lc" == *"post"* \
+           || "$lc" == *" -f "* || "$lc" == *" --field "* \
+           || "$lc" == *" --method "* \
+           || "$lc" == *"gh"*"api"* || "$lc" == *"curl"* ]]; then
+            return 0  # violation: ai-review/security with write context
         fi
-        return 0  # violation: targets unknown/unspecified context
     fi
 
-    # Rule 3: Any line containing BOTH "gh api" AND "check-runs" is a violation
-    # unless EXCLUSIVELY targeting ai-review/code-quality (no security context).
-    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"check-runs"* ]]; then
-        if [[ "$lc" == *"ai-review/security"* ]]; then
-            return 0  # violation: security context present
-        fi
-        if [[ "$lc" == *"ai-review/code-quality"* ]]; then
-            return 1  # permitted: exclusively code-quality
-        fi
-        return 0  # violation
-    fi
-
-    # Rule 4: Any gh api call referencing ai-review/security with write-indicating
-    # flags is a violation — catches status writes even when the endpoint path is
-    # in a variable or uses a non-literal URL.
-    if [[ "$lc" == *"gh"*"api"* && "$lc" == *"ai-review/security"* ]]; then
-        # Check for write-indicating flags: -f, --field, -X, --method
-        if [[ "$lc" == *" -f "* || "$lc" == *" --field "* || "$lc" == *" -x "* || "$lc" == *" --method "* ]]; then
-            return 0  # violation: implicit write to ai-review/security
+    # Rule 3: gh api / curl to statuses or check-runs without any ai-review
+    # context specified is a violation (unknown context).
+    # Exception: lines exclusively targeting ai-review/code-quality are permitted.
+    if [[ "$lc" == *"statuses/"* || "$lc" == *"check-runs"* ]]; then
+        # Only check lines that use an HTTP client (gh api or curl)
+        if [[ "$lc" == *"gh"*"api"* || "$lc" == *"curl"* ]]; then
+            if [[ "$lc" == *"ai-review/code-quality"* ]] && [[ "$lc" != *"ai-review/security"* ]]; then
+                return 1  # permitted: exclusively code-quality
+            fi
+            # Already handled security context above in Rule 2, but if it
+            # somehow reaches here (e.g. no ai-review context at all), flag it.
+            return 0  # violation: unknown or unspecified context
         fi
     fi
 

@@ -13,3 +13,6 @@ gh pr comment $PR_URL --body-file findings.md
 
 # Permitted: reading (GET) a non-status, non-check-runs endpoint
 gh api "/repos/{owner}/{repo}/pulls/$pr_number"
+
+# Permitted: blessed xtask path for ai-review/security
+cargo xtask security-review-exec approve --context ai-review/security

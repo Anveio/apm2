@@ -31,3 +31,15 @@ gh api --method POST "/repos/{owner}/{repo}/statuses/$sha" -f state="success" -f
 
 # Pattern J: mixed-context bypass — security in check-runs with code-quality also present
 gh api "/repos/{owner}/{repo}/check-runs" -f name="ai-review/security" -f name="ai-review/code-quality" -f conclusion="success"
+
+# Pattern K: curl bypass — direct POST to statuses endpoint with security context
+curl -X POST "https://api.github.com/repos/{owner}/{repo}/statuses/$sha" -d '{"context":"ai-review/security","state":"success"}'
+
+# Pattern L: variable indirection bypass — endpoint and context in variables
+endpoint="/repos/{owner}/{repo}/statuses/$sha"; ctx="ai-review/security"; gh api "$endpoint" -f context="$ctx"
+
+# Pattern M: curl with check-runs endpoint and security context
+curl -H "Authorization: token $TOKEN" -X POST "https://api.github.com/repos/{owner}/{repo}/check-runs" -d '{"name":"ai-review/security","conclusion":"success"}'
+
+# Pattern N: variable indirection with check-runs — no gh api on same line as ai-review/security
+statuses_url="/repos/{owner}/{repo}/check-runs"; gh api "$statuses_url" -f name="ai-review/security" -f conclusion="success"

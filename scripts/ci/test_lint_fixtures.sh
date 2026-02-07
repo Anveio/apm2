@@ -6,6 +6,7 @@
 # 2. review_artifact_lint detection function permits all known-safe patterns
 # 3. evidence_refs_lint block extraction scopes correctly to YAML keys
 # 4. test_refs_lint path extraction handles YAML comments and quoted scalars
+# 5. ticket ref validation detects broken requirement_ref / artifact_ref
 #
 # Exit codes:
 #   0 - All fixture tests pass
@@ -143,6 +144,54 @@ if [[ "$result_bare" == "crates/foo/src/bar.rs" ]]; then
 else
     log_fail "Bare path NOT handled: expected 'crates/foo/src/bar.rs', got '$result_bare'"
 fi
+echo
+
+# --- Test 5: ticket ref validation ---
+echo "Test 5: ticket ref validation (requirement_ref / artifact_ref)"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Helper: validate a single ref from a fixture YAML file.
+# Extracts the file path, strips #anchor, and checks if the file exists.
+validate_ticket_ref() {
+    local fixture="$1"
+    local ref_key="$2"  # "requirement_ref" or "artifact_ref"
+    local expect="$3"   # "valid" or "broken"
+
+    local has_broken=0
+    while IFS= read -r ref_line; do
+        local ref_path
+        ref_path=$(echo "$ref_line" | sed -n "s/.*${ref_key}:[[:space:]]*\"\{0,1\}\([^\"#]*\).*/\1/p")
+        if [[ -n "$ref_path" ]]; then
+            ref_path="${ref_path%"${ref_path##*[![:space:]]}"}"
+            if [[ ! -f "${REPO_ROOT}/${ref_path}" ]]; then
+                has_broken=1
+            fi
+        fi
+    done < <(grep "${ref_key}:" "$fixture" 2>/dev/null || true)
+
+    if [[ "$expect" == "valid" ]]; then
+        if [[ $has_broken -eq 0 ]]; then
+            log_pass "Valid fixture ${ref_key} refs all resolve: $(basename "$fixture")"
+        else
+            log_fail "Valid fixture ${ref_key} ref unexpectedly broken: $(basename "$fixture")"
+        fi
+    else
+        if [[ $has_broken -eq 1 ]]; then
+            log_pass "Broken fixture ${ref_key} refs correctly detected: $(basename "$fixture")"
+        else
+            log_fail "Broken fixture ${ref_key} refs not detected: $(basename "$fixture")"
+        fi
+    fi
+}
+
+# Test 5a: Valid ticket refs should all resolve
+validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_valid.yaml" "requirement_ref" "valid"
+validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_valid.yaml" "artifact_ref" "valid"
+
+# Test 5b: Broken ticket refs should be detected
+validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_broken.yaml" "requirement_ref" "broken"
+validate_ticket_ref "${FIXTURE_DIR}/ticket_refs_broken.yaml" "artifact_ref" "broken"
 echo
 
 # --- Summary ---
