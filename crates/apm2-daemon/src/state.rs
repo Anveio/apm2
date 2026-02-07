@@ -16,8 +16,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use apm2_core::config::EcosystemConfig;
+use apm2_core::config::{AdapterRotationConfig, AdapterRotationStrategyConfig, EcosystemConfig};
 use apm2_core::credentials::CredentialStore;
+use apm2_core::fac::{
+    AdapterSelectionPolicy, AdapterSelectionStrategy, CLAUDE_CODE_PROFILE_ID,
+    GEMINI_CLI_PROFILE_ID, LOCAL_INFERENCE_PROFILE_ID, ProfileWeight, all_builtin_profiles,
+};
 use apm2_core::process::ProcessId;
 use apm2_core::process::runner::ProcessRunner;
 use apm2_core::schema_registry::InMemorySchemaRegistry;
@@ -25,6 +29,7 @@ use apm2_core::supervisor::Supervisor;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::cas::{DurableCas, DurableCasConfig};
 use crate::episode::capability::{InMemoryCasManifestLoader, StubManifestLoader};
@@ -66,6 +71,102 @@ use crate::session::{SessionRegistry, SessionStopConditionsStore, SessionTelemet
 /// (`apm2-receipt-signing`) and GitHub token service name
 /// (`apm2-github-tokens`) to avoid keyring entry collisions.
 const CREDENTIAL_STORE_SERVICE_NAME: &str = "apm2-credentials";
+
+/// Stores all builtin adapter profiles in CAS and returns `profile_id` -> hash.
+///
+/// TCK-00400 requires all builtin profiles to be addressable in CAS at daemon
+/// startup so hash-based selection and explicit overrides can resolve them.
+fn seed_builtin_profiles_in_cas(
+    cas: &dyn apm2_core::evidence::ContentAddressedStore,
+) -> Result<HashMap<String, [u8; 32]>, String> {
+    let mut profile_hashes: HashMap<String, [u8; 32]> = HashMap::new();
+    for profile in all_builtin_profiles() {
+        let profile_id = profile.profile_id.clone();
+        let hash = profile
+            .store_in_cas(cas)
+            .map_err(|e| format!("failed to store builtin profile '{profile_id}' in CAS: {e}"))?;
+        profile_hashes.insert(profile_id, hash);
+    }
+    Ok(profile_hashes)
+}
+
+/// Returns true if this builtin profile is supported by the registered
+/// adapters.
+fn is_profile_adapter_available(
+    profile_id: &str,
+    adapter_registry: &crate::episode::AdapterRegistry,
+) -> bool {
+    use crate::episode::AdapterType;
+
+    match profile_id {
+        // Current spawn path uses Raw adapter for black-box profiles.
+        CLAUDE_CODE_PROFILE_ID | GEMINI_CLI_PROFILE_ID | LOCAL_INFERENCE_PROFILE_ID => {
+            adapter_registry.contains(AdapterType::Raw)
+        },
+        // All other profiles (including Codex) remain disabled until dedicated
+        // adapter support lands (TCK-00402).
+        _ => false,
+    }
+}
+
+/// Builds adapter selection policy + availability set from config and CAS
+/// hashes.
+fn build_adapter_selection_policy(
+    rotation: &AdapterRotationConfig,
+    profile_hashes: &HashMap<String, [u8; 32]>,
+    adapter_registry: &crate::episode::AdapterRegistry,
+) -> Result<(AdapterSelectionPolicy, std::collections::BTreeSet<[u8; 32]>), String> {
+    let strategy = match rotation.strategy {
+        AdapterRotationStrategyConfig::WeightedRandom => AdapterSelectionStrategy::WeightedRandom,
+        AdapterRotationStrategyConfig::RoundRobin => AdapterSelectionStrategy::RoundRobin,
+    };
+
+    let mut available_profile_hashes = std::collections::BTreeSet::new();
+    let mut entries: Vec<ProfileWeight> = Vec::with_capacity(rotation.profiles.len());
+    for configured in &rotation.profiles {
+        let Some(profile_hash) = profile_hashes.get(&configured.profile_id).copied() else {
+            return Err(format!(
+                "daemon.adapter_rotation references unknown profile_id '{}'",
+                configured.profile_id
+            ));
+        };
+
+        if is_profile_adapter_available(&configured.profile_id, adapter_registry) {
+            available_profile_hashes.insert(profile_hash);
+        }
+
+        entries.push(ProfileWeight {
+            profile_hash,
+            profile_id: configured.profile_id.clone(),
+            weight: configured.weight,
+            enabled: configured.enabled,
+            fallback_priority: configured.fallback_priority,
+            last_failure_at: None,
+            failure_count: 0,
+        });
+    }
+
+    let policy = AdapterSelectionPolicy {
+        entries,
+        strategy,
+        rate_limit_backoff_secs: rotation.rate_limit_backoff_secs,
+    };
+    policy.validate().map_err(|e| e.to_string())?;
+
+    // Fail closed at startup if no configured+enabled profile is currently
+    // adapter-eligible.
+    let has_runtime_eligible = policy.entries.iter().any(|entry| {
+        entry.enabled && entry.weight > 0 && available_profile_hashes.contains(&entry.profile_hash)
+    });
+    if !has_runtime_eligible {
+        return Err(
+            "daemon.adapter_rotation has no adapter-eligible enabled profile (all gated unavailable)"
+                .to_string(),
+        );
+    }
+
+    Ok((policy, available_profile_hashes))
+}
 
 #[cfg(not(test))]
 const GOVERNANCE_FRESHNESS_POLL_INTERVAL_MS: u64 = 30_000;
@@ -398,6 +499,25 @@ impl DispatcherState {
         sqlite_conn: Option<Arc<Mutex<Connection>>>,
         ledger_signing_key: Option<ed25519_dalek::SigningKey>,
     ) -> Self {
+        Self::with_persistence_and_adapter_rotation(
+            session_registry,
+            metrics_registry,
+            sqlite_conn,
+            ledger_signing_key,
+            &AdapterRotationConfig::default(),
+        )
+    }
+
+    /// Creates new dispatcher state with persistent ledger components and
+    /// adapter rotation config (TCK-00400).
+    #[must_use]
+    pub fn with_persistence_and_adapter_rotation(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Option<Arc<Mutex<Connection>>>,
+        ledger_signing_key: Option<ed25519_dalek::SigningKey>,
+        adapter_rotation: &AdapterRotationConfig,
+    ) -> Self {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
         let manifest_store = Arc::new(InMemoryManifestStore::new());
@@ -490,11 +610,33 @@ impl DispatcherState {
             adapter_registry.register(Box::new(
                 crate::episode::claude_code::ClaudeCodeAdapter::new(),
             ));
-            let adapter_registry = Arc::new(adapter_registry);
 
             // TCK-00399: CAS for adapter profile resolution during spawn.
             let cas: Arc<dyn apm2_core::evidence::ContentAddressedStore> =
                 Arc::new(apm2_core::evidence::MemoryCas::new());
+
+            // TCK-00400: Store all builtin adapter profiles in CAS at startup.
+            let profile_hashes = seed_builtin_profiles_in_cas(cas.as_ref())
+                .expect("builtin adapter profile CAS seeding should succeed");
+            let (adapter_selection_policy, available_profile_hashes) =
+                build_adapter_selection_policy(
+                    adapter_rotation,
+                    &profile_hashes,
+                    &adapter_registry,
+                )
+                .unwrap_or_else(|error| {
+                    warn!(
+                        error = %error,
+                        "Invalid daemon.adapter_rotation config; falling back to defaults"
+                    );
+                    build_adapter_selection_policy(
+                        &AdapterRotationConfig::default(),
+                        &profile_hashes,
+                        &adapter_registry,
+                    )
+                    .expect("default adapter rotation policy should be valid")
+                });
+            let adapter_registry = Arc::new(adapter_registry);
 
             PrivilegedDispatcher::with_dependencies(
                 DecodeConfig::default(),
@@ -516,6 +658,11 @@ impl DispatcherState {
             // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
             .with_adapter_registry(adapter_registry)
             .with_cas(cas)
+            .with_adapter_selection_policy(
+                adapter_selection_policy,
+                available_profile_hashes,
+                profile_hashes,
+            )
         } else {
             // Use stubs
             let clock = Arc::new(
@@ -629,12 +776,32 @@ impl DispatcherState {
         sqlite_conn: Arc<Mutex<Connection>>,
         cas_path: impl AsRef<Path>,
     ) -> Result<Self, crate::cas::DurableCasError> {
+        Self::with_persistence_and_cas_and_rotation(
+            session_registry,
+            metrics_registry,
+            sqlite_conn,
+            cas_path,
+            AdapterRotationConfig::default(),
+        )
+    }
+
+    /// Creates new dispatcher state with persistent ledger, CAS, and
+    /// adapter rotation config (TCK-00400).
+    #[allow(clippy::needless_pass_by_value)] // Arc is intentionally moved for shared ownership
+    pub fn with_persistence_and_cas_and_rotation(
+        session_registry: Arc<dyn SessionRegistry>,
+        metrics_registry: Option<SharedMetricsRegistry>,
+        sqlite_conn: Arc<Mutex<Connection>>,
+        cas_path: impl AsRef<Path>,
+        adapter_rotation: AdapterRotationConfig,
+    ) -> Result<Self, crate::cas::DurableCasError> {
         Self::with_persistence_and_cas_and_key(
             session_registry,
             metrics_registry,
             sqlite_conn,
             cas_path,
             None,
+            adapter_rotation,
         )
     }
 
@@ -657,6 +824,7 @@ impl DispatcherState {
         sqlite_conn: Arc<Mutex<Connection>>,
         cas_path: impl AsRef<Path>,
         ledger_signing_key: Option<ed25519_dalek::SigningKey>,
+        adapter_rotation: AdapterRotationConfig,
     ) -> Result<Self, crate::cas::DurableCasError> {
         let token_secret = TokenMinter::generate_secret();
         let token_minter = Arc::new(TokenMinter::new(token_secret));
@@ -779,6 +947,23 @@ impl DispatcherState {
         adapter_registry.register(Box::new(
             crate::episode::claude_code::ClaudeCodeAdapter::new(),
         ));
+        // TCK-00400: Store all builtin adapter profiles in CAS at startup.
+        let profile_hashes = seed_builtin_profiles_in_cas(evidence_cas.as_ref())
+            .expect("builtin adapter profile CAS seeding should succeed");
+        let (adapter_selection_policy, available_profile_hashes) =
+            build_adapter_selection_policy(&adapter_rotation, &profile_hashes, &adapter_registry)
+                .unwrap_or_else(|error| {
+                    warn!(
+                        error = %error,
+                        "Invalid daemon.adapter_rotation config; falling back to defaults"
+                    );
+                    build_adapter_selection_policy(
+                        &AdapterRotationConfig::default(),
+                        &profile_hashes,
+                        &adapter_registry,
+                    )
+                    .expect("default adapter rotation policy should be valid")
+                });
         let adapter_registry = Arc::new(adapter_registry);
         let episode_runtime = episode_runtime.with_adapter_registry(Arc::clone(&adapter_registry));
 
@@ -812,7 +997,12 @@ impl DispatcherState {
         // TCK-00352: Wire V1 manifest store into production path
         .with_v1_manifest_store(Arc::clone(&v1_manifest_store))
         // TCK-00399: Wire adapter registry and CAS for agent CLI process spawning
-        .with_adapter_registry(adapter_registry);
+        .with_adapter_registry(adapter_registry)
+        .with_adapter_selection_policy(
+            adapter_selection_policy,
+            available_profile_hashes,
+            profile_hashes,
+        );
 
         let privileged_dispatcher = if let Some(ref metrics) = metrics_registry {
             privileged_dispatcher.with_metrics(Arc::clone(metrics))

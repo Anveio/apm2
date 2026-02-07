@@ -26,8 +26,8 @@
 //! └─────────────────┘     └─────────────────┘
 //! ```
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use apm2_core::credentials::{
@@ -37,8 +37,9 @@ use apm2_core::determinism::canonicalize_json;
 use apm2_core::events::{DefectRecorded, Validate};
 use apm2_core::evidence::ContentAddressedStore;
 use apm2_core::fac::{
-    AttestationLevel, AttestationRequirements, REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation,
-    ReceiptKind, RiskTier, builtin_profiles, validate_receipt_attestation,
+    AdapterSelectionPolicy, AttestationLevel, AttestationRequirements,
+    REVIEW_RECEIPT_RECORDED_PREFIX, ReceiptAttestation, ReceiptKind, RiskTier, SelectionDecision,
+    builtin_profiles, validate_receipt_attestation,
 };
 use apm2_core::process::ProcessState;
 use bytes::Bytes;
@@ -341,6 +342,8 @@ pub trait LedgerEventEmitter: Send + Sync {
     /// * `contract_binding` - Contract binding from handshake (if available)
     /// * `identity_proof_profile_hash` - Active identity proof profile hash for
     ///   the session identity context (when available)
+    /// * `selection_decision` - Adapter selection metadata when profile was
+    ///   chosen by policy (TCK-00400)
     ///
     /// # Returns
     ///
@@ -361,6 +364,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
         identity_proof_profile_hash: Option<&[u8; 32]>,
+        selection_decision: Option<&SelectionDecision>,
     ) -> Result<SignedLedgerEvent, LedgerEventError>;
 
     /// Emits a generic session event to the ledger (TCK-00290).
@@ -728,6 +732,7 @@ pub trait LedgerEventEmitter: Send + Sync {
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
         identity_proof_profile_hash: Option<&[u8; 32]>,
+        selection_decision: Option<&SelectionDecision>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         // Default implementation: emit sequentially.
         let session_event = self.emit_session_started(
@@ -740,6 +745,7 @@ pub trait LedgerEventEmitter: Send + Sync {
             timestamp_ns,
             contract_binding,
             identity_proof_profile_hash,
+            selection_decision,
         )?;
         let transition_count = self.get_work_transition_count(work_id);
         if let Err(e) = self.emit_work_transitioned(&WorkTransition {
@@ -994,6 +1000,7 @@ pub fn build_session_started_payload(
     role_spec_hash: Option<&[u8; 32]>,
     contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
     identity_proof_profile_hash: Option<&[u8; 32]>,
+    selection_decision: Option<&SelectionDecision>,
 ) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "event_type": "session_started",
@@ -1046,6 +1053,61 @@ pub fn build_session_started_payload(
         payload.as_object_mut().expect("payload is object").insert(
             "identity_proof_profile_hash".to_string(),
             serde_json::Value::String(hex::encode(profile_hash)),
+        );
+    }
+    if let Some(decision) = selection_decision {
+        let mut weights = Vec::with_capacity(decision.selection_weights.len());
+        for weight in &decision.selection_weights {
+            weights.push(serde_json::json!({
+                "profile_id": weight.profile_id,
+                "profile_hash": hex::encode(weight.profile_hash),
+                "configured_weight": weight.configured_weight,
+                "effective_weight": weight.effective_weight,
+                "enabled": weight.enabled,
+                "adapter_available": weight.adapter_available,
+                "rate_limited": weight.rate_limited,
+                "fallback_priority": weight.fallback_priority,
+            }));
+        }
+
+        let obj = payload.as_object_mut().expect("payload is object");
+        obj.insert(
+            "selected_profile_id".to_string(),
+            serde_json::Value::String(decision.selected_profile_id.clone()),
+        );
+        obj.insert(
+            "selection_weights".to_string(),
+            serde_json::Value::Array(weights),
+        );
+        obj.insert(
+            "selection_input_digest".to_string(),
+            serde_json::Value::String(hex::encode(decision.selection_input_digest)),
+        );
+        obj.insert(
+            "selection_seed".to_string(),
+            serde_json::Value::String(hex::encode(decision.seed)),
+        );
+        obj.insert(
+            "selection_policy_hash".to_string(),
+            serde_json::Value::String(hex::encode(decision.policy_hash)),
+        );
+        obj.insert(
+            "selection_attempt".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(u64::from(
+                decision.selection_attempt,
+            ))),
+        );
+        obj.insert(
+            "selection_backoff_epoch".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(decision.backoff_epoch)),
+        );
+        obj.insert(
+            "selection_strategy".to_string(),
+            serde_json::to_value(decision.strategy).expect("selection strategy serializes"),
+        );
+        obj.insert(
+            "selection_used_fallback".to_string(),
+            serde_json::Value::Bool(decision.used_fallback),
         );
     }
     payload
@@ -1239,6 +1301,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
         timestamp_ns: u64,
         contract_binding: Option<&crate::hsi_contract::SessionContractBinding>,
         identity_proof_profile_hash: Option<&[u8; 32]>,
+        selection_decision: Option<&SelectionDecision>,
     ) -> Result<SignedLedgerEvent, LedgerEventError> {
         use ed25519_dalek::Signer;
 
@@ -1257,6 +1320,7 @@ impl LedgerEventEmitter for StubLedgerEventEmitter {
             role_spec_hash,
             contract_binding,
             identity_proof_profile_hash,
+            selection_decision,
         );
 
         let payload_bytes =
@@ -4624,6 +4688,19 @@ pub struct PrivilegedDispatcher {
     /// CAS, builds a `HarnessConfig`, and spawns the agent process via the
     /// appropriate `HarnessAdapter`.
     adapter_registry: Option<Arc<crate::episode::AdapterRegistry>>,
+
+    /// TCK-00400: Deterministic adapter selection policy state.
+    ///
+    /// Stored behind a daemon-only mutex so spawn failures can update
+    /// backoff/failure counters without exposing mutable selection state
+    /// through IPC surfaces.
+    adapter_selection_policy: Option<Arc<Mutex<AdapterSelectionPolicy>>>,
+
+    /// TCK-00400: Profile hashes currently eligible by runtime adapter support.
+    adapter_available_profiles: BTreeSet<[u8; 32]>,
+
+    /// TCK-00400: Reverse lookup for profile hash -> profile ID.
+    adapter_profile_ids_by_hash: HashMap<[u8; 32], String>,
 }
 
 impl Default for PrivilegedDispatcher {
@@ -4766,6 +4843,9 @@ impl PrivilegedDispatcher {
             stop_authority: None,
             governance_freshness_monitor: None,
             adapter_registry: None,
+            adapter_selection_policy: None,
+            adapter_available_profiles: BTreeSet::new(),
+            adapter_profile_ids_by_hash: HashMap::new(),
         }
     }
 
@@ -4829,6 +4909,9 @@ impl PrivilegedDispatcher {
             stop_authority: None,
             governance_freshness_monitor: None,
             adapter_registry: None,
+            adapter_selection_policy: None,
+            adapter_available_profiles: BTreeSet::new(),
+            adapter_profile_ids_by_hash: HashMap::new(),
         }
     }
 
@@ -4911,6 +4994,9 @@ impl PrivilegedDispatcher {
             stop_authority: None,
             governance_freshness_monitor: None,
             adapter_registry: None,
+            adapter_selection_policy: None,
+            adapter_available_profiles: BTreeSet::new(),
+            adapter_profile_ids_by_hash: HashMap::new(),
         }
     }
 
@@ -4970,6 +5056,9 @@ impl PrivilegedDispatcher {
             stop_authority: None,
             governance_freshness_monitor: None,
             adapter_registry: None,
+            adapter_selection_policy: None,
+            adapter_available_profiles: BTreeSet::new(),
+            adapter_profile_ids_by_hash: HashMap::new(),
         }
     }
 
@@ -5090,6 +5179,24 @@ impl PrivilegedDispatcher {
         self
     }
 
+    /// Sets adapter-selection policy state and adapter availability
+    /// (TCK-00400).
+    #[must_use]
+    pub fn with_adapter_selection_policy(
+        mut self,
+        policy: AdapterSelectionPolicy,
+        available_profiles: BTreeSet<[u8; 32]>,
+        profile_hashes_by_id: HashMap<String, [u8; 32]>,
+    ) -> Self {
+        self.adapter_selection_policy = Some(Arc::new(Mutex::new(policy)));
+        self.adapter_available_profiles = available_profiles;
+        self.adapter_profile_ids_by_hash = profile_hashes_by_id
+            .into_iter()
+            .map(|(profile_id, profile_hash)| (profile_hash, profile_id))
+            .collect();
+        self
+    }
+
     /// Replaces the session registry used by this dispatcher (TEST ONLY).
     ///
     /// This allows tests to inject a concrete `InMemorySessionRegistry`
@@ -5143,6 +5250,70 @@ impl PrivilegedDispatcher {
     fn record_governance_probe_failure(&self) {
         if let Some(ref monitor) = self.governance_freshness_monitor {
             monitor.record_failure();
+        }
+    }
+
+    fn is_rate_limited_spawn_error(error: &str) -> bool {
+        let normalized = error.to_ascii_lowercase();
+        normalized.contains("rate limit")
+            || normalized.contains("rate-limited")
+            || normalized.contains("429")
+            || normalized.contains("too many requests")
+            || normalized.contains("resource limit exceeded")
+    }
+
+    fn record_adapter_profile_failure(&self, profile_hash: &[u8; 32], error: &str) {
+        let Some(policy) = &self.adapter_selection_policy else {
+            return;
+        };
+
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let rate_limited = Self::is_rate_limited_spawn_error(error);
+        match policy.lock() {
+            Ok(mut guard) => {
+                if let Err(policy_err) = guard.record_failure(profile_hash, now_secs, rate_limited)
+                {
+                    warn!(
+                        profile_hash = %hex::encode(profile_hash),
+                        error = %policy_err,
+                        "adapter selection failure tracking update failed"
+                    );
+                }
+            },
+            Err(lock_err) => {
+                warn!(
+                    profile_hash = %hex::encode(profile_hash),
+                    error = %lock_err,
+                    "adapter selection policy lock poisoned during failure update"
+                );
+            },
+        }
+    }
+
+    fn record_adapter_profile_success(&self, profile_hash: &[u8; 32]) {
+        let Some(policy) = &self.adapter_selection_policy else {
+            return;
+        };
+
+        match policy.lock() {
+            Ok(mut guard) => {
+                if let Err(policy_err) = guard.record_success(profile_hash) {
+                    warn!(
+                        profile_hash = %hex::encode(profile_hash),
+                        error = %policy_err,
+                        "adapter selection success tracking update failed"
+                    );
+                }
+            },
+            Err(lock_err) => {
+                warn!(
+                    profile_hash = %hex::encode(profile_hash),
+                    error = %lock_err,
+                    "adapter selection policy lock poisoned during success update"
+                );
+            },
         }
     }
 
@@ -5956,8 +6127,8 @@ impl PrivilegedDispatcher {
         requested_hash: Option<&[u8]>,
         role: WorkRole,
         claim: &WorkClaim,
-    ) -> Result<[u8; 32], String> {
-        let resolved_hash = if let Some(raw_hash) = requested_hash {
+    ) -> Result<([u8; 32], Option<SelectionDecision>), String> {
+        let (resolved_hash, selection_decision) = if let Some(raw_hash) = requested_hash {
             if raw_hash.len() != 32 {
                 return Err(format!(
                     "adapter_profile_hash must be exactly 32 bytes, got {}",
@@ -5985,9 +6156,9 @@ impl PrivilegedDispatcher {
                     hex::encode(hash)
                 ));
             }
-            hash
+            (hash, None)
         } else {
-            self.resolve_default_adapter_profile(role)?
+            self.resolve_default_adapter_profile(role, &claim.work_id)?
         };
 
         // SECURITY (BLOCKER fix): Policy-binding validation.
@@ -6024,7 +6195,7 @@ impl PrivilegedDispatcher {
             );
         }
 
-        Ok(resolved_hash)
+        Ok((resolved_hash, selection_decision))
     }
 
     /// Resolves the role-based default adapter profile hash.
@@ -6032,7 +6203,37 @@ impl PrivilegedDispatcher {
     /// Stores the default profile in CAS so that auditors reading the ledger
     /// can resolve the hash. If CAS is not configured, falls back to
     /// computing the hash without persistence.
-    fn resolve_default_adapter_profile(&self, role: WorkRole) -> Result<[u8; 32], String> {
+    fn resolve_default_adapter_profile(
+        &self,
+        role: WorkRole,
+        work_id: &str,
+    ) -> Result<([u8; 32], Option<SelectionDecision>), String> {
+        if let Some(policy_state) = &self.adapter_selection_policy {
+            let selection_attempt = self.event_emitter.get_work_transition_count(work_id);
+            let decision = policy_state
+                .lock()
+                .map_err(|e| format!("adapter selection policy lock poisoned: {e}"))?
+                .select_profile(work_id, selection_attempt, &self.adapter_available_profiles)
+                .map_err(|e| format!("adapter selection failed: {e}"))?;
+
+            let selected_hash = decision.selected_profile_hash;
+            let cas = self
+                .cas
+                .as_ref()
+                .ok_or_else(|| "adapter selection requires CAS configuration".to_string())?;
+            let exists = cas
+                .exists(&selected_hash)
+                .map_err(|e| format!("selected adapter profile CAS validation failed: {e}"))?;
+            if !exists {
+                return Err(format!(
+                    "selected adapter profile hash not found in CAS: {}",
+                    hex::encode(selected_hash)
+                ));
+            }
+
+            return Ok((selected_hash, Some(decision)));
+        }
+
         // TODO(TCK-00397): differentiate per-role profiles post-rollout
         let profile = match role {
             WorkRole::Implementer
@@ -6047,11 +6248,13 @@ impl PrivilegedDispatcher {
                 profile
                     .compute_cas_hash()
                     .map_err(|e| format!("default adapter profile hash computation failed: {e}"))
+                    .map(|hash| (hash, None))
             },
             |cas| {
                 profile
                     .store_in_cas(cas.as_ref())
                     .map_err(|e| format!("default adapter profile CAS storage failed: {e}"))
+                    .map(|hash| (hash, None))
             },
         )
     }
@@ -6588,12 +6791,13 @@ impl PrivilegedDispatcher {
             }
         }
 
-        let adapter_profile_hash = match self.resolve_spawn_adapter_profile_hash(
-            request.adapter_profile_hash.as_deref(),
-            request_role,
-            &claim,
-        ) {
-            Ok(hash) => hash,
+        let (adapter_profile_hash, selection_decision) = match self
+            .resolve_spawn_adapter_profile_hash(
+                request.adapter_profile_hash.as_deref(),
+                request_role,
+                &claim,
+            ) {
+            Ok(resolved) => resolved,
             Err(e) => {
                 warn!(
                     work_id = %request.work_id,
@@ -6608,11 +6812,20 @@ impl PrivilegedDispatcher {
         };
 
         let role_spec_hash = Self::derive_role_spec_hash(&claim);
+        let resolved_profile_id = selection_decision
+            .as_ref()
+            .map(|decision| decision.selected_profile_id.as_str())
+            .or_else(|| {
+                self.adapter_profile_ids_by_hash
+                    .get(&adapter_profile_hash)
+                    .map(String::as_str)
+            });
 
         info!(
             work_id = %request.work_id,
             policy_resolved_ref = %claim.policy_resolution.policy_resolved_ref,
             adapter_profile_hash = %hex::encode(adapter_profile_hash),
+            selected_profile_id = ?resolved_profile_id,
             role_spec_hash_present = role_spec_hash.is_some(),
             "SpawnEpisode authorized with policy resolution"
         );
@@ -7464,6 +7677,7 @@ impl PrivilegedDispatcher {
                 // MAJOR fix: Fail-closed on spawn errors.  A successful
                 // SpawnEpisode response with no agent process is a silent
                 // failure.  Roll back the episode and return an error.
+                self.record_adapter_profile_failure(&adapter_profile_hash, &e);
                 error!(
                     episode_id = %episode_id,
                     error = %e,
@@ -7488,6 +7702,8 @@ impl PrivilegedDispatcher {
                     msg,
                 ));
             }
+
+            self.record_adapter_profile_success(&adapter_profile_hash);
         }
 
         // TCK-00358: Resolve identity proof profile hash for SessionStarted.
@@ -7526,6 +7742,7 @@ impl PrivilegedDispatcher {
             timestamp_ns,
             ctx.contract_binding(),
             identity_proof_profile_hash.as_ref(),
+            selection_decision.as_ref(),
         ) {
             // TCK-00384 review fix: unified post-start rollback stops the
             // episode and cleans up session/telemetry/manifest.
@@ -17519,6 +17736,7 @@ mod tests {
                     ts,
                     None,
                     None,
+                    None,
                 )
                 .unwrap();
 
@@ -17632,6 +17850,7 @@ mod tests {
                 &[0xAA; 32],
                 None,
                 2_000_000_000,
+                None,
                 None,
                 None,
             );
