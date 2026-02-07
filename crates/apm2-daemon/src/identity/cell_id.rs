@@ -276,6 +276,9 @@ fn validate_trust_domain(value: &str) -> Result<(), KeyIdError> {
     if value.chars().any(char::is_whitespace) {
         return Err(KeyIdError::ContainsInteriorWhitespace);
     }
+    if value.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+        return Err(KeyIdError::ContainsControlCharacter);
+    }
     if value.len() > MAX_TRUST_DOMAIN_LEN {
         return Err(KeyIdError::InvalidDescriptor {
             reason: format!(
@@ -704,5 +707,42 @@ mod tests {
 
         // Hashes must differ (genesis artifact != cell id binary).
         assert_ne!(genesis_result.hash, id_result.hash);
+    }
+
+    // =========================================================================
+    // MAJOR-1: Control character rejection tests (trust_domain)
+    // =========================================================================
+
+    #[test]
+    fn trust_domain_rejects_null_byte() {
+        let err = CellGenesisV1::new(
+            [0x11; 32],
+            PolicyRootId::Single(make_public_key_id(0xAB)),
+            "cell\0example",
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
+    }
+
+    #[test]
+    fn trust_domain_rejects_soh_control() {
+        let err = CellGenesisV1::new(
+            [0x11; 32],
+            PolicyRootId::Single(make_public_key_id(0xAB)),
+            "cell\x01example",
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
+    }
+
+    #[test]
+    fn trust_domain_rejects_del_control() {
+        let err = CellGenesisV1::new(
+            [0x11; 32],
+            PolicyRootId::Single(make_public_key_id(0xAB)),
+            "cell\x7Fexample",
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
     }
 }

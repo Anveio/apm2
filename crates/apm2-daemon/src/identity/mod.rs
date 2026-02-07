@@ -227,6 +227,11 @@ pub enum KeyIdError {
     #[error("input contains non-ASCII characters")]
     ContainsNonAscii,
 
+    /// Input contains ASCII control characters (0x00-0x1F, 0x7F) that are
+    /// not in the printable ASCII range (0x21-0x7E).
+    #[error("input contains ASCII control characters")]
+    ContainsControlCharacter,
+
     /// Hex payload has wrong length (expected exactly 64 hex characters).
     #[error("hex payload length mismatch: expected 64, got {got}")]
     HexLengthMismatch {

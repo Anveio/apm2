@@ -38,6 +38,15 @@ const GENESIS_DOMAIN_SEPARATION: &[u8] = b"apm2:holon_genesis:v1\0";
 /// Version tag byte for V1 binary form.
 const VERSION_TAG_V1: u8 = 0x01;
 
+/// Presence bitmap bit: optional `purpose` is present.
+const PURPOSE_PRESENT_BIT: u8 = 0b0000_0001;
+
+/// Presence bitmap bit: optional `created_anchor` is present.
+const CREATED_ANCHOR_PRESENT_BIT: u8 = 0b0000_0010;
+
+/// Expected byte length for Ed25519 public keys.
+pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
+
 /// Maximum byte length for genesis public key bytes.
 pub const MAX_GENESIS_PUBLIC_KEY_BYTES: usize = 256;
 
@@ -161,16 +170,23 @@ impl HolonGenesisV1 {
 
     /// Deterministic canonical bytes for CAS addressing (HSI 1.7.4b).
     ///
-    /// Encoding:
+    /// Uses injective length-prefixed encoding to prevent ambiguous framing.
+    /// Fixed-length fields are explicitly delimited and optional fields are
+    /// controlled by a single presence bitmap.
+    ///
     /// ```text
-    /// apm2:holon_genesis:v1\0 + cell_id_hash + "\n" + pkid_binary + "\n" + pubkey_bytes
-    /// + ["\n" + purpose]
-    /// + ["\n" + created_anchor]
+    /// apm2:holon_genesis:v1\0
+    /// + cell_id_hash (32 bytes, fixed)
+    /// + "\n"
+    /// + pkid_binary (33 bytes, fixed)
+    /// + "\n"
+    /// + len(pubkey_bytes) as u32 LE + pubkey_bytes
+    /// + presence_bitmap (bit0 = purpose present, bit1 = anchor present)
+    /// + [if purpose present: len(purpose) as u32 LE + purpose]
+    /// + [if anchor present: len(anchor) as u32 LE + anchor]
     /// ```
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let pkid_binary = self.holon_genesis_public_key_id.to_binary();
-        let purpose_len = self.purpose.map_or(0, |p| 1 + p.as_token().len());
-        let anchor_len = self.created_anchor.as_ref().map_or(0, |a| 1 + a.len());
 
         let mut out = Vec::with_capacity(
             GENESIS_DOMAIN_SEPARATION.len()
@@ -178,9 +194,11 @@ impl HolonGenesisV1 {
                 + 1
                 + BINARY_LEN
                 + 1
+                + 4
                 + self.holon_genesis_public_key_bytes.len()
-                + purpose_len
-                + anchor_len,
+                + 1
+                + self.purpose.map_or(0, |p| 4 + p.as_token().len())
+                + self.created_anchor.as_ref().map_or(0, |a| 4 + a.len()),
         );
 
         out.extend_from_slice(GENESIS_DOMAIN_SEPARATION);
@@ -188,16 +206,38 @@ impl HolonGenesisV1 {
         out.push(b'\n');
         out.extend_from_slice(&pkid_binary);
         out.push(b'\n');
+
+        // Variable-length field: pubkey_bytes with 4-byte LE length prefix.
+        let pk_len = u32::try_from(self.holon_genesis_public_key_bytes.len())
+            .expect("holon_genesis_public_key_bytes length is bounded to <= 256");
+        out.extend_from_slice(&pk_len.to_le_bytes());
         out.extend_from_slice(&self.holon_genesis_public_key_bytes);
 
+        let mut presence_bitmap = 0u8;
+        if self.purpose.is_some() {
+            presence_bitmap |= PURPOSE_PRESENT_BIT;
+        }
+        if self.created_anchor.is_some() {
+            presence_bitmap |= CREATED_ANCHOR_PRESENT_BIT;
+        }
+        out.push(presence_bitmap);
+
         if let Some(purpose) = self.purpose {
-            out.push(b'\n');
-            out.extend_from_slice(purpose.as_token().as_bytes());
+            let token = purpose.as_token().as_bytes();
+            let token_len =
+                u32::try_from(token.len()).expect("HolonPurpose token length must fit in u32");
+            out.extend_from_slice(&token_len.to_le_bytes());
+            out.extend_from_slice(token);
         }
+
         if let Some(anchor) = self.created_anchor.as_ref() {
-            out.push(b'\n');
-            out.extend_from_slice(anchor.as_bytes());
+            let anchor_bytes = anchor.as_bytes();
+            let anchor_len =
+                u32::try_from(anchor_bytes.len()).expect("created_anchor length must fit in u32");
+            out.extend_from_slice(&anchor_len.to_le_bytes());
+            out.extend_from_slice(anchor_bytes);
         }
+
         out
     }
 }
@@ -329,6 +369,17 @@ fn validate_public_key_bytes(bytes: &[u8]) -> Result<(), KeyIdError> {
             ),
         });
     }
+    // Ed25519 public keys must be exactly 32 bytes. Since the only supported
+    // identity scheme uses Ed25519 (AlgorithmTag::Ed25519), we enforce this
+    // invariant for all genesis key bytes.
+    if bytes.len() != ED25519_PUBLIC_KEY_LEN {
+        return Err(KeyIdError::InvalidDescriptor {
+            reason: format!(
+                "Ed25519 public key must be exactly {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
+                bytes.len()
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -349,6 +400,9 @@ fn validate_created_anchor(anchor: &str) -> Result<(), KeyIdError> {
     }
     if anchor.chars().any(char::is_whitespace) {
         return Err(KeyIdError::ContainsInteriorWhitespace);
+    }
+    if anchor.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+        return Err(KeyIdError::ContainsControlCharacter);
     }
     if anchor.len() > MAX_CREATED_ANCHOR_LEN {
         return Err(KeyIdError::InvalidDescriptor {
@@ -474,6 +528,30 @@ mod tests {
 
         assert_eq!(HolonIdV1::from_genesis(&g1), HolonIdV1::from_genesis(&g2));
         assert_ne!(g1.canonical_bytes(), g2.canonical_bytes());
+    }
+
+    #[test]
+    fn canonical_bytes_disambiguate_purpose_vs_anchor_payloads() {
+        let cell_id = make_cell_id(0x11, "cell.example.internal");
+        let key_bytes = make_public_key_bytes(0xCC);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+
+        let purpose_only = HolonGenesisV1::new(
+            cell_id.clone(),
+            key_id.clone(),
+            key_bytes.clone(),
+            Some(HolonPurpose::Agent),
+            None,
+        )
+        .unwrap();
+        let anchor_only =
+            HolonGenesisV1::new(cell_id, key_id, key_bytes, None, Some("AGENT".to_string()))
+                .unwrap();
+
+        assert_ne!(
+            purpose_only.canonical_bytes(),
+            anchor_only.canonical_bytes()
+        );
     }
 
     #[test]
@@ -627,6 +705,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_public_key_bytes_shorter_than_ed25519_len() {
+        let key_bytes = vec![0xAB; ED25519_PUBLIC_KEY_LEN - 1];
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, KeyIdError::InvalidDescriptor { .. }));
+    }
+
+    #[test]
+    fn rejects_public_key_bytes_longer_than_ed25519_len() {
+        let key_bytes = vec![0xAB; ED25519_PUBLIC_KEY_LEN + 1];
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, KeyIdError::InvalidDescriptor { .. }));
+    }
+
+    #[test]
     fn rejects_mismatched_public_key_id_and_bytes() {
         let key_bytes = make_public_key_bytes(0xAA);
         let wrong_id = make_public_key_id(0xBB);
@@ -715,6 +823,36 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, KeyIdError::ContainsPercentEncoding);
+    }
+
+    #[test]
+    fn created_anchor_rejects_nul_byte() {
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            Some("anchor\0one".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
+    }
+
+    #[test]
+    fn created_anchor_rejects_ascii_control_character() {
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            Some(format!("anchor{}one", '\u{0007}')),
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
     }
 
     #[test]
@@ -872,5 +1010,204 @@ mod tests {
 
         // Hashes must differ (genesis artifact != holon id binary).
         assert_ne!(genesis_result.hash, id_result.hash);
+    }
+
+    // =========================================================================
+    // BLOCKER-1: Length-prefixed canonical encoding regression tests
+    // =========================================================================
+
+    /// Regression: purpose=Some("AGENT")/anchor=None vs
+    /// purpose=None/anchor=Some("AGENT") must produce different canonical
+    /// bytes (the old delimiter-based encoding allowed these to collide).
+    #[test]
+    fn canonical_bytes_no_collision_purpose_vs_anchor() {
+        let cell_id = make_cell_id(0x11, "cell.example.internal");
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+
+        let g1 = HolonGenesisV1::new(
+            cell_id.clone(),
+            key_id.clone(),
+            key_bytes.clone(),
+            Some(HolonPurpose::Agent),
+            None,
+        )
+        .unwrap();
+        let g2 = HolonGenesisV1::new(cell_id, key_id, key_bytes, None, Some("AGENT".to_string()))
+            .unwrap();
+
+        assert_ne!(
+            g1.canonical_bytes(),
+            g2.canonical_bytes(),
+            "purpose=Some(AGENT)/anchor=None must not collide with purpose=None/anchor=Some(AGENT)"
+        );
+    }
+
+    /// Adversarial: embedded delimiter bytes (newlines) in anchor must not
+    /// cause framing ambiguity. With length-prefixed encoding, the anchor
+    /// field data is length-delimited, so embedded newlines are harmless.
+    #[test]
+    fn canonical_bytes_adversarial_embedded_delimiter() {
+        let cell_id = make_cell_id(0x11, "cell.example.internal");
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+
+        // Anchors with embedded content that would be dangerous under
+        // delimiter-based framing. Since control chars are now rejected,
+        // we test with printable anchors that differ only in structure.
+        let g1 = HolonGenesisV1::new(
+            cell_id.clone(),
+            key_id.clone(),
+            key_bytes.clone(),
+            Some(HolonPurpose::Agent),
+            Some("anchor-alpha".to_string()),
+        )
+        .unwrap();
+        let g2 = HolonGenesisV1::new(
+            cell_id,
+            key_id,
+            key_bytes,
+            Some(HolonPurpose::Agent),
+            Some("anchor-beta".to_string()),
+        )
+        .unwrap();
+
+        assert_ne!(
+            g1.canonical_bytes(),
+            g2.canonical_bytes(),
+            "different anchors must produce different canonical bytes"
+        );
+    }
+
+    /// Length-prefixed round-trip: canonical bytes are deterministic and the
+    /// length prefix structure is consistent.
+    #[test]
+    fn canonical_bytes_length_prefix_structure() {
+        let genesis = make_holon_genesis();
+        let bytes = genesis.canonical_bytes();
+
+        // Verify domain separator is at the start
+        assert!(
+            bytes.starts_with(GENESIS_DOMAIN_SEPARATION),
+            "canonical bytes must start with genesis domain separator"
+        );
+
+        // Verify determinism
+        assert_eq!(bytes, genesis.canonical_bytes());
+
+        // Verify that a genesis with no optional fields also works
+        let cell_id = make_cell_id(0x11, "cell.example.internal");
+        let key_bytes = make_public_key_bytes(0xBB);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let bare = HolonGenesisV1::new(cell_id, key_id, key_bytes, None, None).unwrap();
+        let bare_bytes = bare.canonical_bytes();
+        assert_eq!(bare_bytes, bare.canonical_bytes());
+
+        // bare and full genesis must differ
+        assert_ne!(bytes, bare_bytes);
+    }
+
+    // =========================================================================
+    // BLOCKER-2: Ed25519 key length validation tests
+    // =========================================================================
+
+    #[test]
+    fn rejects_31_byte_public_key() {
+        let key_bytes = vec![0xAA; 31];
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "31-byte key must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_33_byte_public_key() {
+        let key_bytes = vec![0xAA; 33];
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, KeyIdError::InvalidDescriptor { .. }),
+            "33-byte key must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_exactly_32_byte_public_key() {
+        let key_bytes = make_public_key_bytes(0xAA);
+        assert_eq!(key_bytes.len(), 32);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let genesis = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            None,
+        );
+        assert!(genesis.is_ok(), "exactly 32-byte key must be accepted");
+    }
+
+    // =========================================================================
+    // MAJOR-1: Control character rejection tests (created_anchor)
+    // =========================================================================
+
+    #[test]
+    fn created_anchor_rejects_null_byte() {
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            Some("anchor\0test".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
+    }
+
+    #[test]
+    fn created_anchor_rejects_soh_control() {
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            Some("anchor\x01test".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
+    }
+
+    #[test]
+    fn created_anchor_rejects_del_control() {
+        let key_bytes = make_public_key_bytes(0xAA);
+        let key_id = PublicKeyIdV1::from_key_bytes(AlgorithmTag::Ed25519, &key_bytes);
+        let err = HolonGenesisV1::new(
+            make_cell_id(0x11, "cell.example"),
+            key_id,
+            key_bytes,
+            None,
+            Some("anchor\x7Ftest".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err, KeyIdError::ContainsControlCharacter);
     }
 }
