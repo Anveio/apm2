@@ -8,8 +8,6 @@ on:
   push:
     tags:
       - 'v*'
-    tags-ignore:
-      - 'v*-*'
 
 permissions:
   contents: write
@@ -25,6 +23,8 @@ jobs:
   # Promote artifacts from beta (or dev) and sign
   release:
     name: Promote and Sign
+    # Do not run for pre-release tags (e.g. vX.Y.Z-beta.N).
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     outputs:
       hashes: ${{ steps.hash.outputs.hashes }}
