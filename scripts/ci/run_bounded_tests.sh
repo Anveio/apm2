@@ -43,6 +43,7 @@ Options:
   --memory-max VALUE          systemd MemoryMax (default: 4G)
   --pids-max N                systemd TasksMax (default: 1536)
   --cpu-quota VALUE           systemd CPUQuota (default: 200%)
+  --allow-timeout-fallback    Break-glass: skip systemd-run and use timeout only
   -h, --help                  Show help
 
 Environment:
@@ -87,6 +88,9 @@ while [[ $# -gt 0 ]]; do
             shift
             [[ $# -gt 0 ]] || { log_error "--cpu-quota requires a value"; exit 2; }
             CPU_QUOTA="$1"
+            ;;
+        --allow-timeout-fallback)
+            ALLOW_TIMEOUT_FALLBACK=1
             ;;
         -h|--help)
             usage
@@ -155,9 +159,17 @@ fi
 # Primary path: systemd-run --user with full cgroup enforcement
 # -------------------------------------------------------------------
 
+# Normalize user-runtime defaults when runner service does not export them.
+if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+fi
+
 # Preflight: verify the user bus is reachable.
-if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus" ]]; then
-    log_error "User D-Bus socket not found at ${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus"
+if [[ ! -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+    log_error "User D-Bus socket not found at ${XDG_RUNTIME_DIR}/bus"
     log_error "Ensure loginctl enable-linger is set and the runner service has"
     log_error "Environment=XDG_RUNTIME_DIR=/run/user/$(id -u) in its drop-in."
     exit 1

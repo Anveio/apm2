@@ -31,7 +31,7 @@ jobs:
   check-comment:
     name: Check Comment
     if: github.event_name == 'issue_comment'
-    runs-on: ubuntu-24.04
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     outputs:
       triggered: ${{ steps.check.outputs.triggered }}
       pr_number: ${{ github.event.issue.number }}
@@ -51,7 +51,7 @@ jobs:
 
   benchmark:
     name: Run Benchmarks
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     # Run if: manual trigger, release tag, or /benchmark comment
     if: |
       always() && (
@@ -181,7 +181,7 @@ jobs:
   # Store historical data on releases
   store-history:
     name: Store Historical Data
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     needs: [benchmark]
     if: startsWith(github.ref, 'refs/tags/v')
     continue-on-error: true

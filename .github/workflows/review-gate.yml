@@ -41,14 +41,14 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
-    runs-on: ubuntu-24.04
+    runs-on: &primary_runner [self-hosted, linux, x64, fac-ovh]
     steps:
       - run: echo "Pre-filter passed"
 
   review-gate:
     name: Review Gate
     needs: [pre-filter]
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     outputs:
       gate_state: ${{ steps.evaluate.outputs.gate_state }}
     steps:
@@ -136,7 +136,7 @@ jobs:
     name: Review Gate Success
     needs: [pre-filter, review-gate]
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: *primary_runner
     steps:
       - name: Check review gate result
         id: gate

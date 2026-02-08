@@ -10,6 +10,7 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
   - `systemd-run` available for transient bounded scopes
   - Rust toolchain baseline `nightly-2025-12-01`
   - `cargo-nextest`, `protoc`, and GitHub Actions runner service installed
+  - Parallel job execution requires multiple runner agents registered on this machine with the same labels (one runner process executes one job at a time).
 
 ## Blocking Guard Jobs
 - `Test Safety Guard`
@@ -41,7 +42,11 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
 
 ## Triage Notes
 - `systemd-run` authentication errors:
-  - Ensure runner service account can create transient units (`systemd-run --user` or system scope policy).
+  - Ensure `systemd-run --user` is functional for the runner account.
+  - Verify linger and user manager: `loginctl show-user ubuntu` includes `Linger=yes`, and `systemctl status user@1000.service` is active.
+  - Verify runner service exports user-bus environment:
+    - `XDG_RUNTIME_DIR=/run/user/1000`
+    - `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`
 - Missing cgroup controllers:
   - Validate cgroup v2 mount and controller availability (`cat /sys/fs/cgroup/cgroup.controllers`).
 - Workspace drift failures:
