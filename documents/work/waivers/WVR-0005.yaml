@@ -62,8 +62,8 @@ waiver:
 
   references:
     pr_url: "https://github.com/guardian-intelligence/apm2/pull/502"
-    commit_sha: "26687c54730bbc1c5464ccec393f710522202ef8"
-    commit_message: "ci: force-prepend cargo bin dir in bounded PATH"
+    commit_sha: "8b7729d2cd8e92a44e53cf8b0ab6f8dcbf27c2e5"
+    commit_message: "ci: scope HostToolsCheck to plan and harden PATH"
     related_ticket: "TCK-00410"
 
   approval:
