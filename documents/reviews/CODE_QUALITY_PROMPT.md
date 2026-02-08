@@ -294,33 +294,7 @@ decision_tree:
             the review-gate evaluator from the machine-readable metadata
             block above.
           run: |
-            # Idempotent comment posting: avoid spamming duplicate reviewer
-            # comments on reruns/denials. If we already posted a code-quality
-            # review for this exact head SHA, update that comment instead of
-            # creating a new one.
-            PR_JSON=$(gh pr view $PR_URL --json number,repository)
-            PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
-            OWNER=$(echo "$PR_JSON" | jq -r '.repository.owner.login')
-            REPO=$(echo "$PR_JSON" | jq -r '.repository.name')
-            BOT_LOGIN=$(gh api user --jq '.login')
-            MARKER="<!-- apm2-review-metadata:v1:code-quality -->"
-            # Extract the reviewed HEAD SHA from the findings file itself to
-            # avoid relying on RoleSpec variable substitution in the shell.
-            HEAD_SHA=$(grep -Eoi '[0-9a-f]{40}' quality_findings.md | head -n 1)
-            if [[ -z "$HEAD_SHA" ]]; then
-              echo "::error::Could not extract reviewed head SHA from quality_findings.md"
-              exit 1
-            fi
-
-            COMMENT_ID=$(gh api "/repos/${OWNER}/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" --paginate --jq \
-              "[.[] | select(.user.login == \"$BOT_LOGIN\") | select((.body // \"\") | contains(\"$MARKER\")) | select((.body // \"\") | contains(\"$HEAD_SHA\"))] | sort_by(.updated_at) | last | .id // empty")
-
-            if [[ -n "$COMMENT_ID" ]]; then
-              gh api --method PATCH "/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}" \
-                -F body=@quality_findings.md
-            else
-              gh pr comment $PR_URL --body-file quality_findings.md
-            fi
+            gh pr comment $PR_URL --body-file quality_findings.md
             rm quality_findings.md
         - id: TERMINATE
           action: output

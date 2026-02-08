@@ -239,7 +239,14 @@ decision_tree:
           action: classify
           options[3]:
             - id: STRICTNESS_DECREASE
-              rule: "BLOCK unless valid, unexpired WVR-#### exists and is referenced."
+              rule: |
+                BLOCK unless valid, unexpired WVR-#### exists and is referenced.
+
+                Waiver validation:
+                - `waiver.references.commit_sha` MUST equal reviewed_sha; OR
+                - If the PR head includes a waiver-only commit that only changes
+                  `documents/work/waivers/`, `commit_sha` MAY equal the immediate
+                  parent of reviewed_sha (pre-waiver PR head).
             - id: STRICTNESS_INCREASE
               rule: "BLOCK unless bound RFC exists describing implementation as deterministic checks."
             - id: CLARIFICATION
@@ -326,38 +333,14 @@ decision_tree:
           content: "$MACHINE_READABLE_METADATA_BLOCK"
         - id: POST_AND_UPDATE
           action: command
+          note: |
+            Post findings as a PR comment only.
+            Do NOT call GitHub statuses/check-runs APIs directly.
+            The authoritative `Review Gate Success` status is produced by
+            the review-gate evaluator from the machine-readable metadata
+            block above.
           run: |
-            # Post exactly one authoritative comment containing BOTH the human
-            # findings and the machine-readable metadata block appended above.
-            # Do NOT call `security-review-exec` here; it will produce a second
-            # comment and can confuse downstream evaluation.
-            #
-            # Idempotent posting: avoid spamming duplicate reviewer comments on
-            # reruns/denials. If we already posted a security review for this
-            # exact head SHA, update that comment instead of creating a new one.
-            PR_JSON=$(gh pr view $PR_URL --json number,repository)
-            PR_NUMBER=$(echo "$PR_JSON" | jq -r '.number')
-            OWNER=$(echo "$PR_JSON" | jq -r '.repository.owner.login')
-            REPO=$(echo "$PR_JSON" | jq -r '.repository.name')
-            BOT_LOGIN=$(gh api user --jq '.login')
-            MARKER="<!-- apm2-review-metadata:v1:security -->"
-            # Extract the reviewed HEAD SHA from the findings file itself to
-            # avoid relying on RoleSpec variable substitution in the shell.
-            HEAD_SHA=$(grep -Eoi '[0-9a-f]{40}' security_findings.md | head -n 1)
-            if [[ -z "$HEAD_SHA" ]]; then
-              echo "::error::Could not extract reviewed head SHA from security_findings.md"
-              exit 1
-            fi
-
-            COMMENT_ID=$(gh api "/repos/${OWNER}/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" --paginate --jq \
-              "[.[] | select(.user.login == \"$BOT_LOGIN\") | select((.body // \"\") | contains(\"$MARKER\")) | select((.body // \"\") | contains(\"$HEAD_SHA\"))] | sort_by(.updated_at) | last | .id // empty")
-
-            if [[ -n "$COMMENT_ID" ]]; then
-              gh api --method PATCH "/repos/${OWNER}/${REPO}/issues/comments/${COMMENT_ID}" \
-                -F body=@security_findings.md
-            else
-              gh pr comment $PR_URL --body-file security_findings.md
-            fi
+            gh pr comment $PR_URL --body-file security_findings.md
             rm security_findings.md
         - id: TERMINATE
           action: output

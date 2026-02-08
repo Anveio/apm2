@@ -136,6 +136,36 @@ jobs:
             -f context="ai-review/security" \
             -f description="Security review pending"
 
+      - name: Delete prior security review artifacts for this head (dedupe)
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_APPROVE_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing required secret AUTO_APPROVE_PAT (authoritative reviewer identity token)."
+            exit 1
+          fi
+
+          OWNER_REPO="${{ github.repository }}"
+          PR_NUMBER="${{ steps.pr.outputs.pr_number }}"
+          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
+          BOT_LOGIN=$(gh api user --jq '.login')
+          MARKER="<!-- apm2-review-metadata:v1:security -->"
+
+          IDS=$(gh api "/repos/${OWNER_REPO}/issues/${PR_NUMBER}/comments?per_page=100" --paginate --jq \
+            "[.[] | select(.user.login == \"$BOT_LOGIN\") | select((.body // \"\") | contains(\"$MARKER\")) | select((.body // \"\") | contains(\"$HEAD_SHA\")) | .id] | .[]")
+
+          if [[ -z "${IDS:-}" ]]; then
+            exit 0
+          fi
+
+          while IFS= read -r id; do
+            if [[ -n "${id}" ]]; then
+              gh api --method DELETE "/repos/${OWNER_REPO}/issues/comments/${id}"
+            fi
+          done <<< "$IDS"
+
       - name: Run security review
         if: steps.pr.outputs.skip != 'true'
         env:
