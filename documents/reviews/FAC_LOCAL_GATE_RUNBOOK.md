@@ -18,14 +18,24 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
 
 ## Blocking Guard Checks
 - `Bounded CI Suite`
-  - Command: `./scripts/ci/run_bounded_tests.sh --timeout-seconds 4800 --kill-after-seconds 30 --memory-max 64G --pids-max 8192 --cpu-quota 1600% -- ./scripts/ci/run_local_ci_orchestrator.sh`
-  - The full local suite runs in one transient user unit/cgroup boundary.
-- Restored check surface (none removed), executed inside orchestrator:
+  - Command (deep profile): `cargo run --locked --package apm2-cli -- ci run --profile github-deep --bounded-timeout-seconds 4800 --bounded-kill-after-seconds 30 --bounded-memory-max 64G --bounded-pids-max 8192 --bounded-cpu-quota 1600% --heartbeat-seconds 1 --heavy-lane-tokens 4 --log-mode dual --artifacts-dir target/ci/runs`
+  - Command (fast PR profile): `cargo run --locked --package apm2-cli -- ci run --profile github-pr-fast --bounded-timeout-seconds 4800 --bounded-kill-after-seconds 30 --bounded-memory-max 64G --bounded-pids-max 8192 --bounded-cpu-quota 1600% --heartbeat-seconds 1 --heavy-lane-tokens 4 --log-mode dual --artifacts-dir target/ci/runs`
+  - Command (slow-lane profile): `cargo run --locked --package apm2-cli -- ci run --profile github-slow-lane --bounded-timeout-seconds 4800 --bounded-kill-after-seconds 30 --bounded-memory-max 64G --bounded-pids-max 8192 --bounded-cpu-quota 1600% --heartbeat-seconds 1 --heavy-lane-tokens 4 --log-mode dual --artifacts-dir target/ci/runs`
+  - `apm2 ci run` wraps the suite once in a transient user unit/cgroup boundary; no shell orchestrator is used.
+- Deep profile check surface, executed inside orchestrator:
   - `rustfmt`, `proto-verify`, `clippy`, `doc`
   - `workspace-integrity-snapshot`, `bounded-test-runner`, `workspace-integrity-guard`, `bounded-doctests`, `test-vectors`
-  - `msrv`, `cargo-deny`, `cargo-audit`, `coverage`, `release-build`
+  - `msrv`, `cargo-deny`, `cargo-audit`, `coverage`
   - `safety-proof-coverage`, `legacy-ipc-guard`, `evidence-refs-lint`, `test-refs-lint`, `proto-enum-drift`, `review-artifact-lint`, `status-write-command-lint`, `test-safety-guard`, `guardrail-fixtures`
   - `workspace-integrity-guard` verifies the snapshot after the single `bounded-test-runner` execution (no duplicate `nextest` run).
+- Fast profile check surface (PR):
+  - `rustfmt`
+  - `workspace-integrity-snapshot`, `bounded-test-runner`, `workspace-integrity-guard`
+  - `safety-proof-coverage`, `legacy-ipc-guard`, `evidence-refs-lint`, `test-refs-lint`, `proto-enum-drift`, `review-artifact-lint`, `status-write-command-lint`, `test-safety-guard`, `guardrail-fixtures`
+  - Proto regeneration and heavyweight compile/lint/doc/coverage stages are reserved for `github-deep` to avoid duplicate compile passes in PR fast gates.
+- Slow-lane profile check surface (non-gating):
+  - `release-build`
+  - Triggered by `.github/workflows/ci-slow-lane.yml` and excluded from required `CI Success`.
 
 ## Operational Procedure
 1. Confirm `fac-ovh` resolves to this host and runner service:
@@ -34,12 +44,14 @@ Operate FAC-local CI gate execution on OVH self-hosted runners while keeping Git
 2. Confirm runner is online in GitHub Actions with label set: `self-hosted`, `linux`, `x64`, `fac-ovh`.
 3. Trigger CI on PR and merge-group SHA.
 4. Verify `CI Success` job logs show:
-   - `Preflight passed: systemd-run --user is functional.`
+   - `Preflight passed: systemd-run --user is functional`
    - `Starting bounded command in transient user unit`
-   - `=== CI Summary ===` and PASS/FAIL rows for the full restored check list
-   - `Bounded command completed successfully.`
-   - If coverage runs, `target/ci/lcov.info` exists and Codecov upload step executes (non-blocking).
-5. On failures, inspect job logs and corresponding guard script output.
+   - periodic `HEALTH:` heartbeat lines (default every 1s)
+   - `=== CI Summary ===` and PASS/FAIL rows for the profile's check surface
+   - if tests leak child processes, bounded teardown logs `detected lingering bounded-unit processes; attempting drain` followed by completion status
+   - run artifacts emitted under `target/ci/runs/<run_id>/` (manifest, events.ndjson, per-task logs, summary.json)
+   - If deep profile coverage runs, `target/ci/lcov.info` exists and Codecov upload step executes (non-blocking).
+5. On failures, inspect summary output and the matching `target/ci/runs/<run_id>/tasks/<task_id>.log` entries.
 6. If test-safety false positives occur, add minimal scoped entries to `scripts/ci/test_safety_allowlist.txt`.
 
 ## Triage Notes

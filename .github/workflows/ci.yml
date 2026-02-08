@@ -22,7 +22,6 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
   RUST_BACKTRACE: 1
-  APM2_CI_ALLOW_TIMEOUT_FALLBACK: "0"
 
 permissions:
   contents: read
@@ -42,22 +41,34 @@ jobs:
         with:
           toolchain: nightly-2025-12-01
 
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+
       - name: Run bounded local CI suite
         run: |
-          ./scripts/ci/run_bounded_tests.sh \
-            --timeout-seconds 4800 \
-            --kill-after-seconds 30 \
-            --memory-max 64G \
-            --pids-max 8192 \
-            --cpu-quota 1600% \
-            -- ./scripts/ci/run_local_ci_orchestrator.sh
+          PROFILE="github-deep"
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            PROFILE="github-pr-fast"
+          fi
 
-      - name: Upload CI orchestrator logs
+          echo "Using CI profile: ${PROFILE}"
+          cargo run --locked --package apm2-cli -- ci run \
+            --profile "${PROFILE}" \
+            --bounded-timeout-seconds 4800 \
+            --bounded-kill-after-seconds 30 \
+            --bounded-memory-max 64G \
+            --bounded-pids-max 8192 \
+            --bounded-cpu-quota 1600% \
+            --heartbeat-seconds 1 \
+            --heavy-lane-tokens 4 \
+            --log-mode dual \
+            --artifacts-dir target/ci/runs
+
+      - name: Upload CI run artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-orchestrator-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/ci/orchestrator_logs/
+          name: ci-run-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/ci/runs/
           if-no-files-found: warn
           retention-days: 14
 

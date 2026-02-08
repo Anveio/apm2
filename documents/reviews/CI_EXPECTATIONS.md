@@ -25,8 +25,26 @@
     },
     "execution_model": {
       "github_surface": "single required workflow job `CI Success` on runner labels [self-hosted, linux, x64, fac-ovh]",
-      "local_executor": "./scripts/ci/run_bounded_tests.sh --timeout-seconds 4800 --kill-after-seconds 30 --memory-max 64G --pids-max 8192 --cpu-quota 1600% -- ./scripts/ci/run_local_ci_orchestrator.sh",
-      "note": "The entire CI suite runs in one transient user unit/cgroup boundary; no prior CI checks are removed from the suite."
+      "local_executor": "cargo run --locked --package apm2-cli -- ci run --profile <github-pr-fast|github-deep|github-slow-lane> --bounded-timeout-seconds 4800 --bounded-kill-after-seconds 30 --bounded-memory-max 64G --bounded-pids-max 8192 --bounded-cpu-quota 1600% --heartbeat-seconds 1 --heavy-lane-tokens 4 --log-mode dual --artifacts-dir target/ci/runs",
+      "note": "The CI suite is orchestrated by `apm2 ci` in Rust (no shell orchestration), executed once inside a transient user unit/cgroup boundary, drains lingering child processes before unit exit, and emits structured artifacts at target/ci/runs/. `CI Success` uses fast/deep profiles; release build moved to `github-slow-lane` in a separate non-required workflow."
+    },
+    "profiles": {
+      "github-pr-fast": {
+        "event_scope": ["pull_request"],
+        "budget_target_seconds": 120,
+        "intent": "Fast PR gate for high-concurrency iteration while preserving bounded execution and core guardrails.",
+        "surface_note": "Fast profile intentionally omits duplicate compile/proto-heavy stages to keep warm-cache runtimes near the 2-minute target."
+      },
+      "github-deep": {
+        "event_scope": ["push", "merge_group"],
+        "budget_target_seconds": 5400,
+        "intent": "Deep validation surface on mainline and merge-group SHAs (excluding release build)."
+      },
+      "github-slow-lane": {
+        "event_scope": ["push", "workflow_dispatch"],
+        "budget_target_seconds": 10800,
+        "intent": "Slow-lane heavyweight checks outside required CI Success gate."
+      }
     },
     "checks": [
       {
@@ -111,7 +129,7 @@
         "id": "build",
         "name": "Release Build",
         "command": "cargo build --workspace --release",
-        "validates": "Release profile build succeeds"
+        "validates": "Release profile build succeeds (github-slow-lane profile)"
       },
       {
         "id": "safety-proof-coverage",
