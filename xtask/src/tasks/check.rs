@@ -822,13 +822,11 @@ fn is_review_completed_by_comment(
     head_sha: &str,
     reviewer_type: &str,
 ) -> bool {
-    const SECURITY_MARKER: &str = "<!-- apm2-review-metadata:v1:security -->";
-    const QUALITY_MARKER: &str = "<!-- apm2-review-metadata:v1:code-quality -->";
     const MAX_PAGES: u32 = 10;
 
-    let marker = match reviewer_type {
-        "security" => SECURITY_MARKER,
-        "quality" => QUALITY_MARKER,
+    let category = match reviewer_type {
+        "security" => crate::tasks::review_gate::ReviewCategory::Security,
+        "quality" => crate::tasks::review_gate::ReviewCategory::CodeQuality,
         _ => return false,
     };
 
@@ -836,7 +834,12 @@ fn is_review_completed_by_comment(
         return false;
     };
 
-    let needle_sha = head_sha.to_ascii_lowercase();
+    let Ok(trusted_reviewers) = crate::tasks::review_gate::load_trusted_reviewers_map(
+        std::path::Path::new(".github/review-gate/trusted-reviewers.json"),
+    ) else {
+        return false; // fail-closed: cannot validate trust
+    };
+
     for page in 1..=MAX_PAGES {
         let endpoint =
             format!("/repos/{owner_repo}/issues/{pr_number}/comments?per_page=100&page={page}");
@@ -860,7 +863,14 @@ fn is_review_completed_by_comment(
                 continue;
             };
 
-            if body.contains(marker) && body.to_ascii_lowercase().contains(&needle_sha) {
+            if crate::tasks::review_gate::is_authoritative_review_artifact_for_head(
+                &body,
+                category,
+                pr_number.into(),
+                head_sha,
+                &trusted_reviewers,
+                &comment.user.login,
+            ) {
                 return true;
             }
         }
@@ -872,6 +882,12 @@ fn is_review_completed_by_comment(
 #[derive(Debug, Deserialize)]
 struct GithubIssueCommentForCheck {
     body: Option<String>,
+    user: GithubIssueCommentUserForCheck,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubIssueCommentUserForCheck {
+    login: String,
 }
 
 fn parse_pr_url_for_check(pr_url: &str) -> Option<(String, u32)> {

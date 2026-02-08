@@ -64,11 +64,13 @@ pub fn run(
             .context("Failed to serialize review gate evaluation to JSON")?
     );
 
+    // IMPORTANT: stdout is a strict machine contract consumed by workflows.
+    // Keep it JSON-only. Human status hints go to stderr.
     if evaluation.overall_pass {
-        println!("Review gate: PASS");
+        eprintln!("Review gate: PASS");
         Ok(())
     } else if evaluation.overall_pending {
-        println!("Review gate: PENDING (waiting for AI reviews)");
+        eprintln!("Review gate: PENDING (waiting for AI reviews)");
         std::process::exit(2);
     } else {
         bail!("Review gate: FAIL");
@@ -344,7 +346,13 @@ fn parse_comment_metadata(
     comment: &IssueComment,
     category: ReviewCategory,
 ) -> Result<ReviewMetadataV1, String> {
-    let body = comment.body.as_deref().unwrap_or_default();
+    parse_metadata_from_body(comment.body.as_deref().unwrap_or_default(), category)
+}
+
+fn parse_metadata_from_body(
+    body: &str,
+    category: ReviewCategory,
+) -> Result<ReviewMetadataV1, String> {
     let marker = category.marker();
     // Use rfind to select the LAST marker in the body, preventing metadata
     // shadowing when free-form reason text contains an earlier marker copy.
@@ -518,7 +526,7 @@ fn is_valid_sha(sha: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum ReviewCategory {
+pub(super) enum ReviewCategory {
     Security,
     #[serde(rename = "code-quality")]
     CodeQuality,
@@ -597,7 +605,41 @@ impl ReviewMetadataV1 {
     }
 }
 
-type TrustedReviewerMap = HashMap<ReviewCategory, HashMap<String, BTreeSet<String>>>;
+pub(super) type TrustedReviewerMap = HashMap<ReviewCategory, HashMap<String, BTreeSet<String>>>;
+
+pub(super) fn load_trusted_reviewers_map(path: &Path) -> Result<TrustedReviewerMap> {
+    TrustedReviewerConfig::load(path)?.to_allowlist_map()
+}
+
+pub(super) fn is_authoritative_review_artifact_for_head(
+    body: &str,
+    category: ReviewCategory,
+    pr_number: u64,
+    head_sha: &str,
+    trusted_reviewers: &TrustedReviewerMap,
+    comment_author_login: &str,
+) -> bool {
+    let Ok(metadata) = parse_metadata_from_body(body, category) else {
+        return false;
+    };
+
+    if validate_reviewer_trust(
+        trusted_reviewers,
+        category,
+        &metadata.reviewer_id,
+        comment_author_login,
+    )
+    .is_err()
+    {
+        return false;
+    }
+
+    if metadata.pr_number != pr_number {
+        return false;
+    }
+
+    metadata.head_sha.eq_ignore_ascii_case(head_sha)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -763,6 +805,7 @@ struct CategoryArtifact {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashMap};
     use std::fs;
     use std::path::PathBuf;
 
@@ -981,6 +1024,74 @@ Authoritative metadata below:
         assert_eq!(
             parse_owner_repo("git@github.com:example/project.git"),
             Some("example/project".to_string())
+        );
+    }
+
+    #[test]
+    fn authoritative_artifact_predicate_requires_trusted_author_and_valid_metadata() {
+        let pr_number = 502;
+        let head_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let body = format!(
+            r#"## Review
+
+{SECURITY_METADATA_MARKER}
+```json
+{{
+  "schema": "{REVIEW_METADATA_SCHEMA}",
+  "review_type": "security",
+  "pr_number": {pr_number},
+  "head_sha": "{head_sha}",
+  "verdict": "PASS",
+  "severity_counts": {{ "blocker": 0, "major": 0, "minor": 0, "nit": 0 }},
+  "reviewer_id": "apm2-codex-security"
+}}
+```"#
+        );
+
+        let mut reviewers_by_id = HashMap::new();
+        let mut logins = BTreeSet::new();
+        logins.insert("trusted-bot".to_string());
+        reviewers_by_id.insert("apm2-codex-security".to_string(), logins);
+
+        let mut trusted = TrustedReviewerMap::new();
+        trusted.insert(ReviewCategory::Security, reviewers_by_id);
+
+        assert!(
+            is_authoritative_review_artifact_for_head(
+                &body,
+                ReviewCategory::Security,
+                pr_number,
+                head_sha,
+                &trusted,
+                "trusted-bot",
+            ),
+            "trusted author + valid metadata must be accepted"
+        );
+
+        assert!(
+            !is_authoritative_review_artifact_for_head(
+                &body,
+                ReviewCategory::Security,
+                pr_number,
+                head_sha,
+                &trusted,
+                "untrusted-user",
+            ),
+            "untrusted author must be rejected even if marker + sha appear"
+        );
+
+        let malformed = format!("{SECURITY_METADATA_MARKER}\n(no json fence here)\n{head_sha}\n",);
+        assert!(
+            !is_authoritative_review_artifact_for_head(
+                &malformed,
+                ReviewCategory::Security,
+                pr_number,
+                head_sha,
+                &trusted,
+                "trusted-bot",
+            ),
+            "malformed metadata must not count as authoritative"
         );
     }
 
