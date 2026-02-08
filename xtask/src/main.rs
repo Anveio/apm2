@@ -321,6 +321,32 @@ enum SecurityReviewExecCommands {
 /// Review subcommands.
 #[derive(Subcommand)]
 enum ReviewCommands {
+    /// Run both security and code quality reviews (best-effort).
+    ///
+    /// Useful for CI workflows that want to trigger both AI reviewers for a PR
+    /// in one command.
+    All {
+        /// The GitHub PR URL (e.g., `https://github.com/owner/repo/pull/123`)
+        pr_url: String,
+        /// Emit internal receipts/events to daemon (TCK-00295).
+        ///
+        /// When enabled, xtask will attempt to emit internal receipts to the
+        /// daemon. If the daemon is unavailable, xtask continues without
+        /// blocking.
+        ///
+        /// Also enabled via `XTASK_EMIT_INTERNAL=true` environment variable.
+        ///
+        /// NOTE: Internal emission is NON-AUTHORITATIVE scaffolding only.
+        #[arg(long)]
+        emit_internal: bool,
+        /// Emit receipt only, do NOT write directly to GitHub (TCK-00324).
+        #[arg(long)]
+        emit_receipt_only: bool,
+        /// Allow direct GitHub writes (override emit-receipt-only mode).
+        #[arg(long)]
+        allow_github_write: bool,
+    },
+
     /// Run security review using Codex.
     ///
     /// Reads `SECURITY_REVIEW_PROMPT.md`, runs the review,
@@ -437,6 +463,17 @@ fn main() -> Result<()> {
         ),
         Commands::Finish => tasks::finish(),
         Commands::Review { review_type } => match review_type {
+            ReviewCommands::All {
+                pr_url,
+                emit_internal,
+                emit_receipt_only,
+                allow_github_write,
+            } => tasks::review_all(
+                &pr_url,
+                emit_internal,
+                emit_receipt_only,
+                allow_github_write,
+            ),
             ReviewCommands::Security {
                 pr_url,
                 emit_internal,

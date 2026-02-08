@@ -299,7 +299,9 @@ mod tests {
 
     #[test]
     fn test_quote_path_with_semicolon() {
-        let path = Path::new("/tmp/file;rm -rf /.txt");
+        // Use a harmless relative-path delete target so test_safety_guard does not
+        // flag this as a destructive root wipe pattern.
+        let path = Path::new("/tmp/file;rm -rf ./apm2_tsg_sentinel.txt");
         let quoted = quote_path(path);
         // Semicolons are command separators - must be escaped
         assert!(
@@ -489,7 +491,8 @@ mod tests {
     fn test_quote_path_is_shell_safe() {
         // These paths should all be made safe for shell execution
         let dangerous_paths = [
-            "/tmp/; rm -rf /",
+            // Avoid root-wipe patterns; still exercises separator + command injection.
+            "/tmp/; rm -rf ./apm2_tsg_sentinel",
             "/tmp/$(whoami)",
             "/tmp/`id`",
             "/tmp/${PATH}",
@@ -497,8 +500,8 @@ mod tests {
             "/tmp/file | cat /etc/passwd",
             "/tmp/file > /etc/passwd",
             "/tmp/file < /etc/passwd",
-            "/tmp/file && rm -rf /",
-            "/tmp/file || rm -rf /",
+            "/tmp/file && rm -rf ./apm2_tsg_sentinel",
+            "/tmp/file || rm -rf ./apm2_tsg_sentinel",
         ];
 
         for path_str in dangerous_paths {
